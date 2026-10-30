@@ -22,14 +22,20 @@ class RawpyRenderer:
         self.rawpy = rawpy_module
 
     @staticmethod
-    def _wb(raw_wb: Any) -> tuple[float, float, float, float] | None:
+    def _wb(raw_wb: Any, three_color: bool=False) -> tuple[float, float, float, float] | None:
         try:
             vals=tuple(float(x) for x in raw_wb)
-            if len(vals)==4 and all(math.isfinite(x) and x>0 for x in vals):
-                return vals
+            if len(vals)!=4 or not all(math.isfinite(x) and x>0 for x in vals[:3]):
+                return None
+            if not math.isfinite(vals[3]) or vals[3]<=0:
+                # 3-colour Bayer files sometimes leave the unused G2 coefficient at 0.
+                # Infer G2=G only when the decoder reports three actual colours.
+                if not three_color:
+                    return None
+                vals=(vals[0],vals[1],vals[2],vals[1])
+            return vals
         except (ValueError,TypeError):
-            pass
-        return None
+            return None
 
     def inspect(self,path: Path) -> RawMetadata:
         try:
@@ -55,8 +61,9 @@ class RawpyRenderer:
                     signature=""
                 return RawMetadata(camera,
                     int(raw.sizes.width),int(raw.sizes.height),int(raw.sizes.flip),
-                    self._wb(raw.camera_whitebalance),
-                    self._wb(raw.daylight_whitebalance),Path(path).suffix.lower(),signature)
+                    self._wb(raw.camera_whitebalance,getattr(raw,"num_colors",4)==3),
+                    self._wb(raw.daylight_whitebalance,getattr(raw,"num_colors",4)==3),
+                    Path(path).suffix.lower(),signature)
         except Exception as exc:
             raise RawDecodeError(f"cannot inspect {path}: {exc}") from exc
 
