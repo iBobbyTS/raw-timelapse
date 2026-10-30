@@ -1,7 +1,8 @@
 from fractions import Fraction
+import json
 import pytest
 from rawtl.cli import build_parser, load_steps, parse_roi, positive_fps
-from rawtl.types import CancellationToken, ProcessingCancelled
+from rawtl.types import CancellationToken, ProcessingCancelled,InputError
 
 def test_help_and_fraction():
     p=build_parser()
@@ -21,3 +22,11 @@ def test_cancel():
     t.cancel()
     with pytest.raises(ProcessingCancelled):
         t.check()
+
+def test_step_schema(tmp_path):
+    path=tmp_path/"steps.json"
+    path.write_text('[{"start_frame":2,"delta_ev":0.5}]')
+    assert load_steps(path)[0].delta_ev==.5
+    path.write_text('[{"start_frame":true,"delta_ev":0.5}]')
+    with pytest.raises(InputError):
+        load_steps(path)

@@ -1,4 +1,4 @@
-"""Public CLI: argument parsing only; ProcessingService owns all operations."""
+"""Public CLI; only argument parsing, presentation and stable exit codes."""
 from __future__ import annotations
 
 import argparse
@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 import sys
+import traceback
 from .types import ExposureStep, InputError, ProcessingRequest, RawTLError
 
 def positive_fps(value: str) -> Fraction:
@@ -83,30 +84,53 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--overwrite",action="store_true")
     r.add_argument("--encoder",choices=["auto","nvenc","amf","vaapi","videotoolbox","libx264"],default="auto")
     r.add_argument("--ffmpeg",default="ffmpeg")
-    pr=sub.add_parser("probe",help="inspect RAW folder and available encoders without exporting")
+    pr=sub.add_parser("probe",help="inspect RAW folder and actual available encoders")
     pr.add_argument("input",type=Path)
     pr.add_argument("--ffmpeg",default="ffmpeg")
     return p
 
 def main(argv: list[str] | None = None) -> int:
     args=build_parser().parse_args(argv)
+    log=None
     try:
         from .service import ProcessingService
         service=ProcessingService()
-        if args.action == "probe":
-            service.probe(args.input, ffmpeg=args.ffmpeg)
+        if args.action=="probe":
+            result=service.probe(args.input,ffmpeg=args.ffmpeg)
+            print(json.dumps(result,indent=2,ensure_ascii=False,allow_nan=False))
         else:
             req=ProcessingRequest(args.input,args.output,args.fps,args.period,args.strength,args.roi,
                 load_steps(args.steps),args.on_review,args.save_frames,args.overwrite,args.encoder,args.ffmpeg)
-            service.run(req, on_progress=lambda ev: print(
-                f"[{ev.phase}] {ev.processed}/{ev.total} {ev.filename or ''}",file=sys.stderr))
+            def on_progress(ev):
+                nonlocal log
+                line=f"[{ev.phase}] {ev.processed}/{ev.total} {ev.filename or ''} {ev.encoder or ''}".rstrip()
+                print(line,file=sys.stderr)
+                if log is None:
+                    path=req.output_dir/"run.log"
+                    path.parent.mkdir(parents=True,exist_ok=True)
+                    log=path.open("a",encoding="utf-8")
+                print(line,file=log,flush=True)
+            result=service.run(req,on_progress=on_progress)
+            print(json.dumps({"run_status":result.run_status,
+                "video":str(result.video_path),"frames":result.frame_count,
+                "encoder":result.encoder,"report":str(result.report_path)},ensure_ascii=False))
+            if result.run_status!="OK":
+                print("Warning: output is partial; review exposure_report.json",file=sys.stderr)
         return 0
     except KeyboardInterrupt:
-        print("Cancelled", file=sys.stderr)
+        print("Cancelled",file=sys.stderr)
         return 130
     except RawTLError as exc:
         print(f"rawtl: {exc}",file=sys.stderr)
+        if log is not None: print(f"ERROR: {exc}",file=log,flush=True)
         return exc.exit_code
+    except Exception as exc:
+        print(f"rawtl: unexpected error: {exc}",file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        if log is not None: traceback.print_exc(file=log)
+        return 7
+    finally:
+        if log is not None:log.close()
 
 if __name__ == "__main__":
     raise SystemExit(main())
