@@ -90,3 +90,26 @@ def test_decode_failure_and_cancel(tmp_path):
             on_progress=cancel_first,cancel=token)
     assert not (tmp_path/"cancel"/"video.mp4").exists()
     assert json.loads((tmp_path/"cancel"/"exposure_report.json").read_text())["run_status"]=="CANCELLED"
+
+@pytest.mark.skipif(not (FF and FP),reason="FFmpeg unavailable")
+def test_service_e2e_with_deflicker_gain_probe_and_frozen_validation(tmp_path):
+    src=folder(tmp_path,n=30)
+    out=tmp_path/"deflicker"
+    result=ProcessingService(FakeRaw()).run(
+        ProcessingRequest(src,out,encoder="libx264",strength=1.,period=60))
+    assert result.run_status=="OK"
+    report=json.loads((out/"exposure_report.json").read_text())
+    assert report["gain_probe"]["passed"] is True
+    assert report["run_status"]=="OK"
+    assert report["feedback_history"][-1]["passed"] is True
+    assert len(report["frames"])==30
+    assert report["status_counts"].get("OK")==30
+    requested=[row["requested_ev"] for row in report["frames"]]
+    assert all(x is not None for x in requested)
+    # The known alternating exposure error is reversed rather than flattened
+    # after sRGB conversion; fixed target remains in linear light.
+    even=np.mean(requested[::2])
+    odd=np.mean(requested[1::2])
+    assert odd-even > .04
+    assert report["encoder"]["selected"]=="libx264"
+    assert report["video_metadata"]["frames"]==30

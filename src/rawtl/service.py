@@ -155,6 +155,10 @@ class ProcessingService:
             need_review=any(x.applied_ev is None for x in exposure.frames)
             if need_review:
                 report["warnings"].append("REVIEW_REQUIRED: one or more frames have no reliable EV estimate")
+                if request.on_review=="passthrough":
+                    for frame in exposure.frames:
+                        if frame.applied_ev is None:
+                            frame.warnings.append("PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV")
                 if request.on_review=="error":
                     report["run_status"]="REVIEW_REQUIRED"
                     raise ExposureError("exposure estimate incomplete: use --on-review passthrough to output zeros for unreliable frames")
@@ -179,6 +183,8 @@ class ProcessingService:
             previous_summary=None
             best_video=None
             best_png=None
+            best_encoder=None
+            best_video_info=None
             best_score=(float("inf"),float("inf"))
             accepted_summary=None
             best_frame_state=None
@@ -241,6 +247,7 @@ class ProcessingService:
                     if must_validate else None)
                 if summary is None:
                     best_video=video_path;best_png=frame_dir;accepted_summary=None
+                    best_encoder=enc.name;best_video_info=info
                     break
                 current_score=(
                     summary.median_abs_error_ev if summary.median_abs_error_ev is not None else float("inf"),
@@ -258,6 +265,7 @@ class ProcessingService:
                         shutil.rmtree(best_png)
                     best_score=current_score
                     best_video=video_path;best_png=frame_dir
+                    best_encoder=enc.name;best_video_info=info
                     accepted_summary=summary
                     best_frame_state=[(e.applied_ev,e.render_ev,e.render_target_error_ev,
                         e.new_output_clipping_fraction) for e in exposure.frames]
@@ -286,6 +294,8 @@ class ProcessingService:
                 raise ExposureError("renderer failed to achieve frozen exposure targets within two feedback updates")
             if best_video is None or not best_video.exists():
                 raise VerificationError("missing verified temporary MP4")
+            report["encoder"]["selected"]=best_encoder
+            report["video_metadata"]=best_video_info
             self._emit(on_progress,"verify",n,n,encoder=report["encoder"]["selected"])
             # The final PNGs are from the same accepted correction round, not failed retries.
             if best_png is not None:
@@ -295,6 +305,9 @@ class ProcessingService:
             report["run_status"]="PARTIAL" if need_review else "OK"
             report["frames"]=[self._frame_record(ref,est)
                 for ref,est in zip(refs,exposure.frames)]
+            report["status_counts"]={
+                key:sum(z.status==key for z in exposure.frames)
+                for key in sorted({z.status for z in exposure.frames})}
             self._emit(on_progress,"done",n,n,encoder=report["encoder"]["selected"])
             return ProcessingResult(report["run_status"],out,out/"video.mp4",
                 report_path,n,report["encoder"]["selected"])
