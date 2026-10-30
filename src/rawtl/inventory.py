@@ -1,6 +1,6 @@
 """Deterministic flat RAW inventory, compatibility validation, and source manifest."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass,replace
 from pathlib import Path
 from typing import Sequence
 from .types import FrameRef, RawMetadata, RawRenderer, InputError, RawDecodeError
@@ -44,6 +44,10 @@ def check_metadata(ordered: Sequence[FrameRef], renderer: RawRenderer) -> Invent
     if not ordered:
         raise InputError("empty frame list")
     meta=[]
+    camera_models={}
+    batch_reader=getattr(renderer,"camera_models",None)
+    if callable(batch_reader):
+        camera_models=batch_reader([x.path for x in ordered])
     for frame in ordered:
         try:
             data=renderer.inspect(frame.path)
@@ -51,6 +55,9 @@ def check_metadata(ordered: Sequence[FrameRef], renderer: RawRenderer) -> Invent
             raise
         except Exception as exc:
             raise RawDecodeError(f"RAW inspection failed at frame {frame.index} ({frame.filename}): {exc}") from exc
+        selected_camera=camera_models.get(str(frame.path.resolve()))
+        if selected_camera:
+            data=replace(data,camera=selected_camera)
         if data.width <= 0 or data.height <= 0:
             raise RawDecodeError(f"invalid RAW dimensions for {frame.filename}: {data.width}x{data.height}")
         if meta:
@@ -61,6 +68,10 @@ def check_metadata(ordered: Sequence[FrameRef], renderer: RawRenderer) -> Invent
                     f"incompatible RAW at index {frame.index} {frame.filename}: "
                     f"{data.camera} {data.width}x{data.height} orientation={data.orientation}; "
                     f"expected {first.camera} {first.width}x{first.height} orientation={first.orientation}")
+            if (first.sensor_signature and data.sensor_signature and
+                first.sensor_signature!=data.sensor_signature):
+                raise RawDecodeError(
+                    f"RAW sensor/profile fingerprint changed at index {frame.index} {frame.filename}")
         meta.append(data)
     return Inventory(tuple(ordered),tuple(meta))
 

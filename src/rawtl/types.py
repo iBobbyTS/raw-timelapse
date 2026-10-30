@@ -24,6 +24,7 @@ class RawMetadata:
     camera_wb: tuple[float, float, float, float] | None
     daylight_wb: tuple[float, float, float, float] | None
     raw_type: str = ""
+    sensor_signature: str = ""
 
 @dataclass(frozen=True)
 class RawRenderOptions:
