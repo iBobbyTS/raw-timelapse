@@ -65,7 +65,7 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
             raise ExposureError(f"processing conditions changed at frame {i}")
     x=np.asarray([m.log_luminance for m in measurements],dtype=np.float64)
     q=np.asarray([m.valid for m in measurements],dtype=bool)
-    if np.isfinite(x[q]).all() is False:
+    if not bool(np.isfinite(x[q]).all()):
         raise ExposureError("nonfinite valid photometry")
     s=_step_vector(n,steps)
     consensus=np.zeros((n,k),dtype=bool)

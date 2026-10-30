@@ -65,7 +65,9 @@ class ProcessingService:
         if any(x["width"]!=w or x["height"]!=h for x in images):
             raise RawDecodeError("rendered orientation/dimensions differ in representative RAWs")
         fp=resolve_ffprobe(ffmpeg)
-        available,attempts=probe_encoders(ffmpeg,fp,w+w%2,h+h%2,Fraction(30,1),input_dir.parent)
+        with tempfile.TemporaryDirectory(prefix="rawtl-probe-") as probe_dir:
+            available,attempts=probe_encoders(ffmpeg,fp,w+w%2,h+h%2,
+                Fraction(30,1),Path(probe_dir))
         return {"count":len(names),"sorted_files":[x.filename for x in names],
             "camera":meta.camera,"raw_geometry":[meta.width,meta.height],
             "orientation":meta.orientation,"rendered_geometry":[w,h],
@@ -84,6 +86,8 @@ class ProcessingService:
             raise InputError(f"output already exists: {out/'video.mp4'} (pass --overwrite)")
         if request.on_review not in ("error","passthrough"):
             raise InputError("on_review must be error or passthrough")
+        if request.save_frames and (out/"frames").exists() and not request.overwrite:
+            raise InputError(f"PNG frame output already exists: {out/'frames'} (pass --overwrite)")
         out.mkdir(parents=True,exist_ok=True)
         cancel=cancel or CancellationToken()
         report={"schema_version":1,"run_status":"RUNNING","frames":[],
@@ -149,7 +153,7 @@ class ProcessingService:
                 if request.on_review=="error":
                     report["run_status"]="REVIEW_REQUIRED"
                     raise ExposureError("exposure estimate incomplete: use --on-review passthrough to output zeros for unreliable frames")
-            if request.strength!=0 and n>=8:
+            if request.strength!=0 and n>=8 and any(x.applied_ev is not None for x in exposure.frames):
                 self._emit(on_progress,"probe",0,n)
                 probe=probe_gain(r,refs,render_opts,measurements,roi=request.roi)
                 report["gain_probe"]=asdict(probe)
@@ -157,7 +161,7 @@ class ProcessingService:
                     report["run_status"]="GAIN_PROBE_FAILED"
                     raise ExposureError("RAW exposure gain probe failed: "+str(probe.reasons[:3]))
             else:
-                report["gain_probe"]={"status":"SKIPPED","reason":"disabled or short sequence"}
+                report["gain_probe"]={"status":"SKIPPED","reason":"disabled, short sequence or no reliable exposures"}
             ffprobe=resolve_ffprobe(request.ffmpeg)
             width_even=width+width%2
             height_even=height+height%2
@@ -172,6 +176,7 @@ class ProcessingService:
             best_png=None
             best_score=(float("inf"),float("inf"))
             accepted_summary=None
+            best_frame_state=None
             feedback_count=0
             # First pass plus at most two feedback passes.
             for iteration in range(3):
@@ -240,7 +245,8 @@ class ProcessingService:
                     "p95_abs_error_ev":summary.p95_abs_error_ev,
                     "outlier_frames":summary.outlier_frames,
                     "unobservable_frames":summary.unobservable_frames,"passed":summary.passed})
-                if current_score<best_score:
+                if (current_score<best_score or
+                    (summary.passed and (accepted_summary is None or not accepted_summary.passed))):
                     if best_video is not None and best_video!=video_path:
                         best_video.unlink(missing_ok=True)
                     if best_png is not None and best_png!=frame_dir and best_png.exists():
@@ -248,6 +254,8 @@ class ProcessingService:
                     best_score=current_score
                     best_video=video_path;best_png=frame_dir
                     accepted_summary=summary
+                    best_frame_state=[(e.applied_ev,e.render_ev,e.render_target_error_ev,
+                        e.new_output_clipping_fraction) for e in exposure.frames]
                 else:
                     video_path.unlink(missing_ok=True)
                     if frame_dir and frame_dir.exists():shutil.rmtree(frame_dir)
@@ -264,6 +272,10 @@ class ProcessingService:
                     break
                 feedback_count+=1
             report["feedback_updates"]=feedback_count
+            if best_frame_state is not None:
+                for est,state in zip(exposure.frames,best_frame_state):
+                    (est.applied_ev,est.render_ev,est.render_target_error_ev,
+                        est.new_output_clipping_fraction)=state
             if accepted_summary is not None and not accepted_summary.passed:
                 report["run_status"]="TARGET_NOT_REACHED"
                 raise ExposureError("renderer failed to achieve frozen exposure targets within two feedback updates")
