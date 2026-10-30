@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import math
+import json
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 import numpy as np
@@ -31,16 +34,54 @@ class RawpyRenderer:
     def inspect(self,path: Path) -> RawMetadata:
         try:
             with self.rawpy.imread(str(path)) as raw:
-                camera = " ".join(s for s in [
-                    str(getattr(raw.metadata,"make","") or "").strip(),
-                    str(getattr(raw.metadata,"model","") or "").strip()
+                # rawpy 0.27 does not guarantee a .metadata make/model property.
+                optional_metadata=getattr(raw,"metadata",None)
+                camera=" ".join(s for s in [
+                    str(getattr(optional_metadata,"make","") or "").strip(),
+                    str(getattr(optional_metadata,"model","") or "").strip()
                 ] if s).strip() or "UNKNOWN_CAMERA"
+                try:
+                    pattern=raw.raw_pattern
+                    matrix=raw.color_matrix
+                    fingerprint={
+                        "raw_type":str(raw.raw_type),
+                        "num_colors":int(raw.num_colors),
+                        "color_desc":str(raw.color_desc),
+                        "raw_pattern":None if pattern is None else np.asarray(pattern).tolist(),
+                        "matrix":np.asarray(matrix,dtype=np.float64).round(5).tolist()
+                    }
+                    signature=json.dumps(fingerprint,sort_keys=True)
+                except (AttributeError,ValueError,TypeError):
+                    signature=""
                 return RawMetadata(camera,
                     int(raw.sizes.width),int(raw.sizes.height),int(raw.sizes.flip),
                     self._wb(raw.camera_whitebalance),
-                    self._wb(raw.daylight_whitebalance),Path(path).suffix.lower())
+                    self._wb(raw.daylight_whitebalance),Path(path).suffix.lower(),signature)
         except Exception as exc:
             raise RawDecodeError(f"cannot inspect {path}: {exc}") from exc
+
+    def camera_models(self, paths: list[Path]) -> dict[str,str]:
+        """Optional ExifTool batch for accurate camera make/model without requiring it."""
+        executable=shutil.which("exiftool")
+        if not executable:
+            return {}
+        result={}
+        for start in range(0,len(paths),48):
+            chunk=paths[start:start+48]
+            try:
+                p=subprocess.run(
+                    [executable,"-fast2","-j","-Make","-Model",
+                     *[str(x) for x in chunk]],
+                    capture_output=True,text=True,timeout=120,check=True)
+                for item in json.loads(p.stdout):
+                    camera=" ".join(str(item.get(key,"") or "").strip()
+                        for key in ("Make","Model")).strip()
+                    if camera:
+                        result[str(Path(item["SourceFile"]).resolve())]=camera
+            except (OSError,ValueError,KeyError,subprocess.SubprocessError):
+                # Model identity stays explicitly unknown rather than inventing it.
+                continue
+        return result
 
     @staticmethod
     def fixed_wb(metadata: RawMetadata) -> tuple[float,float,float,float]:

@@ -74,8 +74,10 @@ class ProcessingService:
             "fixed_white_balance":list(wb),"representative_frames":images,
             "encoder_available":[x.name for x in available],
             "encoder_attempts":[asdict(x) for x in attempts],
-            "warning":"RAW_PROFILE_UNVERIFIED: verify Canon EOS R6 Mark III CR3 colour manually"
-                if "R6 Mark III" in meta.camera or "R6 Mark 3" in meta.camera else None}
+            "warning":"CAMERA_IDENTITY_UNVERIFIED: ExifTool not available"
+                if meta.camera=="UNKNOWN_CAMERA" else (
+                "RAW_PROFILE_UNVERIFIED: verify Canon EOS R6 Mark III CR3 colour manually"
+                if "R6 Mark III" in meta.camera or "R6 Mark 3" in meta.camera else None)}
 
     def run(self,request: ProcessingRequest,on_progress: Callable | None=None,
             cancel: CancellationToken | None=None) -> ProcessingResult:
@@ -117,8 +119,11 @@ class ProcessingService:
                 "orientation":meta.orientation,
                 "versions":r.versions() if hasattr(r,"versions") else {},
                 "saturation_mask_quality":"approximate"}
-            if "R6 Mark III" in meta.camera:
-                report["warnings"].append("RAW_PROFILE_UNVERIFIED: Canon R6 Mark III colour must be checked")
+            if meta.camera=="UNKNOWN_CAMERA":
+                report["warnings"].append("CAMERA_IDENTITY_UNVERIFIED: install ExifTool for make/model preflight")
+            if "R6 Mark III" in meta.camera or (
+                meta.camera=="UNKNOWN_CAMERA" and meta.raw_type==".cr3"):
+                report["warnings"].append("RAW_PROFILE_UNVERIFIED: Canon CR3 colour must be checked")
             self._emit(on_progress,"inventory",n,n)
             measurements=[]
             baseline_coverage=[]
