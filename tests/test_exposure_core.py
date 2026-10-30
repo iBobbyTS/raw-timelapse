@@ -47,7 +47,9 @@ def test_clean_flicker():
 def test_polluted_tiles():
     m,f=synthetic(300,96,noise=.015,polluted=24)
     e=estimate_exposure(m)
-    assert all(x.applied_ev is not None for x in e.frames)
+    assert all(x.applied_ev is not None for x in e.frames), [
+        (i,z.status,z.valid_tile_count,z.consensus_fraction,z.residual_mad_ev)
+        for i,z in enumerate(e.frames) if z.applied_ev is None][:20]
     rmse,p95=metric(e,f)
     assert rmse<.025 and p95<.04
 

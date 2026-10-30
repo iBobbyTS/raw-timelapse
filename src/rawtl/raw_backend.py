@@ -38,7 +38,7 @@ class RawpyRenderer:
                 return RawMetadata(camera,
                     int(raw.sizes.width),int(raw.sizes.height),int(raw.sizes.flip),
                     self._wb(raw.camera_whitebalance),
-                    self._wb(raw.daylight_whitebalance),path.suffix.lower())
+                    self._wb(raw.daylight_whitebalance),Path(path).suffix.lower())
         except Exception as exc:
             raise RawDecodeError(f"cannot inspect {path}: {exc}") from exc
 

@@ -27,7 +27,7 @@ def test_actual_h264_12_frames(tmp_path):
 def test_auto_encoder_finally_has_cpu(tmp_path):
     available,attempts=probe_encoders(ffmpeg,ffprobe,320,240,Fraction(30),tmp_path)
     assert available
-    assert any(a.name=="libx264" and a.available for a in attempts)
+    assert any(a.encoder=="libx264" and a.available for a in attempts)
 
 def test_wrong_raw_byte_shape(tmp_path):
     c=EncoderCandidate("libx264","libx264")
