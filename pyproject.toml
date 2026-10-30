@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "raw-timelapse"
+version = "0.1.0"
+description = "Offline RAW time-lapse exposure stabilization and H.264 output"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=1.26,<3",
+  "scipy>=1.12,<2",
+  "rawpy>=0.24,<1",
+  "Pillow>=10,<13",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+rawtl = "rawtl.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
