@@ -1,0 +1,92 @@
+import csv
+import json
+import shutil
+from pathlib import Path
+import numpy as np
+import pytest
+from rawtl.types import (
+    LinearFrame,RawMetadata,ProcessingRequest,CancellationToken,ProcessingCancelled,
+    RawDecodeError,ExposureError,InputError)
+from rawtl.service import ProcessingService
+
+FF=shutil.which("ffmpeg");FP=shutil.which("ffprobe")
+
+class FakeRaw:
+    def inspect(self,path):
+        return RawMetadata("Test Camera",320,240,0,(2.,1.,1.5,1.),(2.,1.,1.5,1.))
+    def render_linear(self,path,ev,opts):
+        i=int(path.stem.split("_")[-1])
+        v=.18*2**(ev+.04*(-1)**i)
+        return LinearFrame(np.full((240,320,3),v,dtype=np.float32),
+            np.zeros((240,320),dtype=bool),"approximate",1/65535,False)
+    def versions(self):
+        return {"rawpy":"synthetic","libraw":"synthetic"}
+
+class BlackRaw(FakeRaw):
+    def render_linear(self,path,ev,opts):
+        f=super().render_linear(path,ev,opts)
+        f.rgb.fill(0.)
+        return f
+
+class BrokenRaw(FakeRaw):
+    def render_linear(self,path,ev,opts):
+        if path.stem=="frame_003":
+            raise RawDecodeError("injected decoder error")
+        return super().render_linear(path,ev,opts)
+
+def folder(tmp_path,n=12):
+    src=tmp_path/"raws"
+    src.mkdir()
+    for i in range(n):
+        (src/f"frame_{i:03d}.DNG").write_bytes(b"synthetic")
+    return src
+
+@pytest.mark.skipif(not (FF and FP),reason="FFmpeg unavailable")
+def test_service_e2e_synthetic_no_deflicker(tmp_path):
+    src=folder(tmp_path)
+    out=tmp_path/"out"
+    req=ProcessingRequest(src,out,strength=0.,save_frames=True,encoder="libx264")
+    result=ProcessingService(FakeRaw()).run(req)
+    assert result.run_status=="OK"
+    assert (out/"video.mp4").is_file()
+    assert len(list((out/"frames").glob("*.png")))==12
+    report=json.loads((out/"exposure_report.json").read_text())
+    assert len(report["frames"])==12
+    assert report["encoder"]["selected"]=="libx264"
+    assert [x["render_ev"] for x in report["frames"]]==[0.]*12
+    with (out/"exposure_curve.csv").open(newline="") as f:
+        assert len(list(csv.DictReader(f)))==12
+    with pytest.raises(InputError):
+        ProcessingService(FakeRaw()).run(req)
+    assert (out/"video.mp4").is_file()
+
+@pytest.mark.skipif(not (FF and FP),reason="FFmpeg unavailable")
+def test_review_required_and_passthrough(tmp_path):
+    src=folder(tmp_path)
+    out=tmp_path/"review"
+    with pytest.raises(ExposureError):
+        ProcessingService(BlackRaw()).run(ProcessingRequest(src,out,encoder="libx264"))
+    assert not (out/"video.mp4").exists()
+    report=json.loads((out/"exposure_report.json").read_text())
+    assert report["run_status"]=="REVIEW_REQUIRED"
+    result=ProcessingService(BlackRaw()).run(
+        ProcessingRequest(src,out,on_review="passthrough",encoder="libx264"))
+    assert result.run_status=="PARTIAL"
+    rows=json.loads((out/"exposure_report.json").read_text())["frames"]
+    assert all(x["applied_ev"] is None and x["render_ev"]==0 for x in rows)
+
+def test_decode_failure_and_cancel(tmp_path):
+    src=folder(tmp_path)
+    out=tmp_path/"broken"
+    with pytest.raises(RawDecodeError):
+        ProcessingService(BrokenRaw()).run(ProcessingRequest(src,out,strength=0.))
+    assert not (out/"video.mp4").exists()
+    token=CancellationToken()
+    def cancel_first(ev):
+        if ev.phase=="analysis":token.cancel()
+    with pytest.raises(ProcessingCancelled):
+        ProcessingService(FakeRaw()).run(
+            ProcessingRequest(src,tmp_path/"cancel",strength=0.),
+            on_progress=cancel_first,cancel=token)
+    assert not (tmp_path/"cancel"/"video.mp4").exists()
+    assert json.loads((tmp_path/"cancel"/"exposure_report.json").read_text())["run_status"]=="CANCELLED"
