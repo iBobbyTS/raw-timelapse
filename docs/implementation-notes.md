@@ -31,3 +31,7 @@ Append concrete commands, results and remaining limitations as each implementati
 - T10: documentation and version pins.
 
 **Verification distinction**: GitHub Actions can verify Python and synthetic CPU software encoding on CI; it does not prove GPU hardware encoding or real-camera CR3 compatibility. No user RAW files were included. Camera model / white-balance / colour correctness remain unverified until real source sequences are supplied.
+
+## RAW API note
+
+rawpy 0.27.1 has no guaranteed public camera make/model field; optional ExifTool can read it in batches, otherwise `UNKNOWN_CAMERA` with an explicit warning is reported. Raw pattern / matrix fingerprints catch some incompatible sequences but are not a model identity guarantee. Three-colour sensors may report an unused fourth WB coefficient as zero; V1 infers G2=G only when `num_colors==3` and validates the resulting four positive entries. Real-camera validation is still required.
