@@ -1,0 +1,15 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+dist/
+build/
+out/
+*.mp4
+*.CR3
+*.cr3
+*.NEF
+*.ARW
+*.DNG
