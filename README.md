@@ -1,1 +1,99 @@
 # raw-timelapse
+
+Offline command-line RAW time-lapse processor: deterministic filename ordering, robust exposure smoothing, simple sRGB development, and H.264/MP4 using FFmpeg.
+
+**Status: first implementation.** Synthetic algorithm and software-encoder test coverage is included. Real-world RAW colour and hardware encoding need validation with your own camera and GPU. This is not a colour-managed production RAW grading pipeline.
+
+## Requirements
+
+- Python 3.12+, FFmpeg and ffprobe on your `PATH` (or `--ffmpeg /path/to/ffmpeg`).
+- `rawpy`/LibRaw, NumPy, SciPy and Pillow (installed by pip).
+- Sufficient storage; the target bit rate is **20 MB/s = 160 Mbps**, not 20 Mbps.
+
+Installation:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate                # Windows: .venv\\Scripts\\activate
+python -m pip install -r requirements.lock
+rawtl --help
+rawtl probe /path/to/RAW_DIR
+```
+
+Alternative: `python -m pip install -e ".[test]"` for current compatible dependency versions.
+
+## Process a sequence
+
+```bash
+rawtl run ./raws -o ./out
+rawtl run ./raws -o ./out --fps 30000/1001 --period 60 --strength 1.0
+rawtl run ./raws -o ./out --roi 0.10,0.15,0.70,0.60 --steps steps.json
+rawtl run ./raws -o ./out --on-review passthrough --save-frames
+rawtl run ./raws -o ./out --encoder libx264 --overwrite
+```
+
+Use zero-padded filenames such as `IMG_0001.CR3`. The scanner reads **only the first directory level**, filters common RAW extensions (CR2, CR3, NEF, ARW, DNG, RAF, RW2, ORF), and sorts **case-sensitively by the complete filename**. Without zero padding, `IMG_1.CR3, IMG_10.CR3, IMG_2.CR3` remain in exactly that order; EXIF timestamps are never used for sorting. Unsupported or corrupt RAWs are errors, not silently skipped frames.
+
+The input directory must not contain an output directory and the program never modifies RAWs or sidecar metadata.
+
+### Explicit exposure steps
+
+`steps.json` describes *confirmed* exposure jumps, with 0-based frame indices:
+
+```json
+[
+  {"start_frame":300, "delta_ev":1.0},
+  {"start_frame":600, "delta_ev":-0.6666666667}
+]
+```
+
+Without this file, the algorithm removes **fast flicker**, not persistent photographer-controlled exposure changes. It preserves slower daytime-to-nighttime changes. It cannot inherently distinguish a lightning flash from camera flicker.
+
+The default period `60` is the approximate half-amplitude time scale **in output frames**, not an averaging window. `--strength 0` disables automatic exposure corrections. Sequences shorter than 8 frames are not automatically deflickered, though explicit steps still apply.
+
+### Review states
+
+The analyzer refuses to invent exposure adjustments when there is insufficient usable background, dynamic coverage, or unsaturated data. Default `--on-review error` stops before exporting a final MP4. To export regardless, use `--on-review passthrough`: frames with no reliable estimate render at **0 EV**, while the report retains their `applied_ev=null` and marks the run `PARTIAL`. Do not interpret `PARTIAL` as verified deflicker.
+
+`requested_ev` is the unconstrained solution, `applied_ev` the safe [-2,+2] EV value, and `render_ev` the actual value sent to the renderer (which may be 0 in passthrough). Gain probes can reject a renderer that responds nonlinearly. The frozen-target validation retries no more than twice and does not flatten targets again.
+
+## Files
+
+```text
+out/
+  video.mp4              H.264, 8-bit yuv420p, no audio
+  exposure_report.json   per-frame EV, errors, pipeline versions, encoder attempts
+  exposure_curve.csv     aligned to input filename order
+  run.log                CLI progress and errors
+  frames/                optional final accepted-frame sRGB PNGs
+```
+
+MP4 target bitrate is fixed at **160,000,000 bit/s**; the realized average file bit rate is usually *lower* on easy footage. Default frame rate is 30 fps; any supported rational rate can be supplied.
+
+The encoder selection order is NVIDIA NVENC > AMD AMF (Windows) / AMD VAAPI (Linux AMD device only) > Apple VideoToolbox > software libx264. Each listed codec is **really tested with two full-output-size frames**; a listed codec alone does not prove hardware functionality. When an encoder fails during processing, the sequence restarts at original RAW frame 0 with the next backend. Forced `--encoder` fails rather than silently switching.
+
+## Processing details and limitations
+
+- Linear RGB under fixed RAW development settings, one fixed WB for the entire sequence; no auto-brightening or per-frame auto-WB. 16-bit linear LibRaw output is normalized, compensated at RAW development time and finally encoded via the sRGB OETF.
+- Exposure photometry uses linear RGB tiles and robust temporal smoothing instead of whole-frame mean luminance. Near-white RGB pixels are only a *proxy* for true sensor saturation.
+- Default camera colour transformation is LibRaw's built-in sRGB mapping; no per-camera calibration, lens correction, Log encoding, HDR output or GUI yet. Hooks exist for these future features without expanding the current code path.
+- H.264/MP4 is tagged as BT.709 SDR. sRGB and BT.709 transfer functions are not identical; this is **not** stringent colour management.
+- Canon EOS R6 Mark III CR3 has publicly reported LibRaw colour-profile risks. Validate actual colour against a known-good converter before using it for critical output. Camera support cannot be certified by RAW decoding alone.
+- No video stabilisation, local contrast/color deflicker, optical flow, automatic shot boundaries, advanced white-balance smoothing, highlight reconstruction or RAW-to-Log.
+- Memory is bounded per full-resolution frame, while the small N×K measurement matrix covers the whole sequence. Input files are not loaded all at once.
+- For 45 MP RAW output expect substantial temporary peak RAM for rawpy, linear RGB, measurement buffers and RGB24 encodes. A 160 Mbps target consumes up to ~1.2 GB/min if attained; allocate space for two temporary candidate MP4s.
+
+## Tests
+
+```bash
+python -m pytest -q
+rawtl --help
+rawtl run --help
+rawtl probe --help
+```
+
+Tests cover synthetic exposure metrics, input sorting, fixed WB/exposure options via mocks, gain probe, encoder selection, software FFmpeg integration, reporting and cancellation. Test results from a cloud runner are **not** a substitute for real camera and GPU validation.
+
+See [implementation evidence](docs/implementation-notes.md) and [exposure contract](docs/exposure-contract.md).
+
+Licence: see [LICENSE](LICENSE).
