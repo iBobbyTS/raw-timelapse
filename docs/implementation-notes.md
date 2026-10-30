@@ -16,3 +16,18 @@ Task-by-task development log for the RAW time-lapse CLI. Tasks T0–T10 are conv
 ## Verification log
 
 Append concrete commands, results and remaining limitations as each implementation task completes. Never equate mock results with real camera or GPU validation.
+
+## T1–T10 implementation status
+
+- T1: src-layout package, CLI and Python type/protocol contracts.
+- T2: flat deterministic inventory, strict metadata equality and source manifest.
+- T3: fixed four-channel WB, LibRaw linear 16-bit sRGB render, conservative near-clipped proxy, sRGB OETF, even-dimension edge padding and no-op frame processing hook.
+- T4: ROI tiled linear photometry, 5% trimmed means, five-diagonal Huber-Whittaker IRLS, cross-tile consensus, explicit EV steps and conservative missing-value handling.
+- T5: representative RAW ±0.25EV gain probes, frozen-target comparison, max-two bounded feedback updates.
+- T6: actual target-dimension encoder probe, platform priority and CPU fallback, bounded rawvideo pipe, H.264 output verification using ffprobe.
+- T7: staged video/PNG output and iterative end-to-end streaming service.
+- T8: CLI status output, run.log, strict JSON/CSV diagnostic exports.
+- T9: synthetic/mocked algorithm, state, cancellation, FFmpeg integration tests, platform GitHub Actions workflow.
+- T10: documentation and version pins.
+
+**Verification distinction**: GitHub Actions can verify Python and synthetic CPU software encoding on CI; it does not prove GPU hardware encoding or real-camera CR3 compatibility. No user RAW files were included. Camera model / white-balance / colour correctness remain unverified until real source sequences are supplied.
