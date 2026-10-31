@@ -77,6 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--fps",type=positive_fps,default=Fraction(30))
     r.add_argument("--period",type=positive_period,default=60)
     r.add_argument("--strength",type=strength_value,default=1.)
+    r.add_argument("--brightness",choices=["smooth","uniform"],default="smooth",
+        help="smooth: remove flicker, preserve real brightness evolution; "
+             "uniform: hold one constant brightness across the whole sequence")
     r.add_argument("--roi",type=parse_roi,default=(0.,0.,1.,1.))
     r.add_argument("--steps",type=Path)
     r.add_argument("--on-review",choices=["error","passthrough"],default="error")
@@ -99,7 +102,8 @@ def main(argv: list[str] | None = None) -> int:
             result=service.probe(args.input,ffmpeg=args.ffmpeg)
             print(json.dumps(result,indent=2,ensure_ascii=False,allow_nan=False))
         else:
-            req=ProcessingRequest(args.input,args.output,args.fps,args.period,args.strength,args.roi,
+            req=ProcessingRequest(args.input,args.output,args.fps,args.period,args.strength,
+                args.brightness,args.roi,
                 load_steps(args.steps),args.on_review,args.save_frames,args.overwrite,args.encoder,args.ffmpeg)
             def on_progress(ev):
                 nonlocal log

@@ -27,6 +27,7 @@ Alternative: `python -m pip install -e ".[test]"` for current compatible depende
 ```bash
 rawtl run ./raws -o ./out
 rawtl run ./raws -o ./out --fps 30000/1001 --period 60 --strength 1.0
+rawtl run ./raws -o ./out --brightness uniform
 rawtl run ./raws -o ./out --roi 0.10,0.15,0.70,0.60 --steps steps.json
 rawtl run ./raws -o ./out --on-review passthrough --save-frames
 rawtl run ./raws -o ./out --encoder libx264 --overwrite
@@ -60,6 +61,10 @@ The default period `60` is the approximate half-amplitude time scale **in output
 The analyzer refuses to invent exposure adjustments when there is insufficient usable background, dynamic coverage, or unsaturated data. Default `--on-review error` stops before exporting a final MP4. To export regardless, use `--on-review passthrough`: frames with no reliable estimate render at **0 EV**, while the report retains their `applied_ev=null` and marks the run `PARTIAL`. Do not interpret `PARTIAL` as verified deflicker.
 
 `requested_ev` is the unconstrained solution, `applied_ev` the safe [-2,+2] EV value, and `render_ev` the actual value sent to the renderer (which may be 0 in passthrough). Gain probes can reject a renderer that responds nonlinearly. The frozen-target validation retries no more than twice and does not flatten targets again.
+
+### Brightness modes
+
+`--brightness smooth` (default) removes flicker while preserving real brightness evolution — daytime-to-nighttime ramps and scene-cut level jumps stay visible. `--brightness uniform` instead holds **one constant brightness** across the whole sequence: each frame's common level (median over valid tiles) is corrected to the global median level, so real dimming/brightening, flicker and splice jumps are all flattened. Corrections still respect the ±2 EV safety limits (frames that cannot reach the target are `LIMITED` in the report), and unmeasurable frames still follow `--on-review`. Uniform mode deliberately discards photographic exposure evolution; use it when the clip must look continuously lit.
 
 ## Files
 

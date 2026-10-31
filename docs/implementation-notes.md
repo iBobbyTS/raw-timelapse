@@ -41,6 +41,11 @@ rawpy 0.27.1 has no guaranteed public camera make/model field; optional ExifTool
 A severe **300-frame** case with 25% moving photometric pollution and 0.015 EV observation noise measured **0.0278 EV RMSE** on reliable frames in Linux, macOS, and Windows CI. A strict 0.06 EV spatial MAD threshold rejected two terminal frames as `REVIEW_REQUIRED`. This is a genuine short-sequence limitation, not a reason to lower the algorithm's reliability threshold. Its regression target is RMSE <0.035 EV, P95 <0.065 EV, and no more than 3 rejected edge frames.
 
 The separately retained **900-frame** synthetic benchmark (96 tiles, same contamination/noise) retains the stricter original objective: RMSE <0.025 EV, P95 <0.04 EV, and at least 897 reliable frames. These are synthetic tests, not real camera or LRT comparisons.
+## Uniform brightness mode (2026-10-31)
+
+`--brightness smooth|uniform` (default `smooth`, the scene-cut deflicker above). `uniform` holds one constant output level: each frame's common level (median of step-adjusted valid tiles, same >=max(8,ceil(K/4)) tile floor) is corrected to the global median level with the existing strength scaling, [+/-2] EV clipping (status `LIMITED`), review semantics and frozen-target validation; scene cuts become report metadata. Real day->dusk ramps and splice jumps are deliberately flattened. Estimator branch in `estimate_exposure`; wired through `ProcessingRequest.brightness`, service config report and CLI.
+
+Verification: `pytest -q` with ffmpeg on PATH: **56 passed** (new tests/test_brightness_uniform.py plus a SplicedRaw uniform end-to-end asserting the +1.25 EV median splice jump is fully removed). Real dataset with `--brightness uniform`: exit 0, run_status OK, status counts {UNIFORM: 119}, requested/applied EV range [-1.854, +1.359] (no LIMITED), output level spread 0.0000 EV, gain probe and frozen-target validation passed, VideoToolbox 119 frames verified.
 ## Scene-cut segmentation (2026-10-31, macOS, real DJI DNG data)
 
 Motivation: a real 119-frame input (DJI AC004 DNGs, filename range TIMELAPSE_0003-0862 kept in 10 disjoint runs) aborted with `exposure estimate incomplete` — 56/119 frames REVIEW_REQUIRED because splice jumps (+1.56 EV median, 0.82 EV cross-tile MAD at the 0079→0719 boundary) poisoned the single-timeline Whittaker trend, and tail edge gaps are never interpolated by design.

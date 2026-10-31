@@ -53,6 +53,7 @@ class ProcessingRequest:
     fps: Fraction = Fraction(30, 1)
     period: int = 60
     strength: float = 1.0
+    brightness: str = "smooth"
     roi: tuple[float, float, float, float] = (0., 0., 1., 1.)
     steps: tuple[ExposureStep, ...] = ()
     on_review: str = "error"
