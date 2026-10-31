@@ -41,7 +41,17 @@ rawpy 0.27.1 has no guaranteed public camera make/model field; optional ExifTool
 A severe **300-frame** case with 25% moving photometric pollution and 0.015 EV observation noise measured **0.0278 EV RMSE** on reliable frames in Linux, macOS, and Windows CI. A strict 0.06 EV spatial MAD threshold rejected two terminal frames as `REVIEW_REQUIRED`. This is a genuine short-sequence limitation, not a reason to lower the algorithm's reliability threshold. Its regression target is RMSE <0.035 EV, P95 <0.065 EV, and no more than 3 rejected edge frames.
 
 The separately retained **900-frame** synthetic benchmark (96 tiles, same contamination/noise) retains the stricter original objective: RMSE <0.025 EV, P95 <0.04 EV, and at least 897 reliable frames. These are synthetic tests, not real camera or LRT comparisons.
+## Scene-cut segmentation (2026-10-31, macOS, real DJI DNG data)
+
+Motivation: a real 119-frame input (DJI AC004 DNGs, filename range TIMELAPSE_0003-0862 kept in 10 disjoint runs) aborted with `exposure estimate incomplete` — 56/119 frames REVIEW_REQUIRED because splice jumps (+1.56 EV median, 0.82 EV cross-tile MAD at the 0079→0719 boundary) poisoned the single-timeline Whittaker trend, and tail edge gaps are never interpolated by design.
+
+Change: `estimate_exposure` now detects content jumps between adjacent frames on step-adjusted tile log-luminance (cut iff >=max(8,ceil(K/4)) common valid tiles AND |median delta| >= 0.20 EV AND scaled cross-tile MAD >= 0.08 EV; module constants `SCENE_CUT_MEDIAN_EV` / `SCENE_CUT_TILE_MAD_EV`). Each segment is smoothed and anchored independently; segments <8 frames pass through as SHORT_SEQUENCE_NO_DEFLICKER; confirmed steps are subtracted before detection so they never cut. Reports gain `scene_cuts`; `frames[].segment_id` now comes from the estimate (was the unused `FrameRef.segment_id`). Real-data pair statistics behind the thresholds: within-run max |median| 0.17 EV / max MAD 0.077 EV; detected cuts at indices 77 (1.559/0.818), 79 (0.278/0.095), 80 (0.243/0.089).
+
+Verification (local, ffmpeg-full 8.0.1 via /opt/homebrew/opt/ffmpeg-full/bin — the formula is installed unlinked, so test/acceptance commands need that PATH prefix or an explicit `--ffmpeg`):
+- `pytest -q` with ffmpeg on PATH: **50 passed, 0 skipped** (previously 38 passed / 6 skipped without PATH); new tests in tests/test_scene_cut_segmentation.py plus a SplicedRaw end-to-end in tests/test_service_integration.py.
+- Real dataset: `python -m rawtl run /Volumes/4T/temp/test -o /Volumes/4T/temp/scene-cut-run --ffmpeg /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg` → exit 0, run_status OK, scene_cuts [77,79,80], status counts {OK:114, INTERPOLATED_ESTIMATE:2, SHORT_SEQUENCE_NO_DEFLICKER:3}, zero REVIEW_REQUIRED, gain probe and frozen-target validation passed, VideoToolbox H.264 3648x2736, 119 frames verified by ffprobe.
+
+Known limitation: a splice statistically indistinguishable from common flicker (e.g., median -0.088 EV / MAD 0.012 at 0856→0862) is not cut; the trend absorbs it. Thresholds are calibrated constants, not a universal splice detector; contract updated to V2.
 
 ## Synthetic end-to-end on software encoder
-
 Alongside the disabled-exposure RAW mock test, a regression now exercises **30 mock RAWs, automatic exposure ON**, fixed gain probe, per-tile time-smoothing, FFmpeg libx264 output, `ffprobe` frame count and frozen-target validation. CPU software encoding is actually executed in CI; no physical RAW sensor or real NVENC/AMF/VAAPI/VideoToolbox accelerator is implied. The final result always restores the selected candidate's encoder, video metadata and per-frame render parameters together.

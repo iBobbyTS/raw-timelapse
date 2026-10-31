@@ -1,4 +1,10 @@
-"""Robust common-flicker inference with explicit steps, quality states and EV limits."""
+"""Robust common-flicker inference with explicit steps, quality states and EV limits.
+
+Filename-sorted frames form one timeline. Content jumps (scene cuts) split it
+into independently smoothed segments so a splice between distant moments never
+poisons neighbouring frames, while camera-level exposure jumps stay common
+flicker the estimator removes.
+"""
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -7,6 +13,11 @@ import numpy as np
 from ..types import ExposureError, ExposureStep
 from .measurement import FrameMeasurement
 from .trends import huber_whittaker
+
+# A scene cut needs BOTH a large common shift and large cross-tile disagreement:
+# a spatially uniform jump is common flicker to remove, not a content change.
+SCENE_CUT_MEDIAN_EV = .20
+SCENE_CUT_TILE_MAD_EV = .08
 
 @dataclass
 class FrameEstimate:
@@ -23,6 +34,7 @@ class FrameEstimate:
     render_target_error_ev: float | None = None
     new_output_clipping_fraction: float | None = None
     render_ev: float | None = None
+    segment_id: int = 0
     @property
     def gain(self) -> float | None:
         return None if self.applied_ev is None else float(2**self.applied_ev)
@@ -37,6 +49,7 @@ class ExposureResult:
     trusted_indices: np.ndarray
     trend_unconverged_tiles: int
     period_effective: int
+    scene_cuts: list[dict] = field(default_factory=list)
 
 def _step_vector(n: int,steps: Sequence[ExposureStep]) -> np.ndarray:
     vector=np.zeros(n,dtype=np.float64)
@@ -45,6 +58,84 @@ def _step_vector(n: int,steps: Sequence[ExposureStep]) -> np.ndarray:
             raise ExposureError(f"invalid confirmed step {s}")
         vector[s.start_frame]+=s.delta_ev
     return np.cumsum(vector)
+
+def detect_scene_cuts(step_adjusted: np.ndarray,valid: np.ndarray,
+    *,median_ev: float | None=None,tile_mad_ev: float | None=None
+    ) -> tuple[list[int],list[dict]]:
+    """Find content jumps between consecutive frames of step-adjusted tiles."""
+    a=np.asarray(step_adjusted,dtype=np.float64)
+    q=np.asarray(valid,dtype=bool)
+    if median_ev is None: median_ev=SCENE_CUT_MEDIAN_EV
+    if tile_mad_ev is None: tile_mad_ev=SCENE_CUT_TILE_MAD_EV
+    n,k=a.shape
+    need=max(8,math.ceil(k/4))
+    cuts: list[int]=[]
+    records: list[dict]=[]
+    for t in range(n-1):
+        ok=q[t]&q[t+1]
+        common=int(np.count_nonzero(ok))
+        if common<need:
+            continue
+        d=a[t+1,ok]-a[t,ok]
+        med=float(np.median(d))
+        mad=float(1.4826*np.median(np.abs(d-med)))
+        if abs(med)>=median_ev and mad>=tile_mad_ev:
+            cuts.append(t+1)
+            records.append({"index":t+1,"median_ev":med,"tile_mad_ev":mad,
+                "common_tiles":common})
+    return cuts,records
+
+def _robust_segment(a: np.ndarray,q: np.ndarray,centers: np.ndarray,period: int,
+    lo: int,hi: int,consensus: np.ndarray,residual: np.ndarray,mad: np.ndarray,
+    fractions: np.ndarray,counts: np.ndarray,reliable: np.ndarray,
+    interpolated: np.ndarray,labels: list[str]) -> int:
+    """Fill consensus/reliability state for frames [lo,hi) of one segment."""
+    k=a.shape[1]
+    failed_tiles=0
+    seg=a[lo:hi]
+    qseg=q[lo:hi]
+    trend=np.full_like(seg,np.nan)
+    for col in range(k):
+        fit=huber_whittaker(seg[:,col],qseg[:,col],period)
+        if fit.converged:
+            trend[:,col]=fit.trend
+        elif np.count_nonzero(qseg[:,col])>=8:
+            failed_tiles+=1
+    r=seg-trend
+    for j in range(hi-lo):
+        t=lo+j
+        ok=q[t]&np.isfinite(r[j])
+        counts[t]=int(np.count_nonzero(ok))
+        if counts[t]<max(8,math.ceil(k/4)):
+            continue
+        med=float(np.median(r[j,ok]))
+        dev=np.abs(r[j,ok]-med)
+        scaled_mad=float(1.4826*np.median(dev))
+        agree=dev<=.06
+        fraction=float(np.mean(agree))
+        coord=centers[ok][agree]
+        quadrants={(int(px>=.5),int(py>=.5)) for px,py in coord}
+        residual[t]=med
+        mad[t]=scaled_mad
+        fractions[t]=fraction
+        if scaled_mad<=.06 and fraction>=.60 and len(quadrants)>=3:
+            reliable[t]=True
+            consensus[t,np.flatnonzero(ok)[agree]]=True
+            labels[t]="OK"
+        else:
+            residual[t]=np.nan
+    # Only small internal gaps inside this segment; never span a scene cut,
+    # never extrapolate an edge gap.
+    good=np.flatnonzero(reliable[lo:hi])+lo
+    for a_idx,b_idx in zip(good[:-1],good[1:]):
+        missing=b_idx-a_idx-1
+        if 1<=missing<=3:
+            for t in range(a_idx+1,b_idx):
+                residual[t]=float(np.interp(t,[a_idx,b_idx],
+                    [residual[a_idx],residual[b_idx]]))
+                interpolated[t]=True
+                labels[t]="INTERPOLATED_ESTIMATE"
+    return failed_tiles
 
 def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
     strength: float=1.,steps: Sequence[ExposureStep]=(),ev_limits: tuple[float,float]=(-2.,2.)) -> ExposureResult:
@@ -75,67 +166,50 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
     counts=np.zeros(n,dtype=int)
     reliable=np.zeros(n,dtype=bool)
     interpolated=np.zeros(n,dtype=bool)
+    labels: list[str]=["REVIEW_REQUIRED"]*n
+    segment_ids=np.zeros(n,dtype=int)
+    scene_cuts: list[dict]=[]
     failed_tiles=0
     if strength==0 or n<8:
+        # Whole-sequence short/disabled path: zero residual, confirmed steps only.
         residual[:]=0
         reliable[:]=True
         if n<8 and strength!=0:
             labels=["SHORT_SEQUENCE_NO_DEFLICKER"]*n
         else:
             labels=["DISABLED"]*n
-        # For short sequence, only confirmed steps are applied.
+        segments=[(0,n,False)]
     else:
         a=x-s[:,None]
-        trend=np.full_like(a,np.nan)
-        for col in range(k):
-            fit=huber_whittaker(a[:,col],q[:,col],period)
-            if fit.converged:
-                trend[:,col]=fit.trend
-            elif np.count_nonzero(q[:,col])>=8:
-                failed_tiles+=1
-        r=a-trend
-        for t in range(n):
-            ok=q[t] & np.isfinite(r[t])
-            counts[t]=int(np.count_nonzero(ok))
-            if counts[t]<max(8,math.ceil(k/4)):
-                continue
-            med=float(np.median(r[t,ok]))
-            dev=np.abs(r[t,ok]-med)
-            scaled_mad=float(1.4826*np.median(dev))
-            agree=dev<=.06
-            fraction=float(np.mean(agree))
-            coord=centers[ok][agree]
-            quadrants={(int(px>=.5),int(py>=.5)) for px,py in coord}
-            residual[t]=med
-            mad[t]=scaled_mad
-            fractions[t]=fraction
-            if scaled_mad<=.06 and fraction>=.60 and len(quadrants)>=3:
-                reliable[t]=True
-                indices=np.flatnonzero(ok)[agree]
-                consensus[t,indices]=True
+        cuts,scene_cuts=detect_scene_cuts(a,q)
+        bounds=[0]+cuts+[n]
+        segments=[]
+        for seg_id,(lo,hi) in enumerate(zip(bounds[:-1],bounds[1:])):
+            segment_ids[lo:hi]=seg_id
+            if hi-lo>=8:
+                failed_tiles+=_robust_segment(a,q,centers,period,lo,hi,consensus,
+                    residual,mad,fractions,counts,reliable,interpolated,labels)
+                segments.append((lo,hi,True))
             else:
-                residual[t]=np.nan
-        labels=["OK" if b else "REVIEW_REQUIRED" for b in reliable]
-        # Only small internal gaps, never extrapolate an edge gap.
-        good=np.flatnonzero(reliable)
-        for a_idx,b_idx in zip(good[:-1],good[1:]):
-            missing=b_idx-a_idx-1
-            if 1<=missing<=3:
-                for t in range(a_idx+1,b_idx):
-                    residual[t]=float(np.interp(t,[a_idx,b_idx],[residual[a_idx],residual[b_idx]]))
-                    interpolated[t]=True
-                    labels[t]="INTERPOLATED_ESTIMATE"
+                labels[lo:hi]=["SHORT_SEQUENCE_NO_DEFLICKER"]*(hi-lo)
+                reliable[lo:hi]=True
+                residual[lo:hi]=0
+                segments.append((lo,hi,False))
     raw=np.full(n,np.nan,dtype=np.float64)
     accepted=reliable|interpolated
     if strength==0:
         raw[:]=0.
     else:
         raw[accepted]=strength*(-s[accepted]-residual[accepted])
-    if not np.any(reliable):
-        anchor=0.
-    else:
-        anchor=-float(np.median(raw[reliable]))
-    requested=raw+anchor
+    requested=np.full(n,np.nan,dtype=np.float64)
+    # Each segment anchors to its own reliable frames: exposure continuity is
+    # only claimed inside a content-continuous run, never across a scene cut.
+    for lo,hi,deflickered in segments:
+        if np.any(reliable[lo:hi]):
+            anchor=-float(np.median(raw[lo:hi][reliable[lo:hi]]))
+        else:
+            anchor=0.
+        requested[lo:hi]=raw[lo:hi]+anchor
     frozen=np.full_like(x,np.nan)
     frames=[]
     for t in range(n):
@@ -143,7 +217,10 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
         applied=float(np.clip(val,low,high)) if val is not None else None
         status=labels[t]
         warnings=[]
-        if n<2*period and strength!=0:
+        seg_len=next(hi-lo for lo,hi,_ in segments if lo<=t<hi)
+        whole_short=n<8
+        if (strength!=0 and seg_len<2*period and
+                (whole_short or labels[t]!="SHORT_SEQUENCE_NO_DEFLICKER")):
             warnings.append("SHORT_CONTEXT")
         if failed_tiles:
             warnings.append(f"TREND_NONCONVERGED_TILES={failed_tiles}")
@@ -160,5 +237,7 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
             float(residual[t]) if np.isfinite(residual[t]) else None,val,applied,
             float(s[t]),int(counts[t]) if n>=8 and strength!=0 else int(np.sum(q[t])),
             float(fractions[t]) if np.isfinite(fractions[t]) else None,
-            float(mad[t]) if np.isfinite(mad[t]) else None,warnings))
-    return ExposureResult(frames,x,q,consensus,frozen,reliable,failed_tiles,min(period,n))
+            float(mad[t]) if np.isfinite(mad[t]) else None,warnings,
+            segment_id=int(segment_ids[t])))
+    return ExposureResult(frames,x,q,consensus,frozen,reliable,failed_tiles,
+        min(period,n),scene_cuts)

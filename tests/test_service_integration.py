@@ -75,6 +75,36 @@ def test_review_required_and_passthrough(tmp_path):
     rows=json.loads((out/"exposure_report.json").read_text())["frames"]
     assert all(x["applied_ev"] is None and x["render_ev"]==0 for x in rows)
 
+class SplicedRaw(FakeRaw):
+    """Two content-continuous runs joined at frame 15 by a spatially
+    non-uniform brightness jump (scene cut); the +-0.04 EV common flicker
+    continues across the splice."""
+    def render_linear(self,path,ev,opts):
+        i=int(path.stem.split("_")[-1])
+        v=.18*2**(ev+.04*(-1)**i)
+        top=v*(2.**2.0 if i>=15 else 1.)
+        bottom=v*(2.**.5 if i>=15 else 1.)
+        rgb=np.empty((240,320,3),dtype=np.float32)
+        rgb[:120]=top
+        rgb[120:]=bottom
+        return LinearFrame(rgb,np.zeros((240,320),dtype=bool),"approximate",1/65535,False)
+
+@pytest.mark.skipif(not (FF and FP),reason="FFmpeg unavailable")
+def test_service_e2e_spliced_sequence_deflickers_per_segment(tmp_path):
+    src=folder(tmp_path,n=30)
+    out=tmp_path/"spliced"
+    result=ProcessingService(SplicedRaw()).run(
+        ProcessingRequest(src,out,encoder="libx264",strength=1.,period=60))
+    assert result.run_status=="OK"
+    report=json.loads((out/"exposure_report.json").read_text())
+    assert [c["index"] for c in report["scene_cuts"]]==[15]
+    rows=report["frames"]
+    assert [x["segment_id"] for x in rows[:15]]==[0]*15
+    assert [x["segment_id"] for x in rows[15:]]==[1]*15
+    assert all(x["applied_ev"] is not None for x in rows)
+    assert report["video_metadata"]["frames"]==30
+    assert (out/"video.mp4").is_file()
+
 def test_decode_failure_and_cancel(tmp_path):
     src=folder(tmp_path)
     out=tmp_path/"broken"

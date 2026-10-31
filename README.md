@@ -49,6 +49,10 @@ The input directory must not contain an output directory and the program never m
 
 Without this file, the algorithm removes **fast flicker**, not persistent photographer-controlled exposure changes. It preserves slower daytime-to-nighttime changes. It cannot inherently distinguish a lightning flash from camera flicker.
 
+### Scene cuts (spliced or culled sequences)
+
+Frames concatenate in filename order; capture time and camera numbering are never inputs. The analyzer detects content jumps (scene cuts) between adjacent frames from the tile photometry itself: a large shift that is **both** common (|median tile delta| >= 0.20 EV) and spatially non-uniform (cross-tile MAD >= 0.08 EV). Each content-continuous run is then smoothed independently with its own exposure anchor, so a splice never poisons neighbouring frames and never blocks the run by itself; runs shorter than 8 frames render without automatic deflicker. A spatially *uniform* jump is common flicker to smooth, not a cut — declare known camera exposure jumps in `steps.json`. Detected cuts appear in `exposure_report.json` as `scene_cuts`, and every frame carries its `segment_id`.
+
 The default period `60` is the approximate half-amplitude time scale **in output frames**, not an averaging window. `--strength 0` disables automatic exposure corrections. Sequences shorter than 8 frames are not automatically deflickered, though explicit steps still apply.
 
 ### Review states
