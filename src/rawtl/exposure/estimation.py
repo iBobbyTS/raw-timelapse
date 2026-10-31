@@ -138,12 +138,15 @@ def _robust_segment(a: np.ndarray,q: np.ndarray,centers: np.ndarray,period: int,
     return failed_tiles
 
 def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
-    strength: float=1.,steps: Sequence[ExposureStep]=(),ev_limits: tuple[float,float]=(-2.,2.)) -> ExposureResult:
+    strength: float=1.,steps: Sequence[ExposureStep]=(),
+    brightness: str="smooth",ev_limits: tuple[float,float]=(-2.,2.)) -> ExposureResult:
     n=len(measurements)
     if n<1:
         raise ExposureError("empty exposure sequence")
     if period<6 or not math.isfinite(strength) or not 0<=strength<=1:
         raise ExposureError("invalid period or strength")
+    if brightness not in ("smooth","uniform"):
+        raise ExposureError("brightness must be smooth or uniform")
     low,high=ev_limits
     if not math.isfinite(low+high) or not low<high:
         raise ExposureError("invalid EV limits")
@@ -170,7 +173,7 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
     segment_ids=np.zeros(n,dtype=int)
     scene_cuts: list[dict]=[]
     failed_tiles=0
-    if strength==0 or n<8:
+    if strength==0 or (brightness=="smooth" and n<8):
         # Whole-sequence short/disabled path: zero residual, confirmed steps only.
         residual[:]=0
         reliable[:]=True
@@ -183,18 +186,35 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
         a=x-s[:,None]
         cuts,scene_cuts=detect_scene_cuts(a,q)
         bounds=[0]+cuts+[n]
-        segments=[]
-        for seg_id,(lo,hi) in enumerate(zip(bounds[:-1],bounds[1:])):
-            segment_ids[lo:hi]=seg_id
-            if hi-lo>=8:
-                failed_tiles+=_robust_segment(a,q,centers,period,lo,hi,consensus,
-                    residual,mad,fractions,counts,reliable,interpolated,labels)
-                segments.append((lo,hi,True))
-            else:
-                labels[lo:hi]=["SHORT_SEQUENCE_NO_DEFLICKER"]*(hi-lo)
-                reliable[lo:hi]=True
-                residual[lo:hi]=0
-                segments.append((lo,hi,False))
+        if brightness=="uniform":
+            # Hold one constant brightness: correct every frame's common level
+            # to the global median. Real evolution (day->dusk), flicker and
+            # splice jumps are all flattened; scene cuts stay report metadata.
+            need=max(8,math.ceil(k/4))
+            for seg_id,(lo,hi) in enumerate(zip(bounds[:-1],bounds[1:])):
+                segment_ids[lo:hi]=seg_id
+            for t in range(n):
+                ok=q[t]&np.isfinite(a[t])
+                counts[t]=int(np.count_nonzero(ok))
+                if counts[t]>=need:
+                    residual[t]=float(np.median(a[t,ok]))
+                    reliable[t]=True
+                    consensus[t,ok]=True
+                    labels[t]="UNIFORM"
+            segments=[(0,n,False)]
+        else:
+            segments=[]
+            for seg_id,(lo,hi) in enumerate(zip(bounds[:-1],bounds[1:])):
+                segment_ids[lo:hi]=seg_id
+                if hi-lo>=8:
+                    failed_tiles+=_robust_segment(a,q,centers,period,lo,hi,consensus,
+                        residual,mad,fractions,counts,reliable,interpolated,labels)
+                    segments.append((lo,hi,True))
+                else:
+                    labels[lo:hi]=["SHORT_SEQUENCE_NO_DEFLICKER"]*(hi-lo)
+                    reliable[lo:hi]=True
+                    residual[lo:hi]=0
+                    segments.append((lo,hi,False))
     raw=np.full(n,np.nan,dtype=np.float64)
     accepted=reliable|interpolated
     if strength==0:
@@ -219,7 +239,7 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
         warnings=[]
         seg_len=next(hi-lo for lo,hi,_ in segments if lo<=t<hi)
         whole_short=n<8
-        if (strength!=0 and seg_len<2*period and
+        if (brightness=="smooth" and strength!=0 and seg_len<2*period and
                 (whole_short or labels[t]!="SHORT_SEQUENCE_NO_DEFLICKER")):
             warnings.append("SHORT_CONTEXT")
         if failed_tiles:

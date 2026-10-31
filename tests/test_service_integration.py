@@ -90,6 +90,26 @@ class SplicedRaw(FakeRaw):
         return LinearFrame(rgb,np.zeros((240,320),dtype=bool),"approximate",1/65535,False)
 
 @pytest.mark.skipif(not (FF and FP),reason="FFmpeg unavailable")
+def test_service_e2e_uniform_brightness_flattens_splice(tmp_path):
+    src=folder(tmp_path,n=30)
+    out=tmp_path/"uniform"
+    result=ProcessingService(SplicedRaw()).run(
+        ProcessingRequest(src,out,encoder="libx264",strength=1.,period=60,
+            brightness="uniform"))
+    assert result.run_status=="OK"
+    report=json.loads((out/"exposure_report.json").read_text())
+    assert report["config"]["brightness"]=="uniform"
+    rows=report["frames"]
+    assert all(r["applied_ev"] is not None for r in rows)
+    # The +1.25 EV median splice jump is fully removed, not preserved. The
+    # +-0.04 EV alternating flicker is asymmetric inside each 15-frame block
+    # (8 vs 7 parities), adding +0.08 EV to the block-median difference.
+    before=np.median([r["applied_ev"] for r in rows[:15]])
+    after=np.median([r["applied_ev"] for r in rows[15:]])
+    assert after-before==pytest.approx(-1.25+.08,abs=.02)
+    assert report["video_metadata"]["frames"]==30
+    assert (out/"video.mp4").is_file()
+
 def test_service_e2e_spliced_sequence_deflickers_per_segment(tmp_path):
     src=folder(tmp_path,n=30)
     out=tmp_path/"spliced"

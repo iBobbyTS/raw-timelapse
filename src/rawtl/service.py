@@ -88,6 +88,8 @@ class ProcessingService:
             raise InputError(f"output already exists: {out/'video.mp4'} (pass --overwrite)")
         if request.on_review not in ("error","passthrough"):
             raise InputError("on_review must be error or passthrough")
+        if request.brightness not in ("smooth","uniform"):
+            raise InputError("brightness must be smooth or uniform")
         if request.save_frames and (out/"frames").exists() and not request.overwrite:
             raise InputError(f"PNG frame output already exists: {out/'frames'} (pass --overwrite)")
         out.mkdir(parents=True,exist_ok=True)
@@ -98,7 +100,8 @@ class ProcessingService:
             "video_target_bitrate_bps":160_000_000,
             "config":{"input":str(request.input_dir),"output":str(out),
                 "fps":str(request.fps),"period":request.period,
-                "strength":request.strength,"roi":list(request.roi),
+                "strength":request.strength,"brightness":request.brightness,
+                "roi":list(request.roi),
                 "steps":[asdict(x) for x in request.steps],
                 "on_review":request.on_review,"save_frames":request.save_frames,
                 "encoder":request.encoder,"ffmpeg":request.ffmpeg}}
@@ -147,7 +150,8 @@ class ProcessingService:
             report["frame_count"]=n
             self._check(cancel)
             exposure=estimate_exposure(measurements,period=request.period,
-                strength=request.strength,steps=request.steps)
+                strength=request.strength,steps=request.steps,
+                brightness=request.brightness)
             report["unconverged_trend_tiles"]=exposure.trend_unconverged_tiles
             report["period_effective"]=exposure.period_effective
             report["scene_cuts"]=exposure.scene_cuts
