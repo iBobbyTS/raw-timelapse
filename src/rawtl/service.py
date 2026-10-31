@@ -150,6 +150,7 @@ class ProcessingService:
                 strength=request.strength,steps=request.steps)
             report["unconverged_trend_tiles"]=exposure.trend_unconverged_tiles
             report["period_effective"]=exposure.period_effective
+            report["scene_cuts"]=exposure.scene_cuts
             report["frames"]=[self._frame_record(ref,est)
                 for ref,est in zip(refs,exposure.frames)]
             need_review=any(x.applied_ev is None for x in exposure.frames)
@@ -337,7 +338,7 @@ class ProcessingService:
 
     @staticmethod
     def _frame_record(ref,est) -> dict:
-        data={"index":ref.index,"filename":ref.filename,"segment_id":ref.segment_id,
+        data={"index":ref.index,"filename":ref.filename,"segment_id":est.segment_id,
             "status":est.status,"valid_tile_count":est.valid_tile_count,
             "consensus_fraction":est.consensus_fraction,
             "residual_mad_ev":est.residual_mad_ev,
