@@ -191,6 +191,14 @@ def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
             labels[t]="UNIFORM"
             if measured_level is not None: measured_level[t]=b_hat[t]
             if desired_level is not None: desired_level[t]=comp_target
+        # A bounds-segment of ONE frame has no temporal evidence at all:
+        # documented passthrough instead of a fake estimate.
+        for lo,hi in zip(bounds[:-1],bounds[1:]):
+            if hi-lo==1:
+                requested[lo]=0.
+                reliable[lo]=True
+                residual[lo]=0.
+                labels[lo]="SHORT_SEQUENCE_NO_DEFLICKER"
         good=np.flatnonzero(np.isfinite(requested))
         for a_idx,b_idx in zip(good[:-1],good[1:]):
             missing=b_idx-a_idx-1

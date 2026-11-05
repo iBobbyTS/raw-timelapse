@@ -14,3 +14,16 @@ The standalone exposure-algorithm plan is the normative source; the implementati
 10. The expected mathematical tests cover constant and linear trends, 25% contaminated tiles, step semantics, gap crossing, saturation, severe low light, numerical nonfinite and memory bounds, the true-global-flash ambiguity, and scene-cut segmentation (splice splits, uniform jumps stay unsplit, short middle segments pass through, confirmed steps never cut).
 
 The algorithm's outputs are **not** proof of correct natural-scene change classification; users choose the time-scale and optionally an ROI. Scene-cut thresholds are calibrated constants, not a claim that every real-world splice is distinguishable from flicker; a statistically indistinguishable splice is absorbed by the trend instead of cutting.
+
+## V3 (2026-11-05) — flicker-fix cycle
+
+The contract gained the following invariants from the real-output flicker work (F0-F9):
+
+1. **Acceptance is independent.** Gain probes and render checks verify execution consistency only. Publication is gated (unless <code>--temporal-quality report/off</code>) by an independent decoded-video temporal audit; <code>OK</code> never implies "no flicker" by itself. The four benchmark ROIs never participate in fitting.
+2. **Estimation is matched-background.** The default estimator is a sparse pair graph (lags 1/2/4/8/16, structure/colour/saturation gates, Huber IRLS, one gauge per component, evidence-free frames stay unknown). Per-frame medians of whatever occupies the frame are not exposure evidence. The legacy path stays selectable for comparison, never mixed into metrics.
+3. **Targets have provenance.** Frames carry <code>measured_level_ev</code> and <code>desired_level_ev</code>; targets are frozen before render iterations; feedback adjusts execution, never intent. Uniform references the persistent background (global assumption or per-segment); smooth preserves confirmed steps and the slow trend; neither applies a low-pass to the final correction.
+4. **Continuity is evidence, not assumption.** Capture-time gaps (ExifTool, optional), filename suspicions, structural cuts and confirmed steps are reported as distinct kinds; statistics never cross confirmed gaps.
+5. **DNG semantics are probed, not guessed.** <code>rawtl probe-dng</code> verifies per machine whether BaselineExposure and OpcodeList3 are actually executed; run reports record owner/support status and per-opcode payload variation. Adobe-reference development stays <code>not_tested</code> where unavailable.
+6. **Colour is declared.** sRGB-OETF pixels, explicit BT.709 matrix, limited range, transfer tag <code>iec61966-2-1</code>; missing encoder tags raise contract warnings, never silence.
+
+Schema version is now **2** (finite JSON only). Reports written by version 1 remain readable as historical artifacts; their <code>OK</code> must be re-audited with <code>rawtl audit-video</code> before being quoted as flicker-free.
