@@ -1,0 +1,93 @@
+{
+ "description": "Continuity segments for the 119-frame DJI benchmark (frame indices, zero-based, end-exclusive). Local manifest holds hashes/capture times.",
+ "nominal_interval_s": 60,
+ "gap_rule": "capture-time interval > 1.5x median interval",
+ "segments": [
+  [
+   0,
+   77
+  ],
+  [
+   77,
+   79
+  ],
+  [
+   79,
+   80
+  ],
+  [
+   80,
+   104
+  ],
+  [
+   104,
+   105
+  ],
+  [
+   105,
+   107
+  ],
+  [
+   107,
+   112
+  ],
+  [
+   112,
+   115
+  ],
+  [
+   115,
+   118
+  ],
+  [
+   118,
+   119
+  ]
+ ],
+ "time_gaps": [
+  {
+   "index": 77,
+   "gap_s": 38400
+  },
+  {
+   "index": 79,
+   "gap_s": 300
+  },
+  {
+   "index": 80,
+   "gap_s": 1260
+  },
+  {
+   "index": 104,
+   "gap_s": 1740
+  },
+  {
+   "index": 105,
+   "gap_s": 120
+  },
+  {
+   "index": 107,
+   "gap_s": 180
+  },
+  {
+   "index": 112,
+   "gap_s": 240
+  },
+  {
+   "index": 115,
+   "gap_s": 2400
+  },
+  {
+   "index": 118,
+   "gap_s": 360
+  }
+ ],
+ "primary_acceptance_span": [
+  0,
+  77
+ ],
+ "secondary_day_span": [
+  80,
+  104
+ ]
+}
