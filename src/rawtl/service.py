@@ -124,6 +124,8 @@ class ProcessingService:
             raise InputError("brightness must be smooth or uniform")
         if request.estimator not in ("pairwise","legacy"):
             raise InputError("estimator must be pairwise or legacy")
+        if request.uniform_reference not in ("global","segment"):
+            raise InputError("uniform_reference must be global or segment")
         if request.save_frames and (out/"frames").exists() and not request.overwrite:
             raise InputError(f"PNG frame output already exists: {out/'frames'} (pass --overwrite)")
         out.mkdir(parents=True,exist_ok=True)
@@ -136,6 +138,7 @@ class ProcessingService:
                 "fps":str(request.fps),"period":request.period,
                 "strength":request.strength,"brightness":request.brightness,
                 "estimator":request.estimator,
+                "uniform_reference":request.uniform_reference,
                 "exclude_rois":[list(r) for r in request.exclude_rois],
                 "roi":list(request.roi),
                 "steps":[asdict(x) for x in request.steps],
@@ -260,7 +263,8 @@ class ProcessingService:
                 brightness=request.brightness,
                 time_gaps=[e["index"] for e in cont["time_gaps"]],
                 estimator=request.estimator,
-                exclude_rois=request.exclude_rois)
+                exclude_rois=request.exclude_rois,
+                uniform_reference=request.uniform_reference)
             if exposure.pairwise_summary:
                 report["pairwise_estimation"]=exposure.pairwise_summary
             report["unconverged_trend_tiles"]=exposure.trend_unconverged_tiles
@@ -512,6 +516,8 @@ class ProcessingService:
             "gain":est.gain,
             "render_target_error_ev":est.render_target_error_ev,
             "new_output_clipping_fraction":est.new_output_clipping_fraction,
+            "measured_level_ev":est.measured_level_ev,
+            "desired_level_ev":est.desired_level_ev,
             "warnings":est.warnings}
         if source is not None:
             data["capture_time"]=source.capture_time

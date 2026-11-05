@@ -37,7 +37,8 @@ FIELDS=("index","filename","segment_id","status","valid_tile_count",
         "consensus_fraction","residual_mad_ev","common_residual_ev",
         "cumulative_confirmed_step_ev","requested_ev","applied_ev",
         "render_ev","gain","render_target_error_ev",
-        "new_output_clipping_fraction","warnings")
+        "new_output_clipping_fraction","measured_level_ev","desired_level_ev",
+        "warnings")
 
 def write_curve(path: Path,frames: list[dict]):
     import io

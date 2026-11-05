@@ -75,7 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("input",type=Path,help="flat directory of RAW files")
     r.add_argument("-o","--output",type=Path,required=True)
     r.add_argument("--fps",type=positive_fps,default=Fraction(30))
-    r.add_argument("--period",type=positive_period,default=60)
+    r.add_argument("--period",type=positive_period,default=60,
+        help="trend period in frames for smooth mode ONLY; uniform holds a "
+             "constant reference level and ignores this parameter entirely")
     r.add_argument("--strength",type=strength_value,default=1.)
     r.add_argument("--brightness",choices=["smooth","uniform"],default="smooth",
         help="smooth: remove flicker, preserve real brightness evolution; "
@@ -83,6 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--estimator",choices=["pairwise","legacy"],default="pairwise",
         help="pairwise: matched-background pair graph (default); "
              "legacy: per-frame-median tiles + Whittaker residual (baseline)")
+    r.add_argument("--uniform-reference",choices=["global","segment"],
+        dest="uniform_reference",default="global",
+        help="uniform mode only: global stitches disconnected runs to one "
+             "constant level (cross-boundary offset is an explicit assumption); "
+             "segment keeps each continuous run at its own level")
     r.add_argument("--exclude-rois",type=Path,dest="exclude_rois",
         help="JSON file of ROI boxes [x0,y0,x1,y1] keyed by name; tiles under "
              "them are excluded from estimation (independent acceptance areas)")
@@ -177,7 +184,9 @@ def main(argv: list[str] | None = None) -> int:
             req=ProcessingRequest(
                 input_dir=args.input,output_dir=args.output,fps=args.fps,
                 period=args.period,strength=args.strength,brightness=args.brightness,
-                estimator=args.estimator,roi=args.roi,exclude_rois=exclude,
+                estimator=args.estimator,
+                uniform_reference=args.uniform_reference,
+                roi=args.roi,exclude_rois=exclude,
                 steps=load_steps(args.steps),on_review=args.on_review,
                 temporal_quality=args.temporal_quality,save_frames=args.save_frames,
                 overwrite=args.overwrite,encoder=args.encoder,ffmpeg=args.ffmpeg)
