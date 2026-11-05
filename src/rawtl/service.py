@@ -359,6 +359,8 @@ class ProcessingService:
                         round_success=True
                         report["encoder"]["selected"]=enc.name
                         report["video_metadata"]=info
+                        for warning in info.get("colour_contract_warnings",[]):
+                            report["warnings"].append(f"{enc.name}: {warning}")
                         break
                     except (EncoderError,VerificationError) as exc:
                         report["encoder"]["attempts"].append({
