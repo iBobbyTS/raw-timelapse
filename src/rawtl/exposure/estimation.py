@@ -36,6 +36,8 @@ class FrameEstimate:
     render_target_error_ev: float | None = None
     new_output_clipping_fraction: float | None = None
     render_ev: float | None = None
+    measured_level_ev: float | None = None
+    desired_level_ev: float | None = None
     segment_id: int = 0
     @property
     def gain(self) -> float | None:
@@ -97,7 +99,9 @@ def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
     consensus: np.ndarray,residual: np.ndarray,mad: np.ndarray,
     fractions: np.ndarray,counts: np.ndarray,reliable: np.ndarray,
     interpolated: np.ndarray,labels: list[str],segment_ids: np.ndarray,
-    exclude_rois: tuple[tuple[float,float,float,float],...]
+    exclude_rois: tuple[tuple[float,float,float,float],...],
+    uniform_reference: str="global",measured_level: np.ndarray|None=None,
+    desired_level: np.ndarray|None=None
     ) -> tuple[np.ndarray,dict]:
     """Matched-background estimation: pair graph -> relative brightness b,
     then a brightness-intent target on b (slow trend or constant level on the
@@ -123,7 +127,12 @@ def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
     # level difference across the boundary (all-valid-tile median fallback).
     b_hat=b.copy()
     cross_anchors=[]
-    if len(graph.components)>1:
+    if uniform_reference=="segment":
+        # Per-segment targets: no cross-boundary assumption is made. Each
+        # component keeps its own level; differences between segments are
+        # intentionally NOT flattened.
+        b_hat=b.copy()
+    elif len(graph.components)>1:
         def _row_level(t:int) -> float:
             ok=q[t]&persistent&np.isfinite(x[t])
             if np.count_nonzero(ok)>=need:
@@ -162,14 +171,26 @@ def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
         # current frame's median.
         need=max(8,math.ceil(k/4))
         finite_all=np.flatnonzero(np.isfinite(b_hat))
-        target=(float(np.median(b_hat[finite_all]))
-                if finite_all.size else math.nan)
+        target=math.nan
+        if uniform_reference=="segment":
+            per_comp_target={}
+            for comp in graph.components:
+                member=np.array([t for t in comp if np.isfinite(b_hat[t])])
+                if member.size:
+                    per_comp_target[id(comp)]=float(np.median(b_hat[member]))
+        else:
+            target=(float(np.median(b_hat[finite_all]))
+                    if finite_all.size else math.nan)
         for t in finite_all:
+            comp_target=(per_comp_target[id(next(c for c in graph.components if t in c))]
+                         if uniform_reference=="segment" else target)
             reliable[t]=True
             consensus[t,q[t]&persistent]=True
-            residual[t]=b_hat[t]-target
-            requested[t]=strength*(target-b_hat[t])
+            residual[t]=b_hat[t]-comp_target
+            requested[t]=strength*(comp_target-b_hat[t])
             labels[t]="UNIFORM"
+            if measured_level is not None: measured_level[t]=b_hat[t]
+            if desired_level is not None: desired_level[t]=comp_target
         good=np.flatnonzero(np.isfinite(requested))
         for a_idx,b_idx in zip(good[:-1],good[1:]):
             missing=b_idx-a_idx-1
@@ -205,6 +226,8 @@ def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
                 residual[t]=b_adj[t]-trend[t]
                 requested[t]=strength*(trend[t]-b_adj[t])
                 labels[t]="OK"
+                if measured_level is not None: measured_level[t]=b_adj[t]
+                if desired_level is not None: desired_level[t]=trend[t]
         # anchor each connected component so corrections are level-neutral
         for comp in graph.components:
             member=np.array([t for t in comp if np.isfinite(requested[t])])
@@ -233,7 +256,17 @@ def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
                         [requested[a_idx],requested[b_idx]]))
                     interpolated[t]=True
                     labels[t]="INTERPOLATED_ESTIMATE"
-    summary={"cross_boundary_anchors":{"method":
+    summary={"target_provenance":{
+        "intent":brightness,
+        "reference_scope":uniform_reference if brightness=="uniform" else "trend",
+        "defined_before_iteration":True,
+        "measured":"graph brightness b on persistent matched background"
+        if brightness=="uniform" else "b minus confirmed steps",
+        "desired":"constant level (global median or per-segment median)"
+        if brightness=="uniform" else
+        f"Huber-Whittaker trend, period={period} "
+        f"(lambda=1/(16 sin(pi/P)^4))"},
+        "cross_boundary_anchors":{"method":
         "persistent-background level median across the boundary "
         "(all-valid-tile median fallback); explicit assumption, not evidence",
         "entries":cross_anchors},
@@ -246,7 +279,10 @@ def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
         "excluded_tiles":int(np.count_nonzero(~train)),
         "converged":graph.converged,"iterations":graph.iterations}
     if brightness=="uniform":
-        summary["uniform_target_level_ev"]=None if not math.isfinite(target) else target
+        summary["uniform_target_level_ev"]=(None if not math.isfinite(target) else target)
+        if uniform_reference=="segment":
+            summary["uniform_segment_target_levels_ev"]=sorted(
+                set(per_comp_target.values()))
     return requested,summary
 
 
@@ -306,7 +342,8 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
     strength: float=1.,steps: Sequence[ExposureStep]=(),
     brightness: str="smooth",ev_limits: tuple[float,float]=(-2.,2.),
     time_gaps: Sequence[int]=(),estimator: str="pairwise",
-    exclude_rois: tuple[tuple[float,float,float,float],...]=()) -> ExposureResult:
+    exclude_rois: tuple[tuple[float,float,float,float],...]=(),
+    uniform_reference: str="global") -> ExposureResult:
     n=len(measurements)
     if n<1:
         raise ExposureError("empty exposure sequence")
@@ -316,6 +353,8 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
         raise ExposureError("brightness must be smooth or uniform")
     if estimator not in ("pairwise","legacy"):
         raise ExposureError("estimator must be pairwise or legacy")
+    if uniform_reference not in ("global","segment"):
+        raise ExposureError("uniform_reference must be global or segment")
     gaps=sorted({int(g) for g in time_gaps if 0<int(g)<n})
     low,high=ev_limits
     if not math.isfinite(low+high) or not low<high:
@@ -345,6 +384,8 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
     pairwise_summary: dict={}
     failed_tiles=0
     pairwise_requested=None
+    measured_level=np.full(n,np.nan,dtype=np.float64)
+    desired_level=np.full(n,np.nan,dtype=np.float64)
     if strength==0 or (brightness=="smooth" and n<8):
         # Whole-sequence short/disabled path: zero residual, confirmed steps only.
         residual[:]=0
@@ -366,7 +407,8 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
             pairwise_requested,pairwise_summary=_pairwise_path(measurements,x,q,s,
                 centers,period,strength,brightness,bounds,ev_limits,consensus,
                 residual,mad,fractions,counts,reliable,interpolated,labels,
-                segment_ids,exclude_rois)
+                segment_ids,exclude_rois,uniform_reference,measured_level,
+                desired_level)
             segments=[(lo,hi,hi-lo>=8) for lo,hi in zip(bounds[:-1],bounds[1:])]
         elif brightness=="uniform":
             # Hold one constant brightness: correct every frame's common level
@@ -444,6 +486,10 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
             float(s[t]),int(counts[t]) if n>=8 and strength!=0 else int(np.sum(q[t])),
             float(fractions[t]) if np.isfinite(fractions[t]) else None,
             float(mad[t]) if np.isfinite(mad[t]) else None,warnings,
+            measured_level_ev=(float(measured_level[t])
+                if np.isfinite(measured_level[t]) else None),
+            desired_level_ev=(float(desired_level[t])
+                if np.isfinite(desired_level[t]) else None),
             segment_id=int(segment_ids[t])))
     return ExposureResult(frames,x,q,consensus,frozen,reliable,failed_tiles,
         min(period,n),scene_cuts,time_gaps=gaps,pairwise_summary=pairwise_summary)
