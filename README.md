@@ -81,6 +81,8 @@ MP4 target bitrate is fixed at **160,000,000 bit/s**; the realized average file 
 
 The encoder selection order is NVIDIA NVENC > AMD AMF (Windows) / AMD VAAPI (Linux AMD device only) > Apple VideoToolbox > software libx264. Each listed codec is **really tested with two full-output-size frames**; a listed codec alone does not prove hardware functionality. When an encoder fails during processing, the sequence restarts at original RAW frame 0 with the next backend. Forced `--encoder` fails rather than silently switching.
 
+The output colour contract is explicit: pixels are sRGB-OETF-encoded, converted to YUV with a declared BT.709 matrix and limited range, and the stream is tagged accordingly (transfer iec61966-2-1). libx264 writes the full VUI via codec-private parameters; where an encoder drops tags (VideoToolbox on some builds) the run report records <code>colour_contract_warnings</code> instead of staying silent, and <code>verify_video</code> reports the actual average and worst-one-second bitrate.
+
 ## Processing details and limitations
 
 - Linear RGB under fixed RAW development settings, one fixed WB for the entire sequence; no auto-brightening or per-frame auto-WB. 16-bit linear LibRaw output is normalized, compensated at RAW development time and finally encoded via the sRGB OETF.
@@ -107,7 +109,7 @@ Interpretation note for this dataset: the camera raises BaselineExposure (+1.96 
 
 ### Estimators: matched-background pair graph (default) and legacy
 
- (default) builds a sparse graph of frame nodes connected by robust matched-background brightness differences (lags 1/2/4/8/16 within continuous runs; structure-, colour- and saturation-gated tiles; median + Huber reweighting -- never two independent medians subtracted). A sparse Huber-IRLS solve yields relative brightness <code>b</code> per connected component; targets are defined on <code>b</code>, and tiles under <code>--exclude-rois</code> never participate in fitting (independent acceptance areas). <code>--estimator legacy</code> keeps the previous per-frame-median tile + Whittaker-residual path as a documented baseline for comparison; metrics from the two paths are never mixed.
+<code>rawtl run --estimator pairwise</code> (default) builds a sparse graph of frame nodes connected by robust matched-background brightness differences (lags 1/2/4/8/16 within continuous runs; structure-, colour- and saturation-gated tiles; median + Huber reweighting -- never two independent medians subtracted). A sparse Huber-IRLS solve yields relative brightness <code>b</code> per connected component; targets are defined on <code>b</code>, and tiles under <code>--exclude-rois</code> never participate in fitting (independent acceptance areas). <code>--estimator legacy</code> keeps the previous per-frame-median tile + Whittaker-residual path as a documented baseline for comparison; metrics from the two paths are never mixed.
 
 ## Independent output audit (gain pass is not "no flicker")
 

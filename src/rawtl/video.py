@@ -87,18 +87,56 @@ def ffmpeg_command(ffmpeg: str,c: EncoderCandidate,width: int,height: int,
         "-an"]
     if c.name=="vaapi":
         cmd+=["-vf","format=nv12,hwupload"]
+    else:
+        # Explicit RGB->YUV matrix and range: never rely on swscale defaults.
+        cmd+=["-vf","scale=out_color_matrix=bt709:in_range=full:out_range=tv"]
     cmd+=["-c:v",c.ffmpeg_codec,"-b:v",BITRATE_STR,"-maxrate",BITRATE_STR,
         "-bufsize",BUFFER_STR]
+    if c.name=="libx264":
+        # libx264 ignores the generic -color_* options for VUI writing on
+        # FFmpeg 8; the codec-private parameters do write them.
+        cmd+=["-x264-params",
+              "colorprim=bt709:transfer=iec61966-2-1:colormatrix=bt709"]
     if c.name!="vaapi":
         cmd+=["-pix_fmt","yuv420p"]
-    cmd+=["-color_primaries","bt709","-color_trc","bt709","-colorspace","bt709",
+    # Colour contract, strategy (a): pixels carry the sRGB OETF (see
+    # color.py); declare exactly that, with BT.709 primaries/matrix and
+    # limited range. sRGB and BT.709 transfer functions are NOT identical --
+    # declaring bt709 here would misdescribe the pixels.
+    cmd+=["-color_primaries","bt709","-color_trc","iec61966-2-1",
+        "-colorspace","bt709","-color_range","tv",
         "-movflags","+faststart","-y",str(output)]
     return cmd
+
+def _bitrate_stats(ffprobe: str, path: Path, fps: Fraction) -> dict:
+    """Actual average bitrate and the worst one-second-window peak."""
+    try:
+        result=subprocess.run(
+            [ffprobe,"-v","error","-select_streams","v:0","-show_packets",
+             "-show_entries","packet=pts_time,size","-of","json",str(path)],
+            capture_output=True,text=True,check=True,timeout=180)
+        packets=[(float(p["pts_time"]),int(p["size"])) for p in
+                 json.loads(result.stdout)["packets"] if "pts_time" in p]
+    except (OSError,subprocess.SubprocessError,ValueError,KeyError):
+        return {"avg_bitrate_bps":None,"peak_1s_bitrate_bps":None}
+    if not packets:
+        return {"avg_bitrate_bps":None,"peak_1s_bitrate_bps":None}
+    total_bits=sum(size for _,size in packets)*8
+    duration=max(pts for pts,_ in packets)-min(pts for pts,_ in packets)+1/float(fps)
+    peak=0; window=0; start=packets[0][0]
+    for pts,size in packets:
+        window+=size
+        if pts-start>=1.0:
+            peak=max(peak,window); window=size; start=pts
+    peak=max(peak,window)
+    return {"avg_bitrate_bps":int(total_bits/max(duration,1e-9)),
+            "peak_1s_bitrate_bps":int(peak*8)}
 
 def verify_video(path: Path, ffprobe: str, count: int,width: int,
     height: int,fps: Fraction) -> dict:
     cmd=[ffprobe,"-v","error","-count_frames","-show_entries",
-        "stream=index,codec_type,codec_name,width,height,r_frame_rate,nb_read_frames,pix_fmt",
+        "stream=index,codec_type,codec_name,width,height,r_frame_rate,nb_read_frames,pix_fmt,"+
+        "color_primaries,color_transfer,color_space,color_range",
         "-of","json",str(path)]
     try:
         result=subprocess.run(cmd,capture_output=True,text=True,check=True,timeout=120)
@@ -115,9 +153,24 @@ def verify_video(path: Path, ffprobe: str, count: int,width: int,
         int(actual)!=count or Fraction(v["r_frame_rate"])!=fps or
         v.get("pix_fmt") not in ("yuv420p","nv12")):
         raise VerificationError(f"H.264 video dimensions/framerate/pixfmt/frame count mismatch: {v}")
-    return {"codec":v["codec_name"],"width":width,"height":height,
+    tags={"primaries":v.get("color_primaries"),"transfer":v.get("color_transfer"),
+        "matrix":v.get("color_space"),"range":v.get("color_range")}
+    contract_warnings=[]
+    if tags["primaries"] not in ("bt709",):
+        contract_warnings.append(f"COLOR_PRIMARIES_TAG_MISSING_OR_UNEXPECTED: {tags['primaries']!r}")
+    if tags["transfer"]!="iec61966-2-1":
+        contract_warnings.append(f"COLOR_TRANSFER_TAG_MISSING_OR_UNEXPECTED: {tags['transfer']!r} "
+            "(pixels are sRGB OETF; VideoToolbox builds may refuse VUI transfer tags)")
+    if tags["matrix"]!="bt709":
+        contract_warnings.append(f"COLOR_MATRIX_TAG_MISSING_OR_UNEXPECTED: {tags['matrix']!r}")
+    if tags["range"] not in ("tv","limited"):
+        contract_warnings.append(f"COLOR_RANGE_TAG_MISSING_OR_UNEXPECTED: {tags['range']!r}")
+    info={"codec":v["codec_name"],"width":width,"height":height,
         "fps":str(fps),"frames":int(actual),"pix_fmt":v.get("pix_fmt"),
+        "color_tags":tags,"colour_contract_warnings":contract_warnings,
         "file_size":path.stat().st_size}
+    info.update(_bitrate_stats(ffprobe,path,fps))
+    return info
 
 class VideoWriter:
     """Owns a single FFmpeg subprocess and one temporary output file."""
