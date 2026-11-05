@@ -130,7 +130,7 @@ class ProcessingService:
             raise InputError(f"PNG frame output already exists: {out/'frames'} (pass --overwrite)")
         out.mkdir(parents=True,exist_ok=True)
         cancel=cancel or CancellationToken()
-        report={"schema_version":1,"run_status":"RUNNING","frames":[],
+        report={"schema_version":2,"run_status":"RUNNING","frames":[],
             "encoder":{"selected":None,"attempts":[]},"warnings":[],
             "input_sort":"filename_unicode_case_sensitive",
             "video_target_bitrate_bps":160_000_000,
