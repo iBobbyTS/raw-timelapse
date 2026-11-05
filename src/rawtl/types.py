@@ -57,6 +57,7 @@ class ProcessingRequest:
     roi: tuple[float, float, float, float] = (0., 0., 1., 1.)
     steps: tuple[ExposureStep, ...] = ()
     on_review: str = "error"
+    temporal_quality: str = "strict"
     save_frames: bool = False
     overwrite: bool = False
     encoder: str = "auto"

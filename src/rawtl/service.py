@@ -26,7 +26,34 @@ from .exposure.validation import (
     probe_gain,evaluate_render,feedback_update,feedback_diverged,ValidationSummary)
 from .video import (
     VideoWriter,check_disk_space,probe_encoders,resolve_ffprobe)
+from .quality.video_audit import DETECTOR_MODEL,VideoAuditConfig,audit_video
 from .reporting import write_report,write_curve,strict_jsonable
+
+EXECUTION_STATUS_MAP={"OK":"COMPLETED","PARTIAL":"COMPLETED_WITH_REVIEW",
+    "COMPLETED_WITH_REVIEW":"COMPLETED_WITH_REVIEW"}
+
+def _encoded_quality_fields(audit: dict) -> dict:
+    """Compact view of the independent audit for the run report."""
+    return {"status":audit.get("status"),
+        "detector_model":audit.get("detector_model",DETECTOR_MODEL),
+        "frame_count":audit.get("frame_count"),
+        "candidate_count":audit.get("candidate_count"),
+        "chroma_variation":audit.get("chroma_variation","NOT_IMPLEMENTED"),
+        "metadata_warnings":audit.get("metadata_warnings",[]),
+        "events":audit.get("events",[]),
+        "segments":[{k:s.get(k) for k in ("start","end_exclusive","frames","status",
+            "usable_pairs","pairs","median_abs_step_ev","p95_abs_step_ev",
+            "max_abs_step_ev","curvature_rms_ev","steps_over_0_05_ev")}
+            for s in audit.get("segments",[])]}
+
+def _gain_response_fields(probe: dict) -> dict:
+    if probe.get("passed") is True:
+        return {"status":"PASS","median_error_ev":probe.get("median_error_ev"),
+            "p95_abs_error_ev":probe.get("p95_abs_error_ev"),
+            "observations":probe.get("observations")}
+    if probe.get("passed") is False:
+        return {"status":"FAIL","reasons":probe.get("reasons",[])[:5]}
+    return {"status":"SKIPPED","reason":probe.get("reason")}
 
 class ProcessingService:
     def __init__(self,renderer: RawRenderer | None=None):
@@ -88,6 +115,8 @@ class ProcessingService:
             raise InputError(f"output already exists: {out/'video.mp4'} (pass --overwrite)")
         if request.on_review not in ("error","passthrough"):
             raise InputError("on_review must be error or passthrough")
+        if request.temporal_quality not in ("strict","report","off"):
+            raise InputError("temporal_quality must be strict, report or off")
         if request.brightness not in ("smooth","uniform"):
             raise InputError("brightness must be smooth or uniform")
         if request.save_frames and (out/"frames").exists() and not request.overwrite:
@@ -103,8 +132,13 @@ class ProcessingService:
                 "strength":request.strength,"brightness":request.brightness,
                 "roi":list(request.roi),
                 "steps":[asdict(x) for x in request.steps],
-                "on_review":request.on_review,"save_frames":request.save_frames,
+                "on_review":request.on_review,"temporal_quality":request.temporal_quality,
+                "save_frames":request.save_frames,
                 "encoder":request.encoder,"ffmpeg":request.ffmpeg}}
+        report["render_temporal_quality"]={"status":"NOT_INDEPENDENT",
+            "note":"legacy frozen-target check is self-consistent with whatever "
+                    "correction was proposed; independent render-domain targets are "
+                    "tracked separately"}
         report_path=out/"exposure_report.json"
         temp_videos: list[Path]=[]
         temp_frame_dirs: list[Path]=[]
@@ -301,6 +335,37 @@ class ProcessingService:
                 raise VerificationError("missing verified temporary MP4")
             report["encoder"]["selected"]=best_encoder
             report["video_metadata"]=best_video_info
+            report["gain_response"]=_gain_response_fields(report["gain_probe"])
+            # Independent temporal audit of the encoded artifact: separate from
+            # the container-level verify_video check and from any input-side
+            # photometry. Pixels are encoded with the sRGB OETF today; the
+            # stream-tag mismatch is recorded and fixed with the colour task.
+            audit_result=None
+            if request.temporal_quality!="off":
+                self._emit(on_progress,"audit",0,n,encoder=report["encoder"]["selected"])
+                audit_config=VideoAuditConfig(transfer="srgb",
+                    frame_labels=[ref.filename for ref in refs])
+                try:
+                    audit_result=audit_video(best_video,ffmpeg=request.ffmpeg,
+                        ffprobe=ffprobe,config=audit_config,output_dir=out)
+                except VerificationError as exc:
+                    audit_result={"status":"UNOBSERVABLE","error":str(exc),
+                        "detector_model":DETECTOR_MODEL,"events":[],"segments":[]}
+                    report["warnings"].append(f"TEMPORAL_AUDIT_UNOBSERVABLE: {exc}")
+                report["encoded_temporal_quality"]=_encoded_quality_fields(audit_result)
+                if audit_result.get("status")=="FAIL":
+                    events=audit_result.get("events",[])
+                    summary=(f"encoded temporal quality FAIL: {len(events)} events >0.05 EV; "
+                        f"worst={max((e['common_ev'] for e in events),key=abs):+.4f} EV"
+                        if events else "encoded temporal quality FAIL: thresholds exceeded")
+                    if request.temporal_quality=="strict":
+                        report["run_status"]="TEMPORAL_QUALITY_FAILED"
+                        raise VerificationError(summary+"; rerun with --temporal-quality report "
+                            "to keep the video flagged for review")
+                    report["warnings"].append(summary)
+            else:
+                report["encoded_temporal_quality"]={"status":"SKIPPED",
+                    "note":"temporal audit disabled by request"}
             self._emit(on_progress,"verify",n,n,encoder=report["encoder"]["selected"])
             # The final PNGs are from the same accepted correction round, not failed retries.
             if best_png is not None:
@@ -308,6 +373,10 @@ class ProcessingService:
             # Only committed after correct frame count and all quality gates.
             os.replace(best_video,out/"video.mp4")
             report["run_status"]="PARTIAL" if need_review else "OK"
+            if audit_result is not None and audit_result.get("status")=="FAIL":
+                report["run_status"]="COMPLETED_WITH_REVIEW"
+            report["execution_status"]=EXECUTION_STATUS_MAP.get(
+                report["run_status"],report["run_status"])
             report["frames"]=[self._frame_record(ref,est)
                 for ref,est in zip(refs,exposure.frames)]
             report["status_counts"]={
