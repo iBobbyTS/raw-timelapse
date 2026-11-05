@@ -112,6 +112,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="exposure_report.json providing per-frame source filenames")
     av.add_argument("--width",type=int,default=912)
     av.add_argument("--ffmpeg",default="ffmpeg")
+    pd=sub.add_parser("probe-dng",
+        help="controlled probes: does this backend apply BaselineExposure / OpcodeList3?")
+    pd.add_argument("file",type=Path)
     return p
 
 def main(argv: list[str] | None = None) -> int:
@@ -120,7 +123,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from .service import ProcessingService
         service=ProcessingService()
-        if args.action=="probe":
+        if args.action=="probe-dng":
+            from .raw_backend import RawpyRenderer
+            from .dng_semantics import probe_backend_semantics, read_baseline_exposure
+            renderer=RawpyRenderer()
+            meta=renderer.inspect(args.file)
+            from .types import RawRenderOptions
+            options=RawRenderOptions(RawpyRenderer.fixed_wb(meta))
+            result=probe_backend_semantics(renderer,args.file,options)
+            result["baseline_exposure_tag_value_ev"]=read_baseline_exposure(
+                args.file.read_bytes())
+            print(json.dumps(result,indent=2,ensure_ascii=False,allow_nan=False))
+        elif args.action=="probe":
             result=service.probe(args.input,ffmpeg=args.ffmpeg)
             print(json.dumps(result,indent=2,ensure_ascii=False,allow_nan=False))
         elif args.action=="audit-video":
