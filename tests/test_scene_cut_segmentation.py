@@ -48,7 +48,7 @@ def test_without_cuts_the_splice_stays_unreliable():
     x,_=spliced_sequence()
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(estimation,"SCENE_CUT_MEDIAN_EV",1e9)
-        e=estimate_exposure(frames(x))
+        e=estimate_exposure(frames(x),estimator="legacy")
     assert any(f.applied_ev is None for f in e.frames)
     assert e.scene_cuts==[]
 

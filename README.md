@@ -105,6 +105,10 @@ Real camera DNGs carry per-frame default-development metadata that a raw backend
 
 Interpretation note for this dataset: the camera raises BaselineExposure (+1.96 EV over the first 77 frames) almost exactly opposite to the sensor's darkening. Since the backend ignores the tag, that intended compensation is absent from the render; the exposure policy tasks decide explicitly whether to reconstruct it, so it is never double-applied.
 
+### Estimators: matched-background pair graph (default) and legacy
+
+ (default) builds a sparse graph of frame nodes connected by robust matched-background brightness differences (lags 1/2/4/8/16 within continuous runs; structure-, colour- and saturation-gated tiles; median + Huber reweighting -- never two independent medians subtracted). A sparse Huber-IRLS solve yields relative brightness <code>b</code> per connected component; targets are defined on <code>b</code>, and tiles under <code>--exclude-rois</code> never participate in fitting (independent acceptance areas). <code>--estimator legacy</code> keeps the previous per-frame-median tile + Whittaker-residual path as a documented baseline for comparison; metrics from the two paths are never mixed.
+
 ## Independent output audit (gain pass is not "no flicker")
 
 The render pipeline checks that the RAW backend *executed* the requested EV

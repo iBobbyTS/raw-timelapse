@@ -80,6 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--brightness",choices=["smooth","uniform"],default="smooth",
         help="smooth: remove flicker, preserve real brightness evolution; "
              "uniform: hold one constant brightness across the whole sequence")
+    r.add_argument("--estimator",choices=["pairwise","legacy"],default="pairwise",
+        help="pairwise: matched-background pair graph (default); "
+             "legacy: per-frame-median tiles + Whittaker residual (baseline)")
+    r.add_argument("--exclude-rois",type=Path,dest="exclude_rois",
+        help="JSON file of ROI boxes [x0,y0,x1,y1] keyed by name; tiles under "
+             "them are excluded from estimation (independent acceptance areas)")
     r.add_argument("--roi",type=parse_roi,default=(0.,0.,1.,1.))
     r.add_argument("--steps",type=Path)
     r.add_argument("--on-review",choices=["error","passthrough"],default="error")
@@ -164,10 +170,15 @@ def main(argv: list[str] | None = None) -> int:
                     "curvature_rms_ev","steps_over_0_05_ev")}
                     for s in result["segments"]]},indent=2,ensure_ascii=False,allow_nan=False))
         else:
+            exclude=()
+            if args.exclude_rois:
+                payload=json.loads(args.exclude_rois.read_text(encoding="utf-8"))
+                exclude=tuple(tuple(float(v) for v in box) for box in payload.values())
             req=ProcessingRequest(
                 input_dir=args.input,output_dir=args.output,fps=args.fps,
                 period=args.period,strength=args.strength,brightness=args.brightness,
-                roi=args.roi,steps=load_steps(args.steps),on_review=args.on_review,
+                estimator=args.estimator,roi=args.roi,exclude_rois=exclude,
+                steps=load_steps(args.steps),on_review=args.on_review,
                 temporal_quality=args.temporal_quality,save_frames=args.save_frames,
                 overwrite=args.overwrite,encoder=args.encoder,ffmpeg=args.ffmpeg)
             def on_progress(ev):

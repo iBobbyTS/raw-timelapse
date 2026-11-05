@@ -13,6 +13,8 @@ import numpy as np
 from ..types import ExposureError, ExposureStep
 from .measurement import FrameMeasurement
 from .trends import huber_whittaker
+from .pairwise import build_edges, persistent_background
+from .graph import solve_exposure_graph
 
 # A scene cut needs BOTH a large common shift and large cross-tile disagreement:
 # a spatially uniform jump is common flicker to remove, not a content change.
@@ -51,6 +53,7 @@ class ExposureResult:
     period_effective: int
     scene_cuts: list[dict] = field(default_factory=list)
     time_gaps: list[int] = field(default_factory=list)
+    pairwise_summary: dict = field(default_factory=dict)
 
 def _step_vector(n: int,steps: Sequence[ExposureStep]) -> np.ndarray:
     vector=np.zeros(n,dtype=np.float64)
@@ -85,6 +88,167 @@ def detect_scene_cuts(step_adjusted: np.ndarray,valid: np.ndarray,
             records.append({"index":t+1,"median_ev":med,"tile_mad_ev":mad,
                 "common_tiles":common})
     return cuts,records
+
+
+
+def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
+    q: np.ndarray,s: np.ndarray,centers: np.ndarray,period: int,strength: float,
+    brightness: str,bounds: list[int],ev_limits: tuple[float,float],
+    consensus: np.ndarray,residual: np.ndarray,mad: np.ndarray,
+    fractions: np.ndarray,counts: np.ndarray,reliable: np.ndarray,
+    interpolated: np.ndarray,labels: list[str],segment_ids: np.ndarray,
+    exclude_rois: tuple[tuple[float,float,float,float],...]
+    ) -> tuple[np.ndarray,dict]:
+    """Matched-background estimation: pair graph -> relative brightness b,
+    then a brightness-intent target on b (slow trend or constant level on the
+    persistent background). Fills the shared diagnostic arrays in place."""
+    n,k=x.shape
+    xs=np.unique(centers[:,0]); ys=np.unique(centers[:,1])
+    grid=(len(xs),len(ys))
+    train=np.ones(k,dtype=bool)
+    for (bx,by,bx1,by1) in exclude_rois:
+        inside=((centers[:,0]>=bx)&(centers[:,0]<bx1)&
+                (centers[:,1]>=by)&(centers[:,1]<by1))
+        train&=~inside
+    boundaries=[lo for lo,hi in zip(bounds[:-1],bounds[1:])]
+    edges,edge_stats=build_edges(measurements,boundaries=boundaries,train=train,
+        grid=grid)
+    graph=solve_exposure_graph(n,edges)
+    b=graph.brightness
+    persistent=persistent_background(measurements,b)
+    need=max(8,math.ceil(k/4))
+    # Uniform wants ONE constant level for the whole sequence. Components
+    # separated by cuts/gaps have no cross evidence, so their relative level
+    # is stitched with an explicit assumption: the persistent-background
+    # level difference across the boundary (all-valid-tile median fallback).
+    b_hat=b.copy()
+    cross_anchors=[]
+    if len(graph.components)>1:
+        def _row_level(t:int) -> float:
+            ok=q[t]&persistent&np.isfinite(x[t])
+            if np.count_nonzero(ok)>=need:
+                return float(np.median(x[t,ok]))
+            ok=q[t]&np.isfinite(x[t])
+            return float(np.median(x[t,ok])) if np.count_nonzero(ok) else math.nan
+        # Per component, (row level - b) is a constant (the tile-mix offset).
+        # Stitch each later component so its constant matches the previous
+        # one: output levels then continue across the boundary.
+        consts=[]
+        for comp in graph.components:
+            member=np.array([t for t in comp if np.isfinite(b[t])])
+            vals=np.array([_row_level(t)-b[t] for t in member])
+            consts.append(float(np.median(vals)) if vals.size and
+                np.all(np.isfinite(vals)) else math.nan)
+        prev=None
+        for c_idx,comp in enumerate(graph.components):
+            if prev is not None and math.isfinite(prev) and math.isfinite(consts[c_idx]):
+                shift=consts[c_idx]-prev
+                b_hat[comp]+=shift
+                cross_anchors.append({
+                    "boundary":min(comp),"level_const_before":prev,
+                    "level_const_after":consts[c_idx],"applied_shift_ev":-shift})
+            if math.isfinite(consts[c_idx]):
+                prev=consts[c_idx]
+    need=max(8,math.ceil(k/4))
+    for seg_id,(lo,hi) in enumerate(zip(bounds[:-1],bounds[1:])):
+        segment_ids[lo:hi]=seg_id
+    for t in range(n):
+        counts[t]=int(np.count_nonzero(q[t]&persistent))
+    requested=np.full(n,np.nan,dtype=np.float64)
+    if brightness=="uniform":
+        # Constant brightness on the matched background: the level is the
+        # (globally stitched) graph brightness. The target is a property of
+        # matched surfaces, never of whatever object happens to sit at the
+        # current frame's median.
+        need=max(8,math.ceil(k/4))
+        finite_all=np.flatnonzero(np.isfinite(b_hat))
+        target=(float(np.median(b_hat[finite_all]))
+                if finite_all.size else math.nan)
+        for t in finite_all:
+            reliable[t]=True
+            consensus[t,q[t]&persistent]=True
+            residual[t]=b_hat[t]-target
+            requested[t]=strength*(target-b_hat[t])
+            labels[t]="UNIFORM"
+        good=np.flatnonzero(np.isfinite(requested))
+        for a_idx,b_idx in zip(good[:-1],good[1:]):
+            missing=b_idx-a_idx-1
+            if (1<=missing<=3 and counts[a_idx+1:b_idx].min()>=0 and
+                    all(int(np.sum(q[t]))>=need for t in range(a_idx+1,b_idx)) and
+                    not any(g in boundaries for g in range(a_idx+1,b_idx))):
+                # only measurable-but-unconstrained frames get interpolated;
+                # a frame with no usable photometry stays REVIEW_REQUIRED
+                for t in range(a_idx+1,b_idx):
+                    if not np.any(q[t]):
+                        continue
+                    requested[t]=float(np.interp(t,[a_idx,b_idx],
+                        [requested[a_idx],requested[b_idx]]))
+                    interpolated[t]=True
+                    labels[t]="INTERPOLATED_ESTIMATE"
+    else:
+        # smooth: keep the slow trend of b, remove the fast part. Confirmed
+        # user steps are subtracted from b before fitting so the trend follows
+        # them without trying to "correct" an intentional exposure change.
+        b_adj=b-s
+        trend=np.full(n,np.nan,dtype=np.float64)
+        for comp in graph.components:
+            if len(comp)<8:
+                continue
+            member=np.array(comp)
+            fit=huber_whittaker(b_adj[member],np.isfinite(b_adj[member]),period)
+            if fit.converged:
+                trend[member]=fit.trend
+        for t in range(n):
+            if np.isfinite(b_adj[t]) and np.isfinite(trend[t]):
+                reliable[t]=True
+                consensus[t,q[t]&persistent]=True
+                residual[t]=b_adj[t]-trend[t]
+                requested[t]=strength*(trend[t]-b_adj[t])
+                labels[t]="OK"
+        # anchor each connected component so corrections are level-neutral
+        for comp in graph.components:
+            member=np.array([t for t in comp if np.isfinite(requested[t])])
+            if member.size:
+                anchor=-float(np.median(requested[member]))
+                requested[member]+=anchor
+        # bounds-segments too short for a trend pass through uncorrected
+        for lo,hi in zip(bounds[:-1],bounds[1:]):
+            if hi-lo<8:
+                requested[lo:hi]=0.
+                reliable[lo:hi]=True
+                residual[lo:hi]=0.
+                labels[lo:hi]=["SHORT_SEQUENCE_NO_DEFLICKER"]*(hi-lo)
+        good=np.flatnonzero(np.isfinite(requested))
+        for a_idx,b_idx in zip(good[:-1],good[1:]):
+            missing=b_idx-a_idx-1
+            if (1<=missing<=3 and
+                    all(int(np.sum(q[t]))>=need for t in range(a_idx+1,b_idx)) and
+                    not any(g in boundaries for g in range(a_idx+1,b_idx))):
+                # only measurable-but-unconstrained frames get interpolated;
+                # a frame with no usable photometry stays REVIEW_REQUIRED
+                for t in range(a_idx+1,b_idx):
+                    if not np.any(q[t]):
+                        continue
+                    requested[t]=float(np.interp(t,[a_idx,b_idx],
+                        [requested[a_idx],requested[b_idx]]))
+                    interpolated[t]=True
+                    labels[t]="INTERPOLATED_ESTIMATE"
+    summary={"cross_boundary_anchors":{"method":
+        "persistent-background level median across the boundary "
+        "(all-valid-tile median fallback); explicit assumption, not evidence",
+        "entries":cross_anchors},
+        "edges":len(edges),
+        "edges_by_lag":edge_stats["by_lag"],
+        "edge_reject_reasons":edge_stats["reject_reasons"],
+        "edge_p95_abs_residual_ev":graph.edge_p95_abs_residual_ev,
+        "components":[{"frames":len(c),"gauge":c[0]} for c in graph.components],
+        "persistent_tiles":int(np.count_nonzero(persistent)),
+        "excluded_tiles":int(np.count_nonzero(~train)),
+        "converged":graph.converged,"iterations":graph.iterations}
+    if brightness=="uniform":
+        summary["uniform_target_level_ev"]=None if not math.isfinite(target) else target
+    return requested,summary
+
 
 def _robust_segment(a: np.ndarray,q: np.ndarray,centers: np.ndarray,period: int,
     lo: int,hi: int,consensus: np.ndarray,residual: np.ndarray,mad: np.ndarray,
@@ -141,7 +305,8 @@ def _robust_segment(a: np.ndarray,q: np.ndarray,centers: np.ndarray,period: int,
 def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
     strength: float=1.,steps: Sequence[ExposureStep]=(),
     brightness: str="smooth",ev_limits: tuple[float,float]=(-2.,2.),
-    time_gaps: Sequence[int]=()) -> ExposureResult:
+    time_gaps: Sequence[int]=(),estimator: str="pairwise",
+    exclude_rois: tuple[tuple[float,float,float,float],...]=()) -> ExposureResult:
     n=len(measurements)
     if n<1:
         raise ExposureError("empty exposure sequence")
@@ -149,6 +314,8 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
         raise ExposureError("invalid period or strength")
     if brightness not in ("smooth","uniform"):
         raise ExposureError("brightness must be smooth or uniform")
+    if estimator not in ("pairwise","legacy"):
+        raise ExposureError("estimator must be pairwise or legacy")
     gaps=sorted({int(g) for g in time_gaps if 0<int(g)<n})
     low,high=ev_limits
     if not math.isfinite(low+high) or not low<high:
@@ -175,7 +342,9 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
     labels: list[str]=["REVIEW_REQUIRED"]*n
     segment_ids=np.zeros(n,dtype=int)
     scene_cuts: list[dict]=[]
+    pairwise_summary: dict={}
     failed_tiles=0
+    pairwise_requested=None
     if strength==0 or (brightness=="smooth" and n<8):
         # Whole-sequence short/disabled path: zero residual, confirmed steps only.
         residual[:]=0
@@ -193,7 +362,13 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
         # signal that may coincide).
         bounds=[0]+sorted(set(cuts)|set(gaps))+[n]
         gap_kinds={g:"time_gap" for g in gaps}|{c:"scene_cut" for c in cuts}
-        if brightness=="uniform":
+        if estimator=="pairwise":
+            pairwise_requested,pairwise_summary=_pairwise_path(measurements,x,q,s,
+                centers,period,strength,brightness,bounds,ev_limits,consensus,
+                residual,mad,fractions,counts,reliable,interpolated,labels,
+                segment_ids,exclude_rois)
+            segments=[(lo,hi,hi-lo>=8) for lo,hi in zip(bounds[:-1],bounds[1:])]
+        elif brightness=="uniform":
             # Hold one constant brightness: correct every frame's common level
             # to the global median. Real evolution (day->dusk), flicker and
             # splice jumps are all flattened; scene cuts and time gaps stay
@@ -223,21 +398,24 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
                     reliable[lo:hi]=True
                     residual[lo:hi]=0
                     segments.append((lo,hi,False))
-    raw=np.full(n,np.nan,dtype=np.float64)
     accepted=reliable|interpolated
-    if strength==0:
-        raw[:]=0.
+    if pairwise_requested is not None:
+        requested=pairwise_requested
     else:
-        raw[accepted]=strength*(-s[accepted]-residual[accepted])
-    requested=np.full(n,np.nan,dtype=np.float64)
-    # Each segment anchors to its own reliable frames: exposure continuity is
-    # only claimed inside a content-continuous run, never across a scene cut.
-    for lo,hi,deflickered in segments:
-        if np.any(reliable[lo:hi]):
-            anchor=-float(np.median(raw[lo:hi][reliable[lo:hi]]))
+        raw=np.full(n,np.nan,dtype=np.float64)
+        if strength==0:
+            raw[:]=0.
         else:
-            anchor=0.
-        requested[lo:hi]=raw[lo:hi]+anchor
+            raw[accepted]=strength*(-s[accepted]-residual[accepted])
+        requested=np.full(n,np.nan,dtype=np.float64)
+        # Each segment anchors to its own reliable frames: exposure continuity is
+        # only claimed inside a content-continuous run, never across a scene cut.
+        for lo,hi,deflickered in segments:
+            if np.any(reliable[lo:hi]):
+                anchor=-float(np.median(raw[lo:hi][reliable[lo:hi]]))
+            else:
+                anchor=0.
+            requested[lo:hi]=raw[lo:hi]+anchor
     frozen=np.full_like(x,np.nan)
     frames=[]
     for t in range(n):
@@ -268,4 +446,4 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
             float(mad[t]) if np.isfinite(mad[t]) else None,warnings,
             segment_id=int(segment_ids[t])))
     return ExposureResult(frames,x,q,consensus,frozen,reliable,failed_tiles,
-        min(period,n),scene_cuts,time_gaps=gaps)
+        min(period,n),scene_cuts,time_gaps=gaps,pairwise_summary=pairwise_summary)
