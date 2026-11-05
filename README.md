@@ -81,6 +81,14 @@ MP4 target bitrate is fixed at **160,000,000 bit/s**; the realized average file 
 
 The encoder selection order is NVIDIA NVENC > AMD AMF (Windows) / AMD VAAPI (Linux AMD device only) > Apple VideoToolbox > software libx264. Each listed codec is **really tested with two full-output-size frames**; a listed codec alone does not prove hardware functionality. When an encoder fails during processing, the sequence restarts at original RAW frame 0 with the next backend. Forced `--encoder` fails rather than silently switching.
 
+<h3>Brightness targets and their provenance</h3>
+
+Every pairwise run reports, per frame, <code>measured_level_ev</code> (the matched-background brightness <code>b</code>, confirmed steps removed in smooth mode) and <code>desired_level_ev</code> (the Huber-Whittaker trend for smooth, or the constant reference level for uniform), with <code>requested = strength * (desired - measured)</code>. Targets are frozen before any render iteration; feedback moves <code>applied_ev</code>, never the target.
+
+Uniform mode holds a <strong>persistent reference</strong>, not a per-frame statistic: the level comes from the pair graph of matched background surfaces. <code>--uniform-reference global</code> (default) stitches disconnected runs to one constant level -- the cross-boundary offset is recorded as an explicit assumption; <code>segment</code> keeps each continuous run at its own level. <code>--period</code> affects smooth mode only and is ignored by uniform. Confirmed exposure steps are preserved by smooth and flattened by uniform, by definition of the two intents.
+
+Reports are <code>schema_version 2</code>: <code>execution_status</code>, <code>gain_response</code> (execution consistency only), <code>render_temporal_quality</code> and <code>encoded_temporal_quality</code> are separate; frames carry measured/desired levels, source capture time and BaselineExposure metadata; JSON output is strictly finite (no NaN/Infinity).
+
 The output colour contract is explicit: pixels are sRGB-OETF-encoded, converted to YUV with a declared BT.709 matrix and limited range, and the stream is tagged accordingly (transfer iec61966-2-1). libx264 writes the full VUI via codec-private parameters; where an encoder drops tags (VideoToolbox on some builds) the run report records <code>colour_contract_warnings</code> instead of staying silent, and <code>verify_video</code> reports the actual average and worst-one-second bitrate.
 
 ## Processing details and limitations
