@@ -1,4 +1,13 @@
-"""Gain probes and frozen-target re-render verification (maximum two feedback updates)."""
+"""Gain probes and output-domain render verification (maximum two feedback updates).
+
+Two different questions, deliberately separated:
+- probe_gain: EXECUTION consistency -- does the RAW backend realise a
+  requested EV shift? It says nothing about whether the correction was right.
+- evaluate_render: TARGET consistency in the render domain -- do the actually
+  rendered frames follow the frozen brightness intent (per-frame level vs
+  desired level, anchored by one median offset), with a single-frame gate so
+  one severe mismatch cannot hide inside clean P95 statistics?
+"""
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Sequence
@@ -72,55 +81,73 @@ def probe_gain(renderer: RawRenderer, frames: Sequence[FrameRef],
     return GainProbeResult(passed,tested,median_err,p95,len(errors),reasons)
 
 def evaluate_render(exposure: ExposureResult,
-    rendered: Sequence[FrameMeasurement],*, iteration: int=0) -> ValidationSummary:
+    rendered: Sequence[FrameMeasurement],*, iteration: int=0,
+    single_frame_gate_ev: float=.10) -> ValidationSummary:
+    """Independent render-domain target check.
+
+    For every frame with consensus support, the actually rendered level is the
+    median log-luminance over the SAME consensus tiles; the error is
+    desired_level + offset - rendered_level with one shared median offset, so
+    the check is about the brightness INTENT (and its execution), never about
+    the algebra of the correction that was proposed. One severe frame (>gate)
+    fails the whole summary regardless of clean percentiles.
+    """
     if len(rendered)!=len(exposure.frames):
         raise ValueError("rendered validation frame count mismatch")
     errors=[]; unobservable=[];outliers=[]
+    levels=[]
     for t,(est,m) in enumerate(zip(exposure.frames,rendered)):
-        if est.applied_ev is None or est.status=="LIMITED" or est.status=="REVIEW_REQUIRED":
-            errors.append(None)
-            est.render_target_error_ev=None
-            continue
         original=exposure.consensus_mask[t]
-        # Interpolated/short sequences do not have consensus masks; they are NOT observed validations.
-        if not np.any(original):
+        if (est.applied_ev is None or est.status in ("LIMITED","REVIEW_REQUIRED")
+                or est.desired_level_ev is None or not np.any(original)):
             errors.append(None)
             est.render_target_error_ev=None
+            levels.append(None)
             continue
         if len(m.valid)!=len(original):
             errors.append(None);unobservable.append(t)
             est.render_target_error_ev=None
+            levels.append(None)
             continue
         usable=original & m.valid & np.isfinite(m.log_luminance)
         initial_count=np.count_nonzero(original)
         if (np.count_nonzero(usable)<max(8,math.ceil(len(original)/4)) or
-            np.count_nonzero(usable)<math.ceil(.75*initial_count)):
+                np.count_nonzero(usable)<math.ceil(.75*initial_count)):
             errors.append(None);unobservable.append(t)
             est.render_target_error_ev=None
+            levels.append(None)
             continue
-        diff=exposure.frozen_target[t,usable]-m.log_luminance[usable]
-        error=float(np.median(diff))
-        errors.append(error)
-        est.render_target_error_ev=error
-        if abs(error)>.10:
+        level=float(np.median(m.log_luminance[usable]))
+        levels.append(level)
+        errors.append(None)  # filled after the shared offset is known
+    finite_levels=[(t,l) for t,l in enumerate(levels) if l is not None]
+    if not finite_levels:
+        return ValidationSummary(errors,None,None,outliers,unobservable,False,iteration)
+    desired=np.array([exposure.frames[t].desired_level_ev for t,_ in finite_levels])
+    measured=np.array([l for _,l in finite_levels])
+    offset=float(np.median(measured-desired))
+    for (t,_),error in zip(finite_levels,desired+offset-measured):
+        errors[t]=float(error)
+        exposure.frames[t].render_target_error_ev=float(error)
+        if abs(error)>single_frame_gate_ev:
             outliers.append(t)
     finite=np.array([abs(x) for x in errors if x is not None],dtype=np.float64)
-    if len(finite)==0:
-        return ValidationSummary(errors,None,None,outliers,unobservable,False,iteration)
     med=float(np.median(finite))
     p95=float(np.percentile(finite,95))
-    return ValidationSummary(errors,med,p95,outliers,unobservable,
-        med<=.01 and p95<=.03 and not unobservable,iteration)
+    passed=bool(med<=.01 and p95<=.03 and not outliers and not unobservable)
+    return ValidationSummary(errors,med,p95,outliers,unobservable,passed,iteration)
 
 def feedback_update(exposure: ExposureResult, summary: ValidationSummary,
-    *, limits:tuple[float,float]=(-2.,2.)) -> int:
-    """Mutate applied EV only; frozen target and requested EV remain immutable."""
+    *, limits:tuple[float,float]=(-2.,2.), damping: float=.75,
+    max_step_ev: float=.25) -> int:
+    """Move applied EV toward the frozen target; the target itself never moves."""
     adjusted=0
     for frame,error in zip(exposure.frames,summary.errors):
         if (error is None or frame.applied_ev is None or frame.status in
-            {"LIMITED","REVIEW_REQUIRED","INTERPOLATED_ESTIMATE","DISABLED"}):
+            {"LIMITED","REVIEW_REQUIRED","INTERPOLATED_ESTIMATE","DISABLED",
+             "SHORT_SEQUENCE_NO_DEFLICKER"}):
             continue
-        val=float(np.clip(frame.applied_ev+np.clip(.75*error,-.25,.25),*limits))
+        val=float(np.clip(frame.applied_ev+np.clip(damping*error,-max_step_ev,max_step_ev),*limits))
         if val!=frame.applied_ev:
             frame.applied_ev=val
             adjusted+=1

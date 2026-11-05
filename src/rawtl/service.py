@@ -238,6 +238,7 @@ class ProcessingService:
             self._emit(on_progress,"inventory",n,n)
             measurements=[]
             baseline_coverage=[]
+            base_tile_sat=[]
             width=height=None
             for ref in refs:
                 self._check(cancel)
@@ -251,8 +252,10 @@ class ProcessingService:
                     baseline_coverage.append(float(np.mean(frame.saturation_mask)))
                 else:
                     baseline_coverage.append(float(np.mean(np.any(frame.rgb>=.98,axis=2))))
-                measurements.append(measure_frame(frame,request.roi,
-                    structure_samples=request.estimator=="pairwise"))
+                tile_measure=measure_frame(frame,request.roi,
+                    structure_samples=request.estimator=="pairwise")
+                measurements.append(tile_measure)
+                base_tile_sat.append(tile_measure.saturation_fraction)
                 self._emit(on_progress,"analysis",ref.index+1,n,ref.filename)
                 del frame
             report["analysis_shape"]=[width,height]
@@ -334,8 +337,16 @@ class ProcessingService:
                                     raise RawDecodeError(f"RAW dimensions changed while rendering {ref.filename}")
                                 current_measure=measure_frame(current,request.roi)
                                 rendered.append(current_measure)
-                                current_coverage=float(np.mean(current.saturation_mask)) if current.saturation_mask is not None else float(np.mean(np.any(current.rgb>=.98,axis=2)))
-                                est.new_output_clipping_fraction=max(0.,current_coverage-base_coverage)
+                                # Per-tile monotone saturation increase vs the
+                                # baseline tile occupancy: a tighter clipping
+                                # guard than a difference of global fractions.
+                                if base_tile_sat is not None:
+                                    est.new_output_clipping_fraction=float(
+                                        np.sum(np.maximum(0.,current_measure.saturation_fraction
+                                            -base_tile_sat[ref.index]))/len(base_tile_sat[ref.index]))
+                                else:
+                                    current_coverage=float(np.mean(current.saturation_mask)) if current.saturation_mask is not None else float(np.mean(np.any(current.rgb>=.98,axis=2)))
+                                    est.new_output_clipping_fraction=max(0.,current_coverage-base_coverage)
                                 processed=self.processor.process(current)
                                 rgb8=pad_even_rgb8(self.transfer.to_rgb8(processed))
                                 if frame_dir is not None:
@@ -368,13 +379,18 @@ class ProcessingService:
                     if must_validate else None)
                 if (summary is not None and
                         all(e is None for e in summary.errors)):
-                    # No frame had observable consensus tiles (e.g. every tile
-                    # changed at a splice): nothing to verify and nothing to
-                    # feed back. Accept without claiming verification.
+                    # Nothing observable: either no consensus tiles (every tile
+                    # changed at a splice) or the legacy estimator, which has no
+                    # independent render targets. Skip rather than fail -- and
+                    # never claim verification.
                     report["render_temporal_quality"]={"status":
-                        "NOT_VERIFIED_NO_CONSENSUS","note":
-                        "no frame had observable consensus tiles; frozen-target "
-                        "validation skipped rather than failed"}
+                        "NOT_VERIFIED_NO_CONSENSUS" if request.estimator=="pairwise"
+                        else "NOT_INDEPENDENT_LEGACY","note":
+                        ("no frame had observable consensus tiles; render-domain "
+                         "validation skipped rather than failed" if
+                         request.estimator=="pairwise" else
+                         "legacy estimator defines no independent render-domain "
+                         "targets; encoded-output audit remains the gate")}
                     summary=None
                 if summary is None:
                     best_video=video_path;best_png=frame_dir;accepted_summary=None
