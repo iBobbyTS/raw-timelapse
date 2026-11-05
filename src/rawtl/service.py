@@ -19,6 +19,9 @@ from .types import (
     RawRenderer, VerificationError)
 from .inventory import inspect_directory, prevent_output_overlap
 from .raw_backend import RawpyRenderer
+from .dng_semantics import (
+    FrameSourceInfo, baseline_exposure_summary, continuity, extract_source_metadata,
+    opcode_variation, probe_backend_semantics)
 from .color import SRGBTransfer,pad_even_rgb8
 from .frame_processing import IdentityProcessor
 from .exposure import measure_frame,estimate_exposure
@@ -161,6 +164,70 @@ class ProcessingService:
             if "R6 Mark III" in meta.camera or (
                 meta.camera=="UNKNOWN_CAMERA" and meta.raw_type==".cr3"):
                 report["warnings"].append("RAW_PROFILE_UNVERIFIED: Canon CR3 colour must be checked")
+            # DNG default-development semantics and capture-time continuity.
+            # ExifTool is optional: without it the coverage is filename-only and
+            # the capability probe still runs on real bytes.
+            source_info=extract_source_metadata([f.path for f in refs])
+            if source_info is None:
+                report["warnings"].append(
+                    "SOURCE_METADATA_UNAVAILABLE: install ExifTool for capture-time "
+                    "continuity and DNG development metadata")
+                source_info={ref.filename: FrameSourceInfo(ref.filename)
+                             for ref in refs}
+            ordered_info=[source_info.get(ref.filename, FrameSourceInfo(ref.filename))
+                          for ref in refs]
+            cont=continuity(ordered_info)
+            report["source_continuity"]=cont
+            if meta.raw_type==".dng":
+                probe_semantics=probe_backend_semantics(r,refs[0].path,render_opts)
+                baseline_probe=probe_semantics.get("baseline_exposure",{})
+                opcode_probe=probe_semantics.get("opcode_list3",{})
+                if baseline_probe.get("applied") is True:
+                    baseline_owner="backend"
+                elif baseline_probe.get("applied") is False:
+                    baseline_owner="none"
+                elif baseline_probe.get("tag")=="absent":
+                    baseline_owner="not_applicable"
+                else:
+                    baseline_owner="unknown"
+                if opcode_probe.get("applied") is True:
+                    opcode_support="APPLIED_BY_BACKEND"
+                elif opcode_probe.get("applied") is False:
+                    opcode_support="NOT_APPLIED_BY_THIS_BUILD"
+                elif opcode_probe.get("tag")=="absent":
+                    opcode_support="NOT_APPLICABLE"
+                else:
+                    opcode_support="UNKNOWN"
+                report["render_semantics"]={
+                    "raw_backend":report["decoder"]["versions"],
+                    "baseline_exposure_policy":{
+                        "baseline_application_owner":baseline_owner,
+                        "probe":probe_semantics.get("baseline_exposure",{}),
+                        "note":"owner 'none' means the backend provably ignores the "
+                               "tag; the project does not silently add it"},
+                    "dng_opcode_support":opcode_support,
+                    "opcode_probe":probe_semantics.get("opcode_list3",{}),
+                    "opcode_payload_variation":opcode_variation(source_info),
+                    "baseline_exposure_summary":baseline_exposure_summary(source_info),
+                    "not_tested":["adobe_reference_development",
+                        "opcode_capable_backend","dng_sdk_stage2_3_verification"]}
+                if baseline_owner=="none":
+                    report["warnings"].append(
+                        "DNG_BASELINE_EXPOSURE_IGNORED_BY_BACKEND: per-frame default-"
+                        "development exposure metadata is not executed by this "
+                        "backend build (probe-verified); interpretation policy is "
+                        "explicit, never double-applied")
+                if opcode_support=="NOT_APPLIED_BY_THIS_BUILD":
+                    report["warnings"].append(
+                        "DNG_OPCODE_LIST3_NOT_APPLIED: GainMap/WarpRectilinear "
+                        "payloads present in the files are not executed by this "
+                        "backend build (probe-verified)")
+            discontinuities=[{"index":e["index"],"kind":"time_gap","gap_s":e.get("gap_s")}
+                for e in cont["time_gaps"]]+[
+                {"index":e["index"],"kind":"filename_gap_suspicion",
+                 "filename_step":e.get("filename_step")}
+                for e in cont["filename_suspicions"]]
+            report["source_discontinuities"]=discontinuities
             self._emit(on_progress,"inventory",n,n)
             measurements=[]
             baseline_coverage=[]
@@ -185,12 +252,14 @@ class ProcessingService:
             self._check(cancel)
             exposure=estimate_exposure(measurements,period=request.period,
                 strength=request.strength,steps=request.steps,
-                brightness=request.brightness)
+                brightness=request.brightness,
+                time_gaps=[e["index"] for e in cont["time_gaps"]])
             report["unconverged_trend_tiles"]=exposure.trend_unconverged_tiles
             report["period_effective"]=exposure.period_effective
             report["scene_cuts"]=exposure.scene_cuts
-            report["frames"]=[self._frame_record(ref,est)
-                for ref,est in zip(refs,exposure.frames)]
+            report["estimation_time_gaps"]=list(exposure.time_gaps)
+            report["frames"]=[self._frame_record(ref,est,info)
+                for ref,est,info in zip(refs,exposure.frames,ordered_info)]
             need_review=any(x.applied_ev is None for x in exposure.frames)
             if need_review:
                 report["warnings"].append("REVIEW_REQUIRED: one or more frames have no reliable EV estimate")
@@ -377,8 +446,8 @@ class ProcessingService:
                 report["run_status"]="COMPLETED_WITH_REVIEW"
             report["execution_status"]=EXECUTION_STATUS_MAP.get(
                 report["run_status"],report["run_status"])
-            report["frames"]=[self._frame_record(ref,est)
-                for ref,est in zip(refs,exposure.frames)]
+            report["frames"]=[self._frame_record(ref,est,info)
+                for ref,est,info in zip(refs,exposure.frames,ordered_info)]
             report["status_counts"]={
                 key:sum(z.status==key for z in exposure.frames)
                 for key in sorted({z.status for z in exposure.frames})}
@@ -398,8 +467,10 @@ class ProcessingService:
             # Every failure retains diagnostics. NaN is not legal JSON output.
             try:
                 if "exposure" in locals():
-                    report["frames"]=[self._frame_record(ref,est)
-                        for ref,est in zip(refs,exposure.frames)]
+                    info_rows=locals().get("ordered_info")
+                    report["frames"]=[self._frame_record(ref,est,
+                        info_rows[i] if info_rows else None)
+                        for i,(ref,est) in enumerate(zip(refs,exposure.frames))]
                 write_report(report_path,strict_jsonable(report))
                 if "exposure" in locals():
                     write_curve(out/"exposure_curve.csv",report["frames"])
@@ -410,7 +481,7 @@ class ProcessingService:
                     if p.exists():shutil.rmtree(p,ignore_errors=True)
 
     @staticmethod
-    def _frame_record(ref,est) -> dict:
+    def _frame_record(ref,est,source: FrameSourceInfo | None=None) -> dict:
         data={"index":ref.index,"filename":ref.filename,"segment_id":est.segment_id,
             "status":est.status,"valid_tile_count":est.valid_tile_count,
             "consensus_fraction":est.consensus_fraction,
@@ -423,6 +494,9 @@ class ProcessingService:
             "render_target_error_ev":est.render_target_error_ev,
             "new_output_clipping_fraction":est.new_output_clipping_fraction,
             "warnings":est.warnings}
+        if source is not None:
+            data["capture_time"]=source.capture_time
+            data["baseline_exposure_ev"]=source.baseline_exposure_ev
         return data
 
     @staticmethod

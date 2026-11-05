@@ -50,6 +50,7 @@ class ExposureResult:
     trend_unconverged_tiles: int
     period_effective: int
     scene_cuts: list[dict] = field(default_factory=list)
+    time_gaps: list[int] = field(default_factory=list)
 
 def _step_vector(n: int,steps: Sequence[ExposureStep]) -> np.ndarray:
     vector=np.zeros(n,dtype=np.float64)
@@ -139,7 +140,8 @@ def _robust_segment(a: np.ndarray,q: np.ndarray,centers: np.ndarray,period: int,
 
 def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
     strength: float=1.,steps: Sequence[ExposureStep]=(),
-    brightness: str="smooth",ev_limits: tuple[float,float]=(-2.,2.)) -> ExposureResult:
+    brightness: str="smooth",ev_limits: tuple[float,float]=(-2.,2.),
+    time_gaps: Sequence[int]=()) -> ExposureResult:
     n=len(measurements)
     if n<1:
         raise ExposureError("empty exposure sequence")
@@ -147,6 +149,7 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
         raise ExposureError("invalid period or strength")
     if brightness not in ("smooth","uniform"):
         raise ExposureError("brightness must be smooth or uniform")
+    gaps=sorted({int(g) for g in time_gaps if 0<int(g)<n})
     low,high=ev_limits
     if not math.isfinite(low+high) or not low<high:
         raise ExposureError("invalid EV limits")
@@ -185,11 +188,16 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
     else:
         a=x-s[:,None]
         cuts,scene_cuts=detect_scene_cuts(a,q)
-        bounds=[0]+cuts+[n]
+        # Confirmed capture-time gaps are hard evidence boundaries: statistics
+        # and trends never cross them (scene cuts are a separate, content-based
+        # signal that may coincide).
+        bounds=[0]+sorted(set(cuts)|set(gaps))+[n]
+        gap_kinds={g:"time_gap" for g in gaps}|{c:"scene_cut" for c in cuts}
         if brightness=="uniform":
             # Hold one constant brightness: correct every frame's common level
             # to the global median. Real evolution (day->dusk), flicker and
-            # splice jumps are all flattened; scene cuts stay report metadata.
+            # splice jumps are all flattened; scene cuts and time gaps stay
+            # report metadata (the global anchor policy is explicit).
             need=max(8,math.ceil(k/4))
             for seg_id,(lo,hi) in enumerate(zip(bounds[:-1],bounds[1:])):
                 segment_ids[lo:hi]=seg_id
@@ -260,4 +268,4 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
             float(mad[t]) if np.isfinite(mad[t]) else None,warnings,
             segment_id=int(segment_ids[t])))
     return ExposureResult(frames,x,q,consensus,frozen,reliable,failed_tiles,
-        min(period,n),scene_cuts)
+        min(period,n),scene_cuts,time_gaps=gaps)

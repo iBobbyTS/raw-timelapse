@@ -93,6 +93,18 @@ The encoder selection order is NVIDIA NVENC > AMD AMF (Windows) / AMD VAAPI (Lin
 - For 45 MP RAW output expect substantial temporary peak RAM for rawpy, linear RGB, measurement buffers and RGB24 encodes. A 160 Mbps target consumes up to ~1.2 GB/min if attained; allocate space for two temporary candidate MP4s.
 
 
+
+## DNG development semantics and source continuity
+
+Real camera DNGs carry per-frame default-development metadata that a raw backend may or may not execute. <code>rawtl</code> never guesses:
+
+- <code>rawtl probe-dng FILE</code> runs controlled byte-preserving probes (a +1 EV BaselineExposure patch and an OpcodeList3 tag neutralisation on temporary copies) and reports whether <em>this backend build</em> actually applies them. On the reference machine's rawpy 0.27.1 / LibRaw 0.22.1 both are provably <strong>ignored</strong> (0.0000 EV pixel delta).
+- Every <code>run</code> report includes <code>render_semantics</code> (backend versions, <code>baseline_application_owner</code>, opcode support status, per-opcode payload variation) and <code>source_continuity</code> (nominal interval, capture-time gaps, filename-gap suspicions). GPS and serial numbers are never requested.
+- Statistics and exposure trends never cross confirmed capture-time gaps; scene cuts, time gaps, filename suspicions and user-confirmed steps are reported as distinct kinds.
+- Adobe-reference development and an opcode-capable backend are listed as <code>not_tested</code> on machines without them; no "full DNG support" is claimed.
+
+Interpretation note for this dataset: the camera raises BaselineExposure (+1.96 EV over the first 77 frames) almost exactly opposite to the sensor's darkening. Since the backend ignores the tag, that intended compensation is absent from the render; the exposure policy tasks decide explicitly whether to reconstruct it, so it is never double-applied.
+
 ## Independent output audit (gain pass is not "no flicker")
 
 The render pipeline checks that the RAW backend *executed* the requested EV
