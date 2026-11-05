@@ -21,7 +21,7 @@ def test_short_gap_across_confirmed_step():
     s=sequence()
     for i in [40,41]:
         s[i].valid[:]=False
-    e=estimate_exposure(s,steps=[ExposureStep(41,.4)])
+    e=estimate_exposure(s,steps=[ExposureStep(41,.4)],estimator="legacy")
     assert e.frames[40].status=="INTERPOLATED_ESTIMATE"
     assert e.frames[41].cumulative_confirmed_step_ev==.4
     assert e.frames[41].requested_ev is not None

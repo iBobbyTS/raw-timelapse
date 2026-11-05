@@ -69,7 +69,9 @@ def test_user_step_only_and_short_sequence():
     m,_=synthetic(100,flash=False)
     for i in range(40,100):
         m[i].log_luminance+=1.
-    e=estimate_exposure(m,steps=[ExposureStep(40,1.)])
+    # legacy cancels confirmed steps (applied -1 after the step); pairwise
+    # preserves intentional steps by design (F5 semantics)
+    e=estimate_exposure(m,steps=[ExposureStep(40,1.)],estimator="legacy")
     assert np.median([x.applied_ev for x in e.frames[45:]])-np.median([x.applied_ev for x in e.frames[:35]])==pytest.approx(-1,abs=.06)
     small,_=synthetic(5,flash=False)
     zero=estimate_exposure(small)

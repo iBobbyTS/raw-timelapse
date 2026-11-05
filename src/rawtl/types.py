@@ -54,7 +54,9 @@ class ProcessingRequest:
     period: int = 60
     strength: float = 1.0
     brightness: str = "smooth"
+    estimator: str = "pairwise"
     roi: tuple[float, float, float, float] = (0., 0., 1., 1.)
+    exclude_rois: tuple[tuple[float, float, float, float], ...] = ()
     steps: tuple[ExposureStep, ...] = ()
     on_review: str = "error"
     temporal_quality: str = "strict"

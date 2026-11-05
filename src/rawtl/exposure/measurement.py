@@ -16,6 +16,9 @@ class FrameMeasurement:
     width: int
     height: int
     saturation_mask_quality: str
+    # Pairwise-photometry extras (optional so older callers keep working):
+    log_pixel_samples: np.ndarray | None = None   # float32[K,P] structure probe
+    log_channel_means: np.ndarray | None = None   # float64[K,3] per-tile R/G/B log means
 
 def _area_downsample(a: np.ndarray, width: int, height: int) -> np.ndarray:
     if (a.shape[1],a.shape[0])==(width,height):
@@ -36,7 +39,8 @@ def trimmed_linear_mean(a: np.ndarray, fraction: float = 0.05) -> float:
     return float(np.mean(mid,dtype=np.float64))
 
 def measure_frame(frame: LinearFrame,roi: tuple[float,float,float,float]=(0,0,1,1),
-    *, max_edge: int=1024,grid: tuple[int,int]=(12,8)) -> FrameMeasurement:
+    *, max_edge: int=1024,grid: tuple[int,int]=(12,8),
+    structure_samples: bool=False) -> FrameMeasurement:
     if frame.working_primaries!="linear-srgb":
         raise ExposureError("measurement requires linear-srgb working primaries")
     rgb=frame.rgb
@@ -71,6 +75,12 @@ def measure_frame(frame: LinearFrame,roi: tuple[float,float,float,float]=(0,0,1,
     xs=np.rint(np.linspace(x0,x1,nx+1)).astype(int)
     ys=np.rint(np.linspace(y0,y1,ny+1)).astype(int)
     centers=[]; vals=[]; valid=[]; saturated=[]
+    samples=channel_means=None
+    channel_planes=None
+    if structure_samples:
+        samples=[];channel_means=[]
+        channel_planes=[_area_downsample(np.ascontiguousarray(rgb[...,c],dtype=np.float32),
+                                          width,height) for c in range(3)]
     floor=max(1e-5,8.*float(frame.quantum_linear))
     for j in range(ny):
         for i in range(nx):
@@ -84,6 +94,26 @@ def measure_frame(frame: LinearFrame,roi: tuple[float,float,float,float]=(0,0,1,
             vals.append(math.log2(mean) if ok else np.nan)
             saturated.append(coverage)
             centers.append(((i+.5)/nx,(j+.5)/ny))
+            if structure_samples:
+                # Deterministic strided pixel grid inside the tile: enough for a
+                # structure test, far below full-resolution cost.
+                patch=b[::4,::4]
+                samples.append(np.log2(np.maximum(patch,1e-9)).ravel().astype(np.float32)
+                    if patch.size else np.zeros(0,dtype=np.float32))
+                channel_means.append([
+                    math.log2(max(trimmed_linear_mean(
+                        plane[ys[j]:ys[j+1],xs[i]:xs[i+1]]),1e-9))
+                    for plane in channel_planes]
+                )
+    if structure_samples:
+        width_p=max(len(s) for s in samples)
+        padded=np.full((len(samples),width_p),np.nan,dtype=np.float32)
+        for row,s in enumerate(samples):
+            padded[row,:len(s)]=s
+        return FrameMeasurement(np.asarray(vals,dtype=np.float64),
+            np.asarray(valid,dtype=bool),np.asarray(centers,dtype=np.float64),
+            np.asarray(saturated,dtype=np.float64),width,height,quality,
+            padded,np.asarray(channel_means,dtype=np.float64))
     return FrameMeasurement(np.asarray(vals,dtype=np.float64),
         np.asarray(valid,dtype=bool),np.asarray(centers,dtype=np.float64),
         np.asarray(saturated,dtype=np.float64),width,height,quality)

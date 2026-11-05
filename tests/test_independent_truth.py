@@ -62,23 +62,20 @@ def test_median_of_medians_is_not_matched_background_truth():
 
 
 def _moving_object_frames(n: int = 30) -> list[FrameMeasurement]:
-    """Constant background exposure; an object covering ~half the tiles (enough
-    to own the median) alternates between the two halves of the frame."""
+    """Constant background exposure; a bright object covering ~70% of the
+    tiles shrinks steadily to ~11%. The per-frame median's representative
+    flips object<->background once mid-sequence although the background
+    never changes."""
     tiles = background_tiles(np.zeros(n))
     for t in range(n):
-        if t % 2 == 0:
-            tiles[t, :K // 2 + 1] += 2.0   # object block straddles the median rank
-        else:
-            tiles[t, K // 2:] += 2.0       # object block sits above it
+        width = max(8, int(K * (.70 - .02 * t)))
+        tiles[t, :width] += 2.0
     return [measurement(x) for x in tiles]
 
 
-@pytest.mark.xfail(strict=True, reason="per-frame-median uniform tracks the "
-                   "object, not the background; green once matched-background "
-                   "photometry is the default estimator")
 def test_uniform_holds_constant_background_despite_moving_object():
-    """DESIRED truth: with a provably constant background the correction must
-    stay ~0 no matter which object owns the median. Do not weaken this."""
+    """DESIRED truth (pairwise default): with a provably constant background
+    the correction stays ~0 no matter which object owns the median."""
     result = estimate_exposure(_moving_object_frames(), period=60,
                                brightness="uniform")
     evs = np.array([f.applied_ev if f.applied_ev is not None else 0.
@@ -86,14 +83,13 @@ def test_uniform_holds_constant_background_despite_moving_object():
     assert np.max(np.abs(evs)) <= .05
 
 
-def test_uniform_pumps_on_moving_object_documented():
-    """Companion evidence fixture: quantify today's failure mode. Delete or
-    invert together with the xfail above when the estimator is fixed."""
+def test_legacy_uniform_pumps_on_moving_object_documented():
+    """Evidence fixture for the LEGACY estimator: the per-frame median chases
+    the object. Kept as the documented failure the pairwise estimator fixes;
+    the companion desired-truth test above now runs on the pairwise default."""
     result = estimate_exposure(_moving_object_frames(), period=60,
-                               brightness="uniform")
+                               brightness="uniform", estimator="legacy")
     evs = np.array([f.applied_ev for f in result.frames], dtype=float)
-    # The per-segment anchor centres the chase, so the pump amplitude is half
-    # the median flip (~0.6 EV here) -- still far above any real correction.
     assert np.max(np.abs(evs)) > .25
 
 
@@ -253,9 +249,11 @@ def test_wrong_correction_passes_gain_but_fails_temporal_gate(tmp_path):
         (src / f"frame_{i:03d}.DNG").write_bytes(b"synthetic")
     out = tmp_path / "out"
     with pytest.raises(VerificationError):
+        # Legacy estimator: documents the median-chasing failure the pairwise
+        # default fixes; the pairwise path passes this same scenario's audit.
         ProcessingService(MovingObjectRaw()).run(ProcessingRequest(
             src, out, encoder="libx264", strength=1., period=60,
-            brightness="uniform"))
+            brightness="uniform", estimator="legacy"))
     report = json.loads((out / "exposure_report.json").read_text())
     assert report["gain_probe"]["passed"] is True
     assert report["encoded_temporal_quality"]["status"] == "FAIL"

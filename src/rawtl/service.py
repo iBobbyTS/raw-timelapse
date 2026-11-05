@@ -122,6 +122,8 @@ class ProcessingService:
             raise InputError("temporal_quality must be strict, report or off")
         if request.brightness not in ("smooth","uniform"):
             raise InputError("brightness must be smooth or uniform")
+        if request.estimator not in ("pairwise","legacy"):
+            raise InputError("estimator must be pairwise or legacy")
         if request.save_frames and (out/"frames").exists() and not request.overwrite:
             raise InputError(f"PNG frame output already exists: {out/'frames'} (pass --overwrite)")
         out.mkdir(parents=True,exist_ok=True)
@@ -133,6 +135,8 @@ class ProcessingService:
             "config":{"input":str(request.input_dir),"output":str(out),
                 "fps":str(request.fps),"period":request.period,
                 "strength":request.strength,"brightness":request.brightness,
+                "estimator":request.estimator,
+                "exclude_rois":[list(r) for r in request.exclude_rois],
                 "roi":list(request.roi),
                 "steps":[asdict(x) for x in request.steps],
                 "on_review":request.on_review,"temporal_quality":request.temporal_quality,
@@ -244,7 +248,8 @@ class ProcessingService:
                     baseline_coverage.append(float(np.mean(frame.saturation_mask)))
                 else:
                     baseline_coverage.append(float(np.mean(np.any(frame.rgb>=.98,axis=2))))
-                measurements.append(measure_frame(frame,request.roi))
+                measurements.append(measure_frame(frame,request.roi,
+                    structure_samples=request.estimator=="pairwise"))
                 self._emit(on_progress,"analysis",ref.index+1,n,ref.filename)
                 del frame
             report["analysis_shape"]=[width,height]
@@ -253,7 +258,11 @@ class ProcessingService:
             exposure=estimate_exposure(measurements,period=request.period,
                 strength=request.strength,steps=request.steps,
                 brightness=request.brightness,
-                time_gaps=[e["index"] for e in cont["time_gaps"]])
+                time_gaps=[e["index"] for e in cont["time_gaps"]],
+                estimator=request.estimator,
+                exclude_rois=request.exclude_rois)
+            if exposure.pairwise_summary:
+                report["pairwise_estimation"]=exposure.pairwise_summary
             report["unconverged_trend_tiles"]=exposure.trend_unconverged_tiles
             report["period_effective"]=exposure.period_effective
             report["scene_cuts"]=exposure.scene_cuts
@@ -353,6 +362,16 @@ class ProcessingService:
                 must_validate=request.strength!=0 and n>=8 and np.any(exposure.trusted_indices)
                 summary=(evaluate_render(exposure,rendered,iteration=iteration)
                     if must_validate else None)
+                if (summary is not None and
+                        all(e is None for e in summary.errors)):
+                    # No frame had observable consensus tiles (e.g. every tile
+                    # changed at a splice): nothing to verify and nothing to
+                    # feed back. Accept without claiming verification.
+                    report["render_temporal_quality"]={"status":
+                        "NOT_VERIFIED_NO_CONSENSUS","note":
+                        "no frame had observable consensus tiles; frozen-target "
+                        "validation skipped rather than failed"}
+                    summary=None
                 if summary is None:
                     best_video=video_path;best_png=frame_dir;accepted_summary=None
                     best_encoder=enc.name;best_video_info=info
