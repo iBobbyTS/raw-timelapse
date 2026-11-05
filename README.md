@@ -92,6 +92,31 @@ The encoder selection order is NVIDIA NVENC > AMD AMF (Windows) / AMD VAAPI (Lin
 - Memory is bounded per full-resolution frame, while the small N×K measurement matrix covers the whole sequence. Input files are not loaded all at once.
 - For 45 MP RAW output expect substantial temporary peak RAM for rawpy, linear RGB, measurement buffers and RGB24 encodes. A 160 Mbps target consumes up to ~1.2 GB/min if attained; allocate space for two temporary candidate MP4s.
 
+
+## Independent output audit (gain pass is not "no flicker")
+
+The render pipeline checks that the RAW backend *executed* the requested EV
+(gain probe / frozen-target validation). That says nothing about whether the
+corrections themselves were the right ones: a wrong correction curve is still
+executed faithfully. The run report therefore separates four statuses:
+
+- <code>execution_status</code> — did the pipeline complete;
+- <code>gain_response</code> — did the RAW backend execute the requested EV;
+- <code>render_temporal_quality</code> — independent render-domain temporal targets (tracked separately while the legacy frozen-target check remains self-consistent by construction);
+- <code>encoded_temporal_quality</code> — an **independent detector** that decodes the produced MP4, inverts the transfer function, reduces in linear light and measures common-mode brightness steps, three-frame residuals, slow-drift guards and candidate jump events on matched tile support. Chroma variation is reported as <code>NOT_IMPLEMENTED</code>, never as 0.
+
+<code>rawtl run</code> audits the encoded video before publishing it. <code>--temporal-quality strict</code> (default) refuses to publish a video whose audit FAILs (<code>TEMPORAL_QUALITY_FAILED</code>, exit 7); <code>report</code> publishes it as <code>COMPLETED_WITH_REVIEW</code> with the event list; <code>off</code> records <code>SKIPPED</code> — never a pass. This gate is independent of the input-metering <code>--on-review</code> switch.
+
+Any existing video can be audited read-only, no RAWs required:
+
+    rawtl audit-video out/video.mp4 -o audit_out \
+        --transfer srgb \
+        --rois benchmarks/dji-ac004-indoor/rois.json \
+        --segments benchmarks/dji-ac004-indoor/segments.json \
+        --report out/exposure_report.json
+
+<code>--transfer</code> is mandatory when the stream carries no usable SDR transfer tag; it is never inferred from the pixel format, and HDR/Log streams are rejected instead of silently audited. Statistics never cross source-discontinuity boundaries given via <code>--segments</code>; 1–7-frame runs are reported <code>SHORT_CONTEXT</code> and unmeasurable stretches <code>UNOBSERVABLE</code> rather than zero. See [flicker baseline](docs/flicker-baseline.md) for the real-output evidence this detector reproduced.
+
 ## Tests
 
 ```bash

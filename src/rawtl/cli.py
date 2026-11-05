@@ -83,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--roi",type=parse_roi,default=(0.,0.,1.,1.))
     r.add_argument("--steps",type=Path)
     r.add_argument("--on-review",choices=["error","passthrough"],default="error")
+    r.add_argument("--temporal-quality",choices=["strict","report","off"],default="strict",
+        dest="temporal_quality",
+        help="strict: fail the run when the encoded video shows residual flicker; "
+             "report: publish the video as COMPLETED_WITH_REVIEW with events; "
+             "off: skip the independent audit (status SKIPPED, never a pass)")
     r.add_argument("--save-frames",action="store_true")
     r.add_argument("--overwrite",action="store_true")
     r.add_argument("--encoder",choices=["auto","nvenc","amf","vaapi","videotoolbox","libx264"],default="auto")
@@ -90,6 +95,23 @@ def build_parser() -> argparse.ArgumentParser:
     pr=sub.add_parser("probe",help="inspect RAW folder and actual available encoders")
     pr.add_argument("input",type=Path)
     pr.add_argument("--ffmpeg",default="ffmpeg")
+    av=sub.add_parser("audit-video",
+        help="independent read-only temporal-flicker audit of an encoded video")
+    av.add_argument("video",type=Path)
+    av.add_argument("-o","--output",type=Path,required=True,
+        help="directory for temporal_audit.json / pairs.csv / frames.csv")
+    av.add_argument("--transfer",choices=["srgb","bt709"],default=None,
+        help="explicit inverse-transfer assumption; required when the stream "
+             "has no usable SDR transfer tag (never inferred from pixel format)")
+    av.add_argument("--rois",type=Path,
+        help="JSON of independent ROI boxes [x0,y0,x1,y1] keyed by name")
+    av.add_argument("--segments",type=Path,
+        help="JSON continuity segments [[start,end),...] or {\"segments\": ...}; "
+             "statistics never cross segment boundaries")
+    av.add_argument("--report",type=Path,
+        help="exposure_report.json providing per-frame source filenames")
+    av.add_argument("--width",type=int,default=912)
+    av.add_argument("--ffmpeg",default="ffmpeg")
     return p
 
 def main(argv: list[str] | None = None) -> int:
@@ -101,10 +123,39 @@ def main(argv: list[str] | None = None) -> int:
         if args.action=="probe":
             result=service.probe(args.input,ffmpeg=args.ffmpeg)
             print(json.dumps(result,indent=2,ensure_ascii=False,allow_nan=False))
+        elif args.action=="audit-video":
+            from .video import resolve_ffprobe
+            from .quality.video_audit import VideoAuditConfig,audit_video
+            ffprobe=resolve_ffprobe(args.ffmpeg)
+            rois=json.loads(args.rois.read_text(encoding="utf-8")) if args.rois else None
+            segments_payload=(json.loads(args.segments.read_text(encoding="utf-8"))
+                if args.segments else None)
+            segment_list=(segments_payload.get("segments")
+                if isinstance(segments_payload,dict) else segments_payload) or []
+            boundaries=tuple(int(a) for a,_ in segment_list[1:])
+            labels=None
+            if args.report:
+                frames=json.loads(args.report.read_text(encoding="utf-8"))["frames"]
+                labels=[f["filename"] for f in frames]
+            config=VideoAuditConfig(transfer=args.transfer,rois=rois,
+                boundaries=boundaries,frame_labels=labels,max_width=args.width)
+            result=audit_video(args.video,ffmpeg=args.ffmpeg,ffprobe=ffprobe,
+                config=config,output_dir=args.output)
+            print(json.dumps({"status":result["status"],
+                "frame_count":result["frame_count"],
+                "candidate_count":result["candidate_count"],
+                "events":result["events"],
+                "segments":[{k:s.get(k) for k in ("start","end_exclusive","status",
+                    "usable_pairs","p95_abs_step_ev","max_abs_step_ev",
+                    "curvature_rms_ev","steps_over_0_05_ev")}
+                    for s in result["segments"]]},indent=2,ensure_ascii=False,allow_nan=False))
         else:
-            req=ProcessingRequest(args.input,args.output,args.fps,args.period,args.strength,
-                args.brightness,args.roi,
-                load_steps(args.steps),args.on_review,args.save_frames,args.overwrite,args.encoder,args.ffmpeg)
+            req=ProcessingRequest(
+                input_dir=args.input,output_dir=args.output,fps=args.fps,
+                period=args.period,strength=args.strength,brightness=args.brightness,
+                roi=args.roi,steps=load_steps(args.steps),on_review=args.on_review,
+                temporal_quality=args.temporal_quality,save_frames=args.save_frames,
+                overwrite=args.overwrite,encoder=args.encoder,ffmpeg=args.ffmpeg)
             def on_progress(ev):
                 nonlocal log
                 line=f"[{ev.phase}] {ev.processed}/{ev.total} {ev.filename or ''} {ev.encoder or ''}".rstrip()

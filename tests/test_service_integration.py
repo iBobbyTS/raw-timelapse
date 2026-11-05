@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from rawtl.types import (
     LinearFrame,RawMetadata,ProcessingRequest,CancellationToken,ProcessingCancelled,
-    RawDecodeError,ExposureError,InputError)
+    RawDecodeError,ExposureError,InputError,VerificationError)
 from rawtl.service import ProcessingService
 
 FF=shutil.which("ffmpeg");FP=shutil.which("ffprobe")
@@ -163,3 +163,52 @@ def test_service_e2e_with_deflicker_gain_probe_and_frozen_validation(tmp_path):
     assert odd-even > .04
     assert report["encoder"]["selected"]=="libx264"
     assert report["video_metadata"]["frames"]==30
+
+class FlickerRaw(FakeRaw):
+    """+-0.5 EV alternating exposure that strength=0 leaves fully uncorrected."""
+    def render_linear(self,path,ev,opts):
+        i=int(path.stem.split("_")[-1])
+        v=.18*2**(ev+.5*(-1)**i)
+        return LinearFrame(np.full((240,320,3),v,dtype=np.float32),
+            np.zeros((240,320),dtype=bool),"approximate",1/65535,False)
+
+@pytest.mark.skipif(not (FF and FP),reason="FFmpeg unavailable")
+def test_strict_temporal_gate_blocks_severe_flicker(tmp_path):
+    src=folder(tmp_path,n=30)
+    out=tmp_path/"strict"
+    with pytest.raises(VerificationError):
+        ProcessingService(FlickerRaw()).run(
+            ProcessingRequest(src,out,encoder="libx264",strength=0.))
+    assert not (out/"video.mp4").exists()
+    report=json.loads((out/"exposure_report.json").read_text())
+    assert report["run_status"]=="TEMPORAL_QUALITY_FAILED"
+    assert report["encoded_temporal_quality"]["status"]=="FAIL"
+    assert report["encoded_temporal_quality"]["events"]
+    assert (out/"temporal_audit.json").is_file()
+
+@pytest.mark.skipif(not (FF and FP),reason="FFmpeg unavailable")
+def test_report_mode_publishes_flagged_video(tmp_path):
+    src=folder(tmp_path,n=30)
+    out=tmp_path/"review"
+    result=ProcessingService(FlickerRaw()).run(
+        ProcessingRequest(src,out,encoder="libx264",strength=0.,
+            temporal_quality="report"))
+    assert result.run_status=="COMPLETED_WITH_REVIEW"
+    assert (out/"video.mp4").is_file()
+    report=json.loads((out/"exposure_report.json").read_text())
+    assert report["encoded_temporal_quality"]["status"]=="FAIL"
+    assert any("temporal quality FAIL" in w for w in report["warnings"])
+
+@pytest.mark.skipif(not (FF and FP),reason="FFmpeg unavailable")
+def test_clean_run_reports_separated_status_fields(tmp_path):
+    src=folder(tmp_path)
+    out=tmp_path/"clean"
+    result=ProcessingService(FakeRaw()).run(
+        ProcessingRequest(src,out,strength=0.,encoder="libx264"))
+    assert result.run_status=="OK"
+    report=json.loads((out/"exposure_report.json").read_text())
+    assert report["execution_status"]=="COMPLETED"
+    assert report["gain_response"]["status"]=="SKIPPED"
+    assert report["render_temporal_quality"]["status"]=="NOT_INDEPENDENT"
+    assert report["encoded_temporal_quality"]["status"] in ("PASS","UNOBSERVABLE","SHORT_CONTEXT")  # 12 frames is short context
+    assert report["config"]["temporal_quality"]=="strict"
