@@ -55,7 +55,7 @@ class ProcessingRequest:
     strength: float = 1.0
     brightness: str = "smooth"
     estimator: str = "pairwise"
-    uniform_reference: str = "global"
+    ev_limits: tuple[float, float] | None = None
     roi: tuple[float, float, float, float] = (0., 0., 1., 1.)
     exclude_rois: tuple[tuple[float, float, float, float], ...] = ()
     steps: tuple[ExposureStep, ...] = ()

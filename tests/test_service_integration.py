@@ -110,7 +110,7 @@ def test_service_e2e_uniform_brightness_flattens_splice(tmp_path):
     assert report["video_metadata"]["frames"]==30
     assert (out/"video.mp4").is_file()
 
-def test_service_e2e_spliced_sequence_deflickers_per_segment(tmp_path):
+def test_service_e2e_spliced_sequence_deflickers_whole(tmp_path):
     src=folder(tmp_path,n=30)
     out=tmp_path/"spliced"
     result=ProcessingService(SplicedRaw()).run(
@@ -119,11 +119,28 @@ def test_service_e2e_spliced_sequence_deflickers_per_segment(tmp_path):
     report=json.loads((out/"exposure_report.json").read_text())
     assert [c["index"] for c in report["scene_cuts"]]==[15]
     rows=report["frames"]
-    assert [x["segment_id"] for x in rows[:15]]==[0]*15
-    assert [x["segment_id"] for x in rows[15:]]==[1]*15
+    assert {x["segment_id"] for x in rows}=={0}
     assert all(x["applied_ev"] is not None for x in rows)
     assert report["video_metadata"]["frames"]==30
     assert (out/"video.mp4").is_file()
+
+def test_service_e2e_whole_mode_splice_ok(tmp_path):
+    # No segmentation concept: the splice is never an estimation boundary;
+    # the components are stitched to one level and the internal audit must
+    # not count the cross-cut step as a flicker event.
+    src=folder(tmp_path,n=30)
+    out=tmp_path/"whole"
+    result=ProcessingService(SplicedRaw()).run(
+        ProcessingRequest(src,out,encoder="libx264",strength=1.,period=60,
+            brightness="uniform"))
+    assert result.run_status=="OK"
+    report=json.loads((out/"exposure_report.json").read_text())
+    assert [c["index"] for c in report["scene_cuts"]]==[15]
+    assert {x["segment_id"] for x in report["frames"]}=={0}
+    assert all(x["applied_ev"] is not None for x in report["frames"])
+    # 2x15-frame segments sit below the detector's 24-frame gating bar, so the
+    # honest verdict is SHORT_CONTEXT; the cross-cut step must NOT be FAIL.
+    assert report["encoded_temporal_quality"]["status"] in ("PASS","SHORT_CONTEXT")
 
 def test_decode_failure_and_cancel(tmp_path):
     src=folder(tmp_path)

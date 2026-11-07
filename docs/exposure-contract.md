@@ -27,3 +27,11 @@ The contract gained the following invariants from the real-output flicker work (
 6. **Colour is declared.** sRGB-OETF pixels, explicit BT.709 matrix, limited range, transfer tag <code>iec61966-2-1</code>; missing encoder tags raise contract warnings, never silence.
 
 Schema version is now **2** (finite JSON only). Reports written by version 1 remain readable as historical artifacts; their <code>OK</code> must be re-audited with <code>rawtl audit-video</code> before being quoted as flicker-free.
+
+## V4 (2026-11-06) — whole-sequence default and unbounded render EV
+
+Owner directive: deflickering treats the input as ONE sequence in filename order and holds it to one exposure intent; discontinuities are evidence to report, not boundaries to split on.
+
+1. **There is no segmentation concept.** The input is deflickered as ONE sequence in filename order, always: scene cuts, capture-time gaps and filename jumps are reported metadata and never estimation boundaries (<code>--segmentation</code> and <code>--uniform-reference segment</code> no longer exist). Pair-quality gates reject non-matching frame pairs; graph components are stitched so the whole-frame typical level continues across each boundary (boundary-local, assumption recorded per boundary; an unverifiable island interrupts level chaining rather than fabricating an anchor). Lone measurable frames are leveled absolutely with an explicit <code>ABSOLUTE_LEVEL</code> status. The encoded-video audit still excludes pairs across known discontinuities -- measurement hygiene (a cross-cut pair cannot evidence level continuity), not segmentation.
+2. **Render EV is unbounded.** LibRaw realises <code>exp_shift</code> only in [0.25, 8.0] (-2..+3 EV) and silently clamps outside; the renderer composes the in-range shift with an exact post-decode linear gain, so any finite EV is realised. <code>--ev-limits LOW,HIGH</code> restores explicit clamping (LIMITED/EXPOSURE_LIMITED states) when wanted; reports record <code>ev_limits</code>.
+3. **Toolchain is recorded.** The decoder version block includes the ExifTool version (or <code>NOT_FOUND</code>): a missing ExifTool silently degrades continuity to filename-only, and that condition must be visible in evidence, not only in a warning.

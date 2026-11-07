@@ -217,7 +217,7 @@ def test_baseline_summary_ranges():
     assert s["range_ev"] == [1.08, 3.04]
 
 
-def test_estimation_time_gaps_split_segments():
+def test_time_gaps_are_reported_not_boundaries():
     from rawtl.exposure.estimation import estimate_exposure
     from rawtl.exposure.measurement import FrameMeasurement
     k = 96
@@ -229,9 +229,7 @@ def test_estimation_time_gaps_split_segments():
                                      centers, np.zeros(k), 480, 360, "exact")
                     for t in range(30)]
     result = estimate_exposure(measurements, period=60, time_gaps=[15])
-    ids = [f.segment_id for f in result.frames]
-    assert ids[:15] == [0] * 15 and ids[15:] == [1] * 15
+    # gaps are reported metadata only: estimation stays one whole sequence
+    assert {f.segment_id for f in result.frames} == {0}
     assert result.time_gaps == [15]
-    # no cross-gap interpolation of any kind
-    assert all("INTERPOLATED" not in " ".join(f.warnings) or f.index < 15
-               for f in result.frames)
+    assert all(f.applied_ev is not None for f in result.frames)

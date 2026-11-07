@@ -31,6 +31,20 @@ def parse_roi(value: str) -> tuple[float,float,float,float]:
     except ValueError as exc:
         raise argparse.ArgumentTypeError("ROI must be x,y,w,h within normalized image bounds") from exc
 
+def parse_ev_limits(value: str) -> tuple[float,float] | None:
+    text=value.strip().lower()
+    if text in ("none","unbounded",""):
+        return None
+    try:
+        parts=text.split(",",1)
+        lo,hi=float(parts[0]),float(parts[1])
+        if not (math.isfinite(lo) and math.isfinite(hi)) or not lo<hi:
+            raise ValueError(value)
+        return (lo,hi)
+    except (ValueError, IndexError) as exc:
+        raise argparse.ArgumentTypeError(
+            'EV limits must be "none" or two finite floats "LOW,HIGH" with LOW<HIGH') from exc
+
 def positive_period(value: str) -> int:
     try:
         v=int(value)
@@ -85,11 +99,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--estimator",choices=["pairwise","legacy"],default="pairwise",
         help="pairwise: matched-background pair graph (default); "
              "legacy: per-frame-median tiles + Whittaker residual (baseline)")
-    r.add_argument("--uniform-reference",choices=["global","segment"],
-        dest="uniform_reference",default="global",
-        help="uniform mode only: global stitches disconnected runs to one "
-             "constant level (cross-boundary offset is an explicit assumption); "
-             "segment keeps each continuous run at its own level")
+    r.add_argument("--ev-limits",dest="ev_limits",type=parse_ev_limits,default=None,
+        help='clamp applied EV to "LOW,HIGH" (e.g. "-2,2"); "none" (default) '
+             'applies any finite correction without clamping')
     r.add_argument("--exclude-rois",type=Path,dest="exclude_rois",
         help="JSON file of ROI boxes [x0,y0,x1,y1] keyed by name; tiles under "
              "them are excluded from estimation (independent acceptance areas)")
@@ -185,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
                 input_dir=args.input,output_dir=args.output,fps=args.fps,
                 period=args.period,strength=args.strength,brightness=args.brightness,
                 estimator=args.estimator,
-                uniform_reference=args.uniform_reference,
+                ev_limits=args.ev_limits,
                 roi=args.roi,exclude_rois=exclude,
                 steps=load_steps(args.steps),on_review=args.on_review,
                 temporal_quality=args.temporal_quality,save_frames=args.save_frames,

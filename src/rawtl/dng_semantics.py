@@ -358,6 +358,21 @@ def _opcode_binary_digests(exe: str, paths: Sequence[Path],
                 record.opcode_entry_digests[key] = split_opcode_digests(payload)
 
 
+def exiftool_version(exe: str | None = None) -> str | None:
+    """Version string when ExifTool is resolvable, else None.
+
+    Recorded in the run report so a missing ExifTool (silent capture-time
+    continuity loss) is visible in evidence, not only in a warning."""
+    exe = exe or shutil.which("exiftool")
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run([exe, "-ver"], capture_output=True, text=True,
+                              timeout=30, check=True)
+        return proc.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
 def extract_source_metadata(paths: Sequence[Path],
                             executable: str | None = None) -> dict[str, FrameSourceInfo] | None:
     """Batch ExifTool extraction; returns None when ExifTool is unavailable.

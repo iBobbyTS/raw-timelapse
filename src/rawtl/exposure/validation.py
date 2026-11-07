@@ -138,16 +138,20 @@ def evaluate_render(exposure: ExposureResult,
     return ValidationSummary(errors,med,p95,outliers,unobservable,passed,iteration)
 
 def feedback_update(exposure: ExposureResult, summary: ValidationSummary,
-    *, limits:tuple[float,float]=(-2.,2.), damping: float=.75,
+    *, limits:tuple[float,float]|None=None, damping: float=.75,
     max_step_ev: float=.25) -> int:
-    """Move applied EV toward the frozen target; the target itself never moves."""
+    """Move applied EV toward the frozen target; the target itself never moves.
+
+    limits=None (default) is unbounded; explicit limits keep feedback inside the
+    same clamp the estimator used."""
+    lo,hi=limits if limits is not None else (-math.inf,math.inf)
     adjusted=0
     for frame,error in zip(exposure.frames,summary.errors):
         if (error is None or frame.applied_ev is None or frame.status in
             {"LIMITED","REVIEW_REQUIRED","INTERPOLATED_ESTIMATE","DISABLED",
              "SHORT_SEQUENCE_NO_DEFLICKER"}):
             continue
-        val=float(np.clip(frame.applied_ev+np.clip(damping*error,-max_step_ev,max_step_ev),*limits))
+        val=float(np.clip(frame.applied_ev+np.clip(damping*error,-max_step_ev,max_step_ev),lo,hi))
         if val!=frame.applied_ev:
             frame.applied_ev=val
             adjusted+=1
