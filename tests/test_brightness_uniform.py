@@ -43,13 +43,23 @@ def test_uniform_holds_constant_brightness():
 
 def test_uniform_clips_to_ev_limits():
     x=evolving_sequence(n=90,cut=45,ramp=.07,jump=1.5)  # span > 4 EV
-    e=estimate_exposure(frames(x),brightness="uniform")
+    e=estimate_exposure(frames(x),brightness="uniform",ev_limits=(-2.,2.))
     statuses={f.status for f in e.frames}
     assert "LIMITED" in statuses
     clipped=[f for f in e.frames if f.status=="LIMITED"]
     assert all(f.applied_ev in (-2.,2.) for f in clipped)
     assert all("EXPOSURE_LIMITED" in f.warnings for f in clipped)
     assert all(f.applied_ev is not None for f in e.frames)
+
+def test_uniform_unbounded_applies_any_ev():
+    x=evolving_sequence(n=90,cut=45,ramp=.07,jump=1.5)  # span > 4 EV
+    e=estimate_exposure(frames(x),brightness="uniform")
+    assert all(f.status=="UNIFORM" for f in e.frames)
+    assert all(f.requested_ev==f.applied_ev for f in e.frames)
+    assert all("EXPOSURE_LIMITED" not in f.warnings for f in e.frames)
+    span=[f.applied_ev for f in e.frames]
+    assert min(span)<-2. or max(span)>2.
+
 
 def test_uniform_works_short_and_disabled():
     x=evolving_sequence(n=5,cut=5)

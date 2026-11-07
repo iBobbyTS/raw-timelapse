@@ -1,4 +1,4 @@
-"""Robust common-flicker inference with explicit steps, quality states and EV limits.
+"""Robust common-flicker inference with explicit steps, quality states and optional EV limits.
 
 Filename-sorted frames form one timeline. Content jumps (scene cuts) split it
 into independently smoothed segments so a splice between distant moments never
@@ -95,12 +95,12 @@ def detect_scene_cuts(step_adjusted: np.ndarray,valid: np.ndarray,
 
 def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
     q: np.ndarray,s: np.ndarray,centers: np.ndarray,period: int,strength: float,
-    brightness: str,bounds: list[int],ev_limits: tuple[float,float],
+    brightness: str,bounds: list[int],ev_limits: tuple[float,float] | None,
     consensus: np.ndarray,residual: np.ndarray,mad: np.ndarray,
     fractions: np.ndarray,counts: np.ndarray,reliable: np.ndarray,
     interpolated: np.ndarray,labels: list[str],segment_ids: np.ndarray,
     exclude_rois: tuple[tuple[float,float,float,float],...],
-    uniform_reference: str="global",measured_level: np.ndarray|None=None,
+    measured_level: np.ndarray|None=None,
     desired_level: np.ndarray|None=None
     ) -> tuple[np.ndarray,dict]:
     """Matched-background estimation: pair graph -> relative brightness b,
@@ -121,43 +121,57 @@ def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
     b=graph.brightness
     persistent=persistent_background(measurements,b)
     need=max(8,math.ceil(k/4))
+    def _row_level_all(t:int) -> float:
+        # Whole-frame typical tile: what the eye integrates. Used ONLY for
+        # cross-boundary assumptions (component stitching, lone-frame
+        # absolute leveling); flicker removal itself always rests on matched
+        # persistent pairs.
+        ok=q[t]&np.isfinite(x[t])
+        return float(np.median(x[t,ok])) if np.count_nonzero(ok) else math.nan
     # Uniform wants ONE constant level for the whole sequence. Components
     # separated by cuts/gaps have no cross evidence, so their relative level
-    # is stitched with an explicit assumption: the persistent-background
-    # level difference across the boundary (all-valid-tile median fallback).
+    # is stitched with an explicit assumption: the WHOLE-FRAME typical tile
+    # mix (all-valid-tile median) continues across the boundary. This is the
+    # owner's whole-sequence intent -- perceived overall brightness stays
+    # continuous even when tracked surfaces and the rest of the scene
+    # diverge (e.g. selective lighting change across a capture gap).
     b_hat=b.copy()
     cross_anchors=[]
-    if uniform_reference=="segment":
-        # Per-segment targets: no cross-boundary assumption is made. Each
-        # component keeps its own level; differences between segments are
-        # intentionally NOT flattened.
-        b_hat=b.copy()
-    elif len(graph.components)>1:
-        def _row_level(t:int) -> float:
-            ok=q[t]&persistent&np.isfinite(x[t])
-            if np.count_nonzero(ok)>=need:
-                return float(np.median(x[t,ok]))
-            ok=q[t]&np.isfinite(x[t])
-            return float(np.median(x[t,ok])) if np.count_nonzero(ok) else math.nan
-        # Per component, (row level - b) is a constant (the tile-mix offset).
-        # Stitch each later component so its constant matches the previous
-        # one: output levels then continue across the boundary.
-        consts=[]
-        for comp in graph.components:
-            member=np.array([t for t in comp if np.isfinite(b[t])])
-            vals=np.array([_row_level(t)-b[t] for t in member])
-            consts.append(float(np.median(vals)) if vals.size and
-                np.all(np.isfinite(vals)) else math.nan)
+    if len(graph.components)>1:
+        # Boundary-local whole-frame continuity: shift each later component
+        # so the WHOLE-FRAME typical level of its first frames continues from
+        # the previous component's last frames (median of up to 3 frames per
+        # side, robust to one odd frame). Aligning component MEDIANS is not
+        # enough: the tile-mix offset (row_level_all - b) drifts within real
+        # components, so a median-aligned stitch can still leave a large
+        # perceived step at the boundary itself.
+        def _edge_const(comp,at_start:bool) -> float:
+            member=sorted(t for t in comp if np.isfinite(b[t]))
+            if not member:
+                return math.nan
+            sel=member[:3] if at_start else member[-3:]
+            vals=[_row_level_all(t)-b[t] for t in sel]
+            vals=[v for v in vals if math.isfinite(v)]
+            return float(np.median(vals)) if vals else math.nan
         prev=None
-        for c_idx,comp in enumerate(graph.components):
-            if prev is not None and math.isfinite(prev) and math.isfinite(consts[c_idx]):
-                shift=consts[c_idx]-prev
+        for comp in graph.components:
+            start_c=_edge_const(comp,True)
+            if prev is not None and math.isfinite(prev) and math.isfinite(start_c):
+                shift=start_c-prev
                 b_hat[comp]+=shift
                 cross_anchors.append({
-                    "boundary":min(comp),"level_const_before":prev,
-                    "level_const_after":consts[c_idx],"applied_shift_ev":-shift})
-            if math.isfinite(consts[c_idx]):
-                prev=consts[c_idx]
+                    "boundary":min(comp),"local_const_before":prev,
+                    "local_const_after":start_c,"applied_shift_ev":-shift})
+            elif prev is not None and math.isfinite(prev):
+                # An unverifiable island (NaN-brightness component) INTERRUPTS
+                # the chain: both of its boundaries carry real content change,
+                # so forcing continuity across both ends is over-constrained.
+                # The next component keeps its graph-gauge placement instead
+                # of a fabricated anchor.
+                cross_anchors.append({"boundary":min(comp),
+                    "note":"unverifiable island interrupts level chaining; "
+                    "the following component keeps its graph-gauge placement"})
+            prev=_edge_const(comp,False)
     need=max(8,math.ceil(k/4))
     for seg_id,(lo,hi) in enumerate(zip(bounds[:-1],bounds[1:])):
         segment_ids[lo:hi]=seg_id
@@ -171,34 +185,39 @@ def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
         # current frame's median.
         need=max(8,math.ceil(k/4))
         finite_all=np.flatnonzero(np.isfinite(b_hat))
-        target=math.nan
-        if uniform_reference=="segment":
-            per_comp_target={}
-            for comp in graph.components:
-                member=np.array([t for t in comp if np.isfinite(b_hat[t])])
-                if member.size:
-                    per_comp_target[id(comp)]=float(np.median(b_hat[member]))
-        else:
-            target=(float(np.median(b_hat[finite_all]))
-                    if finite_all.size else math.nan)
+        target=(float(np.median(b_hat[finite_all]))
+                if finite_all.size else math.nan)
         for t in finite_all:
-            comp_target=(per_comp_target[id(next(c for c in graph.components if t in c))]
-                         if uniform_reference=="segment" else target)
             reliable[t]=True
             consensus[t,q[t]&persistent]=True
-            residual[t]=b_hat[t]-comp_target
-            requested[t]=strength*(comp_target-b_hat[t])
+            residual[t]=b_hat[t]-target
+            requested[t]=strength*(target-b_hat[t])
             labels[t]="UNIFORM"
             if measured_level is not None: measured_level[t]=b_hat[t]
-            if desired_level is not None: desired_level[t]=comp_target
-        # A bounds-segment of ONE frame has no temporal evidence at all:
-        # documented passthrough instead of a fake estimate.
-        for lo,hi in zip(bounds[:-1],bounds[1:]):
-            if hi-lo==1:
-                requested[lo]=0.
-                reliable[lo]=True
-                residual[lo]=0.
-                labels[lo]="SHORT_SEQUENCE_NO_DEFLICKER"
+            if desired_level is not None: desired_level[t]=target
+        # Lone nodes carry no pair evidence, but the uniform target is a
+        # property of matched surfaces, not of pairs: a measurable lone frame
+        # is still leveled ABSOLUTELY against the whole-frame reference
+        # (row_level_all - global level-const, the same basis as component
+        # stitching). Lower confidence, explicit status; the render-domain
+        # check still verifies it against the same target.
+        if math.isfinite(target):
+            row_consts=np.array([_row_level_all(t)-b_hat[t] for t in finite_all])
+            row_consts=row_consts[np.isfinite(row_consts)]
+            lone=[t for comp in graph.components if len(comp)==1
+                for t in comp if not np.isfinite(b_hat[t]) and np.any(q[t])]
+            if row_consts.size and lone:
+                global_const=float(np.median(row_consts))
+                for t in lone:
+                    level=_row_level_all(t)-global_const
+                    if not math.isfinite(level):
+                        continue
+                    requested[t]=strength*(target-level)
+                    interpolated[t]=True  # unverified estimate flag machinery
+                    labels[t]="ABSOLUTE_LEVEL"
+                    consensus[t,q[t]]=True
+                    if measured_level is not None: measured_level[t]=level
+                    if desired_level is not None: desired_level[t]=target
         good=np.flatnonzero(np.isfinite(requested))
         for a_idx,b_idx in zip(good[:-1],good[1:]):
             missing=b_idx-a_idx-1
@@ -242,17 +261,13 @@ def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
             if member.size:
                 anchor=-float(np.median(requested[member]))
                 requested[member]+=anchor
-        # bounds-segments too short for a trend pass through uncorrected
-        for lo,hi in zip(bounds[:-1],bounds[1:]):
-            if hi-lo<8:
-                requested[lo:hi]=0.
-                reliable[lo:hi]=True
-                residual[lo:hi]=0.
-                labels[lo:hi]=["SHORT_SEQUENCE_NO_DEFLICKER"]*(hi-lo)
         good=np.flatnonzero(np.isfinite(requested))
         for a_idx,b_idx in zip(good[:-1],good[1:]):
             missing=b_idx-a_idx-1
-            if (1<=missing<=3 and
+            # A run shorter than the 8-frame trend threshold has no
+            # self-evidence (a content island): continuity interpolation is
+            # the documented assumption, flagged INTERPOLATED_NOT_VERIFIED.
+            if (1<=missing<=7 and
                     all(int(np.sum(q[t]))>=need for t in range(a_idx+1,b_idx)) and
                     not any(g in boundaries for g in range(a_idx+1,b_idx))):
                 # only measurable-but-unconstrained frames get interpolated;
@@ -266,17 +281,18 @@ def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
                     labels[t]="INTERPOLATED_ESTIMATE"
     summary={"target_provenance":{
         "intent":brightness,
-        "reference_scope":uniform_reference if brightness=="uniform" else "trend",
+        "reference_scope":"global" if brightness=="uniform" else "trend",
         "defined_before_iteration":True,
         "measured":"graph brightness b on persistent matched background"
         if brightness=="uniform" else "b minus confirmed steps",
-        "desired":"constant level (global median or per-segment median)"
+        "desired":"constant level (global median of the stitched graph brightness)"
         if brightness=="uniform" else
         f"Huber-Whittaker trend, period={period} "
         f"(lambda=1/(16 sin(pi/P)^4))"},
         "cross_boundary_anchors":{"method":
-        "persistent-background level median across the boundary "
-        "(all-valid-tile median fallback); explicit assumption, not evidence",
+        "whole-frame all-valid-tile median level const across the boundary "
+        "(owner whole-sequence intent: perceived overall brightness stays "
+        "continuous); explicit assumption, not evidence",
         "entries":cross_anchors},
         "edges":len(edges),
         "edges_by_lag":edge_stats["by_lag"],
@@ -288,9 +304,6 @@ def _pairwise_path(measurements: Sequence[FrameMeasurement],x: np.ndarray,
         "converged":graph.converged,"iterations":graph.iterations}
     if brightness=="uniform":
         summary["uniform_target_level_ev"]=(None if not math.isfinite(target) else target)
-        if uniform_reference=="segment":
-            summary["uniform_segment_target_levels_ev"]=sorted(
-                set(per_comp_target.values()))
     return requested,summary
 
 
@@ -348,10 +361,10 @@ def _robust_segment(a: np.ndarray,q: np.ndarray,centers: np.ndarray,period: int,
 
 def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
     strength: float=1.,steps: Sequence[ExposureStep]=(),
-    brightness: str="smooth",ev_limits: tuple[float,float]=(-2.,2.),
+    brightness: str="smooth",ev_limits: tuple[float,float] | None=None,
     time_gaps: Sequence[int]=(),estimator: str="pairwise",
     exclude_rois: tuple[tuple[float,float,float,float],...]=(),
-    uniform_reference: str="global") -> ExposureResult:
+) -> ExposureResult:
     n=len(measurements)
     if n<1:
         raise ExposureError("empty exposure sequence")
@@ -361,12 +374,15 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
         raise ExposureError("brightness must be smooth or uniform")
     if estimator not in ("pairwise","legacy"):
         raise ExposureError("estimator must be pairwise or legacy")
-    if uniform_reference not in ("global","segment"):
-        raise ExposureError("uniform_reference must be global or segment")
     gaps=sorted({int(g) for g in time_gaps if 0<int(g)<n})
-    low,high=ev_limits
-    if not math.isfinite(low+high) or not low<high:
-        raise ExposureError("invalid EV limits")
+    if ev_limits is None:
+        # Unbounded: any finite request is applied as-is; the renderer realises
+        # any finite EV, so there is no hidden second clamp downstream.
+        low,high=-math.inf,math.inf
+    else:
+        low,high=ev_limits
+        if not math.isfinite(low+high) or not low<high:
+            raise ExposureError("invalid EV limits")
     k=len(measurements[0].log_luminance)
     if k<8:
         raise ExposureError("insufficient tile grid")
@@ -405,17 +421,19 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
         segments=[(0,n,False)]
     else:
         a=x-s[:,None]
-        cuts,scene_cuts=detect_scene_cuts(a,q)
-        # Confirmed capture-time gaps are hard evidence boundaries: statistics
-        # and trends never cross them (scene cuts are a separate, content-based
-        # signal that may coincide).
-        bounds=[0]+sorted(set(cuts)|set(gaps))+[n]
-        gap_kinds={g:"time_gap" for g in gaps}|{c:"scene_cut" for c in cuts}
+        # One sequence, always: the input is deflickered as a WHOLE in filename
+        # order. Discontinuities (scene cuts, capture-time gaps, filename
+        # jumps) are reported metadata, never estimation boundaries -- there
+        # is no segmentation concept. Pair-quality gates reject non-matching
+        # pairs; graph components are stitched so perceived whole-frame
+        # brightness continues, with the assumption recorded per boundary.
+        _cuts,scene_cuts=detect_scene_cuts(a,q)
+        bounds=[0,n]
         if estimator=="pairwise":
             pairwise_requested,pairwise_summary=_pairwise_path(measurements,x,q,s,
                 centers,period,strength,brightness,bounds,ev_limits,consensus,
                 residual,mad,fractions,counts,reliable,interpolated,labels,
-                segment_ids,exclude_rois,uniform_reference,measured_level,
+                segment_ids,exclude_rois,measured_level,
                 desired_level)
             segments=[(lo,hi,hi-lo>=8) for lo,hi in zip(bounds[:-1],bounds[1:])]
         elif brightness=="uniform":
@@ -486,7 +504,8 @@ def estimate_exposure(measurements: Sequence[FrameMeasurement],*,period: int=60,
         elif not accepted[t]:
             status="REVIEW_REQUIRED"
         if interpolated[t]:
-            warnings.append("INTERPOLATED_NOT_VERIFIED")
+            warnings.append("LONE_FRAME_ABSOLUTE_LEVEL" if labels[t]=="ABSOLUTE_LEVEL"
+                else "INTERPOLATED_NOT_VERIFIED")
         if applied is not None:
             frozen[t,q[t]]=x[t,q[t]]+val
         frames.append(FrameEstimate(t,status,

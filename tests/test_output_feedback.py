@@ -5,7 +5,9 @@ import pytest
 
 from rawtl.exposure.estimation import estimate_exposure
 from rawtl.exposure.measurement import FrameMeasurement
-from rawtl.exposure.validation import evaluate_render, feedback_update, probe_gain
+from rawtl.exposure.validation import (
+    ValidationSummary, evaluate_render, feedback_update, probe_gain,
+)
 
 NX, NY = 12, 8
 K = NX * NY
@@ -103,9 +105,21 @@ def test_unobservable_frames_do_not_silently_pass():
 def test_interpolated_and_limited_frames_are_not_validated():
     x = base_sequence()
     big = x.copy()
-    big[10:] += 4.0        # forces LIMITED clipping
-    exposure = estimate_exposure(frames(big), period=60)
+    big[10:] += 4.0        # forces LIMITED clipping at explicit limits
+    exposure = estimate_exposure(frames(big), period=60, ev_limits=(-2., 2.))
     rendered = _rendered_from(exposure, big)
     summary = evaluate_render(exposure, rendered)
     # LIMITED frames carry None errors, not fake zeros
     assert any(e is None for e in summary.errors)
+
+def test_feedback_moves_beyond_two_by_default():
+    x = base_sequence()
+    exposure = estimate_exposure(frames(x), period=60)
+    exposure.frames[0].applied_ev = -1.9
+    summary = ValidationSummary([-.5] + [None] * (len(x) - 1), None, None, [], [], False)
+    adjusted = feedback_update(exposure, summary)
+    assert adjusted == 1
+    # unbounded: -1.9 plus the clipped max step (-0.25) lands below -2 EV
+    assert exposure.frames[0].applied_ev == pytest.approx(-2.15)
+    feedback_update(exposure, summary, limits=(-2., 2.))
+    assert exposure.frames[0].applied_ev == -2.

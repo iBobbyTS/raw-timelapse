@@ -29,6 +29,6 @@ def test_short_gap_across_confirmed_step():
 
 def test_limit_keeps_request_distinct():
     s=sequence(5)
-    e=estimate_exposure(s,steps=[ExposureStep(3,5.)])
+    e=estimate_exposure(s,ev_limits=(-2.,2.),steps=[ExposureStep(3,5.)])
     assert any(f.status=="LIMITED" for f in e.frames)
     assert all(f.applied_ev is not None for f in e.frames)

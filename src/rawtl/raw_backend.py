@@ -98,12 +98,24 @@ class RawpyRenderer:
             return metadata.daylight_wb
         raise RawDecodeError("first RAW has no valid four-channel camera/daylight WB")
 
+    # LibRaw realises exp_shift only inside its documented [0.25, 8.0] range
+    # (-2..+3 EV) and silently clamps outside it (probe 2026-11-06 on a real
+    # DNG: requested -4 EV renders as -1.99, +4 as +2.98). Any finite EV is
+    # realised by composing the in-range exp_shift with an exact post-decode
+    # linear gain; on the dimming side the composition adds 0.0000 EV of
+    # measured error beyond the in-range path's own bias.
+    EXP_SHIFT_RANGE=(0.25,8.0)
+
     def render_linear(self,path: Path,exposure_ev: float,
         options: RawRenderOptions) -> LinearFrame:
         if options.color_transform_id!="libraw_builtin_srgb" or options.transfer_id!="linear":
             raise RawDecodeError("V1 supports only libraw_builtin_srgb / linear rendering")
-        if not math.isfinite(exposure_ev) or not -2 <= exposure_ev <= 2:
-            raise RawDecodeError(f"exposure EV out of V1 safe range [-2,2]: {exposure_ev}")
+        if not math.isfinite(exposure_ev):
+            raise RawDecodeError(f"exposure EV must be finite: {exposure_ev}")
+        gain=2.0**exposure_ev
+        lo,hi=self.EXP_SHIFT_RANGE
+        shift=float(min(max(gain,lo),hi))
+        extra=gain/shift  # exactly 1.0 whenever the request is inside the honoured range
         wb=options.fixed_white_balance
         if len(wb)!=4 or any(not math.isfinite(x) or x <= 0 for x in wb):
             raise RawDecodeError("invalid fixed four-channel WB")
@@ -115,12 +127,18 @@ class RawpyRenderer:
                     no_auto_bright=True, adjust_maximum_thr=0.0,
                     use_auto_wb=False, use_camera_wb=False, user_wb=list(wb),
                     bright=1.0, highlight_mode=self.rawpy.HighlightMode.Clip,
-                    exp_shift=float(2**exposure_ev), exp_preserve_highlights=0.0)
+                    exp_shift=shift, exp_preserve_highlights=0.0)
                 if a.dtype!=np.uint16 or a.ndim!=3 or a.shape[2]!=3:
                     raise ValueError(f"unexpected processed format {a.shape} {a.dtype}")
-                saturated=(a >= 64224).any(axis=2)  # ~0.98*65535; proxy, not sensor saturation
                 rgb=a.astype(np.float32)
                 rgb *= np.float32(1/65535)
+                if extra!=1.:
+                    rgb *= np.float32(extra)
+                    # Saturation must describe the delivered linear data, so it
+                    # is recomputed after the post-gain (may grow AND shrink).
+                    saturated=(rgb>=np.float32(64224/65535)).any(axis=2)
+                else:
+                    saturated=(a >= 64224).any(axis=2)  # ~0.98*65535; proxy, not sensor saturation
                 return LinearFrame(rgb,saturated,"approximate",1/65535,True,"linear-srgb")
         except RawDecodeError:
             raise

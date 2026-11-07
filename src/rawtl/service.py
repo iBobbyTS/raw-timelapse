@@ -20,7 +20,8 @@ from .types import (
 from .inventory import inspect_directory, prevent_output_overlap
 from .raw_backend import RawpyRenderer
 from .dng_semantics import (
-    FrameSourceInfo, baseline_exposure_summary, continuity, extract_source_metadata,
+    FrameSourceInfo, baseline_exposure_summary, continuity, exiftool_version,
+    extract_source_metadata,
     opcode_variation, probe_backend_semantics)
 from .color import SRGBTransfer,pad_even_rgb8
 from .frame_processing import IdentityProcessor
@@ -124,8 +125,6 @@ class ProcessingService:
             raise InputError("brightness must be smooth or uniform")
         if request.estimator not in ("pairwise","legacy"):
             raise InputError("estimator must be pairwise or legacy")
-        if request.uniform_reference not in ("global","segment"):
-            raise InputError("uniform_reference must be global or segment")
         if request.save_frames and (out/"frames").exists() and not request.overwrite:
             raise InputError(f"PNG frame output already exists: {out/'frames'} (pass --overwrite)")
         out.mkdir(parents=True,exist_ok=True)
@@ -138,7 +137,6 @@ class ProcessingService:
                 "fps":str(request.fps),"period":request.period,
                 "strength":request.strength,"brightness":request.brightness,
                 "estimator":request.estimator,
-                "uniform_reference":request.uniform_reference,
                 "exclude_rois":[list(r) for r in request.exclude_rois],
                 "roi":list(request.roi),
                 "steps":[asdict(x) for x in request.steps],
@@ -162,9 +160,11 @@ class ProcessingService:
             meta=inventory.first
             wb=RawpyRenderer.fixed_wb(meta)
             render_opts=RawRenderOptions(wb)
+            versions=r.versions() if hasattr(r,"versions") else {}
+            versions["exiftool"]=exiftool_version() or "NOT_FOUND"
             report["decoder"]={"camera":meta.camera,"fixed_wb":list(wb),
                 "orientation":meta.orientation,
-                "versions":r.versions() if hasattr(r,"versions") else {},
+                "versions":versions,
                 "saturation_mask_quality":"approximate"}
             if meta.camera=="UNKNOWN_CAMERA":
                 report["warnings"].append("CAMERA_IDENTITY_UNVERIFIED: install ExifTool for make/model preflight")
@@ -267,13 +267,15 @@ class ProcessingService:
                 time_gaps=[e["index"] for e in cont["time_gaps"]],
                 estimator=request.estimator,
                 exclude_rois=request.exclude_rois,
-                uniform_reference=request.uniform_reference)
+                ev_limits=request.ev_limits)
             if exposure.pairwise_summary:
                 report["pairwise_estimation"]=exposure.pairwise_summary
             report["unconverged_trend_tiles"]=exposure.trend_unconverged_tiles
             report["period_effective"]=exposure.period_effective
             report["scene_cuts"]=exposure.scene_cuts
             report["estimation_time_gaps"]=list(exposure.time_gaps)
+            report["ev_limits"]=(list(request.ev_limits)
+                if request.ev_limits is not None else None)
             report["frames"]=[self._frame_record(ref,est,info)
                 for ref,est,info in zip(refs,exposure.frames,ordered_info)]
             need_review=any(x.applied_ev is None for x in exposure.frames)
@@ -429,7 +431,7 @@ class ProcessingService:
                 if iteration>=2:
                     break
                 previous_summary=summary
-                updated=feedback_update(exposure,summary)
+                updated=feedback_update(exposure,summary,limits=request.ev_limits)
                 if updated==0:
                     break
                 feedback_count+=1
@@ -453,8 +455,17 @@ class ProcessingService:
             audit_result=None
             if request.temporal_quality!="off":
                 self._emit(on_progress,"audit",0,n,encoder=report["encoder"]["selected"])
+                # The audit measures level continuity, which cross-cut and
+                # cross-gap pairs cannot evidence (content changed; the same
+                # reason the estimator's edge gates reject them). Known
+                # discontinuities are therefore always excluded from the
+                # audit's pair evidence -- measurement hygiene, not
+                # segmentation: the deflicker itself never splits.
+                audit_boundaries=sorted({int(c["index"]) for c in exposure.scene_cuts}
+                    |set(exposure.time_gaps))
                 audit_config=VideoAuditConfig(transfer="srgb",
-                    frame_labels=[ref.filename for ref in refs])
+                    frame_labels=[ref.filename for ref in refs],
+                    boundaries=audit_boundaries)
                 try:
                     audit_result=audit_video(best_video,ffmpeg=request.ffmpeg,
                         ffprobe=ffprobe,config=audit_config,output_dir=out)
