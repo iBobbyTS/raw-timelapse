@@ -5,7 +5,10 @@ use crate::error::{Error, Result, EXIT_PUBLISH};
 use crate::frame::FrameSequence;
 use crate::json::{self, Json};
 use crate::preview;
-use crate::video::{ProbeInfo, RoundtripReport, LINEAR_FINAL_NAME, PREVIEW_FINAL_NAME};
+use crate::video::{
+    preview_filter, preview_geometry, ProbeInfo, RoundtripReport, LINEAR_FINAL_NAME,
+    PREVIEW_FINAL_NAME,
+};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -29,6 +32,7 @@ pub struct ManifestInput<'a> {
 
 pub fn build(input: &ManifestInput<'_>) -> Json {
     let sequence = input.sequence;
+    let preview_scale = preview_geometry(sequence.width, sequence.height);
     let frames: Vec<Json> = sequence
         .frames
         .iter()
@@ -290,13 +294,19 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                 ("purpose", Json::Str("display-referred review preview; not a measurement source".to_string())),
                 ("codec", Json::Str("h264".to_string())),
                 ("pix_fmt", Json::Str("yuv420p".to_string())),
+                ("scale", Json::obj(vec![
+                    ("applied", Json::Bool(preview_scale.scaled)),
+                    ("algorithm", if preview_scale.scaled { Json::Str("lanczos".to_string()) } else { Json::Null }),
+                    ("source", Json::Array(vec![Json::Int(sequence.width as i64), Json::Int(sequence.height as i64)])),
+                    ("preview", Json::Array(vec![Json::Int(preview_scale.width as i64), Json::Int(preview_scale.height as i64)])),
+                ])),
                 ("encoder_parameters", Json::Array(vec![
                     Json::Str("-c:v h264_videotoolbox".to_string()),
                     Json::Str("-allow_sw 0".to_string()),
                     Json::Str("-profile:v high".to_string()),
                     Json::Str("-b:v 0 -q:v 65".to_string()),
                     Json::Str("-pix_fmt yuv420p".to_string()),
-                    Json::Str("-vf scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv".to_string()),
+                    Json::Str(format!("-vf {}", preview_filter(preview_scale))),
                     Json::Str("-colorspace bt709 -color_primaries bt709 -color_trc iec61966-2-1 -color_range tv".to_string()),
                 ])),
                 ("color_contract", preview::color_contract_json()),

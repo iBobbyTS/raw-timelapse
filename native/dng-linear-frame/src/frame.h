@@ -18,11 +18,16 @@ struct Routing {
   uint32_t ifd;
   uint32_t photometric;
 };
-Routing inspect(const fs::path &);
+// Recognized DNG (classic TIFF structure declaring DNGVersion) metadata.
+// nullopt means the file is not a recognized DNG; it is resolved by the
+// configured converter instead. Malformed recognized DNGs still throw.
+std::optional<Routing> inspect(const fs::path &);
 Vec read_neutral(const fs::path &);
 // EXIF DateTimeOriginal from the main IFD or its Exif sub-IFD; null when absent.
 std::optional<std::string> read_capture_time(const fs::path &);
-enum class Route { direct, converter };
+// direct: LinearRaw main IFD. converter: CFA main IFD. vendor_raw: not a
+// recognized DNG, so the converter is the sole arbiter of the input.
+enum class Route { direct, converter, vendor_raw };
 Route route(uint32_t photometric);
 Mat inverse(const Mat &);
 Mat multiply(const Mat &, const Mat &);

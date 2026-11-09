@@ -312,3 +312,63 @@ run_status 词表：OK / COMPLETED_WITH_REVIEW / 操作性失败类（PARTIAL、
 
 **NOT_TESTED/边界**：兜底在"场景切变密集"素材上的弦修正幅度（如夜驾 35–37 帧）为设计内行为——跨切变不把内容变化当曝光修正；若 owner 希望 LRT 式全序列跨切变平滑，改动点为兜底分段边界（一处）。Windows/Linux、跨 provider 数值等同不声称。
 
+
+## 通用 RAW 输入接入（S01）：判型路由与枚举策略（2026-11-09）
+
+- 权威：用户 REQ-001~007（`.agent-work/REQUIREMENTS.md`）、`docs/architecture-v2.6.md` §0.5/§6.1（严格路由、失败显式报错、无 fallback），owner 决定：格式层只拒绝同目录混排后缀（同后缀不同规格不检查）；分辨率层整个目录必须一致；REQ-008 预览层（2026-11-09，实施期追加）：宽 >4096 素材的 sRGB 预览等比降采样到 4096（lanczos），FFV1 母版全分辨率，≤4096 行为不变。
+- 实现：`native/dng-linear-frame/src/{frame.h,tiff.cpp,main.cpp,decode.cpp}`、`native/dng-linear-frame/tests/integration.py`、`pipeline/src/{order.rs,deflicker_run.rs,cli.rs}`、`pipeline/src/{video.rs,manifest.rs}`（仅预览降采样策略及其 manifest 记录，见下）、`native/dng-linear-frame/README.md`、`pipeline/README.md`、本条目。`decode.cpp` 仅做 `inspect()` 可选返回值的最小接口适配，无语义改动。
+
+### 两项头号行为变化（行为变更，非纯重构）
+
+1. **非 TIFF / TIFF 无 DNGVersion 输入从 exit 20 拒绝改为 vendor-raw → ADC**。判型谓词由「是否 TIFF」改为「是否识别为 DNG」：经典 TIFF（magic 42）声明 `DNGVersion`(50706) 即识别为 DNG，随后既有校验（唯一全分辨率主 RAW IFD、34892 直通、32803 Converter、歧义/缺失 photometric 拒绝）逐字节不变。BigTIFF（magic 43）仍在既有 magic 处显式 exit 20。其余一切文件——非 TIFF 容器（CR3/RAF/RW2/X3F/IIQ/ORF）、TIFF 容器但无 DNGVersion（CR2/NEF/ARW/PEF/3FR/FFF）以及普通 TIFF/JPEG 图像——进入 vendor-raw：复用同一 Converter argv、单输出检查、34892 独立验证、超时、transcript 与临时目录清理；ADC 拒绝即显式报错（exit 24/25/23），无任何 fallback 或厂商/扩展名白名单。vendor-raw sidecar：`route` 新字面量 `vendor-raw-converter-linearraw-sdk`；`source_sha256` 仍哈希原始输入；`as_shot_neutral` 与 `capture_time` 改读转换后 DNG（原文件无这些标签）；`source_main_ifd_offset`/`source_photometric` 为 `null`；未新增 `source_class` 字段。34892/32803 路径的 sidecar 语义不变。
+2. **枚举不再静默跳过非 .dng 文件**。`pipeline/src/order.rs` 现跳过隐藏文件（点开头）与 `.xmp` 边车，其余常规文件均为候选帧；候选帧后缀（大小写不敏感）不一致 → `EXIT_INPUT`(10) 并说明"单目录单一后缀"策略；无候选帧 → 报错。原先 `notes.txt` 类文件被静默忽略，现在会参与单后缀判定（与 `.dng` 混排时直接拒绝），这是刻意行为变化。纯 `.dng` 目录的数字排序、大小写同名拒绝与歧义键拒绝不变；`deflicker_run.rs` 的枚举计数文案改为后缀中性（"found {} frame(s)"）。
+
+### 环境与检查
+
+| 项 | 值 |
+| --- | --- |
+| OS / 架构 | macOS 27.0.1 arm64 |
+| rustc / cargo | 1.99.1（Homebrew） |
+| ffmpeg / ffprobe | 8.0.1（`/opt/homebrew/opt/ffmpeg-full/bin`） |
+| Adobe DNG Converter | 18.7 (2743) |
+
+| 命令 | 真实退出码 / 结果 | 证据（根=`.agent-work/tmp/raw-input-routing/s01/`） |
+| --- | --- | --- |
+| native configure + build | 0 / 0 | `logs/native-configure.log`、`logs/native-build.log` |
+| `ctest --test-dir native/build --output-on-failure` | 0；3/3 pass（含新增 vendor-raw 用例）；预览轮复确认 0；3/3 | `logs/native-ctest.log`、`logs-preview/native-ctest.log` |
+| `cargo clean` + `cargo test`（首轮） | 0；90 lib + 55 bin + 17 集成 = **162 passed, 0 failed** | `logs/cargo-clean.log`、`logs/cargo-test.log` |
+| `cargo clean` + `cargo test`（预览降采样后） | 0；90 lib + 59 bin（含 4 个 preview geometry/filter 单测）+ 17 集成 = **166 passed, 0 failed** | `logs-preview/cargo-clean.log`、`logs-preview/cargo-test.log` |
+| `cargo build --release` | 0 | `logs/cargo-build-release.log`、`logs-preview/cargo-build-release.log` |
+| cr3/dxo e2e 复跑（降采样） | 0 / 0；预览 4096x2734 / 4096x2732；验收脚本 exit 0 | `logs-preview/e2e-{cr3,dxo}.log`、`e2e-preview/{cr3,dxo}/`、`logs-preview/verify-preview-e2e.txt` |
+| uncompressed 回归（≤4096） | 0；解码 framemd5 相同；容器仅 SEI 时间戳 2 字节差异 | `logs-preview/regression-preview-framemd5.txt`、`preview-sei-diff.txt`、`preview-byte-diff-analysis.txt` |
+
+native 新增回归覆盖：非 TIFF 输入与 TIFF 无 DNGVersion（CR2/NEF/ARW 形制）输入均经 Converter double 成功并消费验证后的 LinearRaw；vendor 输入被 Converter 拒绝时 exit 24 且 transcript 保留、输出非 LinearRaw 时 exit 23；截断的识别 DNG 仍 exit 20；BigTIFF exit 20；vendor-raw 的 `as_shot_neutral`/`capture_time` 与转换产物直通路径一致、`source_sha256` 为原始输入、`source_*` 为 null。pipeline 新增单测：混排后缀拒绝、隐藏/`.xmp`/子目录跳过、无候选帧报错、大小写同后缀接受（首轮）；预览几何 ≤4096 不变、>4096 等比缩放并取偶高、退化宽高比钳制、滤镜链仅在缩放时前置 lanczos（预览轮）。原 `notes.txt` fixture 按新策略更新。
+
+### AC3 四类真实素材 e2e（每目录 3 帧，默认参数含去闪）
+
+| 目录（输入） | 帧尺寸 | 逐帧 route | FFV1 / 预览 / manifest | 退出码 |
+| --- | --- | --- | --- | --- |
+| `uncompressed_camera_dng` | 4000x2256 | `cfa-converter-linearraw-sdk` ×3 | 齐全；预览 4000x2256（未缩放） | 0 |
+| `jxl_adc_dng` | 4000x2256 | `cfa-converter-linearraw-sdk` ×3 | 齐全；预览 4000x2256（未缩放） | 0 |
+| `cr3` | 6984x4660 | `vendor-raw-converter-linearraw-sdk` ×3 | 齐全；FFV1 6984x4660、预览 4096x2734 | 0 |
+| `dxo_dng` | 6960x4640 | `linearraw-sdk` ×3 | 齐全；FFV1 6960x4640、预览 4096x2732 | 0 |
+
+- 输入由 `/Users/ibobby/Temp/tl/*` 各取按名排序前 3 帧复制到 `inputs/`。首轮（无预览降采样）日志 `logs/e2e-*.log`、产物 `e2e/*`、逐帧 route 汇总 `logs/ac3-routes.txt`（`verify_e2e.py` exit 0）；预览降采样后 cr3/dxo 复跑日志 `logs-preview/e2e-{cr3,dxo}.log`、产物 `e2e-preview/{cr3,dxo}/`，验收 `logs-preview/verify-preview-e2e.txt`（`verify_preview_e2e.py` exit 0：route、FFV1 全分辨率、预览 4096 宽、manifest scale/vf 全部 PASS）。
+- 首轮发现并上报的阻塞：cr3/dxo 的 sRGB 预览在 25MP 级素材上 `h264_videotoolbox` 报 `cannot create compression session: -12903`（FFV1/往返均已通过）。owner 决定（REQ-008）后实现条件降采样：源宽 ≤4096 完全沿用既有滤镜链；>4096 时在既有 bt709 色彩矩阵转换前插入 `scale=4096:<even proportional height>:flags=lanczos`。探针证据（ffmpeg 内置 `color` 源、相同编码参数）：4000x2256、4096x2304、4096x4096 成功；4098x2304、5000x3000、6960x4640、6984x4660 均 exit 187（`logs/vt-*.log`、`logs-preview/vt2-*.log`、`logs-preview/vt3-*.log`），确认上限是宽度 >4096。`manifest.json` 新增 `preview.scale`（applied/algorithm/source/preview）并让 `preview.encoder_parameters` 的 `-vf` 反映实际链；`validate_preview` 按计算出的预览几何校验 ffprobe 尺寸；审计只消费 FFV1 母版，尺寸语义不变。
+- ≤4096 回归：uncompressed 复跑（`e2e-preview/uncompressed/`）与首轮 `e2e/uncompressed/srgb-preview-h264.mp4` 对比：**容器仅 2 字节不同**，定位为 H.264 SEI（NAL type 6）内的 VideoToolbox 时间戳字段；SPS/PPS/IDR/切片 NAL 逐字节相同，解码帧 framemd5 完全相同（`logs-preview/regression-preview-framemd5.txt`、`preview-sei-diff.txt`、`preview-byte-diff-analysis.txt`）。同一新二进制的两次运行也在同一 SEI 字段相差 1 字节（`preview-after-uncompressed-rerun.sha256`），故该字节差异是编码器运行时间戳的固有非确定性，不是行为变化；≤4096 的 manifest `preview.scale.applied=false`、`-vf` 与改动前一致，归一化运行目录后编码命令逐字节相同（`regression-preview-command.txt`）。降采样路径不触发该回归（缩放链只在 >4096 时加入）。
+
+### AC4 反例（均无视频产出）
+
+| 反例 | 目录 | 退出码 / 信息 | 证据 |
+| --- | --- | --- | --- |
+| 混排后缀 `.CR3` + `.dng` | `fixtures/mixed-extensions/` | 10；"mixed file extensions ... single file extension per directory (case-insensitive)" | `logs/ac4-mixed-extensions.log` |
+| 同后缀不同分辨率（dxo 6960x4640 + ADC-CR3 6984x4660，均 `.dng`） | `fixtures/mixed-resolution/` | 30；"frame 2/2 (IMG_0002.dng) has dimensions 6984x4660 but the sequence is 6960x4640" | `logs/ac4-mixed-resolution.log` |
+
+同后缀反例的 ADC 产物由 `"/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter" -c -l -d fixtures/adc-cr3 <CR3>` 生成（exit 0，`logs/adc-cr3-convert.log`），即 vendor-raw 路由使用的同一转换路径。
+
+### 未覆盖 / UNKNOWN / 边界
+
+- **预览降采样边界**：仅 `width > 4096` 触发；`width == 4096` 及以下完全沿用既有链。预览是展示用途、非测量源，降采样后的预览不是像素级母版；FFV1 母版始终全分辨率。`≤4096` 的预览文件在容器层不能跨运行逐字节复现（VideoToolbox 在 H.264 SEI 内写运行时间戳），但图像 NAL 与解码帧逐字节相同。
+- **NOT_TESTED**：Windows/Linux（本适配器与预览编码均 macOS）；TIFF 系厂商 RAW 真机样本（CR2/NEF/ARW/PEF/3FR/FFF）——AC1 用合成"经典 TIFF 无 DNGVersion"最小目录覆盖判型，未验证各厂商真实文件的 ADC 产物；非 TIFF 真机样本仅 CR3 用于 AC3/AC4；>4096 素材的预览仅由 cr3/dxo 两类真实素材覆盖，未覆盖极端宽高比真机素材（退化宽高比仅有单测）。
+- **UNKNOWN**：普通 TIFF/JPEG 图像交 ADC 的失败文案/耗时（无专门支持承诺，仅要求显式报错）；ADC 对厂商 RAW 的裁剪/元数据烘焙细节沿用既有声明；不同 VideoToolbox/ffmpeg 版本对 SEI 时间戳与压缩行为的一致性。
+- 未改动：`frame.rs`/`manifest.rs` 的其余语义、`video.rs` 的 FFV1/往返/发布路径、去闪引擎语义、ADC 调用参数与验证逻辑、白平衡冻结、错误码家族；未新增 fallback/LibRaw/白名单/分辨率预检。`manifest.rs` 仅新增 preview.scale 并把 `preview.encoder_parameters` 的 `-vf` 改为实际链。

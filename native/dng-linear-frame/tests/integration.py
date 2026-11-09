@@ -305,6 +305,63 @@ tool(cfa,'failed-conversion',options=['--converter',str(failure)],code=24)
 timeout=fake('converter-timeout','exec /bin/sleep 10')
 tool(cfa,'timeout',options=['--converter',str(timeout),'--converter-timeout','1'],code=25)
 tool(base,'bad-wb',options=['--white-balance','1,-1,1'],code=2)
+
+# S01: recognition is structural (classic TIFF + DNGVersion). Everything else
+# is a vendor/other RAW candidate that only the converter may resolve.
+vendor_output=dng('vendor-converted',datetime_original='2010:01:02 03:04:05')
+vendor_direct=tool(vendor_output,'vendor-output-direct')
+assert vendor_direct['route']=='linearraw-sdk'
+conv_vendor=fake('converter-vendor',f'touch {shlex.quote(str(marker))}\ncp {shlex.quote(str(vendor_output))} "$4/converted.dng"')
+non_tiff=work/'vendor-cr3-like.CR3'
+non_tiff.write_bytes(b'\0\0\0\x18ftypcrx '*40+b'\x01\x02'+bytes(range(256)))
+marker.unlink(missing_ok=True)
+vendor=tool(non_tiff,'vendor-non-tiff',options=['--converter',str(conv_vendor)])
+assert marker.exists()
+assert vendor['route']=='vendor-raw-converter-linearraw-sdk'
+assert vendor['converter']['used'] is True
+assert vendor['converter']['verified_main_ifd_photometric']==34892
+assert vendor['source_main_ifd_offset'] is None and vendor['source_photometric'] is None
+assert vendor['source_sha256']==hashlib.sha256(non_tiff.read_bytes()).hexdigest()
+# As-shot neutral and capture time come from the converted DNG, not the input.
+assert vendor['as_shot_neutral']==vendor_direct['as_shot_neutral']
+assert vendor['capture_time']=='2010:01:02 03:04:05'
+assert (work/'vendor-non-tiff.png').read_bytes()==(work/'vendor-output-direct.png').read_bytes()
+
+def tiff_container(name,*,dng_version=False,pi=32803,truncate_tail=False):
+    # Minimal little-endian classic TIFF directory (CR2/NEF/ARW-shaped input).
+    tags=[(254,4,1,0),(256,4,1,16),(257,4,1,16),(262,3,1,pi)]
+    if dng_version:tags.append((50706,1,4,0))
+    entries=b''
+    for tag,typ,count,value in tags:
+        if tag==50706:field=b'\x01\x04\x00\x00'
+        elif typ==3:field=struct.pack('<H',value)+b'\0\0'
+        else:field=struct.pack('<I',value)
+        entries+=struct.pack('<HHI',tag,typ,count)+field
+    data=b'II*\0'+struct.pack('<I',8)+struct.pack('<H',len(tags))+entries
+    if not truncate_tail:data+=struct.pack('<I',0)
+    path=work/name;path.write_bytes(data);return path
+
+# TIFF container without DNGVersion: vendor RAW class, converter decides.
+vendor_tiff=tiff_container('vendor-tiff-like.CR2')
+marker.unlink(missing_ok=True)
+tiff_meta=tool(vendor_tiff,'vendor-tiff',options=['--converter',str(conv_vendor)])
+assert marker.exists() and tiff_meta['route']=='vendor-raw-converter-linearraw-sdk'
+assert tiff_meta['source_photometric'] is None
+
+# Converter rejection of a vendor input is explicit and keeps its transcript.
+rejecting=fake('converter-reject','touch '+shlex.quote(str(marker))+'\necho deliberate-failure >&2\nexit 7')
+marker.unlink(missing_ok=True)
+r=run([exe,non_tiff,work/'vendor-reject.png',work/'vendor-reject.json','--converter',str(rejecting)],24)
+assert marker.exists() and b'deliberate-failure' in r.stderr
+bad_vendor=fake('converter-bad-vendor',f'cp {shlex.quote(str(cfa))} "$4/not-linear.dng"')
+tool(non_tiff,'vendor-not-linear',options=['--converter',str(bad_vendor)],code=23)
+
+# A recognized DNG stays subject to the unchanged validation (exit 20), and
+# BigTIFF remains an explicit rejection rather than a converter candidate.
+tool(tiff_container('malformed-dng.DNG',dng_version=True,truncate_tail=True),'malformed-dng',code=20)
+bigtiff=work/'bigtiff.DNG';bigtiff.write_bytes(b'II'+struct.pack('<H',43)+struct.pack('<I',8)+b'\0'*8)
+tool(bigtiff,'bigtiff',options=['--converter',str(conv)],code=20)
+
 # Big-endian metadata route + preview trap: build minimal TIFF directory graph.
 def directory_fixture(name,main_pi,preview_pi=34892):
     def directory(tags,next_at=0):

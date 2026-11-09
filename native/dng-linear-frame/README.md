@@ -111,15 +111,29 @@ report and audit flow. The two occupancy series feed distinct decisions:
 camera-domain occupancy gates tile validity/estimation, while delivered-domain
 occupancy drives the report's output-clipping delta.
 
-Routing reads classic TIFF directory metadata **before SDK entry**, requires
-DNGVersion and exactly one full-resolution (`NewSubfileType=0`) main RAW IFD,
-and ignores reduced-resolution previews. BigTIFF and ambiguous full-resolution
-IFDs are explicitly rejected. Only three-channel LinearRaw decode is supported.
+Routing reads classic TIFF directory metadata **before SDK entry**. The
+classification predicate is *recognized DNG*, not *is TIFF*: a classic TIFF
+(magic 42) that declares `DNGVersion` is a DNG and must have exactly one
+full-resolution (`NewSubfileType=0`) main RAW IFD; reduced-resolution previews
+are ignored, and ambiguous full-resolution IFDs are explicitly rejected.
+BigTIFF (magic 43) is rejected explicitly rather than guessed. Only
+three-channel LinearRaw decode is supported.
 
-- Main RAW `34892`: direct Adobe SDK decode.
+- Main RAW `34892`: direct Adobe SDK decode (`route: linearraw-sdk`).
 - Main RAW `32803`: Adobe Converter `-c -l -d <run-temp-directory> <input>`;
-  require exactly one output and independently verify main RAW `34892`, then SDK.
-- Other/missing values: reject. There is no fallback provider.
+  require exactly one output and independently verify main RAW `34892`, then
+  SDK (`route: cfa-converter-linearraw-sdk`).
+- A malformed recognized DNG (missing/ambiguous main RAW IFD, other
+  photometric value, truncated structure) is still rejected. There is no
+  fallback provider.
+- Everything else — non-TIFF containers (e.g. CR3/RAF/RW2/X3F/IIQ/ORF), TIFF
+  containers without `DNGVersion` (e.g. CR2/NEF/ARW/PEF/3FR/FFF), and ordinary
+  TIFF images — is routed through the same Converter invocation and result
+  verification (`route: vendor-raw-converter-linearraw-sdk`). The Converter is
+  the sole arbiter of whether such a file is a supported RAW; there is no
+  vendor/extension whitelist. For these inputs `source_sha256` still hashes the
+  original input, while `source_main_ifd_offset` and `source_photometric` are
+  `null` (they describe a recognized DNG's main IFD).
 
 Default Converter: `/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter`.
 The timeout defaults to 120 seconds; allowed override 1–3600 seconds. Execution
@@ -135,17 +149,20 @@ precision (the SDK's six-decimal stored neutral is not substituted). Values
 must be finite and positive. The color calculation normalizes their maximum
 to one. S02 must read the first numerically ordered frame's
 `applied_white_balance` array, then pass those same three values as
-`--white-balance` to subsequent frames. `as_shot_neutral` always describes the
-original source; `decoded_as_shot_neutral` describes the SDK input after any
+`--white-balance` to subsequent frames. `as_shot_neutral` describes the
+recognized source DNG; for a vendor/other RAW the original file has no
+AsShotNeutral tag, so it (and `capture_time`) is read from the Converter's DNG
+output instead. `decoded_as_shot_neutral` describes the SDK input after any
 Converter step; `white_balance_source` is `as-shot` or `override`.
 
 JSON schema version 1 also provides `source_sha256`, `route`, dimensions,
 `color` (actual SDK-selected profile, illuminants, matrices, white, applied
 transform), `decode_semantics`, `observed_scene_min`/`observed_scene_max` after
 the requested gain and before quantization, `exposure_ev`, `gain`,
-`capture_time` (EXIF `DateTimeOriginal` from the source; legal directories of
-any fitting size are scanned, and `null` means absent or structurally
-unreadable metadata — optional metadata never fails the frame),
+`capture_time` (EXIF `DateTimeOriginal` from the recognized DNG, or from the
+Converter output for a vendor/other RAW; legal directories of any fitting size
+are scanned, and `null` means absent or structurally unreadable metadata —
+optional metadata never fails the frame),
 `analysis_sidecar` (requested path or `null`), and the explicit `quantization`
 policy/counts. It is a numeric sidecar; no claim that 0.18 equals 18% physical
 reflectance is made. PNG bytes are deterministic on the tested toolchain; JSON
@@ -203,7 +220,10 @@ are declared, and the actual composed matrices are recorded.
 
 Default CTest generates small DNGs in the build tree, runs the real SDK, checks
 routing (including big-endian/preview traps, missing tags, failed/invalid/timeout
-Converter doubles), independent Decimal Chapter 6 reference values including
+Converter doubles), structural classification of non-TIFF and
+TIFF-without-DNGVersion (CR2/NEF/ARW-shaped) inputs through the Converter
+double, Converter rejection of a vendor input, truncated recognized DNGs,
+BigTIFF rejection, independent Decimal Chapter 6 reference values including
 the DJI non-symmetric matrix and non-neutral vectors, override WB, FP32 range,
 quantization known values and actual PNG sample encoding. Converter doubles
 only test routing; they are not decode fallbacks.

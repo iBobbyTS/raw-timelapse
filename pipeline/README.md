@@ -1,7 +1,8 @@
 # rawtl-linear-video
 
 Rust driver for the end-to-end linear time-lapse system: enumerate a directory
-of CFA/LinearRaw DNG frames, call the accepted `dng-linear-frame` producer,
+of DNG frames (LinearRaw or CFA) or of any other RAW format the Adobe DNG
+Converter can parse, call the accepted `dng-linear-frame` producer,
 freeze the sequence white balance, run the legacy V4 deflicker node (enabled by
 default), encode a lossless 16-bit scene-linear FFV1 video, validate it by full
 decode roundtrip, audit the encoded result independently, render a
@@ -25,7 +26,7 @@ The binary is `pipeline/target/release/rawtl-linear-video`.
 ## Run
 
 ```sh
-rawtl-linear-video --input <DNG_DIR> --output <RUN_DIR> \
+rawtl-linear-video --input <RAW_DIR> --output <RUN_DIR> \
   [--fps 30] \
   [--dng-linear-frame /abs/path/to/dng-linear-frame] \
   [--ffmpeg /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg] \
@@ -90,14 +91,30 @@ directory is retained with that distinguishable name and the error message
 names it; no file is ever created under a final deliverable name before
 validation succeeds.
 
-## Ordering
+## Input formats and ordering
 
-Frame enumeration is case-insensitive on the `.dng` extension. Names are
-tokenised into alternating text and digit runs; text compares
+The input directory is one sequence and must contain a single file extension
+per directory (case-insensitive). Hidden files (dot-prefixed) and `.xmp`
+sidecars are skipped; every other regular file is a candidate frame. A
+directory mixing extensions (for example `.CR3` and `.dng`) is rejected with
+the input-error exit; there is no vendor/extension whitelist inside a single
+extension, because the native producer routes each frame structurally and the
+Adobe DNG Converter is the arbiter of whether a vendor RAW is supported. Files
+that the Converter rejects fail the run with its transcript; nothing is silently
+skipped.
+
+Frame names are tokenised into alternating text and digit runs; text compares
 case-insensitively and digit runs compare by numeric value, so `IMG_2` sorts
 before `IMG_10`. Names without any digit run, names differing only by case, and
 pairs whose keys differ only in digit spelling (`IMG_1` vs `IMG_01`) are
 rejected as ambiguous. There is no lexicographic fallback.
+
+Each frame's format class is recorded in its sidecar route: `linearraw-sdk`
+(LinearRaw DNG, direct SDK), `cfa-converter-linearraw-sdk` (CFA DNG via the
+Converter), or `vendor-raw-converter-linearraw-sdk` (not a recognized DNG:
+non-TIFF containers such as CR3, TIFF containers without DNGVersion such as
+CR2/NEF/ARW, or ordinary images — the Converter decides). All frames must share
+one resolution; a mismatch is a hard decode-time error with no video produced.
 
 ## Sequence-frozen white balance (REQ-008)
 
@@ -152,10 +169,24 @@ encodes with macOS VideoToolbox H.264
 (`h264`, `yuv420p`, dimensions, frame count, frame rate) and a full decode to
 `null`.
 
+The macOS hardware H.264 encoder rejects source widths above 4096 (measured:
+4096x2304 succeeds, 5000x3000 fails with `cannot create compression session:
+-12903`; owner decision 2026-11-09). Sources wider than 4096 are therefore
+proportionally downscaled to 4096 width with lanczos resampling in the RGB
+domain, prepended to the existing colour-matrix conversion; the height is
+`round(source_height * 4096 / source_width)` raised to the nearest even value.
+The FFV1 master is never scaled and keeps full resolution. Sources at or below
+4096 keep the historical filter chain and encode path. The applied geometry,
+algorithm and the exact `-vf` chain are recorded in `manifest.json`
+(`preview.scale`, `preview.encoder_parameters`), and preview validation checks
+the computed preview dimensions, not the master dimensions.
+
 Unit tests assert neutral (`0.18 → 118,118,118`), a non-neutral reference
 (`[0.5,0.25,0.125] → [216,129,89]`), the two-sided clipping policy, the sRGB
-transfer, and that treating AP1 values as display sRGB is rejected by the
-non-neutral test.
+transfer, that treating AP1 values as display sRGB is rejected by the
+non-neutral test, and the preview downscale geometry/filter policy (no scale at
+or below 4096, proportional lanczos scale above it, even-height chroma
+alignment).
 
 ## Deflicker node (legacy V4)
 
