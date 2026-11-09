@@ -77,7 +77,8 @@ Json optional_matrix(const dng_matrix &m) {
 }
 } // namespace
 Decoded decode(const fs::path &path, const std::optional<Vec> &wb) {
-  if (route(inspect(path).photometric) != Route::direct)
+  auto routing = inspect(path);
+  if (!routing || route(routing->photometric) != Route::direct)
     throw Error(23, "CFA cannot enter SDK");
   try {
     Host host;

@@ -19,6 +19,61 @@ pub const PREVIEW_PIX_FMT: &str = "yuv420p";
 pub const LINEAR_FINAL_NAME: &str = "linear-acescg-16bit-ffv1.mkv";
 pub const PREVIEW_FINAL_NAME: &str = "srgb-preview-h264.mp4";
 
+/// macOS VideoToolbox hardware H.264 rejects source widths above 4096
+/// (`cannot create compression session: -12903`), so the display-referred
+/// preview is proportionally downscaled to this width. The FFV1 master is
+/// never scaled.
+pub const PREVIEW_MAX_WIDTH: u32 = 4096;
+
+/// Applied preview geometry for one source frame size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewGeometry {
+    pub width: u32,
+    pub height: u32,
+    pub scaled: bool,
+}
+
+/// Proportional preview downscale policy: widths at or below
+/// [`PREVIEW_MAX_WIDTH`] are unchanged. Wider sources scale to that width; the
+/// height is rounded to the nearest integer and raised to the nearest even
+/// value (yuv420p chroma alignment), with a minimum of 2.
+pub fn preview_geometry(width: u32, height: u32) -> PreviewGeometry {
+    if width <= PREVIEW_MAX_WIDTH {
+        return PreviewGeometry {
+            width,
+            height,
+            scaled: false,
+        };
+    }
+    let numerator = u64::from(height) * u64::from(PREVIEW_MAX_WIDTH);
+    let mut scaled_height = ((numerator + u64::from(width) / 2) / u64::from(width)) as u32;
+    scaled_height = scaled_height.max(2);
+    if scaled_height % 2 == 1 {
+        scaled_height += 1;
+    }
+    PreviewGeometry {
+        width: PREVIEW_MAX_WIDTH,
+        height: scaled_height,
+        scaled: true,
+    }
+}
+
+/// The `-vf` value used by the preview encoder. The unscaled chain is the
+/// historical one; a scaled preview prepends RGB lanczos resampling before the
+/// existing colour-matrix conversion.
+pub fn preview_filter(geometry: PreviewGeometry) -> String {
+    const CONVERT: &str = "scale=out_color_matrix=bt709:out_range=tv,\
+setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv";
+    if geometry.scaled {
+        format!(
+            "scale={}:{}:flags=lanczos,{CONVERT}",
+            geometry.width, geometry.height
+        )
+    } else {
+        CONVERT.to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProbeInfo {
     pub codec_name: String,
@@ -236,6 +291,7 @@ pub fn validate_preview(
     count: usize,
     fps: Fps,
 ) -> Result<ProbeInfo> {
+    let expected = preview_geometry(width, height);
     let probe = probe_stream(ffprobe, file)?;
     if probe.codec_name != PREVIEW_CODEC {
         return Err(Error::new(
@@ -255,12 +311,12 @@ pub fn validate_preview(
             ),
         ));
     }
-    if probe.width != width || probe.height != height {
+    if probe.width != expected.width || probe.height != expected.height {
         return Err(Error::new(
             EXIT_PREVIEW,
             format!(
                 "preview is {}x{}, expected {}x{}",
-                probe.width, probe.height, width, height
+                probe.width, probe.height, expected.width, expected.height
             ),
         ));
     }
@@ -538,6 +594,7 @@ pub fn encode_preview(
     output: &Path,
     log_path: &Path,
 ) -> Result<()> {
+    let geometry = preview_geometry(width, height);
     let args = vec![
         "-hide_banner".to_string(),
         "-nostdin".to_string(),
@@ -556,7 +613,7 @@ pub fn encode_preview(
         "-frames:v".to_string(),
         count.to_string(),
         "-vf".to_string(),
-        "scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv".to_string(),
+        preview_filter(geometry),
         "-c:v".to_string(),
         "h264_videotoolbox".to_string(),
         "-allow_sw".to_string(),
@@ -585,14 +642,25 @@ pub fn encode_preview(
     ];
     let command = proc::display_command(ffmpeg, &args);
     let captured = proc::run_capture(ffmpeg, &args, EXIT_PREVIEW)?;
+    // Keep the unscaled log byte-identical; scaled runs record the applied
+    // geometry alongside the source size.
+    let scale_note = if geometry.scaled {
+        format!(
+            "\npreview scale: {}x{} -> {}x{} (lanczos; VideoToolbox max width {})",
+            width, height, geometry.width, geometry.height, PREVIEW_MAX_WIDTH
+        )
+    } else {
+        String::new()
+    };
     write_log(
         log_path,
         &format!(
-            "command: {command}\ninput: {}x{} rgb24 x{} @ {}\nexit: {} ({:.3}s)\nstdout:\n{}\nstderr:\n{}\n",
+            "command: {command}\ninput: {}x{} rgb24 x{} @ {}{}\nexit: {} ({:.3}s)\nstdout:\n{}\nstderr:\n{}\n",
             width,
             height,
             count,
             fps.arg(),
+            scale_note,
             proc::exit_description(&captured.status),
             captured.duration.as_secs_f64(),
             captured.stdout,
@@ -1037,5 +1105,84 @@ mod tests {
         assert!(error.message.contains("frame 3"));
         assert!(error.message.contains("byte 4"));
         assert!(error.message.contains("3 but decoded video = 9"));
+    }
+
+    #[test]
+    fn preview_geometry_keeps_material_at_or_below_the_limit() {
+        for (width, height) in [(4096, 2304), (4000, 2256), (8, 6), (1, 1)] {
+            assert_eq!(
+                preview_geometry(width, height),
+                PreviewGeometry {
+                    width,
+                    height,
+                    scaled: false
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn preview_geometry_scales_wider_material_proportionally() {
+        // The two 25 MP real-material sources (CR3 ADC output and DxO DNG).
+        assert_eq!(
+            preview_geometry(6984, 4660),
+            PreviewGeometry {
+                width: 4096,
+                height: 2734,
+                scaled: true
+            }
+        );
+        assert_eq!(
+            preview_geometry(6960, 4640),
+            PreviewGeometry {
+                width: 4096,
+                height: 2732,
+                scaled: true
+            }
+        );
+        // Aspect ratio is preserved within one pixel and the width is the cap.
+        for (width, height) in [(5000u32, 3000u32), (12000, 8000), (8192, 8192)] {
+            let geometry = preview_geometry(width, height);
+            assert!(geometry.scaled);
+            assert_eq!(geometry.width, PREVIEW_MAX_WIDTH);
+            let expected = f64::from(height) * f64::from(PREVIEW_MAX_WIDTH) / f64::from(width);
+            assert!((f64::from(geometry.height) - expected).abs() <= 1.5);
+        }
+    }
+
+    #[test]
+    fn preview_geometry_aligns_chroma_and_clamps_tiny_heights() {
+        // Nearest integer is 999 (odd), raised to 1000 for yuv420p.
+        assert_eq!(
+            preview_geometry(4100, 1000),
+            PreviewGeometry {
+                width: 4096,
+                height: 1000,
+                scaled: true
+            }
+        );
+        // A degenerate aspect still yields an even, non-zero height.
+        assert_eq!(
+            preview_geometry(20000, 1),
+            PreviewGeometry {
+                width: 4096,
+                height: 2,
+                scaled: true
+            }
+        );
+        for (width, height) in [(6984u32, 4660u32), (4100, 1000), (5000, 3000), (20000, 1)] {
+            assert_eq!(preview_geometry(width, height).height % 2, 0);
+        }
+    }
+
+    #[test]
+    fn preview_filter_only_prepends_lanczos_when_scaled() {
+        const CONVERT: &str = "scale=out_color_matrix=bt709:out_range=tv,\
+setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv";
+        assert_eq!(preview_filter(preview_geometry(8, 6)), CONVERT);
+        assert_eq!(
+            preview_filter(preview_geometry(5000, 3000)),
+            format!("scale=4096:2458:flags=lanczos,{CONVERT}")
+        );
     }
 }

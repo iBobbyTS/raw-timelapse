@@ -116,7 +116,7 @@ fn run_with_boundary(
     crate::proc::require_executable(&options.ffprobe, "--ffprobe")?;
 
     let sources = crate::order::enumerate_dng(input)?;
-    println!("found {} DNG frame(s) in numeric order:", sources.len());
+    println!("found {} frame(s) in numeric order:", sources.len());
     for (index, source) in sources.iter().enumerate() {
         println!("  {:>3}. {}", index + 1, source.name);
     }

@@ -4,8 +4,11 @@
 #include <set>
 namespace frame {
 // Read only TIFF directory metadata before giving any file to the SDK.
-// Classic TIFF only; BigTIFF is rejected explicitly rather than guessed.
-Routing inspect(const fs::path &path) {
+// Recognition is structural: classic TIFF (magic 42) declaring DNGVersion.
+// Anything else is not a DNG and is left to the converter. BigTIFF (magic 43)
+// is rejected explicitly rather than guessed; a recognized DNG then goes
+// through the full validation below byte-for-byte unchanged.
+std::optional<Routing> inspect(const fs::path &path) {
   std::ifstream f(path, std::ios::binary);
   if (!f)
     throw Error(20, "cannot open DNG: " + path.string());
@@ -24,17 +27,34 @@ Routing inspect(const fs::path &path) {
       v |= uint32_t(b[j]) << (8 * (little ? j : n - 1 - j));
     return v;
   };
-  auto order = read(0, 2);
-  if (order == 0x4949)
+  auto order = [&] {
+    try {
+      return std::optional<uint32_t>(read(0, 2));
+    } catch (const Error &) {
+      return std::optional<uint32_t>(); // too short to be a TIFF container
+    }
+  }();
+  if (!order)
+    return std::nullopt;
+  if (*order == 0x4949)
     little = true;
-  else if (order == 0x4d4d)
+  else if (*order == 0x4d4d)
     little = false;
   else
-    throw Error(20, "not TIFF");
-  if (read(2, 2) != 42)
+    return std::nullopt; // not a TIFF container: not a recognized DNG
+  auto magic = [&] {
+    try {
+      return std::optional<uint32_t>(read(2, 2));
+    } catch (const Error &) {
+      return std::optional<uint32_t>();
+    }
+  }();
+  if (!magic)
+    return std::nullopt;
+  if (*magic == 43)
     throw Error(20, "only classic TIFF DNG is supported");
-  std::vector<uint32_t> pending{read(4, 4)};
-  std::set<uint32_t> seen;
+  if (*magic != 42)
+    return std::nullopt; // not a recognized TIFF structure
   bool dng = false;
   struct Candidate {
     uint32_t offset;
@@ -42,51 +62,61 @@ Routing inspect(const fs::path &path) {
     uint64_t area;
   };
   std::vector<Candidate> candidates;
-  while (!pending.empty()) {
-    uint32_t at = pending.back();
-    pending.pop_back();
-    if (!at)
-      continue;
-    if (!seen.insert(at).second)
-      throw Error(20, "cyclic/aliased TIFF IFD");
-    if (seen.size() > 256)
-      throw Error(20, "too many TIFF IFDs");
-    auto n = read(at, 2);
-    std::map<uint32_t, uint32_t> values;
-    for (uint32_t i = 0; i < n; ++i) {
-      uint64_t p = uint64_t(at) + 2 + 12 * i;
-      auto tag = read(p, 2), type = read(p + 2, 2), count = read(p + 4, 4);
-      if (tag == 50706 && count == 4 && type == 1)
-        dng = true;
-      if (tag != 254 && tag != 256 && tag != 257 && tag != 262 && tag != 330)
+  try {
+    std::vector<uint32_t> pending{read(4, 4)};
+    std::set<uint32_t> seen;
+    while (!pending.empty()) {
+      uint32_t at = pending.back();
+      pending.pop_back();
+      if (!at)
         continue;
-      if ((type != 3 && type != 4 && type != 13) || count == 0 || count > 256)
-        throw Error(20, "invalid TIFF routing tag");
-      uint32_t bytes = type == 3 ? 2 : 4;
-      uint64_t data = uint64_t(count) * bytes <= 4 ? p + 8 : read(p + 8, 4);
-      if (tag == 330) {
-        for (uint32_t k = 0; k < count; ++k)
-          pending.push_back(read(data + k * bytes, bytes));
-      } else {
-        if (count != 1 || values.count(tag))
-          throw Error(20, "ambiguous TIFF routing tag");
-        values[tag] = read(data, bytes);
+      if (!seen.insert(at).second)
+        throw Error(20, "cyclic/aliased TIFF IFD");
+      if (seen.size() > 256)
+        throw Error(20, "too many TIFF IFDs");
+      auto n = read(at, 2);
+      std::map<uint32_t, uint32_t> values;
+      for (uint32_t i = 0; i < n; ++i) {
+        uint64_t p = uint64_t(at) + 2 + 12 * i;
+        auto tag = read(p, 2), type = read(p + 2, 2), count = read(p + 4, 4);
+        if (tag == 50706 && count == 4 && type == 1)
+          dng = true;
+        if (tag != 254 && tag != 256 && tag != 257 && tag != 262 && tag != 330)
+          continue;
+        if ((type != 3 && type != 4 && type != 13) || count == 0 || count > 256)
+          throw Error(20, "invalid TIFF routing tag");
+        uint32_t bytes = type == 3 ? 2 : 4;
+        uint64_t data = uint64_t(count) * bytes <= 4 ? p + 8 : read(p + 8, 4);
+        if (tag == 330) {
+          for (uint32_t k = 0; k < count; ++k)
+            pending.push_back(read(data + k * bytes, bytes));
+        } else {
+          if (count != 1 || values.count(tag))
+            throw Error(20, "ambiguous TIFF routing tag");
+          values[tag] = read(data, bytes);
+        }
       }
+      pending.push_back(read(uint64_t(at) + 2 + 12 * n, 4));
+      if (values[254] == 0 && values[256] > 0 && values[257] > 0)
+        candidates.push_back(
+            {at, values.count(262) ? std::optional(values[262]) : std::nullopt,
+             uint64_t(values[256]) * values[257]});
     }
-    pending.push_back(read(uint64_t(at) + 2 + 12 * n, 4));
-    if (values[254] == 0 && values[256] > 0 && values[257] > 0)
-      candidates.push_back(
-          {at, values.count(262) ? std::optional(values[262]) : std::nullopt,
-           uint64_t(values[256]) * values[257]});
+  } catch (const Error &) {
+    // Structural failure before any DNGVersion tag: the file is a TIFF
+    // container that is not a recognized DNG, so the converter decides.
+    if (!dng)
+      return std::nullopt;
+    throw;
   }
   if (!dng)
-    throw Error(20, "DNGVersion tag missing");
+    return std::nullopt; // TIFF without DNGVersion: not a recognized DNG
   if (candidates.size() != 1)
     throw Error(20, "expected exactly one full-resolution main RAW IFD");
   auto c = candidates.front();
   if (!c.pi)
     throw Error(21, "main RAW IFD PhotometricInterpretation missing");
-  return {c.offset, *c.pi};
+  return Routing{c.offset, *c.pi};
 }
 Route route(uint32_t p) {
   if (p == 34892)

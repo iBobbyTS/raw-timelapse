@@ -187,13 +187,15 @@ int main(int argc, char **argv) {
       throw Error(2, "analysis sidecar must be distinct from input and "
                      "outputs");
     auto routing = inspect(input);
-    auto kind = route(routing.photometric);
-    Vec own = read_neutral(input);
+    // Recognition is DNG-structural: only a recognized DNG is routed by its
+    // main RAW photometric; every other file is a vendor/other RAW candidate
+    // for the converter alone.
+    auto kind = routing ? route(routing->photometric) : Route::vendor_raw;
     std::string source_hash = sha256(input);
     Temp temp;
     fs::path decoded_path = input;
     Json conversion{{"used", false}};
-    if (kind == Route::converter) {
+    auto convert = [&] {
       fs::path dir = temp.path / "linear";
       fs::create_directory(dir);
       std::vector<std::string> command{converter, "-c",         "-l",
@@ -215,7 +217,7 @@ int main(int argc, char **argv) {
         throw Error(23, "Converter must produce exactly one DNG");
       decoded_path = files.front();
       auto check = inspect(decoded_path);
-      if (check.photometric != 34892)
+      if (!check || check->photometric != 34892)
         throw Error(23,
                     "Converter output main RAW IFD is not LinearRaw (34892)");
       std::vector<Json> args;
@@ -230,14 +232,27 @@ int main(int argc, char **argv) {
           {"stdout_stderr", transcript},
           {"output_name", decoded_path.filename().string()},
           {"output_sha256", sha256(decoded_path)},
-          {"verified_main_ifd_photometric", int(check.photometric)},
+          {"verified_main_ifd_photometric", int(check->photometric)},
           {"temporary_directory", temp.path.string()},
           {"cleanup", "removed before publishing sidecar"},
           {"upstream_semantics", "Converter performs CFA demosaic; detailed "
                                  "clipping/metadata baking UNKNOWN"}};
+    };
+    // "as-shot" metadata comes from the recognized DNG itself. A vendor/other
+    // input is hashed as the original file, but its neutral and capture time
+    // exist only in the converter's DNG output (probed: ADC preserves both).
+    Vec own;
+    if (kind == Route::vendor_raw) {
+      convert();
+      own = read_neutral(decoded_path);
+    } else {
+      own = read_neutral(input);
+      if (kind == Route::converter)
+        convert();
     }
     Decoded d = decode(decoded_path, wb ? wb : std::optional<Vec>(own));
-    auto capture_time = read_capture_time(input);
+    auto capture_time = read_capture_time(
+        kind == Route::vendor_raw ? decoded_path : input);
     const double gain = std::exp2(exposure_ev);
     const bool want_analysis = !analysis_path.empty();
     std::vector<uint16_t> pixels;
@@ -272,10 +287,15 @@ int main(int argc, char **argv) {
         {"schema_version", 1},
         {"source", input.string()},
         {"source_sha256", source_hash},
-        {"source_main_ifd_offset", int(routing.ifd)},
-        {"source_photometric", int(routing.photometric)},
-        {"route", kind == Route::direct ? "linearraw-sdk"
-                                        : "cfa-converter-linearraw-sdk"},
+        {"source_main_ifd_offset",
+         routing ? Json(int(routing->ifd)) : Json()},
+        {"source_photometric",
+         routing ? Json(int(routing->photometric)) : Json()},
+        {"route", kind == Route::direct
+                      ? "linearraw-sdk"
+                      : kind == Route::converter
+                            ? "cfa-converter-linearraw-sdk"
+                            : "vendor-raw-converter-linearraw-sdk"},
         {"converter", conversion},
         {"sdk_version", kDNGSDK_GetInfoVersion},
         {"sdk_build",

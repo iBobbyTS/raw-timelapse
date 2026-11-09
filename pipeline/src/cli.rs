@@ -23,7 +23,8 @@ USAGE:
     rawtl-linear-video --input <DIR> --output <DIR> [OPTIONS]
 
 REQUIRED:
-    --input <DIR>              Directory of .dng frames (read only, not overlapping output)
+    --input <DIR>              Directory of RAW or DNG frames: one file extension per directory;
+                               hidden files and .xmp sidecars are skipped (read only, not overlapping output)
     --output <DIR>             Run directory; must be absent or empty
 
 OPTIONS:
