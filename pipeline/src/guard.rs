@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result, EXIT_INPUT, EXIT_OUTPUT_GUARD, EXIT_OUTPUT_NOT_EMPTY};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub fn canonical_input(path: &Path) -> Result<PathBuf> {
     let canonical = fs::canonicalize(path).map_err(|err| {
@@ -29,7 +29,52 @@ pub fn canonical_input(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+/// Resolve existing parents (including symlinks) and append missing components
+/// without creating anything, so disjointness can be checked before writes.
+pub fn canonical_output(path: &Path) -> Result<PathBuf> {
+    let resolve_error = |err| {
+        Error::new(
+            EXIT_OUTPUT_GUARD,
+            format!("cannot resolve output directory {}: {err}", path.display()),
+        )
+    };
+    if path.as_os_str().is_empty() {
+        return fs::canonicalize(path).map_err(resolve_error);
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(resolve_error)?.join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        if component == Component::ParentDir {
+            resolved.pop();
+            continue;
+        }
+        resolved.push(component.as_os_str());
+        match fs::canonicalize(&resolved) {
+            Ok(canonical) => {
+                if !canonical.is_dir() {
+                    return Err(Error::new(
+                        EXIT_OUTPUT_GUARD,
+                        format!(
+                            "output path exists and is not a directory: {}",
+                            resolved.display()
+                        ),
+                    ));
+                }
+                resolved = canonical;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(resolve_error(err)),
+        }
+    }
+    Ok(resolved)
+}
+
 /// Create the run output directory if needed and return its canonical path.
+/// The caller must check disjointness using `canonical_output` before calling.
 /// The caller must still check emptiness before writing.
 pub fn prepare_output(path: &Path) -> Result<PathBuf> {
     if path.exists() {
@@ -159,12 +204,13 @@ mod tests {
     fn accepts_separate_directories() {
         let root = temp_root("separate");
         let input = root.join("material");
-        let output = root.join("run");
+        let output = root.join("missing-parent/run");
         fs::create_dir_all(&input).expect("create input");
-        fs::create_dir_all(&output).expect("create output");
         let input = fs::canonicalize(&input).expect("canonical");
-        let output = fs::canonicalize(&output).expect("canonical");
-        assert!(ensure_disjoint(&input, &output).is_ok());
+        let resolved = canonical_output(&output).expect("resolve missing output");
+        assert!(!output.parent().expect("parent").exists());
+        assert!(ensure_disjoint(&input, &resolved).is_ok());
+        assert_eq!(prepare_output(&resolved).expect("prepare output"), resolved);
     }
 
     #[test]
@@ -181,5 +227,11 @@ mod tests {
         let root = temp_root("empty");
         let output = prepare_output(&root).expect("prepare");
         assert!(ensure_output_empty(&output).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_output_path() {
+        let error = canonical_output(Path::new("")).expect_err("empty path must remain invalid");
+        assert_eq!(error.code, EXIT_OUTPUT_GUARD);
     }
 }
