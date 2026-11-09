@@ -1,9 +1,10 @@
 # rawtl-linear-video
 
-Rust driver for the minimal end-to-end linear time-lapse system: enumerate a
-directory of CFA/LinearRaw DNG frames, call the accepted `dng-linear-frame`
-producer once per frame, freeze the sequence white balance, encode a lossless
-16-bit scene-linear FFV1 video, validate it by full decode roundtrip, render a
+Rust driver for the end-to-end linear time-lapse system: enumerate a directory
+of CFA/LinearRaw DNG frames, call the accepted `dng-linear-frame` producer,
+freeze the sequence white balance, run the legacy V4 deflicker node (enabled by
+default), encode a lossless 16-bit scene-linear FFV1 video, validate it by full
+decode roundtrip, audit the encoded result independently, render a
 display-referred sRGB review preview, and publish both deliverables atomically.
 
 The crate has no external Rust dependencies, no async runtime and no Python in
@@ -30,7 +31,11 @@ rawtl-linear-video --input <DNG_DIR> --output <RUN_DIR> \
   [--ffmpeg /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg] \
   [--ffprobe /opt/homebrew/opt/ffmpeg-full/bin/ffprobe] \
   [--converter "/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter"] \
-  [--converter-timeout 120]
+  [--converter-timeout 120] \
+  [--strength 1.0] [--period 60] [--brightness smooth|uniform] \
+  [--estimator pairwise|legacy] [--ev-limits none|LOW,HIGH] \
+  [--roi X,Y,W,H] [--exclude-roi X0,Y0,X1,Y1 ...] [--step START:EV ...] \
+  [--on-review error|passthrough] [--temporal-quality strict|report|off]
 ```
 
 Defaults:
@@ -42,6 +47,10 @@ Defaults:
 - `--fps 30` — the frozen legacy default (`legacy/python/src/rawtl/cli.py:91`,
   `Fraction(30)`). Rational rates such as `30000/1001` are accepted; the
   positive-rate and `<= 1000` bounds match the legacy parser.
+- Deflicker defaults (`legacy/python/src/rawtl/cli.py:95-114`): strength 1.0,
+  period 60, brightness smooth, estimator pairwise, unbounded EV, full-frame
+  ROI, no exclusions or confirmed steps, `on_review=error`,
+  `temporal_quality=strict`. `--strength 0` disables the node entirely.
 
 `--converter` and `--converter-timeout` are forwarded to the native producer;
 by default the native tool uses the Adobe DNG Converter application path and
@@ -56,13 +65,17 @@ contain each other in either direction. The input directory is only read.
 <output>/
   frames/frame_%06d.png   RGB16 scene-linear ACEScg/AP1/D60 (code/16384)
   frames/frame_%06d.json  native producer sidecar (route, WB provenance, range, ...)
-  logs/frame_%06d.log     native command line, exit status, stdout/stderr, timing
-  logs/encode-linear.log
-  logs/roundtrip.log
-  logs/render-preview.log
-  logs/encode-preview.log
+  analysis/baseline/      per-frame 0 EV analysis sidecars (deflicker input)
+  analysis/applied/       per-frame applied-EV analysis sidecars (accepted round)
+  analysis/probe/         gain-probe measurements (when executed)
+  logs/                   per-pass native, encoder, roundtrip and audit transcripts
+  exposure_report.json    per-frame decisions, statuses, probe/audit summaries
+  exposure-curve.csv      legacy write_curve fields, one row per frame
+  temporal_audit.json     independent encoded-video audit (when executed)
+  pairs.csv, frames.csv   audit pair/frame evidence
   manifest.json           run provenance, frozen WB, fps provenance, encoder
-                          parameters, probe results, roundtrip and preview checks
+                          parameters, probe results, roundtrip/preview checks and
+                          the deflicker block (config, status counts, audit summary)
   linear-acescg-16bit-ffv1.mkv
   srgb-preview-h264.mp4
 ```
@@ -140,6 +153,88 @@ Unit tests assert neutral (`0.18 → 118,118,118`), a non-neutral reference
 transfer, and that treating AP1 values as display sRGB is rejected by the
 non-neutral test.
 
+## Deflicker node (legacy V4)
+
+The node is ported from the frozen `backup/main-legacy @ f6d3ae7`
+(`src/rawtl/exposure/**`, `service.py`, `quality/{photometry,video_audit}.py`)
+onto this synchronous CLI. Domain mapping is declared: the estimator consumes
+the analysis projection `0.2126/0.7152/0.0722` over ACEScg AP1/D60 scene-linear
+pixels (the same frozen WB as the delivery chain), not legacy's linear-sRGB
+render. The two per-tile occupancy series in the analysis sidecar remain
+distinct: `saturation_fraction` is the camera-domain gate (EV-invariant) and
+`output_clip_fraction` is the delivered-domain clip series (EV-dependent).
+
+Enabled path:
+
+1. **Analysis pass** — every frame is decoded at 0 EV with
+   `--no-png --emit-analysis`, using the accepted native producer and the
+   unchanged sequence-frozen white balance. Only measurements are kept. The
+   native metadata `exposure_ev` is checked at full precision; the analysis
+   sidecar's `exposure_ev` is checked at the producer's 10-significant-digit
+   decimal precision (exact 10-digit representation or half a decimal ulp), so
+   fractional corrections do not trip the seam while materially wrong gains are
+   still rejected.
+2. **Continuity** — capture-time gaps come from the median nominal interval
+   (`gap_factor 1.5`, at least 3 samples). Filename numeric jumps are report
+   metadata only. Missing `capture_time` degrades coverage to `filename_only`
+   and adds no audit boundaries.
+3. **Estimation** — the S02 engine (`rawtl_linear_video::deflicker`) runs the
+   whole-sequence V4 state machine: pairwise graph or legacy estimator, smooth
+   trend or uniform target, confirmed steps, EV limits, scene-cut metadata and
+   interpolated/lone-frame states.
+4. **Review policy** — any frame without a reliable EV estimate makes
+   `REVIEW_REQUIRED`. `--on-review error` (default) stops the run (exit 80);
+   `--on-review passthrough` renders it at 0 EV, marks
+   `PASSTHROUGH_UNCORRECTED_FRAME`, and reports `PARTIAL`.
+5. **Gain probe** — skipped when disabled, shorter than 8 frames or without a
+   reliable estimate; otherwise representative frames (up to five) are analyzed
+   at -0.25/+0.25 EV and the per-tile log response must match the requested EV
+   (median |error| <= 0.02, P95 <= 0.05). Failure stops the run (exit 81).
+6. **Application pass** — frames are re-decoded with `--exposure-ev <applied>`
+   and an analysis sidecar, writing the PNG/metadata pair plus applied-EV
+   measurements. `new_output_clipping_fraction` is the per-tile positive
+   increase of `output_clip_fraction` over the 0 EV baseline divided by tile
+   count.
+7. **Render validation and feedback** — the applied measurements are compared
+   with the frozen targets (`median <= 0.01 EV`, `P95 <= 0.03 EV`, no severe
+   frame) using one shared offset. At most two feedback updates change
+   `applied_ev` only (damping 0.75, step 0.25); divergence aborts and keeps the
+   best round; a best round that still fails ends the run `TARGET_NOT_REACHED`
+   (exit 82) without publishing. All-unobservable validation is reported as
+   `NOT_VERIFIED_NO_CONSENSUS` / `NOT_INDEPENDENT_LEGACY`, never as a pass.
+8. **Encode / validate / roundtrip / preview** — unchanged from the linear
+   pipeline above.
+9. **Independent audit** — the temporary linear master is decoded by ffmpeg as
+   `rgb48le`, converted with the declared `linear16` inverse transfer
+   (`code / 16384`), area-reduced in linear light, and measured on a 24x18 tile
+   grid with the same paired photometric mathematics as legacy. Audit
+   boundaries are scene cuts union capture-time gaps. The delivered-code
+   saturation proxy is `code >= int(0.965 * 65535)` — a literal port applied to
+   the 16-bit delivered codes, deliberately not the sidecar's linear-scale
+   `16057` series. `strict` fails the run on `FAIL` (exit 83, no publication);
+   `report` publishes as `COMPLETED_WITH_REVIEW`; `off` records `SKIPPED`.
+   Observation failures are recorded as `UNOBSERVABLE`, never as a pass.
+10. **Reports and publication** — `exposure_report.json` and
+    `exposure-curve.csv` are written atomically before the manifest and
+    publication. Any failure after the guarded output directory exists retains
+    a report, including required-executable (exit 20) and source-enumeration
+    (exit 10) failures before the first frame (the report may carry an empty
+    frame list); guard/usage rejections happen before report initialization and
+    produce none. A report-write failure on the failure path does not mask the
+    original error. The manifest gains a `deflicker` block with config, status counts,
+    probe and audit summaries. Atomic publication is unchanged.
+
+Declared boundaries: the audit's linear16 analysis assumption (the stream has
+no colour tags), legacy float32 area reduction versus this f64 reduction
+(semantically equal, not bit-identical), and encoder byte determinism
+(Matroska metadata is not stable; FFV1 payload identity is proven by the
+lossless roundtrip and framemd5 diagnostics).
+
+`--strength 0` is the REQ-011 regression path: a single pass with the exact
+historical native argument shape (no analysis, probe, validation or audit),
+`DISABLED` frame records in the report and a disabled manifest block. It
+reproduces the pre-deflicker PNG/video content byte-for-byte.
+
 ## Failure semantics and exit codes
 
 Any frame failure stops the run immediately: the failing frame name, exit code,
@@ -161,16 +256,27 @@ possible.
 | 50 | ffprobe validation or lossless-roundtrip failure |
 | 60 | sRGB preview render/encode/validation failure |
 | 70 | Manifest publication or final rename failure |
+| 80 | `REVIEW_REQUIRED` with `--on-review error` |
+| 81 | Gain probe failed |
+| 82 | Render targets not reached (`TARGET_NOT_REACHED`) |
+| 83 | Encoded temporal audit `FAIL` under `--temporal-quality strict` |
 
 ## Tests
 
 `cargo test` runs unit tests plus integration tests that use the real ffmpeg at
-the default path and a fake native producer (a shell script writing tiny
-16-bit PNG fixtures and schema_version 1 sidecars). The fake producer covers:
-numeric ordering (`IMG_1, IMG_2, IMG_10`), frozen-WB propagation and detection
-of a producer that ignores the override, fail-fast on a bad frame, encoder
-failure after bytes are written, ffprobe rejection, roundtrip mismatch, and
-directory guards. Real-material runs are opt-in:
+the default path and a fake native producer (a standalone Rust program compiled
+once by the harness, writing 16-bit PNG fixtures, native metadata and analysis
+sidecars). The producer covers numeric ordering (`IMG_1, IMG_2, IMG_10`),
+frozen-WB propagation and drift detection, fail-fast, encoder failure after
+bytes are written, ffprobe rejection, roundtrip mismatch and directory guards.
+Deflicker scenarios cover injected alternating gain (corrected, audit passes),
+confirmed steps (requested EV preserved; the legacy shared-offset render check
+reports a genuine level step as `TARGET_NOT_REACHED`), EV limits (`LIMITED`
+with requested != applied), render under-execution, `on_review` error versus
+passthrough, a wrong correction that passes the gain probe but fails the encoded
+audit (no publication), and the `--strength 0` regression path (fixture-equal
+PNGs, identical FFV1 content and encoder arguments). Real-material runs are
+opt-in:
 
 ```sh
 pipeline/target/release/rawtl-linear-video \
@@ -181,7 +287,8 @@ pipeline/target/release/rawtl-linear-video \
 
 ## Non-goals
 
-No deflicker/exposure estimation, plugin ABI, graph engine, events, Stage 1
-cache, official Log output, GPU, packaging, or Python runtime. The frozen
-legacy Python implementation remains read-only and is not a numerical oracle
-for this ACEScg chain.
+No plugin ABI, events, Stage 1 cache, official Log output, GPU, packaging or
+Python runtime. The deflicker node uses no Python/SciPy/rawpy. Multi-ROI audit,
+chroma-variation analysis and progress callbacks remain out of scope. The frozen
+legacy Python implementation remains read-only and is not a numerical oracle for
+this ACEScg chain.

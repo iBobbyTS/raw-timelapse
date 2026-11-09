@@ -1,22 +1,33 @@
 //! rawtl-linear-video: DNG frame sequence -> 16-bit scene-linear FFV1 video
 //! plus a display-referred sRGB review preview.
+//!
+//! The deflicker node (legacy V4 semantics) is enabled by default; every pass,
+//! failure path, report and publication rule lives in the modules below.
 
+mod audit;
 mod cli;
+mod deflicker_run;
 mod error;
 mod frame;
 mod guard;
-mod json;
 mod manifest;
 mod order;
 mod preview;
 mod proc;
 mod video;
 
+// The binary and the library compile the same source files. Re-exporting the
+// library modules keeps a single nominal `Json`/`deflicker` type across the
+// engine and the process orchestration.
+pub use rawtl_linear_video::deflicker;
+pub use rawtl_linear_video::json;
+
 use cli::{Options, Parsed};
 use error::{Error, Result, EXIT_PUBLISH, EXIT_TOOL};
+use order::SourceFrame;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn main() {
@@ -40,6 +51,15 @@ fn main() {
     }
 }
 
+pub struct RunContext<'a> {
+    pub options: &'a Options,
+    pub input: &'a Path,
+    pub output: &'a Path,
+    pub sources: &'a [SourceFrame],
+    pub partial_dir: PathBuf,
+    pub started: Instant,
+}
+
 fn run(options: &Options) -> Result<()> {
     let started = Instant::now();
     let input = guard::canonical_input(&options.input)?;
@@ -48,54 +68,11 @@ fn run(options: &Options) -> Result<()> {
     let output = guard::prepare_output(&output)?;
     guard::ensure_output_empty(&output)?;
 
-    proc::require_executable(&options.native_tool, "--dng-linear-frame")?;
-    proc::require_executable(&options.ffmpeg, "--ffmpeg")?;
-    proc::require_executable(&options.ffprobe, "--ffprobe")?;
-
-    println!("rawtl-linear-video {}", env!("CARGO_PKG_VERSION"));
-    println!("input:  {}", input.display());
-    println!("output: {}", output.display());
-    println!(
-        "fps:    {} ({})",
-        options.fps.arg(),
-        if options.fps_explicit {
-            "CLI override"
-        } else {
-            cli::LEGACY_FPS_PROVENANCE
-        }
-    );
-
-    let sources = order::enumerate_dng(&input)?;
-    println!("found {} DNG frame(s) in numeric order:", sources.len());
-    for (index, source) in sources.iter().enumerate() {
-        println!("  {:>3}. {}", index + 1, source.name);
-    }
-
-    let frames_dir = output.join("frames");
-    let logs_dir = output.join("logs");
-    let sequence = frame::produce(
-        &options.native_tool,
-        &sources,
-        &frames_dir,
-        &logs_dir,
-        options.converter.as_deref(),
-        options.converter_timeout,
-    )?;
-    println!(
-        "frozen white balance: {} from {} (applied to every later frame)",
-        frame::format_wb(sequence.reference_wb),
-        sequence.reference_frame
-    );
-    println!(
-        "frames complete: {} frames of {}x{} in {:.2}s",
-        sequence.frames.len(),
-        sequence.width,
-        sequence.height,
-        sequence.total_duration.as_secs_f64()
-    );
-
+    // The guarded, writable output directory is established. From here on every
+    // failure (including required-executable and source-enumeration failures)
+    // must retain a report; guard rejections above stay report-free.
     let partial_dir = output.join(".rawtl-partial");
-    let outcome = finish(options, &input, &output, &sequence, &partial_dir, started);
+    let outcome = deflicker_run::run(options, &input, &output, started);
     if outcome.is_err() && partial_dir.exists() {
         eprintln!(
             "note: partial/intermediate artifacts retained at {}; no final deliverable name was published",
@@ -105,14 +82,26 @@ fn run(options: &Options) -> Result<()> {
     outcome
 }
 
-fn finish(
-    options: &Options,
-    input: &Path,
-    output: &Path,
+pub struct EncodedStage {
+    pub temp_linear: PathBuf,
+    pub temp_preview: PathBuf,
+    pub linear_probe: video::ProbeInfo,
+    pub roundtrip: video::RoundtripReport,
+    pub preview_probe: video::ProbeInfo,
+    pub linear_bytes: u64,
+    pub preview_bytes: u64,
+    pub timings: BTreeMap<String, Duration>,
+}
+
+/// Encode the accepted frame directory, validate the stream, prove the lossless
+/// roundtrip and render/validate the preview. Shared by both deflicker paths.
+pub fn encode_and_validate(
+    context: &RunContext<'_>,
     sequence: &frame::FrameSequence,
-    partial_dir: &Path,
-    started: Instant,
-) -> Result<()> {
+) -> Result<EncodedStage> {
+    let options = context.options;
+    let output = context.output;
+    let partial_dir = &context.partial_dir;
     fs::create_dir_all(partial_dir).map_err(|err| {
         Error::new(
             EXIT_PUBLISH,
@@ -244,37 +233,69 @@ fn finish(
         )
     })?;
 
-    timings.insert("total".to_string(), started.elapsed());
+    Ok(EncodedStage {
+        temp_linear,
+        temp_preview,
+        linear_probe,
+        roundtrip,
+        preview_probe,
+        linear_bytes,
+        preview_bytes,
+        timings,
+    })
+}
+
+/// Build and write the manifest, then publish both validated deliverables.
+pub fn publish_run(
+    context: &RunContext<'_>,
+    sequence: &frame::FrameSequence,
+    mut stage: EncodedStage,
+    deflicker: json::Json,
+) -> Result<()> {
+    let options = context.options;
+    let output = context.output;
+    stage
+        .timings
+        .insert("total".to_string(), context.started.elapsed());
 
     let manifest_json = manifest::build(&manifest::ManifestInput {
         options,
-        input,
+        input: context.input,
         output,
         sequence,
-        linear_probe: &linear_probe,
-        roundtrip: &roundtrip,
-        preview_probe: &preview_probe,
-        linear_bytes,
-        preview_bytes,
+        linear_probe: &stage.linear_probe,
+        roundtrip: &stage.roundtrip,
+        preview_probe: &stage.preview_probe,
+        linear_bytes: stage.linear_bytes,
+        preview_bytes: stage.preview_bytes,
         ffmpeg_version: tool_version(&options.ffmpeg).unwrap_or_else(|| "UNKNOWN".to_string()),
         ffprobe_version: tool_version(&options.ffprobe).unwrap_or_else(|| "UNKNOWN".to_string()),
-        timings: &timings,
+        timings: &stage.timings,
+        deflicker,
     });
     manifest::write(&output.join("manifest.json"), &manifest_json)?;
 
     let final_linear = output.join(video::LINEAR_FINAL_NAME);
     let final_preview = output.join(video::PREVIEW_FINAL_NAME);
-    video::publish(&temp_linear, &final_linear, &temp_preview, &final_preview)?;
+    video::publish(
+        &stage.temp_linear,
+        &final_linear,
+        &stage.temp_preview,
+        &final_preview,
+    )?;
 
-    match fs::remove_dir_all(partial_dir) {
+    match fs::remove_dir_all(&context.partial_dir) {
         Ok(()) => {}
         Err(err) => eprintln!(
             "warning: could not remove partial directory {}: {err}",
-            partial_dir.display()
+            context.partial_dir.display()
         ),
     }
 
-    println!("\nrun complete in {:.2}s", started.elapsed().as_secs_f64());
+    println!(
+        "\nrun complete in {:.2}s",
+        context.started.elapsed().as_secs_f64()
+    );
     println!("linear video: {}", final_linear.display());
     println!("sRGB preview: {}", final_preview.display());
     println!("manifest:     {}", output.join("manifest.json").display());

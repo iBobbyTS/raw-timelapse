@@ -217,3 +217,62 @@
 - **不声称**：与 legacy/rawpy 的数值等同；视频字节可复现；preview 是可测量的交付域（它只是 display-referred 眼检预览）；`.DS_Store` 等 Finder 元数据不影响交付物。
 - JSON/manifest 含运行路径与耗时，非确定性合同的一部分；确定性证据针对原生 PNG（S01）与本次无损往返（内容级）。
 - 本节完成的是 T14 邻近编码竖切的最小系统语义；T14 的插件/官方 profile/审计框架、T13 的 Log 输出、T15/T16 等不在本计划范围。independent code review、Section acceptance 与 commit 由 Main 负责。
+
+## 2026-11-09 — S03 / F01：去闪节点管线集成（两遍编排/验证反馈/独立审计/报告/端到端）
+
+本节对应用户任务 COR-004（把 legacy V4 去闪子系统重建为当前系统的处理节点）在 F01 的 S03 竖切：CLI 参数、两遍编排、增益探针、渲染验证与 ≤2 次反馈、独立编码视频审计、曝光报告/曲线、manifest 去闪块、原子发布与 `--strength 0` 回归路径。实现位于 `pipeline/src/{main,cli,error,frame,manifest,audit,deflicker_run}.rs`、`pipeline/tests/**`、`pipeline/README.md`；除 Main 授权的 `native/dng-linear-frame/README.md` 交叉引用（repair-1）外未修改 `native/**`（S01 冻结）；未修改 `pipeline/src/deflicker/**` 引擎内部、`git-worktree/**`、颜色/量化/WB 决策。提交由 Main 负责，本执行者没有 commit/push/分支操作。
+
+### 环境与构建
+
+- macOS 27.0（darwin 27.0.0）arm64；rustc/cargo 1.99.1（Homebrew）；ffmpeg/ffprobe 8.0.1（`/opt/homebrew/opt/ffmpeg-full/bin`）。
+- native 工具从当前源码全新构建（构建目录先清空）：`cmake -S native/dng-linear-frame -B .agent-work/tmp/deflicker-node/s03/native-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/homebrew` → `cmake --build ... -j 8`，exit 0；`ctest --test-dir ... --output-on-failure` → 3/3 pass（`logs/native-configure.log`、`native-build.log`、`native-ctest.log`）。未复用 S01 旧二进制。
+- pipeline：`cargo clean` + `cargo build --release`，exit 0（`logs/pipeline-build-release*.log`）。修复轮次后的最终 `cargo test`：**90 lib + 42 bin 单测 + 17 集成测试 = 149 passed，0 failed**，exit 0（repair-2 证据 `repair-2/repair-2-cargo-test.*`；初版 145 为修复前计数，已被取代）。
+
+### CLI 与默认值
+
+- 新增 `--strength`（1.0）、`--period`（60，>=6）、`--brightness smooth|uniform`、`--estimator pairwise|legacy`、`--ev-limits none|LOW,HIGH`、`--roi X,Y,W,H`、`--exclude-roi X0,Y0,X1,Y1`（可重复）、`--step START:EV`（可重复、0 基）、`--on-review error|passthrough`、`--temporal-quality strict|report|off`。默认值即 legacy V4 默认（`legacy/python/src/rawtl/cli.py:95-114`），去闪默认开启。
+- 新增退出码：80 `REVIEW_REQUIRED`、81 增益探针失败、82 `TARGET_NOT_REACHED`、83 编码审计 strict `FAIL`；现有 2/10/11/12/20/30/40/50/60/70 不变。USAGE 与 `pipeline/README.md` 已同步。
+- `--strength 0`：单遍、无分析/探针/验证/审计执行，报告逐帧 `DISABLED`，manifest `deflicker.enabled=false`；native 参数形状与改动前完全一致（不附加 `--exposure-ev/--emit-analysis/--no-png`）。
+
+### 编排语义（同步 CLI）
+
+分析遍（`--no-png --emit-analysis`，0 EV，序列冻结 WB 不变）→ capture-time 连续性（中位标称间隔、gap_factor 1.5、≥3 样本；文件名数字跳变仅报告元数据）→ S02 估计 → REVIEW 策略（默认 error→80；passthrough→0 EV 渲染并标记 `PASSTHROUGH_UNCORRECTED_FRAME`，报告 `PARTIAL`）→ 增益探针（strength 0 / n<8 / 无可靠估计→`SKIPPED`；否则代表帧 ≤5 × ±0.25 EV，门 median≤0.02、P95≤0.05）→ 应用遍（逐帧 `--exposure-ev=applied --emit-analysis` + PNG）→ `evaluate_render`（不可观测→`NOT_VERIFIED_NO_CONSENSUS`/`NOT_INDEPENDENT_LEGACY`，绝不伪造 PASS）→ ≤2 次反馈（只改 applied EV；发散保最优；仍不达标→82 且不发布）→ 现有编码/ffprobe/无损往返/预览 → 独立审计（ffmpeg `rgb48le` 解码线性母版、`linear16`（code/16384）逆传递、f64 BOX 面积降采样、24×18 paired photometry；边界=scene cuts ∪ capture-time gaps；交付码饱和代理 `code>=int(0.965*65535)`，与 sidecar 的 16057 线性刻度序列明确区分）→ `exposure_report.json` + `exposure-curve.csv`（守卫后的失败也写；报告写失败不掩盖原始错误）→ manifest `deflicker` 块 → 原子发布。`new_output_clipping_fraction` = applied 与 0 EV baseline 的逐 tile `output_clip_fraction` 正增量之和 / tile 数。守卫后的失败一律保留报告——包括首帧之前的必需可执行文件检查（exit 20）与源枚举（exit 10）失败（报告允许空 frames）；守卫/用法拒绝仍不产生报告。分析 sidecar 的 `exposure_ev` 按 producer 的 10 位有效数字精度校验（精确 10 位格式或半 ulp 界），native metadata JSON 的 `exposure_ev` 仍按全精度精确校验；因此分数 EV 不会误报 exit 30，而实质错误的增益仍被拒绝。
+
+### 真实样例（39 帧，默认参数）— 如实结果
+
+命令：`rawtl-linear-video --input /Users/ibobby/Temp/tl --output outputs/deflicker-node-e2e --dng-linear-frame <fresh native>`。真实退出码 **80**，`run_status=REVIEW_REQUIRED`：分析遍 39 帧 40.74s，估计后 **39/39 帧 REVIEW_REQUIRED**；pairwise 候选边 164、可靠边 0，拒绝原因 `structure_mad=164 / colour_change=164 / insufficient_support=164`；scene cuts 29，capture-time gaps 0（标称间隔 5s）。增益探针未执行（REVIEW 在探针前终止）。这不是实现缺陷：冻结 legacy golden `legacy/python/tests/fixtures/real-material/exposure-plan.json` 在同一素材、同一默认参数下达到 **状态级等价**——39/39 REVIEW_REQUIRED、0 条可靠边（164 条候选全部拒绝，per-lag 拒绝数 38/37/35/31/23 完全一致）；拒绝原因计数有 2 条差异：golden 为 structure_mad=164、colour_change=162、insufficient_support=164，本次为 164/164/164；scene cuts 30（本次 29，阈值边缘）。真实素材是夜间行车延时（每帧 5s，画面内容持续变化），matched-background 估计器没有可用背景。按 legacy 语义，默认 `on_review=error` 应在该状态失败，故未发布视频；`exposure_report.json`/`exposure-curve.csv` 已写。域映射导致的数值边界差异：scene cuts 29 vs legacy 30（阈值边缘），不改变状态结论。
+
+为完整覆盖后半程，补充一次 `--on-review passthrough`（其余默认）：exit **0**，`PARTIAL`/`COMPLETED_WITH_REVIEW`，39 帧以 0 EV 输出并逐帧标记，探针 `SKIPPED`（无可靠曝光），审计 `SHORT_CONTEXT`（29 个边界→30 段，0 events），FFV1 无损往返 `PASS`，线性视频/预览/报告/曲线/`temporal_audit.json`/`pairs.csv`/`frames.csv` 齐备；ffprobe：`ffv1/gbrp16le/4000x2256/39 帧/30 fps`，preview `h264/yuv420p/4000x2256/39`。该补充运行不属于 AC2 的“默认参数”判定，仅证明失败状态之外的链路。
+
+### REQ-011 回归（`--strength 0`，真实样例）— 需要 Main/owner 决策
+
+- 39 帧 PNG：与存档 `.agent-work/tmp/linear-video-pipeline/logs/frame-png-sha256.txt` **39/39 逐字节一致**（mismatched=0，`e2e/regression/frame-compare.txt`）。
+- preview MP4：SHA-256 与存档一致 `9192449d…`（派生物，不作 REQ-011 判定）。
+- 线性母版 MKV：文件大小相同（583,584,930 bytes），但 SHA-256 不同（本次 `27a86c23…`，存档 `9aae33e5…`）。差异仅 **43 字节**，全部位于 Matroska 头部（`DateUTC` 220–223、`SegmentUID` 264–279，以及头部 CRC/时间相关字段）；解码后的 FFV1 内容逐帧 **39/39 framemd5 相同**（`regression-framemd5-compare.txt`：mismatched_frames=0），进程内无损往返亦 `PASS`。
+- 根因与实现无关：同一份 PNG 序列用同一 ffmpeg 8.0.1 命令连续 mux 两次即产生不同 MKV（实验记录见 `e2e/regression/container-determinism-experiment.txt`；`-fflags +bitexact -flags +bitexact` 也不能消除随机 SegmentUID/DateUTC）。因此“线性母版 MKV 逐字节等于 @f461baa 存档”在**当前编码器字节确定性边界**内不可实现；PNG 部分（REQ-011 的确定性主体）已逐字节满足。
+- 按 TASK 要求，本节**不将 framemd5 内容一致视为 REQ-011 通过**：线性母版字节不一致须上报 Main，由 owner 决策“修订 REQ-011 为内容/无损往返判定，或引入可复现的 muxer 方案并重制基线”。本执行者未修改编码参数或基线。
+
+### 报告确定性
+
+默认参数运行（失败路径）重跑一次（独立输出目录）：两次 `exposure_report.json` 在归一化 `config.output` 后**逐字节相同**（浮点固定格式、无耗时/时间戳字段），两次退出码均 80（`e2e/default/report-determinism.txt`）。
+
+### 检查与证据
+
+| 命令/选择 | 真实退出码与结果 | 证据（根=`.agent-work/tmp/deflicker-node/s03/`） |
+| --- | --- | --- |
+| native 全新 configure/build/ctest | 0/0/0；3/3 tests pass | `logs/native-*.log` |
+| `cargo clean` + `cargo test` | 0；145 passed（90+40+15），0 failed | `logs/cargo-clean-final.*`、`cargo-test-final.*` |
+| 39 帧默认参数 e2e | **80**（REVIEW_REQUIRED，39/39 review，0 条边） | `e2e/default/e2e-default.*`、`exposure_report.json`、`exposure-curve.csv` |
+| 默认参数重跑（报告确定性） | 80；报告归一化后相同 | `e2e/default/e2e-default-rerun.*`、`report-determinism.txt` |
+| 39 帧 passthrough e2e（补充） | 0；PARTIAL；审计 SHORT_CONTEXT；roundtrip PASS | `e2e/passthrough/*` |
+| 39 帧 `--strength 0` | 0；PNG 39/39 一致；framemd5 39/39 一致；MKV 容器 43 字节差异 | `e2e/regression/*` |
+| 集成测试（合成 DNG + 真实 ffmpeg） | 15/15 pass | `logs/cargo-test-final.stdout` |
+
+集成测试覆盖：默认 pairwise 纠正交替增益且审计 PASS；确认台阶（估计侧保留、共享 offset 渲染检查判 `TARGET_NOT_REACHED`）；`--ev-limits`→LIMITED 且 requested≠applied；探针路径正确而渲染欠执行→82；`on_review` error→80 / passthrough→0 EV 标记；错误修正过探针但审计 strict FAIL→83 且不发布；`--strength 0` 单遍回归（PNG fixture 逐字节、FFV1 内容与编码参数一致）。
+
+### NOT_TESTED / UNKNOWN / 边界
+
+- **NOT_TESTED**：Windows/Linux；真实素材上的成功发布路径（该素材按 legacy 语义就是 REVIEW_REQUIRED，passthrough 仅补充后半程）；真实素材 `--step`/`--roi`/`--exclude-roi`/`--ev-limits` 组合；审计 JSON 的 `video_sha256`（纯 std 无哈希实现，记录为 `NOT_COMPUTED_STD_ONLY`，内容身份由无损往返证明）；多 ROI/chroma variation（legacy 明示 NOT_IMPLEMENTED）。
+- **UNKNOWN**：跨 provider（legacy rawpy/linear-sRGB ↔ ACEScg）数值等同；审计面积降采样与 legacy float32 的逐位一致（声明为语义等价、非逐位）；ffmpeg/Matroska 容器字节确定性的稳定方案。
+- **不声称**：与 legacy 产生域数值等同；MKV 容器字节可复现；审计 PASS 等价于“物理光照未变化”；`--strength 0` 的载荷字节由本次证据覆盖，不代表其他 ffmpeg 版本。
+- `native/dng-linear-frame/README.md`：repair 1 经 Main 授权仅新增一段交叉引用（分析遍/探针使用 `--exposure-ev/--emit-analysis/--no-png`、应用遍使用 `--exposure-ev/--emit-analysis`，编排见 `pipeline/README.md`）；未改动任何 native 代码/测试/CMake。

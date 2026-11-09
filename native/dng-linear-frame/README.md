@@ -103,6 +103,14 @@ The same input and options produce byte-identical sidecar JSON (fixed
 `source_sha256`, analysis geometry, `exposure_ev`, the fixed analysis constants,
 and the row-major tile list.
 
+Pipeline consumption: the `rawtl-linear-video` sequence driver invokes this tool
+with `--exposure-ev`, `--emit-analysis` and `--no-png` during its deflicker
+analysis pass and gain probes, and with `--exposure-ev` plus `--emit-analysis`
+during each application pass. See `pipeline/README.md` for the orchestration,
+report and audit flow. The two occupancy series feed distinct decisions:
+camera-domain occupancy gates tile validity/estimation, while delivered-domain
+occupancy drives the report's output-clipping delta.
+
 Routing reads classic TIFF directory metadata **before SDK entry**, requires
 DNGVersion and exactly one full-resolution (`NewSubfileType=0`) main RAW IFD,
 and ignores reduced-resolution previews. BigTIFF and ambiguous full-resolution

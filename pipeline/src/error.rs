@@ -13,6 +13,11 @@ pub const EXIT_ENCODE: i32 = 40;
 pub const EXIT_VALIDATION: i32 = 50;
 pub const EXIT_PREVIEW: i32 = 60;
 pub const EXIT_PUBLISH: i32 = 70;
+/// Deflicker states keep legacy run_status meaning and get their own codes.
+pub const EXIT_REVIEW: i32 = 80;
+pub const EXIT_GAIN_PROBE: i32 = 81;
+pub const EXIT_RENDER_VALIDATION: i32 = 82;
+pub const EXIT_AUDIT: i32 = 83;
 
 #[derive(Debug, Clone)]
 pub struct Error {
