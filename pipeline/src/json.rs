@@ -86,6 +86,7 @@ pub fn parse(text: &str) -> std::result::Result<Json, String> {
     let mut parser = Parser {
         bytes: text.as_bytes(),
         pos: 0,
+        depth: 0,
     };
     parser.skip_whitespace();
     let value = parser.value()?;
@@ -99,6 +100,7 @@ pub fn parse(text: &str) -> std::result::Result<Json, String> {
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -132,6 +134,16 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self) -> std::result::Result<Json, String> {
+        if self.depth >= 128 {
+            return Err("JSON nesting limit exceeded".to_string());
+        }
+        self.depth += 1;
+        let result = self.value_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn value_inner(&mut self) -> std::result::Result<Json, String> {
         match self.peek() {
             Some(b'{') => self.object(),
             Some(b'[') => self.array(),
@@ -384,8 +396,10 @@ impl<'a> Parser<'a> {
             }
         }
         text.parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
             .map(Json::Float)
-            .map_err(|_| format!("invalid number '{text}'"))
+            .ok_or_else(|| format!("invalid or nonfinite number '{text}'"))
     }
 }
 
