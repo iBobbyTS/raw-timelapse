@@ -1,12 +1,13 @@
 """Regression checks for the frozen V4 golden fixtures (T00).
 
-These tests validate the committed fixture artifacts only; they do not need the
-read-only RAW material and never regenerate anything. Field-by-field replay of
-the algorithm against the material happens in the later Rust migration tasks.
+These tests validate the committed fixture artifacts and generator path safety;
+they do not need the read-only RAW material and never regenerate anything.
+Field-by-field replay against the material happens in later Rust migration tasks.
 """
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 
@@ -127,3 +128,165 @@ def test_end_to_end_baseline_matches_reference_artifact():
     assert record["service_result"]["encoder"] == "libx264"
     assert all(frame["applied_ev"] is None for frame in report["frames"])
     assert report["run_status"] == "PARTIAL"
+
+
+@pytest.fixture(scope="module")
+def golden_generator():
+    source = Path(__file__).resolve().parents[1] / "tools" / "generate_golden_fixtures.py"
+    spec = importlib.util.spec_from_file_location("golden_generator_tests", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _directory_snapshot(root):
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes() if path.is_file() else None
+        for path in root.rglob("*")
+    }
+
+
+@pytest.mark.parametrize("case", [
+    "input", "input-parent", "input-child", "output", "output-parent",
+    "output-child", "input-symlink", "output-symlink",
+])
+def test_generator_rejects_overlapping_work_paths(golden_generator, tmp_path, case):
+    input_dir = tmp_path / "material" / "input"
+    input_dir.mkdir(parents=True)
+    (input_dir / "frame.DNG").write_bytes(b"read-only material")
+    output_dir = tmp_path / "fixtures"
+    output_dir.mkdir()
+    (output_dir / "keep.json").write_bytes(b"existing fixture")
+    work_dir = {
+        "input": input_dir,
+        "input-parent": input_dir.parent,
+        "input-child": input_dir / "scratch",
+        "output": output_dir,
+        "output-parent": tmp_path,
+        "output-child": output_dir / "scratch",
+    }.get(case)
+    if case.endswith("symlink"):
+        work_dir = tmp_path / "alias"
+        work_dir.symlink_to(input_dir if case == "input-symlink" else output_dir,
+                            target_is_directory=True)
+    before = _directory_snapshot(tmp_path)
+    with pytest.raises(ValueError, match="work directory must not overlap"):
+        golden_generator.validate_directories(input_dir, output_dir, work_dir)
+    assert _directory_snapshot(tmp_path) == before
+
+
+def test_generator_cli_rejects_overlap_before_mutation(
+    golden_generator, tmp_path, monkeypatch, capsys,
+):
+    input_dir = tmp_path / "material"
+    input_dir.mkdir()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid paths must be rejected before mutation or generation")
+
+    monkeypatch.setattr(Path, "mkdir", forbidden)
+    monkeypatch.setattr(golden_generator.shutil, "rmtree", forbidden)
+    monkeypatch.setattr(golden_generator, "generate", forbidden)
+    with pytest.raises(SystemExit) as error:
+        golden_generator.main([
+            "--input-dir", str(input_dir), "--output-dir", str(tmp_path / "fixtures"),
+            "--work-dir", str(input_dir),
+        ])
+    assert error.value.code == 2
+    assert "work directory must not overlap" in capsys.readouterr().err
+
+
+def test_generator_refuses_preexisting_work_directory(
+    golden_generator, tmp_path, monkeypatch, capsys,
+):
+    input_dir = tmp_path / "material"
+    output_dir = tmp_path / "fixtures"
+    work_dir = tmp_path / "unrelated"
+    for directory in (input_dir, output_dir, work_dir / "e2e"):
+        directory.mkdir(parents=True)
+        (directory / "keep").write_bytes(b"must survive")
+    before = _directory_snapshot(tmp_path)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("a pre-existing work directory must not reach generation or cleanup")
+
+    monkeypatch.setattr(golden_generator, "generate", forbidden)
+    monkeypatch.setattr(golden_generator.shutil, "rmtree", forbidden)
+    with pytest.raises(SystemExit) as error:
+        golden_generator.main([
+            "--input-dir", str(input_dir), "--output-dir", str(output_dir),
+            "--work-dir", str(work_dir),
+        ])
+    assert error.value.code == 2
+    assert "work directory must not already exist" in capsys.readouterr().err
+    assert _directory_snapshot(tmp_path) == before
+
+
+def test_generator_does_not_clean_work_created_after_validation(
+    golden_generator, tmp_path, monkeypatch, capsys,
+):
+    input_dir = tmp_path / "material"
+    input_dir.mkdir()
+    output_dir = tmp_path / "fixtures"
+    work_dir = tmp_path / "scratch"
+    validate = golden_generator.validate_directories
+
+    def validate_then_create(*args):
+        resolved = validate(*args)
+        work_dir.mkdir()
+        (work_dir / "keep").write_bytes(b"created by another invocation")
+        return resolved
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("failed exclusive creation must not reach generation or cleanup")
+
+    monkeypatch.setattr(golden_generator, "validate_directories", validate_then_create)
+    monkeypatch.setattr(golden_generator, "generate", forbidden)
+    monkeypatch.setattr(golden_generator.shutil, "rmtree", forbidden)
+    with pytest.raises(SystemExit) as error:
+        golden_generator.main([
+            "--input-dir", str(input_dir), "--output-dir", str(output_dir),
+            "--work-dir", str(work_dir),
+        ])
+    assert error.value.code == 2
+    assert "work directory must not already exist" in capsys.readouterr().err
+    assert (work_dir / "keep").read_bytes() == b"created by another invocation"
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("explicit_work", [False, True], ids=["default", "explicit"])
+@pytest.mark.parametrize("fail_generation", [False, True], ids=["success", "failure"])
+def test_generator_cleans_only_owned_scratch(
+    golden_generator, tmp_path, monkeypatch, explicit_work, fail_generation,
+):
+    input_dir = tmp_path / "material"
+    output_dir = tmp_path / "fixtures"
+    unrelated = tmp_path / "unrelated"
+    for directory in (input_dir, output_dir, unrelated):
+        directory.mkdir()
+        (directory / "keep").write_bytes(b"must survive")
+    before = _directory_snapshot(tmp_path)
+    work_dir = tmp_path / ("scratch" if explicit_work else "fixtures.work")
+    calls = []
+
+    def fake_generate(actual_input, actual_output, actual_work, ffmpeg, threads):
+        calls.append((actual_input, actual_output, actual_work))
+        assert actual_work.is_dir()
+        assert list(actual_work.iterdir()) == []
+        (actual_work / "e2e").mkdir()
+        (actual_work / "e2e" / "partial").write_bytes(b"incomplete generation")
+        if fail_generation:
+            raise RuntimeError("injected generation failure")
+
+    monkeypatch.setattr(golden_generator, "generate", fake_generate)
+    argv = ["--input-dir", str(input_dir), "--output-dir", str(output_dir)]
+    if explicit_work:
+        argv.extend(["--work-dir", str(work_dir)])
+    if fail_generation:
+        with pytest.raises(RuntimeError, match="injected generation failure"):
+            golden_generator.main(argv)
+    else:
+        assert golden_generator.main(argv) == 0
+    assert calls == [(input_dir.resolve(), output_dir.resolve(), work_dir.resolve())]
+    assert not work_dir.exists()
+    assert _directory_snapshot(tmp_path) == before

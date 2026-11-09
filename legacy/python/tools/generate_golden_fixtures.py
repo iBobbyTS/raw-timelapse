@@ -600,6 +600,29 @@ def generate(input_dir: Path, output_dir: Path, work_dir: Path, ffmpeg: str,
     print(f"[5/5] fixtures written to {output_dir}", flush=True)
 
 
+def validate_directories(
+    input_dir: Path, output_dir: Path, work_dir: Path | None = None,
+) -> tuple[Path, Path, Path]:
+    """Resolve and validate paths without creating or removing anything."""
+    input_dir = input_dir.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
+    requested_work = (work_dir.expanduser() if work_dir is not None
+                      else output_dir.parent / (output_dir.name + ".work"))
+    work_dir = requested_work.resolve()
+
+    if not input_dir.is_dir():
+        raise ValueError(f"input directory not found: {input_dir}")
+    if output_dir.is_relative_to(input_dir):
+        raise ValueError("output directory must not be inside the read-only material")
+    if work_dir.is_relative_to(input_dir) or input_dir.is_relative_to(work_dir):
+        raise ValueError("work directory must not overlap the read-only material")
+    if work_dir.is_relative_to(output_dir) or output_dir.is_relative_to(work_dir):
+        raise ValueError("work directory must not overlap the output directory")
+    if work_dir.exists() or requested_work.is_symlink():
+        raise ValueError(f"work directory must not already exist: {work_dir}")
+    return input_dir, output_dir, work_dir
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, required=True,
@@ -607,24 +630,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, required=True,
                         help="fixture directory to write")
     parser.add_argument("--work-dir", type=Path, default=None,
-                        help="scratch directory for the end-to-end run "
-                             "(default: <output-dir>.work; removed afterwards)")
+                        help="new scratch directory; must not already exist or "
+                             "overlap input/output in either direction "
+                             "(default: <output-dir>.work; created and removed "
+                             "by this invocation, including on failure)")
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--encoder-threads", type=int, default=ENCODER_THREADS,
                         help="pin the FFmpeg encoder thread count for reproducible "
                              "MP4 bytes (0 keeps the legacy automatic value)")
     args = parser.parse_args(argv)
 
-    input_dir = args.input_dir.expanduser().resolve()
-    output_dir = args.output_dir.expanduser().resolve()
-    work_dir = (args.work_dir.expanduser().resolve() if args.work_dir
-                else output_dir.parent / (output_dir.name + ".work"))
-
-    if not input_dir.is_dir():
-        parser.error(f"input directory not found: {input_dir}")
-    if output_dir == input_dir or input_dir in output_dir.parents:
-        parser.error("output directory must not be inside the read-only material")
-    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        input_dir, output_dir, work_dir = validate_directories(
+            args.input_dir, args.output_dir, args.work_dir,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    try:
+        work_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        parser.error(f"work directory must not already exist: {work_dir}")
+    # Cleanup is entered only after exclusive creation succeeds: this root is ours.
     try:
         generate(input_dir, output_dir, work_dir, args.ffmpeg, args.encoder_threads)
     finally:
