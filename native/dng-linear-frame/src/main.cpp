@@ -1,4 +1,5 @@
 #include "dng_flags.h"
+#include "analysis.h"
 #include "frame.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <algorithm>
@@ -88,6 +89,37 @@ Vec parse_wb(std::string s) {
     throw Error(2, "unexpected white balance suffix");
   return v;
 }
+double parse_ev(const std::string &s) {
+  size_t end = 0;
+  double value = 0;
+  try {
+    value = std::stod(s, &end);
+  } catch (...) {
+    throw Error(3, "invalid exposure EV");
+  }
+  if (end != s.size() || !std::isfinite(value))
+    throw Error(3, "--exposure-ev requires one finite number");
+  if (!std::isfinite(std::exp2(value)))
+    throw Error(3, "exposure EV gain is not finite");
+  return value;
+}
+analysis::Roi parse_roi(const std::string &s) {
+  std::stringstream in(s);
+  analysis::Roi roi;
+  char comma;
+  double *field[4] = {&roi.x, &roi.y, &roi.w, &roi.h};
+  for (int i = 0; i < 4; ++i) {
+    if (!(in >> *field[i]))
+      throw Error(3, "analysis ROI requires X,Y,W,H");
+    if (i < 3 && (!(in >> comma) || comma != ','))
+      throw Error(3, "analysis ROI requires X,Y,W,H");
+  }
+  in >> std::ws;
+  if (!in.eof())
+    throw Error(3, "unexpected analysis ROI suffix");
+  analysis::validate_roi(roi);
+  return roi;
+}
 } // namespace
 int main(int argc, char **argv) {
   using namespace frame;
@@ -95,7 +127,9 @@ int main(int argc, char **argv) {
     if (argc < 4)
       throw Error(2, "usage: dng-linear-frame <input.dng> <output.png> "
                      "<output.json> [--white-balance R,G,B] [--converter PATH] "
-                     "[--converter-timeout SECONDS]");
+                     "[--converter-timeout SECONDS] [--exposure-ev EV] "
+                     "[--emit-analysis PATH] [--analysis-roi X,Y,W,H] "
+                     "[--no-png]");
     fs::path input = fs::canonical(argv[1]),
              png = fs::weakly_canonical(argv[2]),
              json = fs::weakly_canonical(argv[3]);
@@ -107,8 +141,17 @@ int main(int argc, char **argv) {
     std::string converter = "/Applications/Adobe DNG "
                             "Converter.app/Contents/MacOS/Adobe DNG Converter";
     int timeout = 120;
+    double exposure_ev = 0;
+    fs::path analysis_path;
+    analysis::Roi roi;
+    bool no_png = false;
+    bool roi_set = false;
     for (int i = 4; i < argc; ++i) {
       std::string a = argv[i];
+      if (a == "--no-png") {
+        no_png = true;
+        continue;
+      }
       if (i + 1 >= argc)
         throw Error(2, "option value missing");
       std::string value = argv[++i];
@@ -116,7 +159,14 @@ int main(int argc, char **argv) {
         wb = parse_wb(value);
       else if (a == "--converter")
         converter = value;
-      else if (a == "--converter-timeout") {
+      else if (a == "--exposure-ev")
+        exposure_ev = parse_ev(value);
+      else if (a == "--emit-analysis")
+        analysis_path = fs::weakly_canonical(value);
+      else if (a == "--analysis-roi") {
+        roi = parse_roi(value);
+        roi_set = true;
+      } else if (a == "--converter-timeout") {
         size_t end = 0;
         try {
           timeout = std::stoi(value, &end);
@@ -128,6 +178,14 @@ int main(int argc, char **argv) {
       } else
         throw Error(2, "unknown option: " + a);
     }
+    if (roi_set && analysis_path.empty())
+      throw Error(2, "--analysis-roi requires --emit-analysis");
+    if (!analysis_path.empty() &&
+        (analysis_path == input || analysis_path == png ||
+         analysis_path == json ||
+         (fs::exists(analysis_path) && fs::equivalent(input, analysis_path))))
+      throw Error(2, "analysis sidecar must be distinct from input and "
+                     "outputs");
     auto routing = inspect(input);
     auto kind = route(routing.photometric);
     Vec own = read_neutral(input);
@@ -179,23 +237,37 @@ int main(int argc, char **argv) {
                                  "clipping/metadata baking UNKNOWN"}};
     }
     Decoded d = decode(decoded_path, wb ? wb : std::optional<Vec>(own));
-    std::vector<uint16_t> pixels(d.camera.size());
+    auto capture_time = read_capture_time(input);
+    const double gain = std::exp2(exposure_ev);
+    const bool want_analysis = !analysis_path.empty();
+    std::vector<uint16_t> pixels;
+    if (!no_png)
+      pixels.resize(d.camera.size());
+    std::vector<float> gained_scene;
+    if (want_analysis)
+      gained_scene.resize(d.camera.size());
     double low = INFINITY, high = -INFINITY;
     size_t negatives = 0, upper = 0;
     for (size_t i = 0; i < d.camera.size(); i += 3) {
       Vec camera{d.camera[i], d.camera[i + 1], d.camera[i + 2]};
       Vec scene = multiply(d.camera_to_ap1, camera);
       for (int c = 0; c < 3; ++c) {
-        float x = static_cast<float>(scene[c]);
+        float x = static_cast<float>(scene[c] * gain);
         if (!std::isfinite(x))
           throw Error(40, "nonfinite color result");
         low = std::min(low, double(x));
         high = std::max(high, double(x));
         negatives += x < 0;
         upper += x > 65535.0f / 16384.0f;
-        pixels[i + c] = quantize(x);
+        if (want_analysis)
+          gained_scene[i + c] = x;
+        if (!no_png)
+          pixels[i + c] = quantize(x);
       }
     }
+    std::optional<analysis::Analysis> measured;
+    if (want_analysis)
+      measured = analysis::measure(d, gained_scene, roi, exposure_ev);
     Json metadata{
         {"schema_version", 1},
         {"source", input.string()},
@@ -212,6 +284,11 @@ int main(int argc, char **argv) {
         {"height", int(d.height)},
         {"channels", 3},
         {"working_space", "ACEScg AP1/D60 scene-linear FP32"},
+        {"exposure_ev", exposure_ev},
+        {"gain", gain},
+        {"capture_time", capture_time ? Json(*capture_time) : Json()},
+        {"analysis_sidecar",
+         want_analysis ? Json(analysis_path.string()) : Json()},
         {"as_shot_neutral", vec(own)},
         {"decoded_as_shot_neutral", vec(d.as_shot)},
         {"applied_white_balance", vec(d.applied)},
@@ -231,26 +308,46 @@ int main(int argc, char **argv) {
     // Build artifacts in the run directory; cleanup is complete before
     // publishing.
     auto staged_png = temp.path / "frame.png";
-    write_png(staged_png, d.width, d.height, pixels);
+    if (!no_png)
+      write_png(staged_png, d.width, d.height, pixels);
     // Output can reside on another volume, so copy to a sibling before rename.
     auto out_png = png;
     out_png += ".tmp-" + std::to_string(getpid());
     auto out_json = json;
     out_json += ".tmp-" + std::to_string(getpid());
+    auto out_analysis = analysis_path;
+    if (want_analysis)
+      out_analysis += ".tmp-" + std::to_string(getpid());
     try {
-      fs::copy_file(staged_png, out_png, fs::copy_options::overwrite_existing);
+      if (!no_png)
+        fs::copy_file(staged_png, out_png,
+                      fs::copy_options::overwrite_existing);
       save(out_json, metadata.text);
+      if (measured)
+        save(out_analysis,
+             analysis::sidecar_json(*measured, source_hash).text);
       temp.clear();
-      fs::rename(out_png, png);
+      if (!no_png)
+        fs::rename(out_png, png);
       fs::rename(out_json, json);
+      if (measured)
+        fs::rename(out_analysis, analysis_path);
     } catch (...) {
       std::error_code e;
       fs::remove(out_png, e);
       fs::remove(out_json, e);
+      if (measured)
+        fs::remove(out_analysis, e);
       throw;
     }
-    std::cout << "decoded " << d.width << 'x' << d.height << " -> " << png
-              << '\n';
+    std::cout << "decoded " << d.width << 'x' << d.height;
+    if (no_png)
+      std::cout << " (PNG suppressed)";
+    else
+      std::cout << " -> " << png;
+    if (measured)
+      std::cout << " analysis=" << analysis_path;
+    std::cout << '\n';
     return 0;
   } catch (const Error &e) {
     std::cerr << e.what() << '\n';

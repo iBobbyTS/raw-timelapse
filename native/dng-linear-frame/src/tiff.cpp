@@ -136,5 +136,112 @@ Vec read_neutral(const fs::path &path) {
   }
   throw Error(40, "source AsShotNeutral missing");
 }
+std::optional<std::string> read_capture_time(const fs::path &path) {
+  // Optional metadata: malformed or unreadable Exif structures degrade to
+  // "absent" and never fail the frame. Bounded reads still apply.
+  std::ifstream f(path, std::ios::binary);
+  if (!f)
+    return std::nullopt;
+  std::error_code ec;
+  auto size = fs::file_size(path, ec);
+  if (ec || size < 8)
+    return std::nullopt;
+  unsigned char order_bytes[2]{};
+  f.read((char *)order_bytes, 2);
+  if (!f)
+    return std::nullopt;
+  bool little;
+  if (order_bytes[0] == 'I' && order_bytes[1] == 'I')
+    little = true;
+  else if (order_bytes[0] == 'M' && order_bytes[1] == 'M')
+    little = false;
+  else
+    return std::nullopt;
+  auto read = [&](uint64_t at, int n) -> std::optional<uint32_t> {
+    if (at > size || uint64_t(n) > size - at)
+      return std::nullopt;
+    f.clear();
+    f.seekg(at);
+    unsigned char b[4]{};
+    f.read((char *)b, n);
+    if (!f)
+      return std::nullopt;
+    uint32_t v = 0;
+    for (int i = 0; i < n; ++i)
+      v |= uint32_t(b[i]) << (8 * (little ? i : n - 1 - i));
+    return v;
+  };
+  auto magic = read(2, 2);
+  if (!magic || *magic != 42)
+    return std::nullopt;
+  auto ascii = [&](uint64_t entry, uint32_t count) -> std::optional<std::string> {
+    if (count < 1 || count > 64)
+      return std::nullopt;
+    uint64_t data;
+    if (uint64_t(count) <= 4)
+      data = entry + 8;
+    else {
+      auto offset = read(entry + 8, 4);
+      if (!offset)
+        return std::nullopt;
+      data = *offset;
+    }
+    std::string text;
+    for (uint32_t k = 0; k < count; ++k) {
+      auto value = read(data + k, 1);
+      if (!value)
+        return std::nullopt;
+      unsigned char c = static_cast<unsigned char>(*value);
+      if (c == 0)
+        break;
+      if (c < 32 || c > 126)
+        return std::nullopt;
+      text.push_back(static_cast<char>(c));
+    }
+    if (text.empty())
+      return std::nullopt;
+    return text;
+  };
+  auto scan = [&](uint32_t ifd, uint32_t *exif) -> std::optional<std::string> {
+    if (!ifd)
+      return std::nullopt;
+    auto n = read(ifd, 2);
+    if (!n)
+      return std::nullopt;
+    // Accept any legal classic-TIFF directory whose count header, entries and
+    // next-directory trailer all fit inside the file. A truncated or
+    // out-of-range span is unreadable metadata.
+    uint64_t span = 2 + uint64_t(*n) * 12 + 4;
+    if (uint64_t(ifd) + span > size)
+      return std::nullopt;
+    std::optional<std::string> found;
+    for (uint32_t i = 0; i < *n; ++i) {
+      uint64_t p = uint64_t(ifd) + 2 + 12 * i;
+      auto tag = read(p, 2);
+      auto type = read(p + 2, 2);
+      auto count = read(p + 4, 4);
+      if (!tag || !type || !count)
+        return std::nullopt;
+      if (*tag == 36867 && *type == 2 && !found)
+        found = ascii(p, *count);
+      else if (*tag == 34665 && *type == 4 && *count == 1) {
+        auto pointer = read(p + 8, 4);
+        if (!pointer)
+          return std::nullopt;
+        *exif = *pointer;
+      }
+    }
+    return found;
+  };
+  auto root = read(4, 4);
+  if (!root)
+    return std::nullopt;
+  uint32_t exif = 0;
+  if (auto direct = scan(*root, &exif))
+    return direct;
+  if (!exif)
+    return std::nullopt;
+  return scan(exif, &exif);
+}
 
 } // namespace frame
