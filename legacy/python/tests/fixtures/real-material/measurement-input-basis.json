@@ -1,0 +1,290 @@
+{
+  "schema": "rawtl-v4-golden/measurement-input-basis/1",
+  "production_domain": {
+    "decoder": "rawpy / LibRaw (libraw_builtin_srgb postprocess, gamma=(1,1))",
+    "working_primaries": "linear-srgb",
+    "luminance": "BT.709 coefficients (0.2126, 0.7152, 0.0722)",
+    "encoded_video": "sRGB OETF pixels, BT.709 primaries/matrix, limited range",
+    "scope": "Behavioural baseline and quality reference only. Do not use as a numeric oracle for the Adobe DNG Converter / DNG SDK / ACEScg chain: the two chains do not promise pixel equality."
+  },
+  "material": {
+    "source_dir_name": "tl",
+    "frame_count": 39,
+    "frames": [
+      {
+        "filename": "TIMELAPSE_0709.DNG",
+        "bytes": 18521036,
+        "sha256": "92b3f022276d67f281558a2d628cb4aefdc57c43f7f4e817e908310a0d979415"
+      },
+      {
+        "filename": "TIMELAPSE_0710.DNG",
+        "bytes": 18570188,
+        "sha256": "6cd2b648170d3623f4c39312ee074b30ea72fdfbc9a4e2cac181a3345843994f"
+      },
+      {
+        "filename": "TIMELAPSE_0711.DNG",
+        "bytes": 18570188,
+        "sha256": "786c18175e4a048e401238d3919d7d42d93a05ea3e74c720a1ceef3ed96fcca4"
+      },
+      {
+        "filename": "TIMELAPSE_0712.DNG",
+        "bytes": 18590668,
+        "sha256": "15a58adf76adbfb2dd8416294c9fb7b16d34ff6db8325d5d9316a9bb40223ed7"
+      },
+      {
+        "filename": "TIMELAPSE_0713.DNG",
+        "bytes": 18561996,
+        "sha256": "5780115cbd4e60efc1cdc3db6cea5281016d2ae58107227df3453079781599d6"
+      },
+      {
+        "filename": "TIMELAPSE_0714.DNG",
+        "bytes": 18553804,
+        "sha256": "f23e7bf098521f3c4f6fa9acc967785d3fb7324394c1acb1010998af3ad38a6b"
+      },
+      {
+        "filename": "TIMELAPSE_0715.DNG",
+        "bytes": 18582476,
+        "sha256": "4c62db886d3bf4893dccac1692d0e9b706fbc81fca3c922dc181f9b66b2687db"
+      },
+      {
+        "filename": "TIMELAPSE_0716.DNG",
+        "bytes": 18578380,
+        "sha256": "f56f9e95e5d5cc0d167f71d91c822f75762ac8833a3649ed1c88f93915d7a91d"
+      },
+      {
+        "filename": "TIMELAPSE_0717.DNG",
+        "bytes": 18586572,
+        "sha256": "f71876d32996d5a653a41403cf5020221ab466c330ee06cc023a05466ec48bbd"
+      },
+      {
+        "filename": "TIMELAPSE_0718.DNG",
+        "bytes": 18557900,
+        "sha256": "c75db1d42ee07ea64cbd8ea6152134ead1a787ccd47bad2e31894e5c6180f1dc"
+      },
+      {
+        "filename": "TIMELAPSE_0719.DNG",
+        "bytes": 18553804,
+        "sha256": "cb180fbf09e2d77f245865e0d353903a7b882a6317f12f65d02bd8f8c7a5f494"
+      },
+      {
+        "filename": "TIMELAPSE_0720.DNG",
+        "bytes": 18570188,
+        "sha256": "7d2e3ec7e9fbe0198dfdff1082e847c84cf5af2d520c4b82e9c1d4724bf48e48"
+      },
+      {
+        "filename": "TIMELAPSE_0721.DNG",
+        "bytes": 18586572,
+        "sha256": "912d9d4e718535164bca31207045eea1b416e3555577e98eab0374235a20c30d"
+      },
+      {
+        "filename": "TIMELAPSE_0722.DNG",
+        "bytes": 18582476,
+        "sha256": "c6dc397ab640fa2d0c5ebd8243c36554d0971969c5f62867122e973bff6ac18e"
+      },
+      {
+        "filename": "TIMELAPSE_0723.DNG",
+        "bytes": 18590668,
+        "sha256": "5115af5060e50ad15bf50cecbc8010076a23988b19b3a55851ba2fa714a9f7e7"
+      },
+      {
+        "filename": "TIMELAPSE_0724.DNG",
+        "bytes": 18570188,
+        "sha256": "6c4dddb8372723a56c60666e0da6e373aac0509d86ecdaa7d20ae4b6ea955171"
+      },
+      {
+        "filename": "TIMELAPSE_0725.DNG",
+        "bytes": 18566092,
+        "sha256": "37a2d627fe3aabb3c2861d4d551f8816499a7790651444feca24817e33a1fb48"
+      },
+      {
+        "filename": "TIMELAPSE_0726.DNG",
+        "bytes": 18570188,
+        "sha256": "5fd25a53e3cc0d1bbdd476901541aa5dad5b6385da116abcc6020b154fd48d2b"
+      },
+      {
+        "filename": "TIMELAPSE_0727.DNG",
+        "bytes": 18557900,
+        "sha256": "37aa696f40569097a3fa410ca2ccae7ac8477b8e85b888fac3c503194b3835e0"
+      },
+      {
+        "filename": "TIMELAPSE_0728.DNG",
+        "bytes": 18561996,
+        "sha256": "e4bc1d9af2b815a8292b50d5af1d6742a43b07ce0af7c069005b67cb8e4064f1"
+      },
+      {
+        "filename": "TIMELAPSE_0729.DNG",
+        "bytes": 18561996,
+        "sha256": "d09d6851bbf7e42f51524c225916f9ffb778b89eb4e270f362486ba760928f3c"
+      },
+      {
+        "filename": "TIMELAPSE_0730.DNG",
+        "bytes": 18561996,
+        "sha256": "f7cf35b351beefcfca2e4b25e0d71daa6d301155bf4554890a16c098e249397d"
+      },
+      {
+        "filename": "TIMELAPSE_0731.DNG",
+        "bytes": 18570188,
+        "sha256": "f8095df2107ed8deb8b9079ea194e0a7720bddb74166ee993b6f41cce47ec5f7"
+      },
+      {
+        "filename": "TIMELAPSE_0732.DNG",
+        "bytes": 18566092,
+        "sha256": "3b854abd5f79bfca0b952d8e63317f7934c381720fff3e00fbaaf55f6449e0f8"
+      },
+      {
+        "filename": "TIMELAPSE_0733.DNG",
+        "bytes": 18566092,
+        "sha256": "a5ba0d51ea85b2261e4dbabb56041cc656cd336f9f6837a1ea05087c9b0b65d1"
+      },
+      {
+        "filename": "TIMELAPSE_0734.DNG",
+        "bytes": 18541516,
+        "sha256": "92a898b74d16164834bdd48382d6da74d09e002cf211b376d83d10543425105a"
+      },
+      {
+        "filename": "TIMELAPSE_0735.DNG",
+        "bytes": 18533324,
+        "sha256": "863c1e3ad81a1f286d5609f0c67fafdb3107c920a23c66d821b32e33a170709c"
+      },
+      {
+        "filename": "TIMELAPSE_0736.DNG",
+        "bytes": 18553804,
+        "sha256": "9e5a87c89167d17fbb6861d7e364170c9f034634f14c577174fe8aa477557e62"
+      },
+      {
+        "filename": "TIMELAPSE_0737.DNG",
+        "bytes": 18549708,
+        "sha256": "a57ffd979d3ea67d9e2918d1d8b33fc6e2ca21aabd81454944473a2c4474fb61"
+      },
+      {
+        "filename": "TIMELAPSE_0738.DNG",
+        "bytes": 18553804,
+        "sha256": "cf84e4b4a18a8bf4aeeec05bbb39fc13dc7f7305141ddb49018123c156127dc5"
+      },
+      {
+        "filename": "TIMELAPSE_0739.DNG",
+        "bytes": 18541516,
+        "sha256": "f95157373d169f2287ecb6190d1d95b410538594a165048c9e329aed92da276c"
+      },
+      {
+        "filename": "TIMELAPSE_0740.DNG",
+        "bytes": 18566092,
+        "sha256": "6c9dc7679b77ab3e9a5840afcc31bbc89b37758e4684eb897b79d0a4f2e93138"
+      },
+      {
+        "filename": "TIMELAPSE_0741.DNG",
+        "bytes": 18541516,
+        "sha256": "d3022abf4519dcd2831f6d925306e886c699d656bcb258c6324d3a0fd0a2ec82"
+      },
+      {
+        "filename": "TIMELAPSE_0742.DNG",
+        "bytes": 18533324,
+        "sha256": "6f8e66e4f2bcbc9ab96fae912178cbca23089936826c5c8816a19a5d0524db48"
+      },
+      {
+        "filename": "TIMELAPSE_0743.DNG",
+        "bytes": 18512844,
+        "sha256": "bd5d1b472cab88c0c637c8b7fd9196127d006f02af08c919b788b37e709d6793"
+      },
+      {
+        "filename": "TIMELAPSE_0744.DNG",
+        "bytes": 18496460,
+        "sha256": "53a7864993af976ccd71200ff68dfa6d9b3a65fb72d59f325fec800576f6dae0"
+      },
+      {
+        "filename": "TIMELAPSE_0745.DNG",
+        "bytes": 18496460,
+        "sha256": "cd2be8aac437a04687ac9f4e772032155dfc9513f0b011d90c57e3e59823a805"
+      },
+      {
+        "filename": "TIMELAPSE_0746.DNG",
+        "bytes": 18496460,
+        "sha256": "b513d00148d58b309560023bc389286c2b9bb34ab6849112750fd8592a41abfd"
+      },
+      {
+        "filename": "TIMELAPSE_0747.DNG",
+        "bytes": 18496460,
+        "sha256": "d8f50ad741e30f60a72ac7a81ab8f138d8a71c0701e8e6d75c4190300f62d22c"
+      }
+    ],
+    "note": "RAW files are NOT stored in the repository. Re-derive the rendered frames from these identical bytes with the frozen renderer below."
+  },
+  "renderer": {
+    "implementation": "src/rawtl/raw_backend.py:RawpyRenderer.render_linear",
+    "color_transform_id": "libraw_builtin_srgb",
+    "transfer_id": "linear",
+    "exposure_ev": 0.0,
+    "fixed_white_balance": [
+      1.6526716947555542,
+      1.0,
+      2.072519063949585,
+      1.0
+    ],
+    "fixed_white_balance_source": "camera_whitebalance of the first frame",
+    "raw_metadata": {
+      "camera": "DJI AC004",
+      "raw_geometry": [
+        4000,
+        2256
+      ],
+      "orientation": 3,
+      "raw_type": ".dng",
+      "sensor_signature": "{\"color_desc\": \"b'RGBG'\", \"matrix\": [[1.30502, -0.29297, -0.01205, 0.0], [-0.09219, 1.29382, -0.20163, 0.0], [-0.01207, -0.30471, 1.31677, 0.0]], \"num_colors\": 3, \"raw_pattern\": [[2, 3], [1, 0]], \"raw_type\": \"RawType.Flat\"}"
+    },
+    "postprocess": {
+      "output_color": "sRGB",
+      "output_bps": 16,
+      "gamma": [
+        1,
+        1
+      ],
+      "no_auto_bright": true,
+      "adjust_maximum_thr": 0.0,
+      "use_camera_wb": false,
+      "use_auto_wb": false,
+      "user_wb": [
+        1.6526716947555542,
+        1.0,
+        2.072519063949585,
+        1.0
+      ],
+      "bright": 1.0,
+      "highlight_mode": "Clip",
+      "exp_shift": 1.0,
+      "exp_preserve_highlights": 0.0
+    },
+    "versions": {
+      "rawpy": "0.28.0",
+      "libraw": "(0, 22, 2)"
+    }
+  },
+  "measurement": {
+    "function": "src/rawtl/exposure/measurement.py:measure_frame",
+    "roi": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+    ],
+    "max_edge": 1024,
+    "grid": [
+      12,
+      8
+    ],
+    "structure_samples": true,
+    "quantum_linear": 1.5259021896696422e-05,
+    "quantum_linear_consistent": true,
+    "notes": [
+      "Analysis image is area-downsampled so max(width,height)<=max_edge.",
+      "Tile grid is nx=min(grid_x,w//16), ny=min(grid_y,h//16).",
+      "log_pixel_samples are a deterministic b[::4,::4] strided log2 grid per tile, padded to a common width with NaN.",
+      "saturation_fraction is the mean of the renderer saturation mask per tile."
+    ]
+  },
+  "saturation_mask": {
+    "source": "rawpy renderer surrogate",
+    "quality": "approximate",
+    "spec": "any channel >= 64224/65535 (~0.98) of the 16-bit sRGB-linear postprocess output; this is a clipped-linear proxy, not a sensor saturation mask"
+  },
+  "nan_policy": "JSON null represents a non-finite float (NaN or +-Inf). The legacy reporting layer uses the same convention. Tile validity is carried explicitly by the 'valid' mask; pixel-sample binary files contain raw IEEE-754 values, including NaN padding."
+}

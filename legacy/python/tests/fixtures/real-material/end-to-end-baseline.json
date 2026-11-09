@@ -1,0 +1,1798 @@
+{
+  "schema": "rawtl-v4-golden/end-to-end-baseline/1",
+  "production_domain": {
+    "decoder": "rawpy / LibRaw (libraw_builtin_srgb postprocess, gamma=(1,1))",
+    "working_primaries": "linear-srgb",
+    "luminance": "BT.709 coefficients (0.2126, 0.7152, 0.0722)",
+    "encoded_video": "sRGB OETF pixels, BT.709 primaries/matrix, limited range",
+    "scope": "Behavioural baseline and quality reference only. Do not use as a numeric oracle for the Adobe DNG Converter / DNG SDK / ACEScg chain: the two chains do not promise pixel equality."
+  },
+  "service_result": {
+    "run_status": "PARTIAL",
+    "frame_count": 39,
+    "encoder": "libx264"
+  },
+  "report": {
+    "schema_version": 2,
+    "run_status": "PARTIAL",
+    "execution_status": "COMPLETED_WITH_REVIEW",
+    "frame_count": 39,
+    "analysis_shape": [
+      4000,
+      2256
+    ],
+    "input_sort": "filename_unicode_case_sensitive",
+    "video_target_bitrate_bps": 160000000,
+    "period_effective": 39,
+    "scene_cuts": [
+      {
+        "index": 1,
+        "median_ev": 3.851607927972447,
+        "tile_mad_ev": 1.1253412030678143,
+        "common_tiles": 78
+      },
+      {
+        "index": 2,
+        "median_ev": -0.7221357845681728,
+        "tile_mad_ev": 0.33086138819147126,
+        "common_tiles": 72
+      },
+      {
+        "index": 3,
+        "median_ev": 0.6122738278624631,
+        "tile_mad_ev": 0.9464488792720922,
+        "common_tiles": 60
+      },
+      {
+        "index": 4,
+        "median_ev": -1.1273186438780813,
+        "tile_mad_ev": 0.7519504357727668,
+        "common_tiles": 61
+      },
+      {
+        "index": 5,
+        "median_ev": -0.8442760388216026,
+        "tile_mad_ev": 0.24399216755795794,
+        "common_tiles": 69
+      },
+      {
+        "index": 6,
+        "median_ev": 1.6131414478048194,
+        "tile_mad_ev": 0.7309373517276928,
+        "common_tiles": 70
+      },
+      {
+        "index": 8,
+        "median_ev": 0.3125426986873294,
+        "tile_mad_ev": 0.25581446864853163,
+        "common_tiles": 66
+      },
+      {
+        "index": 9,
+        "median_ev": -1.0354398201051804,
+        "tile_mad_ev": 0.879164126628297,
+        "common_tiles": 67
+      },
+      {
+        "index": 10,
+        "median_ev": -0.41593328628803405,
+        "tile_mad_ev": 0.4114669491065186,
+        "common_tiles": 73
+      },
+      {
+        "index": 11,
+        "median_ev": 1.1337507683439503,
+        "tile_mad_ev": 0.9454004507156056,
+        "common_tiles": 72
+      },
+      {
+        "index": 12,
+        "median_ev": 0.4841912881896806,
+        "tile_mad_ev": 0.4558509411200363,
+        "common_tiles": 64
+      },
+      {
+        "index": 13,
+        "median_ev": -0.5041666375080638,
+        "tile_mad_ev": 0.7078067250022998,
+        "common_tiles": 63
+      },
+      {
+        "index": 14,
+        "median_ev": 1.0237405781598743,
+        "tile_mad_ev": 0.6501257913514226,
+        "common_tiles": 61
+      },
+      {
+        "index": 15,
+        "median_ev": -0.9226216815774997,
+        "tile_mad_ev": 0.43220189798776715,
+        "common_tiles": 56
+      },
+      {
+        "index": 16,
+        "median_ev": -0.6320234488064123,
+        "tile_mad_ev": 0.833886890223434,
+        "common_tiles": 70
+      },
+      {
+        "index": 18,
+        "median_ev": -0.6171339857490317,
+        "tile_mad_ev": 0.6888156227982087,
+        "common_tiles": 75
+      },
+      {
+        "index": 21,
+        "median_ev": 0.3530763857094126,
+        "tile_mad_ev": 0.23580081974704256,
+        "common_tiles": 69
+      },
+      {
+        "index": 22,
+        "median_ev": -0.3392050728416578,
+        "tile_mad_ev": 0.3481095488521014,
+        "common_tiles": 69
+      },
+      {
+        "index": 23,
+        "median_ev": -0.9620440566407926,
+        "tile_mad_ev": 0.3957901583443303,
+        "common_tiles": 64
+      },
+      {
+        "index": 24,
+        "median_ev": 1.053556307217045,
+        "tile_mad_ev": 0.8834021148747838,
+        "common_tiles": 69
+      },
+      {
+        "index": 25,
+        "median_ev": -0.9536031704614043,
+        "tile_mad_ev": 0.7331937311577493,
+        "common_tiles": 77
+      },
+      {
+        "index": 26,
+        "median_ev": -0.41107729784921254,
+        "tile_mad_ev": 0.7563173385969915,
+        "common_tiles": 83
+      },
+      {
+        "index": 27,
+        "median_ev": 0.8834123746850517,
+        "tile_mad_ev": 0.41730533779618245,
+        "common_tiles": 84
+      },
+      {
+        "index": 28,
+        "median_ev": 0.2686715875628489,
+        "tile_mad_ev": 0.4898555185595761,
+        "common_tiles": 78
+      },
+      {
+        "index": 29,
+        "median_ev": 0.4885084104530941,
+        "tile_mad_ev": 0.30605244966103345,
+        "common_tiles": 77
+      },
+      {
+        "index": 30,
+        "median_ev": -1.3073280156339284,
+        "tile_mad_ev": 0.5321084060720169,
+        "common_tiles": 78
+      },
+      {
+        "index": 31,
+        "median_ev": 1.5849529444417874,
+        "tile_mad_ev": 0.5843952248238475,
+        "common_tiles": 77
+      },
+      {
+        "index": 32,
+        "median_ev": -1.3145900414065714,
+        "tile_mad_ev": 0.4989892479244623,
+        "common_tiles": 78
+      },
+      {
+        "index": 34,
+        "median_ev": -1.4979081470742486,
+        "tile_mad_ev": 0.6165807027167423,
+        "common_tiles": 88
+      },
+      {
+        "index": 35,
+        "median_ev": -1.8091604222249469,
+        "tile_mad_ev": 0.9260562755369471,
+        "common_tiles": 50
+      }
+    ],
+    "estimation_time_gaps": [],
+    "ev_limits": null,
+    "unconverged_trend_tiles": 0,
+    "feedback_updates": 0,
+    "decoder": {
+      "camera": "DJI AC004",
+      "fixed_wb": [
+        1.6526716947555542,
+        1.0,
+        2.072519063949585,
+        1.0
+      ],
+      "orientation": 3,
+      "versions": {
+        "rawpy": "0.28.0",
+        "libraw": "(0, 22, 2)",
+        "exiftool": "13.50"
+      },
+      "saturation_mask_quality": "approximate"
+    },
+    "render_temporal_quality": {
+      "status": "NOT_INDEPENDENT",
+      "note": "legacy frozen-target check is self-consistent with whatever correction was proposed; independent render-domain targets are tracked separately"
+    },
+    "encoded_temporal_quality": {
+      "status": "SHORT_CONTEXT",
+      "detector_model": "fixed-camera paired photometric common-mode v1",
+      "frame_count": 39,
+      "candidate_count": 0,
+      "chroma_variation": "NOT_IMPLEMENTED",
+      "metadata_warnings": [],
+      "events": [],
+      "segments": [
+        {
+          "start": 0,
+          "end_exclusive": 1,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 0,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 1,
+          "end_exclusive": 2,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 2,
+          "end_exclusive": 3,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 3,
+          "end_exclusive": 4,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 4,
+          "end_exclusive": 5,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 5,
+          "end_exclusive": 6,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 6,
+          "end_exclusive": 8,
+          "frames": 2,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 2,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 8,
+          "end_exclusive": 9,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 9,
+          "end_exclusive": 10,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 10,
+          "end_exclusive": 11,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 11,
+          "end_exclusive": 12,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 12,
+          "end_exclusive": 13,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 13,
+          "end_exclusive": 14,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 14,
+          "end_exclusive": 15,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 15,
+          "end_exclusive": 16,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 16,
+          "end_exclusive": 18,
+          "frames": 2,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 2,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 18,
+          "end_exclusive": 21,
+          "frames": 3,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 3,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 21,
+          "end_exclusive": 22,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 22,
+          "end_exclusive": 23,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 23,
+          "end_exclusive": 24,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 24,
+          "end_exclusive": 25,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 25,
+          "end_exclusive": 26,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 26,
+          "end_exclusive": 27,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 27,
+          "end_exclusive": 28,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 28,
+          "end_exclusive": 29,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 29,
+          "end_exclusive": 30,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 30,
+          "end_exclusive": 31,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 31,
+          "end_exclusive": 32,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 32,
+          "end_exclusive": 34,
+          "frames": 2,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 2,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 34,
+          "end_exclusive": 35,
+          "frames": 1,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 1,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        },
+        {
+          "start": 35,
+          "end_exclusive": 39,
+          "frames": 4,
+          "status": "SHORT_CONTEXT",
+          "usable_pairs": 0,
+          "pairs": 4,
+          "median_abs_step_ev": null,
+          "p95_abs_step_ev": null,
+          "max_abs_step_ev": null,
+          "curvature_rms_ev": null,
+          "steps_over_0_05_ev": 0
+        }
+      ]
+    },
+    "render_semantics": {
+      "raw_backend": {
+        "rawpy": "0.28.0",
+        "libraw": "(0, 22, 2)",
+        "exiftool": "13.50"
+      },
+      "baseline_exposure_policy": {
+        "baseline_application_owner": "none",
+        "probe": {
+          "tag": "present",
+          "tag_value_ev": 1.9,
+          "injected_ev": 1.0,
+          "measured_delta_ev": 0.0,
+          "applied": false
+        },
+        "note": "owner 'none' means the backend provably ignores the tag; the project does not silently add it"
+      },
+      "dng_opcode_support": "NOT_APPLIED_BY_THIS_BUILD",
+      "opcode_probe": {
+        "tag": "present",
+        "max_pixel_delta_ev": 0.0,
+        "applied": false
+      },
+      "opcode_payload_variation": {
+        "OpcodeList3(0xc74e)": {
+          "frames_with_tag": 39,
+          "unique_payloads": 39,
+          "constant": false,
+          "opcodes": {
+            "1_WarpRectilinear": {
+              "frames": 39,
+              "unique_payloads": 1
+            },
+            "9_GainMap": {
+              "frames": 39,
+              "unique_payloads": 39
+            }
+          }
+        }
+      },
+      "baseline_exposure_summary": {
+        "present": true,
+        "frames_with_tag": 39,
+        "unique_values": 4,
+        "range_ev": [
+          1.88,
+          1.93
+        ]
+      },
+      "not_tested": [
+        "adobe_reference_development",
+        "opcode_capable_backend",
+        "dng_sdk_stage2_3_verification"
+      ]
+    },
+    "source_continuity": {
+      "nominal_interval_s": 5.0,
+      "time_gaps": [],
+      "filename_suspicions": [],
+      "segments": [
+        [
+          0,
+          39
+        ]
+      ],
+      "coverage": "capture_time"
+    },
+    "source_discontinuities": [],
+    "gain_probe": {
+      "status": "SKIPPED",
+      "reason": "disabled, short sequence or no reliable exposures"
+    },
+    "gain_response": {
+      "status": "SKIPPED",
+      "reason": "disabled, short sequence or no reliable exposures"
+    },
+    "pairwise_estimation": {
+      "target_provenance": {
+        "intent": "smooth",
+        "reference_scope": "trend",
+        "defined_before_iteration": true,
+        "measured": "b minus confirmed steps",
+        "desired": "Huber-Whittaker trend, period=60 (lambda=1/(16 sin(pi/P)^4))"
+      },
+      "cross_boundary_anchors": {
+        "method": "whole-frame all-valid-tile median level const across the boundary (owner whole-sequence intent: perceived overall brightness stays continuous); explicit assumption, not evidence",
+        "entries": []
+      },
+      "edges": 0,
+      "edges_by_lag": {
+        "1": {
+          "kept": 0,
+          "rejected": 38
+        },
+        "2": {
+          "kept": 0,
+          "rejected": 37
+        },
+        "4": {
+          "kept": 0,
+          "rejected": 35
+        },
+        "8": {
+          "kept": 0,
+          "rejected": 31
+        },
+        "16": {
+          "kept": 0,
+          "rejected": 23
+        }
+      },
+      "edge_reject_reasons": {
+        "structure_mad": 164,
+        "colour_change": 162,
+        "insufficient_support": 164
+      },
+      "edge_p95_abs_residual_ev": null,
+      "components": [],
+      "persistent_tiles": 0,
+      "excluded_tiles": 0,
+      "converged": true,
+      "iterations": 0
+    },
+    "video_metadata": {
+      "codec": "h264",
+      "width": 4000,
+      "height": 2256,
+      "fps": "30",
+      "frames": 39,
+      "pix_fmt": "yuv420p",
+      "color_tags": {
+        "primaries": "bt709",
+        "transfer": "iec61966-2-1",
+        "matrix": "bt709",
+        "range": "tv"
+      },
+      "colour_contract_warnings": [],
+      "file_size": 30797138,
+      "avg_bitrate_bps": 189513477,
+      "peak_1s_bitrate_bps": 217145536
+    },
+    "padded_dimensions": [
+      4000,
+      2256
+    ],
+    "video_expected_budget_bytes": 26000000,
+    "warnings": [
+      "DNG_BASELINE_EXPOSURE_IGNORED_BY_BACKEND: per-frame default-development exposure metadata is not executed by this backend build (probe-verified); interpretation policy is explicit, never double-applied",
+      "DNG_OPCODE_LIST3_NOT_APPLIED: GainMap/WarpRectilinear payloads present in the files are not executed by this backend build (probe-verified)",
+      "REVIEW_REQUIRED: one or more frames have no reliable EV estimate"
+    ],
+    "status_counts": {
+      "REVIEW_REQUIRED": 39
+    },
+    "frames": [
+      {
+        "index": 0,
+        "filename": "TIMELAPSE_0709.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:09:53",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 1,
+        "filename": "TIMELAPSE_0710.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:09:58",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 2,
+        "filename": "TIMELAPSE_0711.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:10:03",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 3,
+        "filename": "TIMELAPSE_0712.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:10:08",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 4,
+        "filename": "TIMELAPSE_0713.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:10:13",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 5,
+        "filename": "TIMELAPSE_0714.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:10:18",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 6,
+        "filename": "TIMELAPSE_0715.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:10:23",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 7,
+        "filename": "TIMELAPSE_0716.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:10:28",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 8,
+        "filename": "TIMELAPSE_0717.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:10:33",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 9,
+        "filename": "TIMELAPSE_0718.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:10:38",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 10,
+        "filename": "TIMELAPSE_0719.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:10:43",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 11,
+        "filename": "TIMELAPSE_0720.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:10:48",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 12,
+        "filename": "TIMELAPSE_0721.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:10:53",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 13,
+        "filename": "TIMELAPSE_0722.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:10:58",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 14,
+        "filename": "TIMELAPSE_0723.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:11:03",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 15,
+        "filename": "TIMELAPSE_0724.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:11:08",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 16,
+        "filename": "TIMELAPSE_0725.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:11:11",
+        "baseline_exposure_ev": 1.9
+      },
+      {
+        "index": 17,
+        "filename": "TIMELAPSE_0726.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:11:18",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 18,
+        "filename": "TIMELAPSE_0727.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:11:21",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 19,
+        "filename": "TIMELAPSE_0728.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:11:28",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 20,
+        "filename": "TIMELAPSE_0729.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:11:33",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 21,
+        "filename": "TIMELAPSE_0730.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:11:38",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 22,
+        "filename": "TIMELAPSE_0731.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:11:43",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 23,
+        "filename": "TIMELAPSE_0732.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:11:46",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 24,
+        "filename": "TIMELAPSE_0733.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:11:53",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 25,
+        "filename": "TIMELAPSE_0734.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:11:56",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 26,
+        "filename": "TIMELAPSE_0735.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:12:01",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 27,
+        "filename": "TIMELAPSE_0736.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:12:06",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 28,
+        "filename": "TIMELAPSE_0737.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:12:11",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 29,
+        "filename": "TIMELAPSE_0738.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:12:16",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 30,
+        "filename": "TIMELAPSE_0739.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:12:21",
+        "baseline_exposure_ev": 1.93
+      },
+      {
+        "index": 31,
+        "filename": "TIMELAPSE_0740.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:12:26",
+        "baseline_exposure_ev": 1.89
+      },
+      {
+        "index": 32,
+        "filename": "TIMELAPSE_0741.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:12:31",
+        "baseline_exposure_ev": 1.88
+      },
+      {
+        "index": 33,
+        "filename": "TIMELAPSE_0742.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:12:36",
+        "baseline_exposure_ev": 1.88
+      },
+      {
+        "index": 34,
+        "filename": "TIMELAPSE_0743.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:12:41",
+        "baseline_exposure_ev": 1.88
+      },
+      {
+        "index": 35,
+        "filename": "TIMELAPSE_0744.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:12:46",
+        "baseline_exposure_ev": 1.88
+      },
+      {
+        "index": 36,
+        "filename": "TIMELAPSE_0745.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:12:51",
+        "baseline_exposure_ev": 1.88
+      },
+      {
+        "index": 37,
+        "filename": "TIMELAPSE_0746.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:12:56",
+        "baseline_exposure_ev": 1.88
+      },
+      {
+        "index": 38,
+        "filename": "TIMELAPSE_0747.DNG",
+        "segment_id": 0,
+        "status": "REVIEW_REQUIRED",
+        "valid_tile_count": 0,
+        "consensus_fraction": null,
+        "residual_mad_ev": null,
+        "common_residual_ev": null,
+        "cumulative_confirmed_step_ev": 0.0,
+        "requested_ev": null,
+        "applied_ev": null,
+        "render_ev": 0.0,
+        "gain": null,
+        "render_target_error_ev": null,
+        "new_output_clipping_fraction": 0.0,
+        "measured_level_ev": null,
+        "desired_level_ev": null,
+        "warnings": [
+          "SHORT_CONTEXT",
+          "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV"
+        ],
+        "capture_time": "2026-11-08T20:13:01",
+        "baseline_exposure_ev": 1.88
+      }
+    ],
+    "run_config": {
+      "fps": "30",
+      "period": 60,
+      "strength": 1.0,
+      "brightness": "smooth",
+      "estimator": "pairwise",
+      "ev_limits": null,
+      "roi": [
+        0.0,
+        0.0,
+        1.0,
+        1.0
+      ],
+      "exclude_rois": [],
+      "on_review": "passthrough",
+      "temporal_quality": "strict",
+      "save_frames": false,
+      "encoder": "libx264"
+    }
+  }
+}

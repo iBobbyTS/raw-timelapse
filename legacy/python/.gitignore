@@ -1,0 +1,20 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+dist/
+build/
+out/
+*.mp4
+*.CR3
+*.cr3
+*.NEF
+*.ARW
+*.DNG
+
+# Golden-fixture scaffolding (T00): the small reference video and any captured
+# fixture media must be tracked even though generic media is ignored above.
+# Source RAW material is never stored in the repository.
+!tests/fixtures/real-material/reference-video.mp4

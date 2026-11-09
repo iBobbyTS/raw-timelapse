@@ -1,0 +1,62 @@
+{
+  "schema": "rawtl-v4-golden/pair-constraints/1",
+  "production_domain": {
+    "decoder": "rawpy / LibRaw (libraw_builtin_srgb postprocess, gamma=(1,1))",
+    "working_primaries": "linear-srgb",
+    "luminance": "BT.709 coefficients (0.2126, 0.7152, 0.0722)",
+    "encoded_video": "sRGB OETF pixels, BT.709 primaries/matrix, limited range",
+    "scope": "Behavioural baseline and quality reference only. Do not use as a numeric oracle for the Adobe DNG Converter / DNG SDK / ACEScg chain: the two chains do not promise pixel equality."
+  },
+  "input": {
+    "estimator": "pairwise",
+    "boundaries": [],
+    "train": "all tiles",
+    "grid": [
+      12,
+      8
+    ],
+    "lags": [],
+    "candidate_lags": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "source": "src/rawtl/exposure/pairwise.py:build_edges",
+    "note": "Only graph-eligible edges are returned by legacy build_edges; rejected candidates are summarized in stats."
+  },
+  "stats": {
+    "candidate_edges": 164,
+    "rejected_edges": 164,
+    "reject_reasons": {
+      "structure_mad": 164,
+      "colour_change": 162,
+      "insufficient_support": 164
+    },
+    "by_lag": {
+      "1": {
+        "kept": 0,
+        "rejected": 38
+      },
+      "2": {
+        "kept": 0,
+        "rejected": 37
+      },
+      "4": {
+        "kept": 0,
+        "rejected": 35
+      },
+      "8": {
+        "kept": 0,
+        "rejected": 31
+      },
+      "16": {
+        "kept": 0,
+        "rejected": 23
+      }
+    }
+  },
+  "edge_count": 0,
+  "edges": []
+}
