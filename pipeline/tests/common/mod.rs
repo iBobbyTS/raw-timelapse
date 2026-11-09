@@ -1,5 +1,10 @@
 //! Test support: tiny RGB16 PNG writer, fake native producers and command
 //! helpers. Kept dependency-free to match the production crate.
+//!
+//! The fake producer is a small standalone Rust program
+//! (`tests/common/fake_native_main.rs`) compiled once with `rustc`. Every test
+//! gets a wrapper script that points `FAKE_NATIVE_CONFIG` at its own sequence
+//! description, so tests can run in parallel.
 
 #![allow(dead_code)]
 
@@ -7,6 +12,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 pub const FFMPEG: &str = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg";
 pub const FFPROBE: &str = "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe";
@@ -156,76 +162,182 @@ fn write_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
 // Fake native producer
 // ---------------------------------------------------------------------------
 
+/// One frame description for the fake producer.
+#[derive(Debug, Clone)]
 pub struct FakeFrame {
     pub name: String,
-    pub fixture: PathBuf,
+    /// When set, the producer copies these PNG bytes at EV 0 (legacy fixtures).
+    pub fixture: Option<PathBuf>,
     pub own_neutral: String,
+    /// log2 of the scene-linear background level (before any EV gain).
+    pub log_level: f64,
+    /// Fraction of the width occupied by a 2x (bright) moving object.
+    pub object_fraction: f64,
+    pub capture_time: Option<String>,
+    /// `flat` or `alternating` (+/-0.5 EV tile pattern, for isolation tests).
+    pub pattern: &'static str,
 }
 
-pub fn fixture(dir: &Path, name: &str, code: u16) -> PathBuf {
-    let path = dir.join(format!("{name}.png"));
-    let pixels = vec![[code, code, code]; (WIDTH * HEIGHT) as usize];
-    write_rgb48_png(&path, WIDTH, HEIGHT, &pixels);
-    path
+impl FakeFrame {
+    pub fn new(name: &str, log_level: f64) -> FakeFrame {
+        FakeFrame {
+            name: name.to_string(),
+            fixture: None,
+            own_neutral: "0.5,1,0.8".to_string(),
+            log_level,
+            object_fraction: 0.0,
+            capture_time: None,
+            pattern: "flat",
+        }
+    }
+
+    pub fn capture(mut self, time: &str) -> FakeFrame {
+        self.capture_time = Some(time.to_string());
+        self
+    }
+
+    pub fn object(mut self, fraction: f64) -> FakeFrame {
+        self.object_fraction = fraction;
+        self
+    }
+
+    pub fn pattern(mut self, pattern: &'static str) -> FakeFrame {
+        self.pattern = pattern;
+        self
+    }
+
+    pub fn neutral(mut self, neutral: &str) -> FakeFrame {
+        self.own_neutral = neutral.to_string();
+        self
+    }
 }
 
-/// Build a shell script that behaves like the accepted single-frame producer:
-/// it copies the fixture keyed by input basename and writes a schema_version 1
-/// sidecar. `fail_on` makes it exit 3 before writing outputs; `ignore_override`
-/// simulates a producer that silently keeps its own neutral.
+fn fake_native_binary() -> PathBuf {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("fake-native-bin");
+            fs::create_dir_all(&directory).expect("create fake native dir");
+            let binary = directory.join("fake-native");
+            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("common")
+                .join("fake_native_main.rs");
+            let output = Command::new("rustc")
+                .args(["--edition", "2021", "-O"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&binary)
+                .output()
+                .expect("run rustc for the fake native producer");
+            assert!(
+                output.status.success(),
+                "fake native compilation failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            binary
+        })
+        .clone()
+}
+
+fn write_fake_native(
+    dir: &Path,
+    frames: &[FakeFrame],
+    fail_on: Option<&str>,
+    ignore_override: bool,
+    width: u32,
+    height: u32,
+    gain_scale: f64,
+) -> PathBuf {
+    let (grid_nx, grid_ny) = if width >= 192 && height >= 128 {
+        (12, 8)
+    } else {
+        (4, 2)
+    };
+    let mut config = String::new();
+    config.push_str(&format!("width={width}\nheight={height}\n"));
+    config.push_str(&format!("grid_nx={grid_nx}\ngrid_ny={grid_ny}\n"));
+    config.push_str(&format!(
+        "ignore_override={}\n",
+        if ignore_override { 1 } else { 0 }
+    ));
+    if let Some(name) = fail_on {
+        config.push_str(&format!("fail_on={name}\n"));
+    }
+    if (gain_scale - 1.0).abs() > f64::EPSILON {
+        config.push_str(&format!("gain_scale={gain_scale}\n"));
+    }
+    for frame in frames {
+        let fixture = frame
+            .fixture
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let capture = frame
+            .capture_time
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
+        config.push_str(&format!(
+            "frame={}|{}|{}|{}|{}|{}|{}\n",
+            frame.name,
+            frame.own_neutral,
+            frame.log_level,
+            frame.object_fraction,
+            capture,
+            fixture,
+            frame.pattern
+        ));
+    }
+    let config_path = dir.join(format!("fake-native-{}.config", std::process::id()));
+    fs::write(&config_path, config).expect("write fake native config");
+
+    let wrapper = dir.join("fake-dng-linear-frame");
+    let script = format!(
+        "#!/bin/sh\nexport FAKE_NATIVE_CONFIG={}\nexec {} \"$@\"\n",
+        shell_quote(&config_path.display().to_string()),
+        shell_quote(&fake_native_binary().display().to_string())
+    );
+    write_executable(&wrapper, &script);
+    wrapper
+}
+
+/// Historical 8x6 fixture sequence used by the pre-deflicker tests.
 pub fn fake_native_tool(
     dir: &Path,
     frames: &[FakeFrame],
     fail_on: Option<&str>,
     ignore_override: bool,
 ) -> PathBuf {
-    let path = dir.join("fake-dng-linear-frame");
-    let mut script = String::new();
-    script.push_str("#!/bin/sh\nset -eu\n");
-    script.push_str("input=\"$1\"; png=\"$2\"; json=\"$3\"; shift 3\n");
-    script.push_str("wb=\"\"\n");
-    script.push_str("while [ \"$#\" -gt 0 ]; do\n");
-    script.push_str("  case \"$1\" in\n");
-    script.push_str("    --white-balance) wb=\"$2\"; shift 2 ;;\n");
-    script.push_str("    --converter) shift 2 ;;\n");
-    script.push_str("    --converter-timeout) shift 2 ;;\n");
-    script.push_str("    *) echo \"unexpected argument: $1\" >&2; exit 2 ;;\n");
-    script.push_str("  esac\n");
-    script.push_str("done\n");
-    script.push_str("name=$(basename \"$input\")\n");
-    if let Some(failing) = fail_on {
-        script.push_str(&format!(
-            "if [ \"$name\" = {} ]; then echo \"synthetic frame failure\" >&2; exit 3; fi\n",
-            shell_quote(failing)
-        ));
-    }
-    script.push_str("case \"$name\" in\n");
-    for frame in frames {
-        script.push_str(&format!(
-            "  {}) fixture={}; own={} ;;\n",
-            shell_quote(&frame.name),
-            shell_quote(&frame.fixture.display().to_string()),
-            shell_quote(&frame.own_neutral)
-        ));
-    }
-    script.push_str("  *) echo \"no fixture for $name\" >&2; exit 4 ;;\n");
-    script.push_str("esac\n");
-    script.push_str("cp \"$fixture\" \"$png\"\n");
-    if ignore_override {
-        script.push_str("applied=\"$own\"; wbsrc=as-shot\n");
-    } else {
-        script.push_str(
-            "if [ -n \"$wb\" ]; then applied=\"$wb\"; wbsrc=override; else applied=\"$own\"; wbsrc=as-shot; fi\n",
-        );
-    }
-    script.push_str("cat > \"$json\" <<EOF\n");
-    script.push_str(&format!(
-        "{{\"schema_version\":1,\"source\":\"$input\",\"source_sha256\":\"fixture\",\"width\":{WIDTH},\"height\":{HEIGHT},\"applied_white_balance\":[$applied],\"white_balance_source\":\"$wbsrc\",\"as_shot_neutral\":[$own],\"observed_scene_min\":0.0,\"observed_scene_max\":1.0,\"quantization\":{{\"scale\":16384,\"rounding\":\"nearest; ties upward\",\"negative_policy\":\"clip to 0\",\"upper_policy\":\"above 65535/16384 clips to 65535\",\"negative_samples\":0,\"above_upper_samples\":0,\"transfer\":\"linear; no OETF\"}}}}\n"
-    ));
-    script.push_str("EOF\n");
-    script.push_str("exit 0\n");
-    write_executable(&path, &script);
-    path
+    write_fake_native(dir, frames, fail_on, ignore_override, WIDTH, HEIGHT, 1.0)
+}
+
+/// Synthetic sequence with an explicit geometry (deflicker tests).
+pub fn fake_native_sequence(
+    dir: &Path,
+    frames: &[FakeFrame],
+    fail_on: Option<&str>,
+    ignore_override: bool,
+    width: u32,
+    height: u32,
+) -> PathBuf {
+    write_fake_native(dir, frames, fail_on, ignore_override, width, height, 1.0)
+}
+
+/// Same sequence, but the producer executes only `scale` of the requested EV
+/// (models a renderer that under-applies gain).
+pub fn fake_native_sequence_gain_scale(
+    dir: &Path,
+    frames: &[FakeFrame],
+    fail_on: Option<&str>,
+    ignore_override: bool,
+    width: u32,
+    height: u32,
+    scale: f64,
+) -> PathBuf {
+    write_fake_native(dir, frames, fail_on, ignore_override, width, height, scale)
 }
 
 pub fn fake_failing_encoder(dir: &Path) -> PathBuf {
@@ -281,22 +393,128 @@ pub fn make_input(dir: &Path, names: &[&str]) {
     }
 }
 
+pub fn fixture(dir: &Path, name: &str, code: u16) -> PathBuf {
+    let path = dir.join(format!("{name}.png"));
+    let pixels = vec![[code, code, code]; (WIDTH * HEIGHT) as usize];
+    write_rgb48_png(&path, WIDTH, HEIGHT, &pixels);
+    path
+}
+
 pub fn standard_frames(fixture_dir: &Path) -> Vec<FakeFrame> {
     vec![
         FakeFrame {
             name: "IMG_1.DNG".to_string(),
-            fixture: fixture(fixture_dir, "IMG_1", 1000),
+            fixture: Some(fixture(fixture_dir, "IMG_1", 1000)),
             own_neutral: "0.5,1,0.8".to_string(),
+            log_level: (1000.0f64 / 16384.0).log2(),
+            object_fraction: 0.0,
+            capture_time: Some("2026:11:08 20:00:00".to_string()),
+            pattern: "flat",
         },
         FakeFrame {
             name: "IMG_2.DNG".to_string(),
-            fixture: fixture(fixture_dir, "IMG_2", 2000),
+            fixture: Some(fixture(fixture_dir, "IMG_2", 2000)),
             own_neutral: "0.6,1,0.7".to_string(),
+            log_level: (2000.0f64 / 16384.0).log2(),
+            object_fraction: 0.0,
+            capture_time: Some("2026:11:08 20:00:10".to_string()),
+            pattern: "flat",
         },
         FakeFrame {
             name: "IMG_10.DNG".to_string(),
-            fixture: fixture(fixture_dir, "IMG_10", 3000),
+            fixture: Some(fixture(fixture_dir, "IMG_10", 3000)),
             own_neutral: "0.55,1,0.75".to_string(),
+            log_level: (3000.0f64 / 16384.0).log2(),
+            object_fraction: 0.0,
+            capture_time: Some("2026:11:08 20:00:20".to_string()),
+            pattern: "flat",
         },
     ]
+}
+
+/// Deterministic synthetic sequence: base 0.18 scene-linear plus injected EV.
+pub fn synthetic_sequence(gains: &[f64]) -> Vec<FakeFrame> {
+    let base = 0.18f64.log2();
+    gains
+        .iter()
+        .enumerate()
+        .map(|(index, gain)| {
+            FakeFrame::new(&format!("frame_{:04}.DNG", index), base + gain).capture(&format!(
+                "2026:11:08 20:{:02}:{:02}",
+                index / 60,
+                index % 60
+            ))
+        })
+        .collect()
+}
+
+pub fn frame_names(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("frame_{:04}.DNG", index))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Assertion helpers shared by the deflicker integration tests
+// ---------------------------------------------------------------------------
+
+pub fn read_json(path: &Path) -> rawtl_linear_video::json::Json {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+    rawtl_linear_video::json::parse(&text)
+        .unwrap_or_else(|err| panic!("invalid JSON {}: {err}", path.display()))
+}
+
+/// Decode the first pixel of a PNG through the real ffmpeg.
+pub fn framemd5(path: &Path) -> String {
+    let output = Command::new(FFMPEG)
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-f", "framemd5", "-"])
+        .output()
+        .expect("run framemd5");
+    assert!(
+        output.status.success(),
+        "framemd5 failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+pub fn png_first_code(path: &Path) -> u16 {
+    let output = Command::new(FFMPEG)
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "rgb48le",
+            "-f",
+            "rawvideo",
+            "-",
+        ])
+        .output()
+        .expect("decode PNG pixel");
+    assert!(
+        output.status.success(),
+        "ffmpeg failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.len() >= 6, "no decoded pixel");
+    u16::from_le_bytes([output.stdout[0], output.stdout[1]])
+}
+
+pub fn frame_record(
+    report: &rawtl_linear_video::json::Json,
+    index: usize,
+) -> rawtl_linear_video::json::Json {
+    report
+        .get("frames")
+        .and_then(|frames| frames.as_array())
+        .and_then(|frames| frames.get(index))
+        .cloned()
+        .unwrap_or_else(|| panic!("report has no frame {index}"))
 }

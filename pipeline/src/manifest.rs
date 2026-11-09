@@ -23,6 +23,8 @@ pub struct ManifestInput<'a> {
     pub ffmpeg_version: String,
     pub ffprobe_version: String,
     pub timings: &'a BTreeMap<String, Duration>,
+    /// Process-owned deflicker block (config, status counts, audit summary).
+    pub deflicker: Json,
 }
 
 pub fn build(input: &ManifestInput<'_>) -> Json {
@@ -321,6 +323,7 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
             ]),
         ),
         ("timings_s", timings_json(input.timings)),
+        ("deflicker", input.deflicker.clone()),
     ])
 }
 
