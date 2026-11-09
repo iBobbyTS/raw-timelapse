@@ -11,11 +11,11 @@
 //! validation or audit) and records DISABLED frame statuses.
 
 use crate::audit::{self, AuditConfig};
-use crate::cli::{DeflickerConfig, Estimator, OnReview, TemporalQuality};
+use crate::cli::{DeflickerConfig, Estimator, TemporalQuality};
 use crate::error::{
-    Error, Result, EXIT_AUDIT, EXIT_FRAME, EXIT_GAIN_PROBE, EXIT_PUBLISH, EXIT_RENDER_VALIDATION,
-    EXIT_REVIEW,
+    Error, Result, EXIT_FRAME, EXIT_GAIN_PROBE, EXIT_PUBLISH, EXIT_RENDER_VALIDATION,
 };
+use crate::fallback::{self, FallbackConfig};
 use crate::frame::{self, FrameInfo, FrameSequence, ProduceConfig};
 use crate::json::{self, Json};
 use crate::{encode_and_validate, publish_run, RunContext};
@@ -96,7 +96,7 @@ fn run_with_boundary(
     if deflicker.enabled() {
         println!(
             "deflicker: enabled (strength {}, period {}, brightness {}, estimator {}, \
-             ev_limits {}, on_review {}, temporal_quality {})",
+             ev_limits {}, temporal_quality {})",
             deflicker.strength,
             deflicker.period,
             deflicker.brightness.as_str(),
@@ -105,7 +105,6 @@ fn run_with_boundary(
                 Some((low, high)) => format!("{low},{high}"),
                 None => "none".to_string(),
             },
-            deflicker.on_review.as_str(),
             deflicker.temporal_quality.as_str(),
         );
     } else {
@@ -280,39 +279,69 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
     );
     state.exposure = Some(exposure);
 
-    // 5. REVIEW_REQUIRED policy.
-    let need_review = state
+    // 5. Fail-open policy: frames without a reliable estimate are filled
+    //    from the global-reference curve (the estimator of last resort),
+    //    aligned to verified neighbours. Publication is never blocked by an
+    //    incomplete estimate; the report records exactly what happened.
+    let unestimated = state
         .exposure
         .as_ref()
         .expect("exposure set")
         .frames
         .iter()
-        .any(|frame| frame.applied_ev.is_none());
-    if need_review {
-        state
-            .warnings
-            .push("REVIEW_REQUIRED: one or more frames have no reliable EV estimate".to_string());
-        match cfg.on_review {
-            OnReview::Error => {
-                state.run_status = "REVIEW_REQUIRED".to_string();
-                return Err(Error::new(
-                    EXIT_REVIEW,
-                    "exposure estimate incomplete: use --on-review passthrough to output \
-                     zeros for unreliable frames",
-                ));
-            }
-            OnReview::Passthrough => {
-                let exposure = state.exposure.as_mut().expect("exposure set");
-                for frame in &mut exposure.frames {
-                    if frame.applied_ev.is_none() {
-                        frame.warnings.push(
-                            "PASSTHROUGH_UNCORRECTED_FRAME: output rendered at 0 EV".to_string(),
-                        );
-                    }
-                }
-                println!("review policy: passthrough (unreliable frames rendered at 0 EV)");
-            }
+        .filter(|frame| frame.applied_ev.is_none())
+        .count();
+    let mut fallback_engaged = false;
+    if unestimated > 0 {
+        let boundaries: Vec<usize> = {
+            let exposure = state.exposure.as_ref().expect("exposure set");
+            let mut set: Vec<usize> = exposure
+                .scene_cuts
+                .iter()
+                .map(|cut| cut.index)
+                .chain(exposure.time_gaps.iter().copied())
+                .filter(|index| *index > 0 && *index < n)
+                .collect();
+            set.sort_unstable();
+            set.dedup();
+            set
+        };
+        let fallback_config = FallbackConfig {
+            period: cfg.period,
+            strength: cfg.strength,
+            brightness: cfg.brightness.as_str().to_string(),
+            ev_limits: cfg.ev_limits,
+            steps: cfg.steps.clone(),
+        };
+        let summary = {
+            let exposure = state.exposure.as_mut().expect("exposure set");
+            fallback::fill_holes(&measurements, exposure, &boundaries, &fallback_config)
+                .map_err(|err| {
+                    Error::new(
+                        EXIT_FRAME,
+                        format!("global-reference fallback failed: {err}"),
+                    )
+                })?
+        };
+        println!(
+            "review policy: global-reference fallback filled {} of {} unestimated \
+             frame(s) ({} at 0 EV)",
+            summary.filled, unestimated, summary.rendered_at_zero_ev
+        );
+        state.warnings.push(format!(
+            "GLOBAL_REFERENCE_FALLBACK: {} of {} frame(s) had no reliable pairwise \
+             estimate and were corrected from the whole-frame reference curve",
+            summary.filled, unestimated
+        ));
+        if summary.rendered_at_zero_ev > 0 {
+            state.warnings.push(format!(
+                "GLOBAL_REFERENCE_UNMEASURED: {} fallback frame(s) rendered at 0 EV \
+                 (no usable tiles in their continuity segment)",
+                summary.rendered_at_zero_ev
+            ));
         }
+        state.global_reference_fallback = summary.to_json();
+        fallback_engaged = true;
     }
 
     // 6. Gain probe (skipped when disabled, short or without reliable estimates).
@@ -353,20 +382,22 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         _ => None,
     });
     state.gain_probe = probe;
+    let mut probe_flagged = false;
     if probe_passed == Some(false) {
+        // Fail-open contract: a failed probe is a recorded review flag, not
+        // a publication gate. The applied gains may be wrong; the report and
+        // manifest carry the probe verdict and reasons verbatim.
         let reasons = state
             .gain_probe
             .get("reasons")
             .cloned()
             .unwrap_or(Json::Null);
-        state.run_status = "GAIN_PROBE_FAILED".to_string();
-        return Err(Error::new(
-            EXIT_GAIN_PROBE,
-            format!(
-                "RAW exposure gain probe failed: {}",
-                json::to_pretty_string(&reasons).trim()
-            ),
+        state.warnings.push(format!(
+            "GAIN_PROBE_FAILED: RAW exposure gain probe reported {} \
+             (published anyway; verify before using the deliverable)",
+            json::to_pretty_string(&reasons).trim()
         ));
+        probe_flagged = true;
     }
 
     // 7. Application passes with render validation and at most two feedback updates.
@@ -553,13 +584,21 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         )
     })?;
     restore(state, best.state.clone());
+    let mut targets_not_reached = false;
     if let Some(summary) = &best.summary {
         if !summary.passed {
-            state.run_status = "TARGET_NOT_REACHED".to_string();
-            return Err(Error::new(
-                EXIT_RENDER_VALIDATION,
-                "renderer failed to achieve frozen exposure targets within two feedback updates",
+            // Fail-open contract: keep the best round, flag it, publish.
+            state.warnings.push(format!(
+                "RENDER_TARGETS_NOT_REACHED: published the best of {} render \
+                 round(s) (median abs error {} EV, p95 {} EV; outliers {}, \
+                 unobservable {})",
+                state.feedback_history.len() + 1,
+                format_option(summary.median_abs_error_ev),
+                format_option(summary.p95_abs_error_ev),
+                summary.outlier_frames.len(),
+                summary.unobservable_frames.len()
             ));
+            targets_not_reached = true;
         }
     }
 
@@ -631,7 +670,7 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
                 ),
             ]);
         }
-        TemporalQuality::Strict | TemporalQuality::Report => {
+        TemporalQuality::Report => {
             println!("independent encoded-video temporal audit...");
             let labels: Vec<String> = final_sequence
                 .frames
@@ -662,19 +701,12 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
                             .and_then(Json::as_array)
                             .map(|events| events.len())
                             .unwrap_or(0);
-                        let summary =
-                            format!("encoded temporal quality FAIL: {events} events >0.05 EV");
-                        if cfg.temporal_quality == TemporalQuality::Strict {
-                            state.run_status = "TEMPORAL_QUALITY_FAILED".to_string();
-                            return Err(Error::new(
-                                EXIT_AUDIT,
-                                format!(
-                                    "{summary}; rerun with --temporal-quality report to keep \
-                                     the video flagged for review"
-                                ),
-                            ));
-                        }
-                        state.warnings.push(summary);
+                        // Fail-open contract: the audit verdict is recorded and
+                        // flagged; publication is never blocked by it.
+                        state.warnings.push(format!(
+                            "encoded temporal quality FAIL: {events} events >0.05 EV \
+                             (published; flagged for review)"
+                        ));
                         state.run_status = "COMPLETED_WITH_REVIEW".to_string();
                     }
                 }
@@ -696,7 +728,12 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
 
     // 10. Run status (never overwrites an explicit failure state).
     if state.run_status == "RUNNING" {
-        state.run_status = if need_review { "PARTIAL" } else { "OK" }.to_string();
+        state.run_status = if fallback_engaged || probe_flagged || targets_not_reached {
+            "COMPLETED_WITH_REVIEW"
+        } else {
+            "OK"
+        }
+        .to_string();
     }
     state.feedback_updates = feedback_count;
 
@@ -952,6 +989,7 @@ struct RunState {
     feedback_updates: usize,
     encoded_temporal_quality: Json,
     render_temporal_quality: Json,
+    global_reference_fallback: Json,
     warnings: Vec<String>,
     run_status: String,
     error: Option<String>,
@@ -1005,7 +1043,6 @@ impl RunState {
                         .collect(),
                 ),
             ),
-            ("on_review", Json::Str(cfg.on_review.as_str().to_string())),
             (
                 "temporal_quality",
                 Json::Str(cfg.temporal_quality.as_str().to_string()),
@@ -1048,6 +1085,7 @@ impl RunState {
             feedback_history: vec![],
             feedback_updates: 0,
             encoded_temporal_quality: Json::Null,
+            global_reference_fallback: Json::Null,
             render_temporal_quality: Json::obj(vec![
                 ("status", Json::Str("NOT_INDEPENDENT".into())),
                 (
@@ -1192,6 +1230,10 @@ fn write_reports(options: &crate::cli::Options, output: &Path, state: &mut RunSt
             "render_temporal_quality".to_string(),
             state.render_temporal_quality.clone(),
         ));
+        entries.push((
+            "global_reference_fallback".to_string(),
+            state.global_reference_fallback.clone(),
+        ));
         entries.push(("source_continuity".to_string(), state.continuity.clone()));
         entries.push((
             "feedback_updates".to_string(),
@@ -1306,7 +1348,7 @@ fn continuity_time_gaps(continuity: &Json) -> Vec<usize> {
 fn execution_status(run_status: &str) -> &'static str {
     match run_status {
         "OK" => "COMPLETED",
-        "PARTIAL" | "COMPLETED_WITH_REVIEW" => "COMPLETED_WITH_REVIEW",
+        "COMPLETED_WITH_REVIEW" => "COMPLETED_WITH_REVIEW",
         _ => "FAILED",
     }
 }
@@ -1441,6 +1483,10 @@ fn enabled_manifest_block(state: &RunState) -> Json {
         (
             "render_temporal_quality",
             state.render_temporal_quality.clone(),
+        ),
+        (
+            "global_reference_fallback",
+            state.global_reference_fallback.clone(),
         ),
         ("feedback_updates", Json::Int(state.feedback_updates as i64)),
         ("report", Json::Str(REPORT_NAME.into())),
@@ -1912,21 +1958,14 @@ fn format_option(value: Option<f64>) -> String {
 /// Statuses that already name a failure class survive the error mapping.
 fn failure_run_status(current: &str, code: i32) -> String {
     match current {
-        "REVIEW_REQUIRED"
-        | "GAIN_PROBE_FAILED"
-        | "TARGET_NOT_REACHED"
-        | "TEMPORAL_QUALITY_FAILED"
-        | "FAILED" => current.to_string(),
+        "GAIN_PROBE_FAILED" | "FAILED" => current.to_string(),
         _ => status_for_exit(code).to_string(),
     }
 }
 
 fn status_for_exit(code: i32) -> &'static str {
     match code {
-        EXIT_REVIEW => "REVIEW_REQUIRED",
         EXIT_GAIN_PROBE => "GAIN_PROBE_FAILED",
-        EXIT_RENDER_VALIDATION => "TARGET_NOT_REACHED",
-        EXIT_AUDIT => "TEMPORAL_QUALITY_FAILED",
         _ => "FAILED",
     }
 }
@@ -2023,22 +2062,14 @@ mod tests {
 
     #[test]
     fn failure_status_never_keeps_a_success_value() {
-        for success in ["RUNNING", "OK", "PARTIAL", "COMPLETED_WITH_REVIEW"] {
+        for success in ["RUNNING", "OK", "COMPLETED_WITH_REVIEW"] {
             assert_eq!(failure_run_status(success, 40), "FAILED");
             assert_eq!(failure_run_status(success, 50), "FAILED");
             assert_eq!(failure_run_status(success, 70), "FAILED");
-            assert_eq!(failure_run_status(success, 80), "REVIEW_REQUIRED");
             assert_eq!(failure_run_status(success, 81), "GAIN_PROBE_FAILED");
-            assert_eq!(failure_run_status(success, 82), "TARGET_NOT_REACHED");
-            assert_eq!(failure_run_status(success, 83), "TEMPORAL_QUALITY_FAILED");
+            assert_eq!(failure_run_status(success, 82), "FAILED");
         }
-        for failure in [
-            "REVIEW_REQUIRED",
-            "GAIN_PROBE_FAILED",
-            "TARGET_NOT_REACHED",
-            "TEMPORAL_QUALITY_FAILED",
-            "FAILED",
-        ] {
+        for failure in ["GAIN_PROBE_FAILED", "FAILED"] {
             assert_eq!(failure_run_status(failure, 40), failure);
             assert_eq!(failure_run_status(failure, 70), failure);
         }

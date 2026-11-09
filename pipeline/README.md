@@ -35,7 +35,7 @@ rawtl-linear-video --input <DNG_DIR> --output <RUN_DIR> \
   [--strength 1.0] [--period 60] [--brightness smooth|uniform] \
   [--estimator pairwise|legacy] [--ev-limits none|LOW,HIGH] \
   [--roi X,Y,W,H] [--exclude-roi X0,Y0,X1,Y1 ...] [--step START:EV ...] \
-  [--on-review error|passthrough] [--temporal-quality strict|report|off]
+  [--temporal-quality report|off]
 ```
 
 Defaults:
@@ -47,10 +47,14 @@ Defaults:
 - `--fps 30` — the frozen legacy default (`legacy/python/src/rawtl/cli.py:91`,
   `Fraction(30)`). Rational rates such as `30000/1001` are accepted; the
   positive-rate and `<= 1000` bounds match the legacy parser.
-- Deflicker defaults (`legacy/python/src/rawtl/cli.py:95-114`): strength 1.0,
-  period 60, brightness smooth, estimator pairwise, unbounded EV, full-frame
-  ROI, no exclusions or confirmed steps, `on_review=error`,
-  `temporal_quality=strict`. `--strength 0` disables the node entirely.
+- Deflicker defaults (`legacy/python/src/rawtl/cli.py:95-114`, amended
+  2026-11-11): strength 1.0, period 60, brightness smooth, estimator
+  pairwise, unbounded EV, full-frame ROI, no exclusions or confirmed steps.
+  The publication gates of the frozen legacy CLI (`on_review=error`,
+  `temporal_quality=strict`) were removed by owner decision: an incomplete
+  estimate falls back to the global-reference curve and the temporal audit
+  records its verdict without blocking publication
+  (`temporal_quality=report`). `--strength 0` disables the node entirely.
 
 `--converter` and `--converter-timeout` are forwarded to the native producer;
 by default the native tool uses the Adobe DNG Converter application path and
@@ -182,14 +186,30 @@ Enabled path:
    whole-sequence V4 state machine: pairwise graph or legacy estimator, smooth
    trend or uniform target, confirmed steps, EV limits, scene-cut metadata and
    interpolated/lone-frame states.
-4. **Review policy** — any frame without a reliable EV estimate makes
-   `REVIEW_REQUIRED`. `--on-review error` (default) stops the run (exit 80);
-   `--on-review passthrough` renders it at 0 EV, marks
-   `PASSTHROUGH_UNCORRECTED_FRAME`, and reports `PARTIAL`.
-5. **Gain probe** — skipped when disabled, shorter than 8 frames or without a
-   reliable estimate; otherwise representative frames (up to five) are analyzed
+4. **Fail-open review policy (global-reference fallback)** — any frame the
+   estimator marks unreliable (`REVIEW_REQUIRED`, no `applied_ev`) is filled
+   from the global-reference curve: the per-frame median valid-tile log2 level
+   (the engine's `row_level` semantics), smoothed by the same
+   Huber-Whittaker trend as the verified path (segment median for `uniform`
+   intent), confirmed steps removed before smoothing, split at scene-cut /
+   capture-time-gap boundaries, and offset-aligned to the nearest verified
+   neighbour estimates so post-correction levels stay continuous across the
+   seam. Filled frames carry status `GLOBAL_REFERENCE`, per-frame
+   `GLOBAL_REFERENCE_FALLBACK` warnings and a report-level
+   `global_reference_fallback` block (holes, anchors, degraded segments). A
+   continuity segment without any usable measurement renders its frames at
+   0 EV with `GLOBAL_REFERENCE_UNMEASURED` warnings. Publication is never
+   blocked by an incomplete estimate. Provenance: the only element borrowed
+   from the reverse-engineered LRTimelapse Visual Deflicker is the concept of
+   a whole-frame reference curve as the estimator of last resort; measurement,
+   smoothing and application are this system's own machinery (no rendered
+   previews, no LOESS, no empirical logit calibration, no accuracy deadband).
+5. **Gain probe** — skipped when disabled, shorter than 8 frames or without any
+   estimated frame; otherwise representative frames (up to five) are analyzed
    at -0.25/+0.25 EV and the per-tile log response must match the requested EV
-   (median |error| <= 0.02, P95 <= 0.05). Failure stops the run (exit 81).
+   (median |error| <= 0.02, P95 <= 0.05). A failed probe is a recorded review
+   flag (`GAIN_PROBE_FAILED` warning, probe JSON verbatim), not a publication
+   gate; probe-side tool failures remain operational errors (exit 81).
 6. **Application pass** — frames are re-decoded with `--exposure-ev <applied>`
    and an analysis sidecar, writing the PNG/metadata pair plus applied-EV
    measurements. `new_output_clipping_fraction` is the per-tile positive
@@ -199,8 +219,9 @@ Enabled path:
    with the frozen targets (`median <= 0.01 EV`, `P95 <= 0.03 EV`, no severe
    frame) using one shared offset. At most two feedback updates change
    `applied_ev` only (damping 0.75, step 0.25); divergence aborts and keeps the
-   best round; a best round that still fails ends the run `TARGET_NOT_REACHED`
-   (exit 82) without publishing. All-unobservable validation is reported as
+   best round. A best round that still fails is published with a
+   `RENDER_TARGETS_NOT_REACHED` warning and `COMPLETED_WITH_REVIEW` — never
+   blocked. All-unobservable validation is reported as
    `NOT_VERIFIED_NO_CONSENSUS` / `NOT_INDEPENDENT_LEGACY`, never as a pass.
 8. **Encode / validate / roundtrip / preview** — unchanged from the linear
    pipeline above.
@@ -211,9 +232,11 @@ Enabled path:
    boundaries are scene cuts union capture-time gaps. The delivered-code
    saturation proxy is `code >= int(0.965 * 65535)` — a literal port applied to
    the 16-bit delivered codes, deliberately not the sidecar's linear-scale
-   `16057` series. `strict` fails the run on `FAIL` (exit 83, no publication);
-   `report` publishes as `COMPLETED_WITH_REVIEW`; `off` records `SKIPPED`.
-   Observation failures are recorded as `UNOBSERVABLE`, never as a pass.
+   `16057` series. The verdict is recorded verbatim (`temporal_audit.json`,
+   manifest `audit_status`) and a `FAIL` adds a warning plus
+   `COMPLETED_WITH_REVIEW`; publication is never blocked. `off` records
+   `SKIPPED`. Observation failures are recorded as `UNOBSERVABLE`, never as a
+   pass.
 10. **Reports and publication** — `exposure_report.json` and
     `exposure-curve.csv` are written atomically before the manifest and
     publication. Any failure after the guarded output directory exists retains
@@ -256,10 +279,14 @@ possible.
 | 50 | ffprobe validation or lossless-roundtrip failure |
 | 60 | sRGB preview render/encode/validation failure |
 | 70 | Manifest publication or final rename failure |
-| 80 | `REVIEW_REQUIRED` with `--on-review error` |
-| 81 | Gain probe failed |
-| 82 | Render targets not reached (`TARGET_NOT_REACHED`) |
-| 83 | Encoded temporal audit `FAIL` under `--temporal-quality strict` |
+| 81 | Gain-probe tool failure (probe verdicts themselves are recorded flags) |
+| 82 | Render-validation internal error (target misses are recorded flags) |
+
+Deflicker estimate completeness, probe verdicts, render-target misses and the
+encoded-audit verdict never stop a run: they are recorded as warnings, frame
+statuses and manifest fields, and the deliverables are published as
+`COMPLETED_WITH_REVIEW` (exit 0). The removed exit codes 80/83 belonged to the
+frozen legacy gate contract (`--on-review error`, `--temporal-quality strict`).
 
 ## Tests
 
@@ -271,12 +298,14 @@ frozen-WB propagation and drift detection, fail-fast, encoder failure after
 bytes are written, ffprobe rejection, roundtrip mismatch and directory guards.
 Deflicker scenarios cover injected alternating gain (corrected, audit passes),
 confirmed steps (requested EV preserved; the legacy shared-offset render check
-reports a genuine level step as `TARGET_NOT_REACHED`), EV limits (`LIMITED`
-with requested != applied), render under-execution, `on_review` error versus
-passthrough, a wrong correction that passes the gain probe but fails the encoded
-audit (no publication), and the `--strength 0` regression path (fixture-equal
-PNGs, identical FFV1 content and encoder arguments). Real-material runs are
-opt-in:
+flags a genuine level step and the run publishes with the warning), EV limits
+(`LIMITED` with requested != applied), render under-execution (best round
+published with `RENDER_TARGETS_NOT_REACHED`), the global-reference fallback
+(unreliable frames get `GLOBAL_REFERENCE` estimates and the run publishes), a
+wrong correction that passes the gain probe while the audit records `FAIL`
+(deliverables still published), and the `--strength 0` regression path
+(fixture-equal PNGs, identical FFV1 content and encoder arguments).
+Real-material runs are opt-in:
 
 ```sh
 pipeline/target/release/rawtl-linear-video \
