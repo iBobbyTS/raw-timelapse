@@ -1,0 +1,13 @@
+[package]
+name = "rawtl-linear-video"
+version = "0.1.0"
+edition = "2021"
+description = "Frame-sequence pipeline and FFV1/sRGB video encoder for scene-linear ACEScg DNG frames"
+publish = false
+
+[[bin]]
+name = "rawtl-linear-video"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3

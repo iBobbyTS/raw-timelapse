@@ -166,3 +166,54 @@
 - **不声称**：与冻结 legacy/rawpy 的数值等同、绝对反射率、物理曝光参考或跨工具链 PNG 字节一致。输出是 SDK white-saturation normalization 的相机线性→ACEScg，不施加 BaselineExposure。
 - JSON 含运行临时路径，确定性合同针对 PNG。PNG/JSON 逐文件发布，I/O 在两次 rename 间失败可留下 PNG，退出非零；S02 必须先检查进程状态。
 - independent code review、Section acceptance、后继释放与最终 T08 commit 由 Main 负责，本报告不替代它们。
+
+## 2026-11-09 — S02 / T14-adjacent：帧序列管线与编码视频（最小整体系统）
+
+本节 primary task marker **T14**（FFmpeg encoder / 高位深 / profile sidecar / 编码后独立审计）的最小系统竖切：只实现用户 COR-003/REQ-007 范围内的“DNG 帧序列 → 16-bit FFV1 线性 MKV + sRGB 预览”，不包含 v2.6 的 encoder 插件 ABI、官方 profile 系统、事件/图执行器或完整审计框架。实现位于 `pipeline/`（Rust 单 crate，`rawtl-linear-video`），消费 S01 已接受的 `native/dng-linear-frame` CLI/JSON/PNG 契约；未修改 native 工具、legacy/python 或 `docs/architecture-v2.6.md`。提交由 Main 负责，本执行者没有 commit/push/分支操作。
+
+### 环境与命令
+
+- macOS 27.0.1 / arm64；rustc/cargo 1.99.1（Homebrew）；ffmpeg/ffprobe 8.0.1（`/opt/homebrew/opt/ffmpeg-full/bin`，fixed default 并记录于 manifest）；native 工具使用 S01 的 matched build `.agent-work/tmp/dng-linear-frame/build-matched/dng-linear-frame`（SDK 1.7.1/2768，Converter 18.7 per S01）。
+- 构建：`cargo clean` + `cargo build --release`（`pipeline/target/release/rawtl-linear-video`），exit 0；`logs/cargo-build-release3.log`。
+- 真实样例命令（39 帧，默认 fps，默认 ffmpeg/ffprobe）：
+
+  ```sh
+  pipeline/target/release/rawtl-linear-video \
+    --input /Users/ibobby/Temp/tl \
+    --output outputs/linear-video-pipeline-e2e \
+    --dng-linear-frame .agent-work/tmp/dng-linear-frame/build-matched/dng-linear-frame
+  ```
+
+  真实退出码 **0**，`real 230.93s`；完整 stdout/stderr 在 `.agent-work/tmp/linear-video-pipeline/logs/e2e-run.log`，退出码文件 `e2e-run.exit`。输入素材只读；交付物在 `outputs/linear-video-pipeline-e2e/`（`/outputs/` 已忽略，不入库）。
+
+### 管线语义与实测
+
+- **排序**：枚举大小写不敏感 `.dng`，按文件名 text/digit run 自然序（数字按数值比较）排序；无数字段、仅大小写不同、数字拼写等价（`IMG_1` vs `IMG_01`）均显式拒绝，无 lexicographic fallback。真实序列 `TIMELAPSE_0709–0747` 按数值顺序 39/39。
+- **序列冻结 WB（REQ-008）**：首帧默认 as-shot 解码，取其 `applied_white_balance` = `0.605080831408776, 1, 0.48250460405156537`（即 0709 AsShotNeutral），作为 `--white-balance` 传给其余 38 帧。39/39 JSON 的 applied 值逐位相同，首帧 `white_balance_source=as-shot`、其余 38 帧 `override`；末帧 0747 保留自身 `as_shot_neutral = 0.6425505824647455, 1, 0.4488222698072805`。逐帧 own neutral 与 applied 均记录在 manifest。独立校验脚本 `verify_e2e.py` 结果 PASS（`logs/e2e-verification.txt`，exit 0）。
+- **fps 来源**：默认 `30/1`，provenance=`legacy/python/src/rawtl/cli.py:91 (argparse default Fraction(30))`；本次未用 `--fps` override。manifest 记录 value/decimal/provenance。
+- **线性编码参数（显式，无隐藏重采样/色彩转换）**：`-framerate 30/1 -start_number 1 -i frames/frame_%06d.png -frames:v 39 -c:v ffv1 -level 3 -g 1 -slicecrc 1 -pix_fmt gbrp16le -map_metadata -1 -f matroska`。ffprobe：`codec_name=ffv1`、`pix_fmt=gbrp16le`、4000×2256、`nb_read_frames=39`、`avg_frame_rate=30/1`；FFV1 文件 583,584,930 bytes，SHA-256 `9aae33e5dfc9306fae753b49711e10fe2dd8989f95baea4d6e455a4acb16f25b`（`logs/ffprobe-linear.txt`、`logs/deliverable-sha256.txt`）。
+- **量化政策消费**：管线本身不做额外量化；每帧 PNG 的 `code/16384` 标尺与 S01 量化政策（nearest, ties upward；负值→0；>65535/16384→65535）由 native JSON 逐帧记录（scale/rounding/两端裁切计数、observed scene min/max）。FFV1 只做无损 RGB16 传输；preview 的 8-bit 量化是独立、显式声明的显示量化（见下）。
+- **无损往返验证**：编码后先写 `.rawtl-partial/linear.mkv`，ffprobe 通过后再把送入的 PNG 序列与编码 MKV 都解码为 `rgb48le`，逐帧逐字节比较（39×54,144,000 bytes/frame）；结果 byte-identical（6.67s），`logs/roundtrip.log` 记 `result: PASS`。独立第二 oracle：`ffmpeg -f framemd5 -pix_fmt gbrp16le` 对 PNG 序列与 MKV 各生成 39 行哈希，`diff` 为空、exit 0（`logs/framemd5-png.txt`、`framemd5-video.txt`、`framemd5-diff.txt`）。
+- **发布语义**：两个交付物均先写运行期临时目录，验证通过后同目录 `rename` 原子发布；成功时临时目录删除（实测 `.rawtl-partial` 不存在），失败时以可区分名保留并打印路径。首选测到一次真实缺陷：首次 39 帧运行的 preview 虽可解码，但外部 ffprobe 显示 `color_primaries/transfer=unknown`；原因是 ffmpeg 8.0.1 的 `scale` filter 重置了帧色彩属性。修复为在 filter chain 追加 `setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv`，并把四项 tag 加入产品验证。首次运行日志保留为 `logs/*-pretagfix.*`（未删改）；第二次运行（上述 exit 0）是最终证据，ffprobe 显示 `color_space=bt709`、`color_primaries=bt709`、`color_transfer=iec61966-2-1`、`color_range=tv`。
+- **sRGB preview 颜色契约**：`code/16384` 解释为 AP1/D60 场景线性；显式矩阵 AP1/D60→XYZ(D60)→Bradford D60→D65→linear sRGB(D65)（矩阵与 white points 记录于 manifest 与 `pipeline/README.md`）；逐通道裁切到 `[0,1]`（负值/域外裁切，无 tone mapping）；IEC 61966-2-1 sRGB OETF；`round(value*255)` 量化到 8-bit。转换在 Rust 中完成（ffmpeg 仅把 PNG 解码为 rgb48le），随后 libx264 `-preset medium -crf 18 -pix_fmt yuv420p`，显式 `scale=out_color_matrix=bt709:out_range=tv` + `setparams`，tag bt709/bt709/iec61966-2-1/tv。preview = 8,344,613 bytes，SHA-256 `9192449d05e46f62e62ff09b986ff41bd5758b2048b76a81dbd5eee3aa6b3017`；ffprobe h264/yuv420p/4000×2256/39/30fps，并通过完整 `-f null -` 解码。数值单测：neutral 0.18→`118,118,118`；非中性 `[0.5,0.25,0.125]`→linear `[0.686670107181761,0.218754435511259,0.099877619173666]`→8-bit `[216,129,89]`；并把“把 AP1 当 sRGB”错误路径（`[188,137,99]`）作为反例拒绝。抽取 preview 第 1/21 帧目检：夜间行车场景，红色尾灯/白色车灯/黄色车道线/仪表盘颜色合理。
+
+### 检查与证据
+
+| 命令/选择 | 真实退出码与结果 | 证据（根=`.agent-work/tmp/linear-video-pipeline/`） |
+| --- | --- | --- |
+| `cargo clean && cargo test -- --test-threads=4` | 0，34 unit + 8 integration，0 failed | `logs/cargo-test-dev3.log` |
+| 39 帧真实端到端（命令见上） | 0；frames 162.71s；total 230.76s | `logs/e2e-run.log`、`e2e-run.exit` |
+| `python3 -I verify_e2e.py outputs/linear-video-pipeline-e2e` | 0，RESULT: PASS（39 帧 WB/来源/尺寸/文件/roundtrip 全核） | `logs/e2e-verification.txt`、`.exit` |
+| `ffprobe -count_frames`（linear/preview） | 0/0；见上文参数 | `logs/ffprobe-linear.txt`、`logs/ffprobe-preview.txt`、`.exit` |
+| PNG 序列 vs MKV `framemd5`（独立实现） | 0/0；39/39 行相同，`diff` exit 0 | `logs/framemd5-*.txt`、`logs/framemd5-diff.exit` |
+| 交付物/39 帧 PNG SHA-256 | 0 | `logs/deliverable-sha256.txt`、`logs/frame-png-sha256.txt` |
+| 集成测试注入场景（fake native + real ffmpeg） | 0；覆盖乱序/自然序、WB 漂移检测、坏帧 fail-fast（exit 30、无视频）、编码器写字节后失败（exit 40、仅有 `.rawtl-partial/linear.mkv`）、ffprobe 拒绝（exit 50）、roundtrip 不一致（exit 50）、目录重叠（exit 11）、非空输出（exit 12） | `pipeline/tests/pipeline_cli.rs`、`cargo-test-dev3.log` |
+| 首次 39 帧运行（preview tag 缺陷，已修复） | 0，但外部 ffprobe 显示 preview primaries/transfer unknown；作为缺陷证据保留 | `logs/e2e-run-pretagfix.log`、`ffprobe-preview-pretagfix.txt` |
+
+### NOT_TESTED / UNKNOWN / 边界
+
+- **NOT_TESTED**：Windows/Linux（产品路径当前以 macOS + Homebrew ffmpeg 为默认；仅 macOS arm64 实测）；`--fps` 非 30 的真实素材端到端（`30000/1001` 等仅单测/参数解析覆盖）；`--converter` / `--converter-timeout` 的真实素材 pass-through（本次用 native 默认）；其他相机、非三通道、direct LinearRaw 输入经完整管线的组合（S01 已覆盖单帧 direct 解码，S02 样例全为 CFA）；中断/信号处理与磁盘满/超大序列的清理保证；播放器兼容性（4K H.264/yuv420p、tag 是否被各播放器尊重）；preview 与外部 sRGB 参考/校准显示器的颜色一致性（仅数值单测 + 两帧目检）；视频编码字节确定性（FFV1/libx264 受线程/版本影响，只对内容与 lossless 往返作声明）；音频/字幕/多视频流（本来不产生）；硬件编码器。
+- **UNKNOWN**：Converter demosaic clipping 与 metadata baking 的详细归属（S01 继承）；播放器端 sRGB/bt709 tag 的实际显示解释；ffmpeg 8.0.1 `scale` filter 重置 primaries/trc 的规范依据（以实测和 `setparams` 修复为准，最终 tag 已由 ffprobe 验证）。
+- **不声称**：与 legacy/rawpy 的数值等同；视频字节可复现；preview 是可测量的交付域（它只是 display-referred 眼检预览）；`.DS_Store` 等 Finder 元数据不影响交付物。
+- JSON/manifest 含运行路径与耗时，非确定性合同的一部分；确定性证据针对原生 PNG（S01）与本次无损往返（内容级）。
+- 本节完成的是 T14 邻近编码竖切的最小系统语义；T14 的插件/官方 profile/审计框架、T13 的 Log 输出、T15/T16 等不在本计划范围。independent code review、Section acceptance 与 commit 由 Main 负责。
