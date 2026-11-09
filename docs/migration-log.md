@@ -218,6 +218,18 @@
 - JSON/manifest 含运行路径与耗时，非确定性合同的一部分；确定性证据针对原生 PNG（S01）与本次无损往返（内容级）。
 - 本节完成的是 T14 邻近编码竖切的最小系统语义；T14 的插件/官方 profile/审计框架、T13 的 Log 输出、T15/T16 等不在本计划范围。independent code review、Section acceptance 与 commit 由 Main 负责。
 
+## 2026-11-09 — 去闪节点程序（F01）完成记录
+
+去闪节点程序三个提交构成完整链（分支 feature/deflicker-node，自已验收的 feature/linear-video-pipeline @f461baa 串联；未合并/push）：
+
+- `2306656` — native 分析模式与曝光增益：`dng-linear-frame` 增 `--exposure-ev`（FP32 场景线性 ×2^EV，量化前，EV=0 与既有输出逐位一致）、`--emit-analysis`（确定性有限 JSON tile 测量 sidecar：12×8 网格/≤1024 BOX 降采样/5% 截尾线性均值→log2/相机域归一化饱和掩码（EV 不变量）与交付域 output_clip_fraction（≥16057）两序列严格分离/::4 结构采样/通道 log 均值）、`--no-png`、`--analysis-roi`、capture_time（DateTimeOriginal，可读即提取、结构损坏为 null）。
+- `25d3c1d` — Rust 纯 std 估计引擎 `pipeline/src/deflicker/`：legacy V4 算法逐语义 port（配对边/图 IRLS+确定性稀疏 PCG/带状 Cholesky Whittaker/整序列状态机 smooth|uniform × pairwise|legacy/台阶/强度/EV 限幅/缝合/插值/状态机）+ 72 个同名 legacy 场景测试移植 + 14 个契约边界回归（fixture 从冻结 legacy 源按 NumPy 种子可逐字节再生成）。
+- `8199338` — 管线集成（上文 S03/F01 条目）：默认开启（legacy 默认参数）、两遍编排、增益探针、渲染验证+≤2 反馈、独立编码视频审计（strict 门控）、曝光报告/曲线、退出码 80–83、`--strength 0` 单遍回归路径。
+
+真实样例结论（/Users/ibobby/Temp/tl，39 帧）：默认参数=诚实 REVIEW_REQUIRED（exit 80，164 候选边 0 可靠——夜间行车素材无匹配背景；状态级复现冻结 legacy golden plan：39/39 REVIEW_REQUIRED、逐 lag 候选计数一致、拒绝原因结构一致、scene cuts 29 vs 30）；`--on-review passthrough` 全链发布（39 帧 0 EV 标记、审计 SHORT_CONTEXT（29 边界切分）、无损往返 PASS）；`--strength 0` 回归=39/39 PNG 逐字节一致+MKV 解码内容 framemd5 全等+预览字节一致（MKV 容器头 DateUTC/SegmentUID/CRC 共 43 字节为记录性例外：muxer 写入编码时刻与随机 UID，基线自身亦不可复现，实验证据含 -fflags +bitexact）。REQ-011 判定细则已据此修订（REQUIREMENTS 2026-11-09）。
+
+诚实边界：跨 provider（rawpy/linear-sRGB）数值等同不承诺；真实素材上成功去闪发布路径 NOT_TESTED（素材本身无匹配背景）；真实素材的 --step/--roi/--estimator legacy 等组合 NOT_TESTED；audit 的 video_sha256 记录为 NOT_COMPUTED_STD_ONLY（内容一致性由无损往返+framemd5 证明）；其他平台未测。审查链：plan A（BLOCKER+NIT 修正）→ B（3 blocker+1 scope 修正）→ 双 CLEAN；S01 A/B（2 轮修复）、S02 A/B 双 CLEAN、S03 A（1 轮修复）+B（1 轮修复）全部 VERIFIED_CLOSED。证据根目录 .agent-work/tmp/deflicker-node/。
+
 ## 2026-11-09 — S03 / F01：去闪节点管线集成（两遍编排/验证反馈/独立审计/报告/端到端）
 
 本节对应用户任务 COR-004（把 legacy V4 去闪子系统重建为当前系统的处理节点）在 F01 的 S03 竖切：CLI 参数、两遍编排、增益探针、渲染验证与 ≤2 次反馈、独立编码视频审计、曝光报告/曲线、manifest 去闪块、原子发布与 `--strength 0` 回归路径。实现位于 `pipeline/src/{main,cli,error,frame,manifest,audit,deflicker_run}.rs`、`pipeline/tests/**`、`pipeline/README.md`；除 Main 授权的 `native/dng-linear-frame/README.md` 交叉引用（repair-1）外未修改 `native/**`（S01 冻结）；未修改 `pipeline/src/deflicker/**` 引擎内部、`git-worktree/**`、颜色/量化/WB 决策。提交由 Main 负责，本执行者没有 commit/push/分支操作。
