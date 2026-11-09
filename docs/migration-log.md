@@ -288,3 +288,27 @@
 - **UNKNOWN**：跨 provider（legacy rawpy/linear-sRGB ↔ ACEScg）数值等同；审计面积降采样与 legacy float32 的逐位一致（声明为语义等价、非逐位）；ffmpeg/Matroska 容器字节确定性的稳定方案。
 - **不声称**：与 legacy 产生域数值等同；MKV 容器字节可复现；审计 PASS 等价于“物理光照未变化”；`--strength 0` 的载荷字节由本次证据覆盖，不代表其他 ffmpeg 版本。
 - `native/dng-linear-frame/README.md`：repair 1 经 Main 授权仅新增一段交叉引用（分析遍/探针使用 `--exposure-ev/--emit-analysis/--no-png`、应用遍使用 `--exposure-ev/--emit-analysis`，编排见 `pipeline/README.md`）；未改动任何 native 代码/测试/CMake。
+
+
+## 去闪失败契约 fail-open 改造：全局参考曲线兜底（2026-11-11，普通流程）
+
+用户指令（COR-005/DEC-005a-c，REQUIREMENTS REQ-012）："最少量引入 lrt 的部分，替代我们算法里 fail-close 的路径，即任何情况都不拒绝，但不全量引入 lrt 的算法"。经三问确认：普通流程；发布门控全部移除；兜底仅补洞+邻接对齐。
+
+**从 LRTimelapse Visual Deflicker 逆向文档（rev-lrt/docs/lrt去闪算法逆向.md）只引入一个概念**——"每帧全局亮度标量 → 平滑参考曲线 → 修正偏离"作为估计器最后防线。测量（0EV sidecar 有效 tile log2 中位数，即引擎 row_level 语义）、平滑（复用 Huber-Whittaker；uniform=分段中位数）、执行（既有 ×2^EV 线性增益通道）全部复用现有部件；不引入视觉预览/JAI 直方图/LOESS/logit 标定/精度死区/multipass。新模块 `pipeline/src/fallback.rs`（管线级，deflicker 引擎=忠实 V4 移植保持封闭）。
+
+四条 fail-close 路径的替代：
+- **exit 80（REVIEW_REQUIRED）**→ 兜底填补：逐帧 status=GLOBAL_REFERENCE、警告与报告级 `global_reference_fallback` 块（洞区间、锚点 δ、线性降级段数）；确认台阶先减后加回（保留不抹平）；场景切变∪时间断层分段；与相邻已验证估计的 δ 对齐保证接缝连续；段内无任何可用测量 → 0 EV + GLOBAL_REFERENCE_UNMEASURED 警告。`--on-review` 参数删除。
+- **exit 81（探针 FAIL）**→ 警告 GAIN_PROBE_FAILED + 照常发布（探针 JSON 原样记录；native 工具崩溃仍为操作性错误 81）。
+- **exit 82（TARGET_NOT_REACHED）**→ 保留最优轮发布 + 警告 RENDER_TARGETS_NOT_REACHED（evaluate_render/feedback 内部不变量错误仍为 82）。
+- **exit 83（审计 strict FAIL）**→ `--temporal-quality` 仅剩 report(默认)/off；FAIL 记录原文 + 警告 + 发布。
+
+run_status 词表：OK / COMPLETED_WITH_REVIEW / 操作性失败类（PARTIAL、REVIEW_REQUIRED、TARGET_NOT_REACHED、TEMPORAL_QUALITY_FAILED 移除）。--strength 0（REQ-011 回归）与短序列路径不变。
+
+**检查**：cargo test **158/158**（90 引擎 + 51 二进制含 9 个新兜底单元测试：整序列洞跟踪参考曲线、+5EV 空间偏置的 δ 对齐与接缝连续性、无有效 tile 插值、整段无测量 0 EV、<8 帧段线性降级、确认台阶保留、ev-limits clamp、strength 缩放+uniform 中位；17 集成含三个门控测试改写为 fail-open 断言）。日志 `.agent-work/tmp/deflicker-failopen/` 与 `.agent-work/tmp/deflicker-short/cargo-test-failopen.log`。
+
+**真实素材 e2e**（同一 native 二进制）：
+- 夜驾 39 帧（原 exit 80 拒绝）：**exit 0 发布**（285 s），39/39 GLOBAL_REFERENCE，兜底 filled=39/0 EV=0，29 处场景切变 → 30 个线性参考段（无锚点 δ=0），applied_ev mean|·|=0.08 EV（多数帧≈0；35–37 帧处于 ≥3 帧无切变段获弦修正 −0.47~−1.36 EV，报告中逐帧可查）。探针 FAIL（末帧无足够非饱和 tile）按新契约记录为警告照常发布；审计 SHORT_CONTEXT（与内容≈passthrough 一致）。
+- short 119 帧（原 strict exit 83 拒绝）：**exit 0 发布**，估计路径完全不变（463/564 边、119/119 OK、applied_ev 范围逐位一致），渲染帧与此前 report 运行抽查 5/5 逐字节相同；审计 FAIL 15 事件如实记录（真实日出/日落趋势步进）。
+
+**NOT_TESTED/边界**：兜底在"场景切变密集"素材上的弦修正幅度（如夜驾 35–37 帧）为设计内行为——跨切变不把内容变化当曝光修正；若 owner 希望 LRT 式全序列跨切变平滑，改动点为兜底分段边界（一处）。Windows/Linux、跨 provider 数值等同不声称。
+

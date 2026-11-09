@@ -577,13 +577,14 @@ fn confirmed_step_is_preserved_and_not_corrected_away() {
         "run",
         &["--step", "10:0.5", "--temporal-quality", "off"],
     );
-    // Legacy semantics: a genuine level step is not part of the frozen target,
-    // so the shared-offset render check reports it as a target error and the
-    // run ends TARGET_NOT_REACHED without publishing. The estimator side must
-    // still preserve the declared step (pairwise intent).
-    assert_eq!(
-        result.status.code(),
-        Some(82),
+    // Legacy semantics for the estimator (a genuine level step is not part of
+    // the frozen target, so the shared-offset render check reports it as a
+    // target error) combined with the fail-open publication contract: the
+    // best round is published as COMPLETED_WITH_REVIEW with a recorded
+    // warning, never blocked. The estimator side must still preserve the
+    // declared step (pairwise intent).
+    assert!(
+        result.status.success(),
         "stdout:\n{}\nstderr:\n{}",
         stdout(&result),
         stderr(&result)
@@ -591,7 +592,18 @@ fn confirmed_step_is_preserved_and_not_corrected_away() {
     let report = read_json(&output.join("exposure_report.json"));
     assert_eq!(
         report.get("run_status").and_then(Json::as_str),
-        Some("TARGET_NOT_REACHED")
+        Some("COMPLETED_WITH_REVIEW")
+    );
+    let warnings = report
+        .get("warnings")
+        .and_then(Json::as_array)
+        .expect("warnings");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .map(|text| text.starts_with("RENDER_TARGETS_NOT_REACHED"))
+            .unwrap_or(false)),
+        "warnings: {warnings:?}"
     );
     for index in 0..10 {
         assert_eq!(
@@ -619,15 +631,17 @@ fn confirmed_step_is_preserved_and_not_corrected_away() {
         mean(0..10),
         mean(10..20)
     );
-    // The audit stage is never reached: validation ends the run first.
-    assert!(
+    // The audit was disabled for this run (--temporal-quality off), so no
+    // audit evidence exists beside the published deliverables.
+    assert_eq!(
         report
             .get("encoded_temporal_quality")
-            .map(|quality| !matches!(quality, Json::Bool(_)) && quality.get("status").is_none())
-            .unwrap_or(true),
-        "no audit evidence before publication"
+            .and_then(|quality| quality.get("status"))
+            .and_then(Json::as_str),
+        Some("SKIPPED")
     );
-    assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
+    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
+    assert!(output.join("srgb-preview-h264.mp4").is_file());
 }
 
 #[test]
@@ -677,7 +691,7 @@ fn ev_limits_clamp_to_limited_and_fail_the_target_check() {
 }
 
 #[test]
-fn render_under_execution_fails_the_target_check() {
+fn render_under_execution_publishes_the_best_round_with_a_warning() {
     let gains: Vec<f64> = (0..30)
         .map(|index| if index % 2 == 0 { -0.3 } else { 0.3 })
         .collect();
@@ -702,17 +716,28 @@ fn render_under_execution_fails_the_target_check() {
         SyntheticMaterial { root, input, tool }
     };
     let (result, output) = run_synthetic(&material, "run", &["--temporal-quality", "off"]);
-    assert_eq!(
-        result.status.code(),
-        Some(82),
-        "stdout:\n{}\nstderr:\n{}",
+    assert!(
+        result.status.success(),
+        "fail-open contract must publish: stdout:\n{}\nstderr:\n{}",
         stdout(&result),
         stderr(&result)
     );
     let report = read_json(&output.join("exposure_report.json"));
     assert_eq!(
         report.get("run_status").and_then(Json::as_str),
-        Some("TARGET_NOT_REACHED")
+        Some("COMPLETED_WITH_REVIEW"),
+        "unreached render targets flag the run instead of blocking it"
+    );
+    let warnings = report
+        .get("warnings")
+        .and_then(Json::as_array)
+        .expect("warnings");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .map(|text| text.starts_with("RENDER_TARGETS_NOT_REACHED"))
+            .unwrap_or(false)),
+        "warnings: {warnings:?}"
     );
     assert_eq!(
         report
@@ -744,11 +769,12 @@ fn render_under_execution_fails_the_target_check() {
             > 0,
         "the pre-repair bug reported zero updates beside a full history"
     );
-    assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
+    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
+    assert!(output.join("srgb-preview-h264.mp4").is_file());
 }
 
 #[test]
-fn wrong_correction_passes_gain_probe_but_fails_the_encoded_audit() {
+fn wrong_correction_passes_the_probe_but_the_audit_records_fail_and_publishes() {
     let base = 0.18f64.log2();
     let frames: Vec<FakeFrame> = (0..30)
         .map(|index| {
@@ -767,17 +793,27 @@ fn wrong_correction_passes_gain_probe_but_fails_the_encoded_audit() {
         "run",
         &["--estimator", "legacy", "--brightness", "uniform"],
     );
-    assert_eq!(
-        result.status.code(),
-        Some(83),
-        "stdout:\n{}\nstderr:\n{}",
+    assert!(
+        result.status.success(),
+        "the audit verdict must never block publication: stdout:\n{}\nstderr:\n{}",
         stdout(&result),
         stderr(&result)
     );
     let report = read_json(&output.join("exposure_report.json"));
     assert_eq!(
         report.get("run_status").and_then(Json::as_str),
-        Some("TEMPORAL_QUALITY_FAILED")
+        Some("COMPLETED_WITH_REVIEW")
+    );
+    let warnings = report
+        .get("warnings")
+        .and_then(Json::as_array)
+        .expect("warnings");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .map(|text| text.starts_with("encoded temporal quality FAIL"))
+            .unwrap_or(false)),
+        "warnings: {warnings:?}"
     );
     assert_eq!(
         report
@@ -796,14 +832,23 @@ fn wrong_correction_passes_gain_probe_but_fails_the_encoded_audit() {
             .unwrap_or(false),
         "audit FAIL must carry events"
     );
-    assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
-    assert!(!output.join("srgb-preview-h264.mp4").exists());
+    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
+    assert!(output.join("srgb-preview-h264.mp4").is_file());
     let audit = read_json(&output.join("temporal_audit.json"));
     assert_eq!(audit.get("status").and_then(Json::as_str), Some("FAIL"));
+    let manifest = read_json(&output.join("manifest.json"));
+    assert_eq!(
+        manifest
+            .get("deflicker")
+            .and_then(|block| block.get("audit_status"))
+            .and_then(Json::as_str),
+        Some("FAIL"),
+        "the manifest must carry the audit verdict verbatim"
+    );
 }
 
 #[test]
-fn on_review_error_stops_and_passthrough_renders_zero_ev() {
+fn unreliable_frames_get_global_reference_fallback_and_publish() {
     let base = 0.18f64.log2();
     let mut frames = synthetic_sequence(&vec![0.0; 12]);
     for (index, frame) in frames.iter_mut().enumerate() {
@@ -811,45 +856,26 @@ fn on_review_error_stops_and_passthrough_renders_zero_ev() {
         frame.capture_time = Some(format!("2026:11:08 20:{:02}:{:02}", index / 60, index % 60));
     }
     frames[8].pattern = "sparse";
-    let material = synthetic_material("on-review", frames);
+    let material = synthetic_material("global-reference", frames);
 
-    let (error_result, error_output) = run_synthetic(&material, "run-error", &[]);
-    assert_eq!(
-        error_result.status.code(),
-        Some(80),
-        "stdout:\n{}\nstderr:\n{}",
-        stdout(&error_result),
-        stderr(&error_result)
-    );
-    let error_report = read_json(&error_output.join("exposure_report.json"));
-    assert_eq!(
-        error_report.get("run_status").and_then(Json::as_str),
-        Some("REVIEW_REQUIRED")
-    );
-    assert!(!error_output.join("linear-acescg-16bit-ffv1.mkv").exists());
-
-    let (pass_result, pass_output) = run_synthetic(
-        &material,
-        "run-passthrough",
-        &["--on-review", "passthrough"],
-    );
+    let (result, output) = run_synthetic(&material, "run", &[]);
     assert!(
-        pass_result.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        stdout(&pass_result),
-        stderr(&pass_result)
+        result.status.success(),
+        "the fail-open contract always publishes: stdout:\n{}\nstderr:\n{}",
+        stdout(&result),
+        stderr(&result)
     );
-    let report = read_json(&pass_output.join("exposure_report.json"));
+    let report = read_json(&output.join("exposure_report.json"));
     assert_eq!(
         report.get("run_status").and_then(Json::as_str),
-        Some("PARTIAL")
+        Some("COMPLETED_WITH_REVIEW")
     );
-    assert_eq!(frame_status(&report, 8), "REVIEW_REQUIRED");
+    assert_eq!(frame_status(&report, 8), "GLOBAL_REFERENCE");
     assert!(
-        frame_number(&report, 8, "applied_ev").is_none(),
-        "passthrough keeps applied_ev unset (rendered at 0 EV)"
+        frame_number(&report, 8, "applied_ev").is_some(),
+        "the fallback must estimate the unreliable frame instead of 0 EV"
     );
-    assert_eq!(frame_number(&report, 8, "render_ev"), Some(0.0));
+    assert!(frame_number(&report, 8, "render_ev").is_some());
     let frame_eight = frame_record(&report, 8);
     let warnings = frame_eight
         .get("warnings")
@@ -858,15 +884,34 @@ fn on_review_error_stops_and_passthrough_renders_zero_ev() {
     assert!(
         warnings.iter().any(|warning| warning
             .as_str()
-            .map(|text| text.starts_with("PASSTHROUGH_UNCORRECTED_FRAME"))
+            .map(|text| text.starts_with("GLOBAL_REFERENCE_FALLBACK"))
             .unwrap_or(false)),
         "frame 8 warnings: {warnings:?}"
     );
     assert!(
         (0..8).any(|index| frame_status(&report, index) == "OK"),
-        "the reliable prefix must stay OK"
+        "the reliable prefix must stay OK (fill-only fallback)"
     );
-    assert!(pass_output.join("linear-acescg-16bit-ffv1.mkv").is_file());
+    let fallback = report
+        .get("global_reference_fallback")
+        .expect("global_reference_fallback block");
+    assert_eq!(
+        fallback.get("frames_filled").and_then(Json::as_u64),
+        Some(1),
+        "fallback block: {fallback:?}"
+    );
+    let run_warnings = report
+        .get("warnings")
+        .and_then(Json::as_array)
+        .expect("warnings");
+    assert!(run_warnings
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .map(|text| text.starts_with("GLOBAL_REFERENCE_FALLBACK"))
+            .unwrap_or(false)));
+    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
+    assert!(output.join("srgb-preview-h264.mp4").is_file());
 }
 
 #[test]

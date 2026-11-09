@@ -7,6 +7,7 @@
 mod audit;
 mod cli;
 mod deflicker_run;
+mod fallback;
 mod error;
 mod frame;
 mod guard;

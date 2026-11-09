@@ -182,6 +182,7 @@ pub fn feedback_update_with(
             "INTERPOLATED_ESTIMATE",
             "DISABLED",
             "SHORT_SEQUENCE_NO_DEFLICKER",
+            "GLOBAL_REFERENCE",
         ]
         .contains(&frame.status.as_str())
         {

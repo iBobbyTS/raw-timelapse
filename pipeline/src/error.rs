@@ -13,10 +13,13 @@ pub const EXIT_ENCODE: i32 = 40;
 pub const EXIT_VALIDATION: i32 = 50;
 pub const EXIT_PREVIEW: i32 = 60;
 pub const EXIT_PUBLISH: i32 = 70;
-/// Deflicker states keep legacy run_status meaning and get their own codes.
-pub const EXIT_REVIEW: i32 = 80;
+/// Probe-side operational failures (native tool crash, unreadable sidecar).
 pub const EXIT_GAIN_PROBE: i32 = 81;
+/// Render-validation internal invariants (never a publication gate).
 pub const EXIT_RENDER_VALIDATION: i32 = 82;
+/// Internal to the audit module; every audit error is degraded to an
+/// UNOBSERVABLE warning by the caller, so the audit verdict never gates
+/// publication and this code never becomes the process exit code.
 pub const EXIT_AUDIT: i32 = 83;
 
 #[derive(Debug, Clone)]

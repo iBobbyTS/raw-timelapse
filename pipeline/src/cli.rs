@@ -11,7 +11,9 @@ pub const LEGACY_FPS_PROVENANCE: &str =
     "legacy/python/src/rawtl/cli.py:91 (argparse default Fraction(30))";
 pub const DEFLICKER_DEFAULTS_PROVENANCE: &str = "legacy/python/src/rawtl/cli.py:95-114 \
 (strength=1.0, period=60, brightness=smooth, estimator=pairwise, \
-ev_limits=none, roi=0,0,1,1, on_review=error, temporal_quality=strict)";
+ev_limits=none, roi=0,0,1,1) amended 2026-11-11: publication gates removed; \
+unreliable frames fall back to the global-reference curve; the temporal \
+audit records but never blocks (temporal_quality=report)";
 
 pub const USAGE: &str = "\
 rawtl-linear-video — DNG frame sequence -> scene-linear ACEScg FFV1 video + sRGB preview
@@ -39,8 +41,7 @@ OPTIONS:
     --roi <X,Y,W,H>            Analysis ROI in normalized image coordinates (default: 0,0,1,1)
     --exclude-roi <X0,Y0,X1,Y1>  Exclude tiles from estimation; repeatable
     --step <START:EV>          Confirmed exposure step at 0-based frame START; repeatable
-    --on-review <MODE>         error | passthrough (default: error)
-    --temporal-quality <MODE>  strict | report | off (default: strict)
+    --temporal-quality <MODE>  report | off (default: report; records, never blocks)
     -h, --help                 Print this help
     --version                  Print version
 
@@ -161,34 +162,7 @@ impl Estimator {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OnReview {
-    Error,
-    Passthrough,
-}
-
-impl OnReview {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            OnReview::Error => "error",
-            OnReview::Passthrough => "passthrough",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "error" => Ok(OnReview::Error),
-            "passthrough" => Ok(OnReview::Passthrough),
-            other => Err(Error::new(
-                EXIT_USAGE,
-                format!("invalid --on-review {other:?}: expected error or passthrough"),
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemporalQuality {
-    Strict,
     Report,
     Off,
 }
@@ -196,7 +170,6 @@ pub enum TemporalQuality {
 impl TemporalQuality {
     pub fn as_str(self) -> &'static str {
         match self {
-            TemporalQuality::Strict => "strict",
             TemporalQuality::Report => "report",
             TemporalQuality::Off => "off",
         }
@@ -204,12 +177,15 @@ impl TemporalQuality {
 
     fn parse(value: &str) -> Result<Self> {
         match value {
-            "strict" => Ok(TemporalQuality::Strict),
             "report" => Ok(TemporalQuality::Report),
             "off" => Ok(TemporalQuality::Off),
             other => Err(Error::new(
                 EXIT_USAGE,
-                format!("invalid --temporal-quality {other:?}: expected strict, report or off"),
+                format!(
+                    "invalid --temporal-quality {other:?}: expected report or off \
+                     (strict was removed: the audit records its verdict but never \
+                     blocks publication)"
+                ),
             )),
         }
     }
@@ -228,7 +204,6 @@ pub struct DeflickerConfig {
     /// Exclusion boxes in [x0, y0, x1, y1] normalized coordinates.
     pub exclude_rois: Vec<[f64; 4]>,
     pub steps: Vec<ExposureStep>,
-    pub on_review: OnReview,
     pub temporal_quality: TemporalQuality,
 }
 
@@ -243,8 +218,7 @@ impl Default for DeflickerConfig {
             roi: [0.0, 0.0, 1.0, 1.0],
             exclude_rois: vec![],
             steps: vec![],
-            on_review: OnReview::Error,
-            temporal_quality: TemporalQuality::Strict,
+            temporal_quality: TemporalQuality::Report,
         }
     }
 }
@@ -392,10 +366,6 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 flag,
                 inline_value,
             )?)?),
-            "--on-review" => {
-                deflicker.on_review =
-                    OnReview::parse(&take_value(args, &mut index, flag, inline_value)?)?
-            }
             "--temporal-quality" => {
                 deflicker.temporal_quality =
                     TemporalQuality::parse(&take_value(args, &mut index, flag, inline_value)?)?
@@ -691,8 +661,7 @@ mod tests {
         assert_eq!(d.roi, [0.0, 0.0, 1.0, 1.0]);
         assert!(d.exclude_rois.is_empty());
         assert!(d.steps.is_empty());
-        assert_eq!(d.on_review, OnReview::Error);
-        assert_eq!(d.temporal_quality, TemporalQuality::Strict);
+        assert_eq!(d.temporal_quality, TemporalQuality::Report);
         assert!(DEFLICKER_DEFAULTS_PROVENANCE.contains("strength=1.0"));
     }
 
@@ -723,10 +692,8 @@ mod tests {
             "10:0.5",
             "--step",
             "20:-0.25",
-            "--on-review",
-            "passthrough",
             "--temporal-quality",
-            "report",
+            "off",
         ])
         .expect("parse");
         let d = &options.deflicker;
@@ -741,8 +708,7 @@ mod tests {
         assert_eq!(d.steps[0].start_frame, 10);
         assert_eq!(d.steps[0].delta_ev, 0.5);
         assert_eq!(d.steps[1].start_frame, 20);
-        assert_eq!(d.on_review, OnReview::Passthrough);
-        assert_eq!(d.temporal_quality, TemporalQuality::Report);
+        assert_eq!(d.temporal_quality, TemporalQuality::Off);
     }
 
     #[test]
@@ -763,8 +729,9 @@ mod tests {
             vec!["--exclude-roi", "0.5,0,0.4,1"],
             vec!["--step", "10"],
             vec!["--step", "-1:0.5"],
-            vec!["--on-review", "warn"],
             vec!["--temporal-quality", "loose"],
+            vec!["--temporal-quality", "strict"],
+            vec!["--on-review", "error"],
         ] {
             let mut args: Vec<&str> = base.to_vec();
             args.extend(extra.iter());
