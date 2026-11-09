@@ -327,10 +327,10 @@ assert vendor['as_shot_neutral']==vendor_direct['as_shot_neutral']
 assert vendor['capture_time']=='2010:01:02 03:04:05'
 assert (work/'vendor-non-tiff.png').read_bytes()==(work/'vendor-output-direct.png').read_bytes()
 
-def tiff_container(name,*,dng_version=False,pi=32803,truncate_tail=False):
+def tiff_container(name,*,dng_version=False,pi=32803,truncate_tail=False,bad_width=False,dng_first=False,next_ifd=0):
     # Minimal little-endian classic TIFF directory (CR2/NEF/ARW-shaped input).
-    tags=[(254,4,1,0),(256,4,1,16),(257,4,1,16),(262,3,1,pi)]
-    if dng_version:tags.append((50706,1,4,0))
+    tags=[(254,4,1,0),(256,1 if bad_width else 4,1,16),(257,4,1,16),(262,3,1,pi)]
+    if dng_version:tags.insert(0 if dng_first else len(tags),(50706,1,4,0))
     entries=b''
     for tag,typ,count,value in tags:
         if tag==50706:field=b'\x01\x04\x00\x00'
@@ -338,7 +338,7 @@ def tiff_container(name,*,dng_version=False,pi=32803,truncate_tail=False):
         else:field=struct.pack('<I',value)
         entries+=struct.pack('<HHI',tag,typ,count)+field
     data=b'II*\0'+struct.pack('<I',8)+struct.pack('<H',len(tags))+entries
-    if not truncate_tail:data+=struct.pack('<I',0)
+    if not truncate_tail:data+=struct.pack('<I',next_ifd)
     path=work/name;path.write_bytes(data);return path
 
 # TIFF container without DNGVersion: vendor RAW class, converter decides.
@@ -347,6 +347,25 @@ marker.unlink(missing_ok=True)
 tiff_meta=tool(vendor_tiff,'vendor-tiff',options=['--converter',str(conv_vendor)])
 assert marker.exists() and tiff_meta['route']=='vendor-raw-converter-linearraw-sdk'
 assert tiff_meta['source_photometric'] is None
+
+# B1-C1: the same malformed routing tag must reject before conversion whether
+# DNGVersion appears before or after it. The no-DNG converse still reaches ADC.
+for first in (False,True):
+    name='bad-width-dng-'+('first' if first else 'last')
+    fixture=tiff_container(name+'.DNG',dng_version=True,bad_width=True,dng_first=first)
+    marker.unlink(missing_ok=True)
+    r=run([exe,fixture,work/(name+'.png'),work/(name+'.json'),'--converter',str(conv_vendor)],20)
+    assert b'invalid TIFF routing tag' in r.stderr and not marker.exists()
+marker.unlink(missing_ok=True)
+vendor_bad_width=tiff_container('vendor-bad-width.CR2',bad_width=True)
+vendor_bad_meta=tool(vendor_bad_width,'vendor-bad-width',options=['--converter',str(conv_vendor)])
+assert marker.exists() and vendor_bad_meta['route']=='vendor-raw-converter-linearraw-sdk'
+
+# Structural failures must reject even when no DNGVersion has been observed.
+for name,options in [('truncated-tiff',{'truncate_tail':True}),('cyclic-tiff',{'next_ifd':8})]:
+    marker.unlink(missing_ok=True)
+    tool(tiff_container(name+'.CR2',**options),name,options=['--converter',str(conv_vendor)],code=20)
+    assert not marker.exists()
 
 # Converter rejection of a vendor input is explicit and keeps its transcript.
 rejecting=fake('converter-reject','touch '+shlex.quote(str(marker))+'\necho deliberate-failure >&2\nexit 7')
