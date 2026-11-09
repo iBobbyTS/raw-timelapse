@@ -20,6 +20,8 @@ struct Routing {
 };
 Routing inspect(const fs::path &);
 Vec read_neutral(const fs::path &);
+// EXIF DateTimeOriginal from the main IFD or its Exif sub-IFD; null when absent.
+std::optional<std::string> read_capture_time(const fs::path &);
 enum class Route { direct, converter };
 Route route(uint32_t photometric);
 Mat inverse(const Mat &);
