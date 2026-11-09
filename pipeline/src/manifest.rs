@@ -291,9 +291,10 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                 ("codec", Json::Str("h264".to_string())),
                 ("pix_fmt", Json::Str("yuv420p".to_string())),
                 ("encoder_parameters", Json::Array(vec![
-                    Json::Str("-c:v libx264".to_string()),
-                    Json::Str("-preset medium".to_string()),
-                    Json::Str("-crf 18".to_string()),
+                    Json::Str("-c:v h264_videotoolbox".to_string()),
+                    Json::Str("-allow_sw 0".to_string()),
+                    Json::Str("-profile:v high".to_string()),
+                    Json::Str("-b:v 0 -q:v 65".to_string()),
                     Json::Str("-pix_fmt yuv420p".to_string()),
                     Json::Str("-vf scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv".to_string()),
                     Json::Str("-colorspace bt709 -color_primaries bt709 -color_trc iec61966-2-1 -color_range tv".to_string()),

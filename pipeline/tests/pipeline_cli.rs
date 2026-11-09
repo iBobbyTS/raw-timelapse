@@ -112,6 +112,8 @@ fn publishes_lossless_linear_video_and_srgb_preview() {
         "\"pix_fmt\": \"gbrp16le\"",
         "\"status\": \"validated\"",
         "\"full_decode\": \"pass\"",
+        "-c:v h264_videotoolbox",
+        "-allow_sw 0",
     ] {
         assert!(manifest.contains(expected), "manifest missing {expected:?}");
     }
@@ -130,6 +132,10 @@ fn publishes_lossless_linear_video_and_srgb_preview() {
     for expected in ["codec_name=h264", "pix_fmt=yuv420p", "nb_read_frames=3"] {
         assert!(preview_probe.contains(expected), "{preview_probe}");
     }
+
+    let encode_log = fs::read_to_string(output.join("logs/encode-preview.log")).expect("log");
+    assert!(encode_log.contains("-c:v h264_videotoolbox"), "{encode_log}");
+    assert!(encode_log.contains("-allow_sw 0"), "{encode_log}");
 
     let roundtrip = fs::read_to_string(output.join("logs/roundtrip.log")).expect("log");
     assert!(roundtrip.contains("result: PASS"), "{roundtrip}");
