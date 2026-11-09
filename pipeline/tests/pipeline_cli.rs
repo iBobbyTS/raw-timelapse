@@ -258,32 +258,70 @@ fn lossless_roundtrip_mismatch_is_rejected() {
 
 #[test]
 fn rejects_overlapping_input_and_output_directories() {
-    require_ffmpeg();
     let root = test_dir("overlap");
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
-    let frames = standard_frames(&fixtures);
-    let tool = fake_native_tool(&fixtures, &frames, None, false);
+    let tool = root.join("unused-native-tool");
+
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+        let mut tree = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(root).expect("read directory") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                tree.insert(path.clone(), None);
+                tree.extend(snapshot(&path));
+            } else {
+                tree.insert(path.clone(), Some(fs::read(path).expect("read file")));
+            }
+        }
+        tree
+    }
+
+    let assert_rejected_without_writes = |input: &Path, output: &Path| {
+        let before = snapshot(&root);
+        let result = run_cli(&base_args(input, output, &tool));
+        assert_eq!(result.status.code(), Some(11), "{}", stderr(&result));
+        assert!(
+            stderr(&result).contains("input/material directory"),
+            "{}",
+            stderr(&result)
+        );
+        assert_eq!(
+            snapshot(&root),
+            before,
+            "rejection must leave no new directories or changed files"
+        );
+    };
 
     // output == input
     let same = root.join("same");
     make_input(&same, &["IMG_1.DNG"]);
-    let result = run_cli(&base_args(&same, &same, &tool));
-    assert_eq!(result.status.code(), Some(11), "{}", stderr(&result));
+    assert_rejected_without_writes(&same, &same);
 
     // output inside input
     let material = root.join("material");
     make_input(&material, &["IMG_1.DNG"]);
     let nested = material.join("out");
-    let result = run_cli(&base_args(&material, &nested, &tool));
-    assert_eq!(result.status.code(), Some(11), "{}", stderr(&result));
+    assert_rejected_without_writes(&material, &nested);
+    assert!(!nested.exists(), "rejected output must not be created");
+    assert_rejected_without_writes(&material, &nested.join("deeper/run"));
+    assert!(
+        !nested.exists(),
+        "missing parents must not be created either"
+    );
+
+    // Resolve an existing symlinked parent before checking a missing output leaf.
+    let alias = root.join("material-alias");
+    std::os::unix::fs::symlink(&material, &alias).expect("create material alias");
+    assert_rejected_without_writes(&material, &alias.join("out"));
+    assert!(
+        !nested.exists(),
+        "symlink aliases must not bypass the guard"
+    );
 
     // input inside output
     let outer = root.join("outer");
     let inner = outer.join("material");
     make_input(&inner, &["IMG_1.DNG"]);
-    let result = run_cli(&base_args(&inner, &outer, &tool));
-    assert_eq!(result.status.code(), Some(11), "{}", stderr(&result));
+    assert_rejected_without_writes(&inner, &outer);
 }
 
 #[test]

@@ -43,8 +43,9 @@ fn main() {
 fn run(options: &Options) -> Result<()> {
     let started = Instant::now();
     let input = guard::canonical_input(&options.input)?;
-    let output = guard::prepare_output(&options.output)?;
+    let output = guard::canonical_output(&options.output)?;
     guard::ensure_disjoint(&input, &output)?;
+    let output = guard::prepare_output(&output)?;
     guard::ensure_output_empty(&output)?;
 
     proc::require_executable(&options.native_tool, "--dng-linear-frame")?;
