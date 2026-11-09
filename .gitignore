@@ -1,1 +1,4 @@
 /git-worktree/
+/native/vendor/
+/outputs/
+/native/build/
