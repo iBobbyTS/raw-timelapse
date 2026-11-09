@@ -51,7 +51,7 @@
 - `docs/migration-log.md`：本文件。
 - `legacy/python/tools/generate_golden_fixtures.py`：golden 再生成入口。
 - `legacy/python/tests/test_golden_fixtures.py`：fixture 完整性/一致性回归测试（不依赖素材）。
-- `legacy/python/tests/fixtures/real-material/`：46 个生成文件 + `README.md`，共约 37 MB：
+- `legacy/python/tests/fixtures/real-material/`：46 个 manifest 列出的载荷文件 + `manifest.json`（共 47 个生成产物）+ `README.md`，共约 37 MB：
   - `measurement-input-basis.json`：renderer 配置、固定 WB、quantum、掩码规格、素材逐文件 SHA-256；
   - `frame-measurements.json` + `pixel-samples/*.f32le.bin`：39 帧 `FrameMeasurement` 全字段（含 `log_pixel_samples` 原始 float32）；
   - `pair-constraints.json`、`exposure-plan.json`：legacy 估计结果；
@@ -80,7 +80,7 @@
 ### 5. 测试结果
 
 - 冻结树原始 23 个测试文件、136 个用例：`136 passed in 29.42s`，无 skip。
-- 新增 `tests/test_golden_fixtures.py`（5 个用例）后：`141 passed in 22.76s`，无 skip。
+- 新增 `tests/test_golden_fixtures.py`（5 个用例）后：`141 passed in 24.04s`，无 skip。
 - 该环境 ffmpeg/ffprobe 可用，因此原测试中的 FFmpeg 条件 skip 均未触发。
 - 未发现需要外部素材才能运行的测试；素材只用于 golden 生成，不参与 pytest。
 
@@ -96,7 +96,7 @@
 
 ### 7. 确定性与 libx264 线程结论
 
-- 两次生成的全部 46 个文件逐字节一致（`diff -r` 退出码 0，SHA-256 清单无差异）。
+- 两次生成的全部 47 个产物（46 个 manifest 列出的载荷文件 + `manifest.json`，不含 `README.md`）逐字节一致（`diff -r` 退出码 0，SHA-256 清单无差异）。
 - 排查发现：同一份 rgb24 输入下，libx264 默认自动 frame threading 会产生不同 MP4 字节（`logs/encoder-determinism*` 与 `real_encode_probe.py` 证据：两次自动线程编码 SHA-256 不同；`-threads 1` 两次完全一致）。测量与估计字段不受影响。
 - 处理：golden 生成器在运行时把 legacy FFmpeg 命令固定为 `-threads 1`（`pin_encoder_threads`，仅改 `rawtl.video.ffmpeg_command` 的运行时引用，`src/rawtl/**` 零改动），并在 `manifest.json` 的 `determinism` 段与 fixture `README.md` 中记录。参考视频是在该确定性编码配置下的产物。
 - rawpy 渲染、measurement、estimate 与 exiftool 元数据在两次独立进程间均逐字节/逐字段一致（`rgb8_hash_probe.py`、`render_determinism_probe.py` 证据）。
