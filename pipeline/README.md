@@ -146,8 +146,8 @@ Conversion runs in Rust on frames decoded by ffmpeg from the sent PNG
 sequence. ffmpeg then converts RGB24 to `yuv420p` with an explicit
 `scale=out_color_matrix=bt709:out_range=tv` plus
 `setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv`,
-encodes with libx264
-(`-preset medium -crf 18`) and tags
+encodes with macOS VideoToolbox H.264
+(`-c:v h264_videotoolbox -allow_sw 0 -profile:v high -b:v 0 -q:v 65`) and tags
 `bt709`/`bt709`/`iec61966-2-1`/`tv`. The preview is validated with ffprobe
 (`h264`, `yuv420p`, dimensions, frame count, frame rate) and a full decode to
 `null`.
