@@ -353,7 +353,7 @@ pub fn validate_preview(
                 ("color_space", "bt709", &probe.color_space),
                 ("color_primaries", "bt709", &probe.color_primaries),
                 ("color_transfer", "iec61966-2-1", &probe.color_transfer),
-                ("color_range", "tv", &probe.color_range),
+                ("color_range", profile.range.as_str(), &probe.color_range),
             ] {
                 if observed != expected {
                     return Err(Error::new(
@@ -680,7 +680,7 @@ pub fn encode_preview(
                 ("-colorspace", "bt709"),
                 ("-color_primaries", "bt709"),
                 ("-color_trc", "iec61966-2-1"),
-                ("-color_range", "tv"),
+                ("-color_range", profile.range.as_str()),
             ] {
                 args.push(flag.to_string());
                 args.push(value.to_string());

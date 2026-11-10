@@ -74,19 +74,21 @@ pub struct ReferenceCode {
     pub label: &'static str,
     /// Official 10-bit code, when the vendor publishes a code value.
     pub code10: u16,
-    /// Expected 8-bit code under the recorded conversion convention
-    /// `round(code10 * 255 / 1023)`.
-    pub code8: u16,
 }
 
 impl ReferenceCode {
-    const fn new(linear: f64, label: &'static str, code10: u16, code8: u16) -> Self {
+    const fn new(linear: f64, label: &'static str, code10: u16) -> Self {
         Self {
             linear,
             label,
             code10,
-            code8,
         }
+    }
+
+    /// Expected 8-bit code under the recorded conversion convention
+    /// `round(code10 * 255 / 1023)`.
+    pub fn code8(self) -> u16 {
+        (self.code10 as f64 * 255.0 / 1023.0).round() as u16
     }
 }
 
@@ -293,32 +295,32 @@ impl Transfer {
     }
 }
 
-const SRGB_REFERENCES: [ReferenceCode; 1] = [ReferenceCode::new(0.18, "18% grey", 472, 118)];
+const SRGB_REFERENCES: [ReferenceCode; 1] = [ReferenceCode::new(0.18, "18% grey", 472)];
 
 const SONY_REFERENCES: [ReferenceCode; 3] = [
-    ReferenceCode::new(0.0, "0% black", 95, 24),
-    ReferenceCode::new(0.18, "18% grey", 420, 105),
-    ReferenceCode::new(0.9, "90% white", 598, 149),
+    ReferenceCode::new(0.0, "0% black", 95),
+    ReferenceCode::new(0.18, "18% grey", 420),
+    ReferenceCode::new(0.9, "90% white", 598),
 ];
 
 const CANON_REFERENCES: [ReferenceCode; 5] = [
-    ReferenceCode::new(0.0, "0% black", 95, 24),
-    ReferenceCode::new(0.18, "18% grey", 407, 101),
-    ReferenceCode::new(0.9, "90% white (100% scene linear)", 575, 143),
-    ReferenceCode::new(7.2, "800%", 797, 199),
-    ReferenceCode::new(14.4, "1600%", 871, 217),
+    ReferenceCode::new(0.0, "0% black", 95),
+    ReferenceCode::new(0.18, "18% grey", 407),
+    ReferenceCode::new(0.9, "90% white (100% scene linear)", 575),
+    ReferenceCode::new(7.2, "800%", 797),
+    ReferenceCode::new(14.4, "1600%", 871),
 ];
 
 const NIKON_REFERENCES: [ReferenceCode; 3] = [
-    ReferenceCode::new(0.0, "0% black", 127, 32),
-    ReferenceCode::new(0.18, "18% grey", 372, 93),
-    ReferenceCode::new(0.9, "90% white", 603, 150),
+    ReferenceCode::new(0.0, "0% black", 127),
+    ReferenceCode::new(0.18, "18% grey", 372),
+    ReferenceCode::new(0.9, "90% white", 603),
 ];
 
 const DJI_REFERENCES: [ReferenceCode; 3] = [
-    ReferenceCode::new(0.0, "0% black", 95, 24),
-    ReferenceCode::new(0.18, "18% grey", 408, 102),
-    ReferenceCode::new(0.9, "90% white", 586, 146),
+    ReferenceCode::new(0.0, "0% black", 95),
+    ReferenceCode::new(0.18, "18% grey", 408),
+    ReferenceCode::new(0.9, "90% white", 586),
 ];
 
 /// One target colour gamut with its official primaries and white point.
@@ -626,7 +628,7 @@ impl ColorProfile {
                                         ("label", Json::Str(reference.label.to_string())),
                                         ("linear", Json::Float(reference.linear)),
                                         ("code10", Json::Int(reference.code10 as i64)),
-                                        ("reference_code8", Json::Int(reference.code8 as i64)),
+                                        ("reference_code8", Json::Int(reference.code8() as i64)),
                                     ])
                                 })
                                 .collect(),
@@ -862,15 +864,6 @@ pub static PROFILES: [ColorProfile; 6] = [
     },
 ];
 
-pub const PROFILE_IDS: [&str; 6] = [
-    "srgb-preview",
-    "dji-dlog-dgamut",
-    "canon-log2-cinema-gamut",
-    "sony-slog3-sgamut3",
-    "sony-slog3-sgamut3-cine",
-    "nikon-nlog-bt2020",
-];
-
 pub fn default_profile() -> &'static ColorProfile {
     &PROFILES[0]
 }
@@ -891,7 +884,14 @@ mod tests {
     fn registry_has_the_frozen_six_profiles_and_srgb_default() {
         assert_eq!(PROFILES.len(), 6);
         assert_eq!(default_profile().id, "srgb-preview");
-        for id in PROFILE_IDS {
+        for id in [
+            "srgb-preview",
+            "dji-dlog-dgamut",
+            "canon-log2-cinema-gamut",
+            "sony-slog3-sgamut3",
+            "sony-slog3-sgamut3-cine",
+            "nikon-nlog-bt2020",
+        ] {
             assert!(lookup(id).is_some(), "missing profile {id}");
         }
         assert_eq!(
@@ -958,14 +958,14 @@ mod tests {
             for reference in profile.transfer.references() {
                 let codes = profile.encode_target_linear([reference.linear; 3]);
                 for channel in 0..3 {
-                    let difference = (codes[channel] as i32 - reference.code8 as i32).abs();
+                    let difference = (codes[channel] as i32 - reference.code8() as i32).abs();
                     assert!(
                         difference <= 1,
                         "{} {} channel {channel}: observed {} vs reference {} (code10 {})",
                         profile.id,
                         reference.label,
                         codes[channel],
-                        reference.code8,
+                        reference.code8(),
                         reference.code10
                     );
                 }

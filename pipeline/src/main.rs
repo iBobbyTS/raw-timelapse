@@ -22,7 +22,6 @@ mod video;
 pub use rawtl_linear_video::color_profile;
 pub use rawtl_linear_video::deflicker;
 pub use rawtl_linear_video::json;
-pub use rawtl_linear_video::preview;
 
 use cli::{Options, Parsed};
 use error::{Error, Result, EXIT_PUBLISH, EXIT_TOOL};
