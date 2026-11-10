@@ -573,7 +573,7 @@ pub fn render_preview(
     let _ = write_log(
         log_path,
         &format!(
-            "command: {command}\nframes: {}x{} x{}\nelapsed: {:.3}s\nexit: {}\nnote: linear RGB16 codes decoded by ffmpeg to rgb48le, then converted to sRGB RGB24 in Rust\n",
+            "command: {command}\nframes: {}x{} x{}\nelapsed: {:.3}s\nexit: {}\nnote: linear RGB16 codes decoded by ffmpeg to rgb48le, then converted to the selected preview profile's RGB24 in Rust\n",
             width,
             height,
             count,
@@ -698,7 +698,7 @@ pub fn encode_preview(
         String::new()
     } else {
         format!(
-            "\npreview profile: {} (range {}, ycbcr matrix {}, tags unspecified)",
+            "\npreview profile: {} (range {}, ycbcr matrix {}, per-field colour tags)",
             profile.id,
             profile.range.as_str(),
             profile.ycbcr_matrix
