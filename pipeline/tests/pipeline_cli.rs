@@ -1263,13 +1263,86 @@ fn preview_profiles_emit_their_declared_colour_contract() {
     }
 }
 
+/// Independent transcription of BT.2020-2 (10/2015), Table 4 NCL equations:
+/// https://www.itu.int/rec/R-REC-BT.2020-2-201510-I/en
+/// Y'=Kr*R'+(1-Kr-Kb)*G'+Kb*B', Cb=(B'-Y')/2(1-Kb), Cr=(R'-Y')/2(1-Kr).
+/// Compare the actual swscale token used by the pipeline with those equations,
+/// before lossy H.264 encoding; allow one code for fixed-point rounding.
+#[test]
+fn bt2020_ncl_swscale_matches_the_standard_derivation() {
+    require_ffmpeg();
+    let root = test_dir("bt2020-standard");
+    for rgb in [
+        [255u8, 0, 0],
+        [0, 255, 0],
+        [0, 0, 255],
+        [196, 64, 32],
+        [128; 3],
+    ] {
+        let input = root.join(format!("{rgb:?}.rgb"));
+        fs::write(&input, rgb.repeat(64 * 48)).expect("write RGB fixture");
+        let [r, g, b] = rgb.map(|code| code as f64 / 255.0);
+        let y = 0.2627 * r + 0.6780 * g + 0.0593 * b;
+        let cb = (b - y) / 1.8814;
+        let cr = (r - y) / 1.4746;
+        for (range, y_scale, c_scale, y_offset) in
+            [("tv", 219.0, 224.0, 16.0), ("pc", 255.0, 255.0, 0.0)]
+        {
+            let output = root.join(format!("{rgb:?}-{range}.yuv"));
+            let filter = format!("scale=out_color_matrix=bt2020:out_range={range},format=yuv444p");
+            let result = std::process::Command::new(FFMPEG)
+                .args([
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-f",
+                    "rawvideo",
+                    "-pixel_format",
+                    "rgb24",
+                    "-video_size",
+                    "64x48",
+                    "-i",
+                ])
+                .arg(&input)
+                .args(["-frames:v", "1", "-vf", &filter, "-f", "rawvideo"])
+                .arg(&output)
+                .output()
+                .expect("run swscale");
+            assert!(result.status.success(), "{}", stderr(&result));
+            let bytes = fs::read(output).expect("YCbCr fixture");
+            assert_eq!(bytes.len(), 64 * 48 * 3);
+            let actual = [bytes[0], bytes[64 * 48], bytes[2 * 64 * 48]];
+            let expected = [
+                y_offset + y_scale * y,
+                128.0 + c_scale * cb,
+                128.0 + c_scale * cr,
+            ]
+            .map(|code| code.round().clamp(0.0, 255.0) as u8);
+            for channel in 0..3 {
+                assert!(
+                    (actual[channel] as i32 - expected[channel] as i32).abs() <= 1,
+                    "{rgb:?} {range}: swscale {actual:?} vs BT.2020-2 {expected:?}"
+                );
+            }
+            println!(
+                "BT.2020 NCL {rgb:?} {range}: standard {expected:?}, swscale {actual:?}: PASS"
+            );
+        }
+    }
+}
+
 /// The known patch goes through the real render -> encode -> decode path. The
 /// expected triples are independently derived (reference_derive.py); they are
 /// separated by >=25 codes so the observation rejects a wrong or bypassed
 /// profile, and the two Sony gamuts differ by 59 codes in red.
 #[test]
 fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
-    const TOLERANCE: i32 = 12;
+    // Uniform 64x48 patches have <=3 codes of correct-path error. The nearest
+    // wrong-matrix result is Canon at 5 codes (wrong range: 8), so a vendor
+    // bound of 3 leaves a two-code rejection margin without relying on tags.
+    // Keep the historical sRGB bound; its live path is outside this repair.
+    const VENDOR_TOLERANCE: i32 = 3;
+    const SRGB_TOLERANCE: i32 = 12;
     let cases: [(&str, &str, &str, &str, [u8; 3]); 6] = [
         (
             "srgb-preview",
@@ -1332,10 +1405,61 @@ fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
             .map(|channel| (decoded[channel] as i32 - expected[channel] as i32).abs())
             .max()
             .unwrap_or(0);
-        assert!(
-            difference <= TOLERANCE,
-            "{id}: decoded {decoded:?} vs independent reference {expected:?} (tolerance {TOLERANCE})"
+        let tolerance = if id == "srgb-preview" {
+            SRGB_TOLERANCE
+        } else {
+            VENDOR_TOLERANCE
+        };
+        let accepts = |pixel: [u8; 3]| {
+            (0..3)
+                .map(|channel| (pixel[channel] as i32 - expected[channel] as i32).abs())
+                .max()
+                .unwrap_or(0)
+                <= tolerance
+        };
+        assert!(accepts(decoded),
+            "{id}: decoded {decoded:?} vs independent reference {expected:?} (tolerance {tolerance})");
+        println!(
+            "sensitivity {id}: correct {decoded:?}, error {difference}, bound {tolerance}: PASS"
         );
+
+        if id != "srgb-preview" {
+            for (name, from, to) in [
+                (
+                    "wrong-matrix",
+                    "out_color_matrix=bt2020",
+                    "out_color_matrix=bt709",
+                ),
+                ("wrong-range", "out_range=pc", "out_range=tv"),
+            ] {
+                // Mutate only the preview's pixel conversion, preserving all
+                // tags and encoder arguments. Decode under the declared matrix
+                // and range, so metadata cannot make a wrong conversion pass.
+                let shim = root.join(format!("ffmpeg-{name}"));
+                write_executable(&shim, &format!(
+                    "#!/bin/bash\nargs=()\nfor arg in \"$@\"; do\n  args+=(\"${{arg//{from}/{to}}}\")\ndone\nexec {} \"${{args[@]}}\"\n",
+                    shell_quote(FFMPEG)
+                ));
+                let output = root.join(name);
+                let mut args = base_args(&input, &output, &tool);
+                args.extend_from_slice(&[
+                    "--preview-profile",
+                    id,
+                    "--ffmpeg",
+                    shim.to_str().expect("utf8"),
+                ]);
+                let result = run_cli(&args);
+                assert!(result.status.success(), "{id} {name}: {}", stderr(&result));
+                let wrong = decode_first_pixel(&output.join(filename), matrix, range);
+                let wrong_difference = (0..3)
+                    .map(|channel| (wrong[channel] as i32 - expected[channel] as i32).abs())
+                    .max()
+                    .unwrap_or(0);
+                assert!(!accepts(wrong),
+                    "{id} {name} must fail the same patch bound {tolerance}: {wrong:?} vs {expected:?}");
+                println!("sensitivity {id}: {name} {wrong:?}, error {wrong_difference}, bound {tolerance}: REJECTED");
+            }
+        }
         observed.push((id, expected));
     }
 
@@ -1349,7 +1473,7 @@ fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
                 .max()
                 .unwrap_or(0);
             assert!(
-                distance > TOLERANCE,
+                distance > SRGB_TOLERANCE,
                 "{left_id} and {right_id} references are not distinguishable: {left_code:?} vs {right_code:?}"
             );
         }

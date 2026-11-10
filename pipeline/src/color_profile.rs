@@ -692,6 +692,14 @@ impl ColorProfile {
                     ),
                     ("dither", Json::Bool(false)),
                     (
+                        "tradeoff",
+                        Json::Str(
+                            "8-bit Log output can show banding; no dither is applied by owner \
+                             decision, and richer output formats remain a future direction."
+                                .to_string(),
+                        ),
+                    ),
+                    (
                         "reference_convention",
                         Json::Str(
                             "official 10-bit codes are compared as code8 = round(code10*255/1023) \
@@ -776,6 +784,21 @@ pub fn quantize_signal(signal: f64) -> u8 {
     (signal.clamp(0.0, 1.0) * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
+// These sources corroborate the coding transform, not a vendor delivery mandate.
+// H.273 separates matrix coefficients from colour primaries and transfer;
+// Khronos independently derives the same NCL matrix in section 15.1.3.
+const BT2020_NCL_CONTAINER_REASON: &str =
+    "Container-coding convention, corroborated by ITU-T H.273 (V4), Coding-independent code \
+     points for video signal type identification (07/2024), section 8.3/Table 4: \
+     MatrixCoefficients=9, Kr=0.2627, Kb=0.0593 \
+     (https://www.itu.int/rec/T-REC-H.273-202407-I/en); and the independent Khronos Data Format \
+     Specification v1.4.0 (02/2025), section 15.1.3, BT.2020 YCbCr conversion \
+     (https://registry.khronos.org/DataFormat/specs/1.4/dataformat.1.4.html). \
+     The sources corroborate the reversible BT.2020 non-constant-luminance coding equations, \
+     not this vendor's delivery coefficients: no consulted vendor document specifies those. \
+     Applying this matrix to vendor Log RGB is an implementation convention, not conversion \
+     to BT.2020 primaries or transfer; generic colour tags remain unspecified.";
+
 pub static PROFILES: [ColorProfile; 6] = [
     ColorProfile {
         id: "srgb-preview",
@@ -797,9 +820,7 @@ pub static PROFILES: [ColorProfile; 6] = [
         range_reason: "Sony technical summary FAQ Q4: S-Log3 is recorded Full range on XAVC, \
                        HDCAM SR and MPEG50, and SDI output is always Full range; Legal/Full \
                        cannot be selected",
-        ycbcr_reason: "the vendor document does not state YCbCr coefficients; BT.2020 \
-                       non-constant luminance is selected because S-Gamut3 meets or exceeds \
-                       BT.2020, and the choice is verified end-to-end",
+        ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::Unspecified,
         preview_filename: "preview-h264-slog3-sgamut3.mp4",
     },
@@ -812,9 +833,7 @@ pub static PROFILES: [ColorProfile; 6] = [
         range_reason: "Sony technical summary FAQ Q4: S-Log3 is recorded Full range on XAVC, \
                        HDCAM SR and MPEG50, and SDI output is always Full range; Legal/Full \
                        cannot be selected",
-        ycbcr_reason: "the vendor document does not state YCbCr coefficients; BT.2020 \
-                       non-constant luminance is selected for the wide-gamut coding headroom, \
-                       and the choice is verified end-to-end",
+        ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::Unspecified,
         preview_filename: "preview-h264-slog3-sgamut3cine.mp4",
     },
@@ -826,9 +845,7 @@ pub static PROFILES: [ColorProfile; 6] = [
         ycbcr_matrix: "bt2020nc",
         range_reason: "Canon white paper FAQ Q6: clips are recorded on the card using full \
                        range levels and SDI output also uses full range",
-        ycbcr_reason: "the vendor document does not state YCbCr coefficients; BT.2020 \
-                       non-constant luminance is selected because Cinema Gamut fully \
-                       encompasses BT.2020, and the choice is verified end-to-end",
+        ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::Unspecified,
         preview_filename: "preview-h264-clog2-cgamut.mp4",
     },
@@ -841,9 +858,21 @@ pub static PROFILES: [ColorProfile; 6] = [
         range_reason: "N-Log Specification Document defines the curve over the full 10-bit \
                        code domain (signal 0 at reflectance -0.0075) and states no legal-range \
                        remap; full range is recorded",
-        ycbcr_reason: "BT.2020 non-constant luminance matches the N-Log BT.2020 gamut; the \
-                       vendor document does not state YCbCr coefficients, so the choice is \
-                       verified end-to-end",
+        ycbcr_reason:
+            "ITU-R BT.2020-2, Parameter values for ultra-high definition television systems \
+                       for production and international programme exchange (10/2015), Table 4 \
+                       (https://www.itu.int/rec/R-REC-BT.2020-2-201510-I/en), governs the \
+                       BT.2020 gamut's non-constant-luminance derivation: \
+                       Y'=0.2627*R'+0.6780*G'+0.0593*B', Cb=(B'-Y')/1.8814, \
+                       Cr=(R'-Y')/1.4746. ITU-T H.273 (V4), Coding-independent code points \
+                       for video signal type identification (07/2024), section 8.3/Table 4 \
+                       (https://www.itu.int/rec/T-REC-H.273-202407-I/en), identifies this \
+                       transform as MatrixCoefficients=9. The swscale bt2020 token implements \
+                       these bt2020nc coefficients (verified numerically). Nikon does not \
+                       separately specify delivery coefficients; selection of NCL coding for \
+                       N-Log and the existing 8-bit/full-range adaptation remain implementation \
+                       conventions, not a claim of full BT.2020 system conformance; tags stay \
+                       unspecified",
         tag_policy: TagPolicy::Unspecified,
         preview_filename: "preview-h264-nlog-bt2020.mp4",
     },
@@ -856,9 +885,7 @@ pub static PROFILES: [ColorProfile; 6] = [
         range_reason: "DJI white paper publishes 10-bit D-Log code values on the full 10-bit \
                        scale (0% = 95, 18% = 408, 90% = 586) with saturation at 1023 and states \
                        no legal-range remap",
-        ycbcr_reason: "the vendor document does not state YCbCr coefficients; BT.2020 \
-                       non-constant luminance is selected for the wide-gamut coding headroom, \
-                       and the choice is verified end-to-end",
+        ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::Unspecified,
         preview_filename: "preview-h264-dlog-dgamut.mp4",
     },
@@ -1147,6 +1174,13 @@ mod tests {
                 quantization.get("dither"),
                 Some(Json::Bool(false))
             ));
+            let tradeoff = quantization
+                .get("tradeoff")
+                .and_then(Json::as_str)
+                .expect("tradeoff");
+            for required in ["banding", "no dither", "owner", "future direction"] {
+                assert!(tradeoff.contains(required), "{}: {tradeoff}", profile.id);
+            }
             let encoding = contract.get("encoding").expect("encoding");
             assert_eq!(
                 encoding.get("range").and_then(|value| value.as_str()),
@@ -1158,6 +1192,23 @@ mod tests {
                     .and_then(|value| value.as_str()),
                 Some(profile.ycbcr_matrix)
             );
+            if profile.tag_policy == TagPolicy::Unspecified {
+                let reason = encoding
+                    .get("ycbcr_reason")
+                    .and_then(Json::as_str)
+                    .expect("YCbCr provenance");
+                assert!(reason.contains("https://www.itu.int/rec/T-REC-H.273-202407-I/en"));
+                if profile.id == "nikon-nlog-bt2020" {
+                    assert!(reason.contains("https://www.itu.int/rec/R-REC-BT.2020-2-201510-I/en"));
+                    assert!(reason.contains("0.2627") && reason.contains("1.8814"));
+                } else {
+                    assert!(reason.contains(
+                        "https://registry.khronos.org/DataFormat/specs/1.4/dataformat.1.4.html"
+                    ));
+                    assert!(reason.contains("no consulted vendor document"));
+                    assert!(reason.contains("implementation convention"));
+                }
+            }
             let tags = encoding.get("tag_policy").expect("tag policy");
             match profile.tag_policy {
                 TagPolicy::Standard => {
