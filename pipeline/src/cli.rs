@@ -320,7 +320,11 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                         EXIT_USAGE,
                         format!(
                             "invalid --preview-profile {value:?}: expected one of {}",
-                            color_profile::PROFILE_IDS.join(", ")
+                            color_profile::PROFILES
+                                .iter()
+                                .map(|profile| profile.id)
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ),
                     )
                 })?;
@@ -739,7 +743,7 @@ mod tests {
     fn parses_preview_profile_and_defaults_to_srgb() {
         let options = parse_run(&["--input", "in", "--output", "out"]).expect("parse");
         assert_eq!(options.preview_profile.id, "srgb-preview");
-        for id in color_profile::PROFILE_IDS {
+        for id in color_profile::PROFILES.iter().map(|profile| profile.id) {
             let options = parse_run(&["--input", "in", "--output", "out", "--preview-profile", id])
                 .expect("parse");
             assert_eq!(options.preview_profile.id, id);
