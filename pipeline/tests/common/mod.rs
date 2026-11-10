@@ -72,6 +72,56 @@ pub fn ffprobe(path: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// ffprobe stream fields including the colour tags used by the profile tests.
+pub fn ffprobe_color(path: &Path) -> String {
+    let output = Command::new(FFPROBE)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=codec_name,pix_fmt,width,height,nb_read_frames,avg_frame_rate,\
+             color_space,color_primaries,color_transfer,color_range",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    assert!(
+        output.status.success(),
+        "ffprobe failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Decode the first pixel of a preview through the real H.264 decoder using an
+/// explicit input matrix/range, returning the RGB24 value. The call rejects
+/// decoder failure instead of silently returning a default.
+pub fn decode_first_pixel(path: &Path, matrix: &str, range: &str) -> [u8; 3] {
+    let filter = format!("scale=in_color_matrix={matrix}:in_range={range},format=rgb24");
+    let output = Command::new(FFMPEG)
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-vf"])
+        .arg(&filter)
+        .args(["-f", "rawvideo", "-"])
+        .output()
+        .expect("run ffmpeg decode");
+    assert!(
+        output.status.success(),
+        "ffmpeg decode failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.len() >= 3, "no decoded pixel");
+    [output.stdout[0], output.stdout[1], output.stdout[2]]
+}
+
 // ---------------------------------------------------------------------------
 // PNG writer (16-bit RGB, filter 0, zlib stored blocks)
 // ---------------------------------------------------------------------------
