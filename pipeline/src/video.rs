@@ -343,56 +343,30 @@ pub fn validate_preview(
         ));
     }
 
-    // The declared colour contract is only meaningful if the tags reach the
-    // container and bitstream. A generic tag on a camera Log profile would be a
-    // fabricated colour claim, so those profiles must stay unspecified while
-    // still carrying the real signal range.
-    match profile.tag_policy {
-        TagPolicy::Standard => {
-            for (field, expected, observed) in [
-                ("color_space", "bt709", &probe.color_space),
-                ("color_primaries", "bt709", &probe.color_primaries),
-                ("color_transfer", "iec61966-2-1", &probe.color_transfer),
-                ("color_range", profile.range.as_str(), &probe.color_range),
-            ] {
-                if observed != expected {
-                    return Err(Error::new(
-                        EXIT_PREVIEW,
-                        format!(
-                            "preview {field} is {observed:?}, expected {expected:?} (declared colour contract)"
-                        ),
-                    ));
-                }
-            }
-        }
-        TagPolicy::Unspecified => {
-            for (field, observed) in [
-                ("color_space", &probe.color_space),
-                ("color_primaries", &probe.color_primaries),
-                ("color_transfer", &probe.color_transfer),
-            ] {
-                if !matches!(observed.as_str(), "unknown" | "") {
-                    return Err(Error::new(
-                        EXIT_PREVIEW,
-                        format!(
-                            "preview {field} is {observed:?}, expected unspecified for {} \
-                             (no fabricated generic colour tag)",
-                            profile.id
-                        ),
-                    ));
-                }
-            }
-            if probe.color_range != profile.range.as_str() {
-                return Err(Error::new(
-                    EXIT_PREVIEW,
-                    format!(
-                        "preview color_range is {:?}, expected {:?} for {}",
-                        probe.color_range,
-                        profile.range.as_str(),
-                        profile.id
-                    ),
-                ));
-            }
+    // Validate every accurate field; unknown Log transfer/primaries stay unknown.
+    for (field, expected, observed) in [
+        (
+            "color_space",
+            profile.tag_policy.matrix_token(),
+            &probe.color_space,
+        ),
+        (
+            "color_primaries",
+            profile.tag_policy.primaries_token(),
+            &probe.color_primaries,
+        ),
+        (
+            "color_transfer",
+            profile.tag_policy.transfer_token(),
+            &probe.color_transfer,
+        ),
+        ("color_range", profile.range.as_str(), &probe.color_range),
+    ] {
+        let matches = observed == expected || (expected == "unknown" && observed.is_empty());
+        if !matches {
+            return Err(Error::new(EXIT_PREVIEW, format!(
+                "preview {field} is {observed:?}, expected {expected:?} for {} (per-field colour contract)", profile.id
+            )));
         }
     }
 
@@ -673,28 +647,36 @@ pub fn encode_preview(
         "-pix_fmt".to_string(),
         PREVIEW_PIX_FMT.to_string(),
     ];
-    match profile.tag_policy {
-        TagPolicy::Standard => {
-            // The historical sRGB argument sequence, kept byte-identical.
-            for (flag, value) in [
-                ("-colorspace", "bt709"),
-                ("-color_primaries", "bt709"),
-                ("-color_trc", "iec61966-2-1"),
-                ("-color_range", profile.range.as_str()),
-            ] {
-                args.push(flag.to_string());
-                args.push(value.to_string());
-            }
+    if profile.tag_policy == TagPolicy::SRGB {
+        // The historical sRGB argument sequence, kept byte-identical.
+        for (flag, value) in [
+            ("-colorspace", "bt709"),
+            ("-color_primaries", "bt709"),
+            ("-color_trc", "iec61966-2-1"),
+            ("-color_range", profile.range.as_str()),
+        ] {
+            args.push(flag.to_string());
+            args.push(value.to_string());
         }
-        TagPolicy::Unspecified => {
-            // Only the real signal range is written; primaries/transfer/matrix
-            // stay unspecified per architecture §6.4. The filter's setparams
-            // clears the matrix metadata that `scale` would otherwise attach.
-            args.push("-color_range".to_string());
-            args.push(profile.range.as_str().to_string());
+    } else {
+        // VideoToolbox on the supported build propagates these fields to SPS
+        // VUI. Partial colour information needs write_colr for MP4 nclx.
+        for (flag, value) in [
+            ("-colorspace", profile.tag_policy.matrix_token()),
+            ("-color_primaries", profile.tag_policy.primaries_token()),
+            ("-color_trc", profile.tag_policy.transfer_token()),
+            ("-color_range", profile.range.as_str()),
+        ] {
+            args.push(flag.to_string());
+            args.push(value.to_string());
         }
     }
-    for (flag, value) in [("-movflags", "+faststart"), ("-f", "mp4")] {
+    let movflags = if profile.tag_policy == TagPolicy::SRGB {
+        "+faststart"
+    } else {
+        "+faststart+write_colr"
+    };
+    for (flag, value) in [("-movflags", movflags), ("-f", "mp4")] {
         args.push(flag.to_string());
         args.push(value.to_string());
     }
@@ -1266,12 +1248,12 @@ mod tests {
     }
 
     #[test]
-    fn vendor_preview_filter_clears_generic_tags() {
+    fn vendor_preview_filter_writes_known_fields() {
         let profile = crate::color_profile::lookup("dji-dlog-dgamut").expect("dji");
         assert_eq!(
             preview_filter(preview_geometry(8, 6), profile),
             "scale=out_color_matrix=bt2020:out_range=pc,\
-             setparams=color_primaries=unknown:color_trc=unknown:colorspace=unknown:range=pc"
+             setparams=color_primaries=unknown:color_trc=unknown:colorspace=bt2020nc:range=pc"
         );
     }
 }

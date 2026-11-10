@@ -122,6 +122,150 @@ pub fn decode_first_pixel(path: &Path, matrix: &str, range: &str) -> [u8; 3] {
     [output.stdout[0], output.stdout[1], output.stdout[2]]
 }
 
+/// Decode with only an RGB output format: no input matrix/range/colour overrides.
+pub fn decode_first_pixel_auto(path: &Path) -> [u8; 3] {
+    let output = Command::new(FFMPEG)
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+        .output()
+        .expect("auto decode");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout[..3].try_into().expect("decoded RGB pixel")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorCodes {
+    pub primaries: u16,
+    pub transfer: u16,
+    pub matrix: u16,
+    pub full: u16,
+}
+
+/// Walk ISO BMFF boxes by declared sizes, never by searching for a byte pattern
+/// that could occur in encoded media. Only the video sample entry is inspected.
+pub fn mp4_nclx(path: &Path) -> ColorCodes {
+    fn boxes(mut data: &[u8]) -> Vec<(&[u8], &[u8])> {
+        let mut out = Vec::new();
+        while !data.is_empty() {
+            assert!(data.len() >= 8, "truncated box header");
+            let size = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+            let (size, header) = match size {
+                0 => (data.len(), 8),
+                1 => {
+                    assert!(data.len() >= 16);
+                    (
+                        usize::try_from(u64::from_be_bytes(data[8..16].try_into().unwrap()))
+                            .unwrap(),
+                        16,
+                    )
+                }
+                _ => (size, 8),
+            };
+            assert!(size >= header && size <= data.len(), "invalid box size");
+            out.push((&data[4..8], &data[header..size]));
+            data = &data[size..];
+        }
+        out
+    }
+    fn child<'a>(data: &'a [u8], kind: &[u8]) -> &'a [u8] {
+        boxes(data)
+            .into_iter()
+            .find(|(name, _)| *name == kind)
+            .expect("required MP4 box")
+            .1
+    }
+    let bytes = fs::read(path).expect("read MP4");
+    let moov = child(&bytes, b"moov");
+    let mut colours = Vec::new();
+    for (_, trak) in boxes(moov).into_iter().filter(|(kind, _)| *kind == b"trak") {
+        let mdia = child(trak, b"mdia");
+        let minf = child(mdia, b"minf");
+        let stbl = child(minf, b"stbl");
+        let stsd = child(stbl, b"stsd");
+        assert!(stsd.len() >= 8);
+        for (kind, sample) in boxes(&stsd[8..]) {
+            if kind != b"avc1" && kind != b"avc3" {
+                continue;
+            }
+            assert!(sample.len() >= 78, "short VisualSampleEntry");
+            let colr = child(&sample[78..], b"colr");
+            assert_eq!(&colr[..4], b"nclx", "expected nclx (not nclc or ICC)");
+            assert_eq!(colr.len(), 11);
+            let value = |at| u16::from_be_bytes(colr[at..at + 2].try_into().unwrap());
+            colours.push(ColorCodes {
+                primaries: value(4),
+                transfer: value(6),
+                matrix: value(8),
+                full: (colr[10] >> 7) as u16,
+            });
+        }
+    }
+    assert_eq!(colours.len(), 1, "one video nclx required");
+    colours[0]
+}
+
+/// Inspect elementary-stream SPS VUI, with no MP4 metadata available to merge.
+/// trace_headers exposes numeric syntax elements; every repeated SPS must agree.
+pub fn h264_sps_vui(path: &Path) -> ColorCodes {
+    let es = path.with_extension("h264");
+    let extract = Command::new(FFMPEG)
+        .args(["-v", "error", "-nostdin", "-y", "-i"])
+        .arg(path)
+        .args(["-map", "0:v:0", "-c:v", "copy", "-f", "h264"])
+        .arg(&es)
+        .output()
+        .expect("extract H.264");
+    assert!(
+        extract.status.success(),
+        "{}",
+        String::from_utf8_lossy(&extract.stderr)
+    );
+    let trace = Command::new(FFMPEG)
+        .args(["-v", "verbose", "-nostdin", "-i"])
+        .arg(&es)
+        .args(["-c:v", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"])
+        .output()
+        .expect("trace SPS");
+    assert!(
+        trace.status.success(),
+        "{}",
+        String::from_utf8_lossy(&trace.stderr)
+    );
+    fs::write(path.with_extension("sps-trace.log"), &trace.stderr).expect("save SPS trace");
+    let text = String::from_utf8(trace.stderr).expect("SPS text");
+    let field = |key: &str| {
+        let values: Vec<u16> = text
+            .lines()
+            .filter(|line| line.split_whitespace().any(|token| token == key))
+            .map(|line| {
+                line.rsplit_once(" = ")
+                    .expect("syntax value")
+                    .1
+                    .trim()
+                    .parse()
+                    .expect("numeric syntax value")
+            })
+            .collect();
+        assert!(!values.is_empty(), "missing SPS VUI {key}");
+        assert!(
+            values.iter().all(|value| *value == values[0]),
+            "inconsistent SPS {key}"
+        );
+        values[0]
+    };
+    ColorCodes {
+        primaries: field("colour_primaries"),
+        transfer: field("transfer_characteristics"),
+        matrix: field("matrix_coefficients"),
+        full: field("video_full_range_flag"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PNG writer (16-bit RGB, filter 0, zlib stored blocks)
 // ---------------------------------------------------------------------------
