@@ -92,6 +92,15 @@ pub fn srgb_oetf(value: f64) -> f64 {
     }
 }
 
+/// IEC 61966-2-1 sRGB electro-optical transfer function (inverse OETF).
+pub fn srgb_eotf(value: f64) -> f64 {
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 /// Clip a linear sRGB triple to [0, 1], apply the sRGB OETF and quantize.
 pub fn encode_display_pixel(linear_srgb: [f64; 3]) -> [u8; 3] {
     let mut out = [0u8; 3];
@@ -199,7 +208,7 @@ pub fn color_contract_json() -> Json {
     ])
 }
 
-fn matrix_json(matrix: &[[f64; 3]; 3]) -> Json {
+pub fn matrix_json(matrix: &[[f64; 3]; 3]) -> Json {
     Json::Array(
         matrix
             .iter()

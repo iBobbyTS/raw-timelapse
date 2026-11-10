@@ -374,3 +374,45 @@ native 新增回归覆盖：非 TIFF 输入与 TIFF 无 DNGVersion（CR2/NEF/ARW
 - **NOT_TESTED**：Windows/Linux（本适配器与预览编码均 macOS）；TIFF 系厂商 RAW 真机样本（CR2/NEF/ARW/PEF/3FR/FFF）——AC1 用合成"经典 TIFF 无 DNGVersion"最小目录覆盖判型，未验证各厂商真实文件的 ADC 产物；非 TIFF 真机样本仅 CR3 用于 AC3/AC4；>4096 素材的预览仅由 cr3/dxo 两类真实素材覆盖，未覆盖极端宽高比真机素材（退化宽高比仅有单测）。
 - **UNKNOWN**：普通 TIFF/JPEG 图像交 ADC 的失败文案/耗时（无专门支持承诺，仅要求显式报错）；ADC 对厂商 RAW 的裁剪/元数据烘焙细节沿用既有声明；不同 VideoToolbox/ffmpeg 版本对 SEI 时间戳与压缩行为的一致性。
 - 未改动：`frame.rs`/`manifest.rs` 的其余语义、`video.rs` 的 FFV1/往返/发布路径、去闪引擎语义、ADC 调用参数与验证逻辑、白平衡冻结、错误码家族；未新增 fallback/LibRaw/白名单/分辨率预检。`manifest.rs` 仅新增 preview.scale 并把 `preview.encoder_parameters` 的 `-vf` 改为实际链。
+
+## 预览输出色彩/Log profile（S01，2026-11-09）
+
+- 权威：用户 REQ-001~008（`.agent-work/REQUIREMENTS.md`）、`docs/architecture-v2.6.md` §0.7/§6.2/§6.4（颜色管线分阶段、官方公式/线性色标尺/中灰/黑位/全有限 range/YCbCr 与标签策略、缺少相关元数据时不能伪造通用色彩标签）、厂商官方文档（逐 profile 出处见 `pipeline/README.md` 与 manifest）。owner 决定：5 个厂商 Log + srgb 默认；range/matrix 以官方标准为准；不加抖动并把 8bit banding 权衡记录在文档；预览文件名携带 log 与 gamut；不做 HLG/PQ；编码器/位深/FFV1 母版/去闪/审计/native 全部不变。
+- 实现：`pipeline/src/color_profile.rs`（6 项注册表、官方 transfer 公式与常量、目标色域 primaries/白点与分阶段矩阵、显式输入域裁切、8bit 无抖动量化、range/YCbCr/标签策略、per-profile manifest 契约与官方参考码值）、`pipeline/src/preview.rs`（保留 sRGB 参考矩阵/函数并新增反 OETF）、`pipeline/src/{video.rs,cli.rs,manifest.rs,main.rs,lib.rs}`、`pipeline/tests/{pipeline_cli.rs,common/mod.rs}`、`pipeline/README.md`、本条目。`audit.rs`、`deflicker*`、`native/`、`order.rs`、`frame.rs`、FFV1 母版路径未改。
+
+### 行为变化与冻结契约
+
+1. **预览文件名契约变更**：旧 `srgb-preview-h264.mp4` 退役，统一改为 `preview-h264-<transfer>-<gamut>.mp4`。六个映射：`srgb-preview`→`preview-h264-srgb-bt709.mp4`、`dji-dlog-dgamut`→`preview-h264-dlog-dgamut.mp4`、`canon-log2-cinema-gamut`→`preview-h264-clog2-cgamut.mp4`、`sony-slog3-sgamut3`→`preview-h264-slog3-sgamut3.mp4`、`sony-slog3-sgamut3-cine`→`preview-h264-slog3-sgamut3cine.mp4`、`nikon-nlog-bt2020`→`preview-h264-nlog-bt2020.mp4`。
+2. **新增 `--preview-profile <ID>`**：默认 `srgb-preview`；未知/空 id → `EXIT_USAGE`(2)。CLI 与 manifest 均记录该 id。
+3. **sRGB 默认路径内容不变**：RGB24 转换、编码器参数、滤镜链与标签逐字节同变更前（基线/新二进制编码命令仅运行目录路径不同）；解码帧 `framemd5` 完全一致、去除 SEI 后的图像 NAL 哈希一致；容器差异仅为 VideoToolbox 在 SEI 内写入的运行时间戳（既有非确定性）。
+4. **厂商 Log 预览不写通用色彩标签**：`color_primaries/color_trc/colorspace` 保持 unspecified（ffprobe 实测 `unknown`），只写真实 `color_range`（全部 `pc`）；`scale` 滤镜自动附带的 matrix 元数据由 `setparams=...unknown` 清除，避免伪造 bt2020nc 标签。校验按 profile 参数化：`pc` 接受 `yuv420p` 或解码器上报的 `yuvj420p`，但仍断言 `color_range=pc`，不误拒合法 full-range 流。
+5. **无抖动**：所有 profile 的 8bit 量化均为 `round(signal*255)`、ties away from zero、无 dither；官方 10bit 参考按 `code8=round(code10*255/1023)` 比较并允许 ±1 双重舍入容差。8bit Log 的 banding 权衡与“未来更丰富的视频输出（10bit/HEVC/ProRes/HLG/PQ）”仅作为记录方向，本次不实现。
+6. **输入域显式裁切**：每 profile 以官方反变换在 signal 0/1 的线性值作为端点，负值与超上限逐通道裁切，无 tone mapping、无隐式 highlight roll-off；Canon Log 2 等曲线按官方公式保留合法负线性值（-0.01 映射到低于 0% 黑码 24 的码值）。
+
+### 官方常量与色域出处（转写）
+
+| profile | 文档 | 关键转写 |
+| --- | --- | --- |
+| Sony S-Gamut3 / S-Gamut3.Cine / S-Log3 | Technical Summary V1.0（sony.jp PDF） | S-Log3 正反公式（420/261.5/0.18/0.01/0.01125/95/171.2102946929/1023）；10bit 0/18/90% 码 95/420/598；两色域 primaries 与 D65；FAQ Q4 full range |
+| Canon Log 2 / Cinema Gamut | Canon Log Gamma Curves white paper（2018-11-01）+ Wide Color Gamuts white paper | Canon Log 2 正反公式（0.24136077/87.099375/0.092864125，reflection=scene linear×0.9）；10bit 0/18/100%/800%/1600% 码 95/407/575/797/871；FAQ Q6 full range。官方白皮书未打印 Cinema Gamut primaries，按 colour-science（引 Canon C500 firmware 页）与 Canon ACES linear Cinema Gamut IDT 交叉核对 |
+| Nikon N-Log / BT.2020 | N-Log Specification Document 1.0.0（2018-09-01） | N-Log 正反公式（650/0.0075/0.328/150/619/452/1023）；BT.2020 primaries 与 D65；参考码由官方公式在完整 10bit 域推导 |
+| DJI D-Log / D-Gamut | D-Log and D-Gamut White Paper（2017-10-10，Zenmuse X7） | D-Log 正反公式（6.025/0.0929/0.9892/0.0108/0.256663/0.584555/0.14/3.89616/2.27752）；10bit 0/18/90% 码 95/408/586；D-Gamut primaries、D65 与打印矩阵。打印矩阵为 4 位小数且非严格中性，代码使用由官方 primaries/白点推导的矩阵（与打印值最大差 1.84e-4） |
+
+### 检查与证据
+
+| 项 | 结果 / 证据（根=`.agent-work/tmp/rawtl-output-profiles/s01/`） |
+| --- | --- |
+| `cargo clean` + `cargo test` | 0；110 lib + 55 bin + 21 集成 = **186 passed, 0 failed**（`logs/impl-cargo-test-full-1.log`） |
+| 新增单测 | 官方参考码（含 Canon 800%/1600%）、独立非中性色块、Sony 双色域区分（AP1 绿红通道差 59 码）、中性灰 1e-9、正反往返、显式域裁切、量化、profile 解析/未知空 id |
+| 新增集成 | 6 profile 真实 CLI exit 0 + 文件名/标签/range/pix_fmt/manifest 断言；已知色块经 render→encode→decode 与独立参考比对（容差 12）；错误矩阵解码被拒绝；未知/空 profile → exit 2 |
+| sRGB 默认回归 | 64x48 3 帧 patch：`framemd5` diff 为空；图像 NAL SHA-256 均为 `68f9aa09…`；编码命令仅运行目录不同（`baseline/`） |
+| 参考值独立推导 | `reference_derive.py`（不调用生产矩阵/函数）与 `reference_derive.out`（`s01/`） |
+
+### 诚实边界
+
+- **YCbCr 矩阵**：厂商文档未给出这些 Log/色域组合的 YCbCr 系数；宽色域 profile 选用 `bt2020nc` 是记录在 manifest 的实现决策（端到端验证），不声称是厂商交付要求。
+- **range 推导**：Nikon/DJI 文档未出现字面 “full range”；`pc` 依据官方 10bit 码域与未声明 legal-range 重映射。Sony FAQ Q4、Canon FAQ Q6 为显式 full range 陈述。
+- **Cinema Gamut primaries**：官方白皮书只作定性描述；数值来自独立交叉核对（colour-science + Canon ACES IDT），代码/README/manifest 均记录该缺口。
+- **DJI 矩阵**：官方打印矩阵舍入导致中性灰偏差 ~1.7e-4，故使用官方 primaries/白点推导矩阵；与打印值差异已记录。
+- **NOT_TESTED**：真实素材上的 5 个 Log profile 观感/播放器兼容；10bit/HLG/PQ（明确排除）；Windows/Linux；不同 ffmpeg/VideoToolbox 版本对 full-range `yuvj420p` 上报与 SEI 时间戳的一致性。
+- 未改动：FFV1 母版、无损往返、去闪、独立审计、native 路由、帧 PNG 语义、编码器与位深、>4096 降采样策略。

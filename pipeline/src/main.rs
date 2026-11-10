@@ -1,5 +1,5 @@
 //! rawtl-linear-video: DNG frame sequence -> 16-bit scene-linear FFV1 video
-//! plus a display-referred sRGB review preview.
+//! plus a display-referred sRGB or camera-Log review preview.
 //!
 //! The deflicker node (legacy V4 semantics) is enabled by default; every pass,
 //! failure path, report and publication rule lives in the modules below.
@@ -13,15 +13,16 @@ mod frame;
 mod guard;
 mod manifest;
 mod order;
-mod preview;
 mod proc;
 mod video;
 
 // The binary and the library compile the same source files. Re-exporting the
-// library modules keeps a single nominal `Json`/`deflicker` type across the
-// engine and the process orchestration.
+// library modules keeps a single nominal `Json`/`deflicker`/colour-profile type
+// across the engine and the process orchestration.
+pub use rawtl_linear_video::color_profile;
 pub use rawtl_linear_video::deflicker;
 pub use rawtl_linear_video::json;
+pub use rawtl_linear_video::preview;
 
 use cli::{Options, Parsed};
 use error::{Error, Result, EXIT_PUBLISH, EXIT_TOOL};
@@ -174,7 +175,14 @@ pub fn encode_and_validate(
         roundtrip.elapsed.as_secs_f64()
     );
 
-    println!("rendering display-referred sRGB preview...");
+    if options.preview_profile.id == "srgb-preview" {
+        println!("rendering display-referred sRGB preview...");
+    } else {
+        println!(
+            "rendering display-referred {} preview...",
+            options.preview_profile.id
+        );
+    }
     let phase = Instant::now();
     video::render_preview(
         &options.ffmpeg,
@@ -185,6 +193,7 @@ pub fn encode_and_validate(
         options.fps,
         &preview_raw,
         &logs_dir.join("render-preview.log"),
+        options.preview_profile,
     )?;
     timings.insert("render_preview".to_string(), phase.elapsed());
 
@@ -198,6 +207,7 @@ pub fn encode_and_validate(
         options.fps,
         &temp_preview,
         &logs_dir.join("encode-preview.log"),
+        options.preview_profile,
     )?;
     timings.insert("encode_preview".to_string(), phase.elapsed());
 
@@ -210,6 +220,7 @@ pub fn encode_and_validate(
         sequence.height,
         count,
         options.fps,
+        options.preview_profile,
     )?;
     timings.insert("validate_preview".to_string(), phase.elapsed());
     println!(
@@ -277,7 +288,7 @@ pub fn publish_run(
     manifest::write(&output.join("manifest.json"), &manifest_json)?;
 
     let final_linear = output.join(video::LINEAR_FINAL_NAME);
-    let final_preview = output.join(video::PREVIEW_FINAL_NAME);
+    let final_preview = output.join(video::preview_final_name(options.preview_profile));
     video::publish(
         &stage.temp_linear,
         &final_linear,
@@ -298,7 +309,15 @@ pub fn publish_run(
         context.started.elapsed().as_secs_f64()
     );
     println!("linear video: {}", final_linear.display());
-    println!("sRGB preview: {}", final_preview.display());
+    if options.preview_profile.id == "srgb-preview" {
+        println!("sRGB preview: {}", final_preview.display());
+    } else {
+        println!(
+            "{} preview: {}",
+            options.preview_profile.id,
+            final_preview.display()
+        );
+    }
     println!("manifest:     {}", output.join("manifest.json").display());
     Ok(())
 }

@@ -97,7 +97,7 @@ fn publishes_lossless_linear_video_and_srgb_preview() {
     }
 
     let linear = output.join("linear-acescg-16bit-ffv1.mkv");
-    let preview = output.join("srgb-preview-h264.mp4");
+    let preview = output.join("preview-h264-srgb-bt709.mp4");
     let partial = output.join(".rawtl-partial");
     assert!(linear.is_file(), "linear video must exist");
     assert!(preview.is_file(), "preview must exist");
@@ -134,7 +134,10 @@ fn publishes_lossless_linear_video_and_srgb_preview() {
     }
 
     let encode_log = fs::read_to_string(output.join("logs/encode-preview.log")).expect("log");
-    assert!(encode_log.contains("-c:v h264_videotoolbox"), "{encode_log}");
+    assert!(
+        encode_log.contains("-c:v h264_videotoolbox"),
+        "{encode_log}"
+    );
     assert!(encode_log.contains("-allow_sw 0"), "{encode_log}");
 
     let roundtrip = fs::read_to_string(output.join("logs/roundtrip.log")).expect("log");
@@ -170,7 +173,7 @@ fn stops_at_the_first_failing_frame_without_video() {
         .join("analysis/baseline/meta/frame_000001.json")
         .is_file());
     assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
-    assert!(!output.join("srgb-preview-h264.mp4").exists());
+    assert!(!output.join("preview-h264-srgb-bt709.mp4").exists());
     assert!(!output.join(".rawtl-partial").exists());
     let log =
         fs::read_to_string(output.join("logs/analysis/frame_000002.log")).expect("failure log");
@@ -201,7 +204,7 @@ fn encoder_failure_after_bytes_written_publishes_nothing() {
     );
 
     assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
-    assert!(!output.join("srgb-preview-h264.mp4").exists());
+    assert!(!output.join("preview-h264-srgb-bt709.mp4").exists());
     let partial = output.join(".rawtl-partial/linear.mkv");
     assert!(
         partial.is_file(),
@@ -251,7 +254,7 @@ fn probe_rejection_publishes_nothing() {
         "{text}"
     );
     assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
-    assert!(!output.join("srgb-preview-h264.mp4").exists());
+    assert!(!output.join("preview-h264-srgb-bt709.mp4").exists());
     assert!(output.join(".rawtl-partial/linear.mkv").is_file());
 }
 
@@ -281,7 +284,7 @@ fn lossless_roundtrip_mismatch_is_rejected() {
         "{text}"
     );
     assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
-    assert!(!output.join("srgb-preview-h264.mp4").exists());
+    assert!(!output.join("preview-h264-srgb-bt709.mp4").exists());
     let report = read_json(&output.join("exposure_report.json"));
     assert_eq!(
         report.get("run_status").and_then(Json::as_str),
@@ -544,7 +547,7 @@ fn default_pairwise_corrects_injected_flicker_and_audit_passes() {
 
     for name in [
         "linear-acescg-16bit-ffv1.mkv",
-        "srgb-preview-h264.mp4",
+        "preview-h264-srgb-bt709.mp4",
         "temporal_audit.json",
         "pairs.csv",
         "frames.csv",
@@ -647,7 +650,7 @@ fn confirmed_step_is_preserved_and_not_corrected_away() {
         Some("SKIPPED")
     );
     assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
-    assert!(output.join("srgb-preview-h264.mp4").is_file());
+    assert!(output.join("preview-h264-srgb-bt709.mp4").is_file());
 }
 
 #[test]
@@ -776,7 +779,7 @@ fn render_under_execution_publishes_the_best_round_with_a_warning() {
         "the pre-repair bug reported zero updates beside a full history"
     );
     assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
-    assert!(output.join("srgb-preview-h264.mp4").is_file());
+    assert!(output.join("preview-h264-srgb-bt709.mp4").is_file());
 }
 
 #[test]
@@ -839,7 +842,7 @@ fn wrong_correction_passes_the_probe_but_the_audit_records_fail_and_publishes() 
         "audit FAIL must carry events"
     );
     assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
-    assert!(output.join("srgb-preview-h264.mp4").is_file());
+    assert!(output.join("preview-h264-srgb-bt709.mp4").is_file());
     let audit = read_json(&output.join("temporal_audit.json"));
     assert_eq!(audit.get("status").and_then(Json::as_str), Some("FAIL"));
     let manifest = read_json(&output.join("manifest.json"));
@@ -910,14 +913,12 @@ fn unreliable_frames_get_global_reference_fallback_and_publish() {
         .get("warnings")
         .and_then(Json::as_array)
         .expect("warnings");
-    assert!(run_warnings
-        .iter()
-        .any(|warning| warning
-            .as_str()
-            .map(|text| text.starts_with("GLOBAL_REFERENCE_FALLBACK"))
-            .unwrap_or(false)));
+    assert!(run_warnings.iter().any(|warning| warning
+        .as_str()
+        .map(|text| text.starts_with("GLOBAL_REFERENCE_FALLBACK"))
+        .unwrap_or(false)));
     assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
-    assert!(output.join("srgb-preview-h264.mp4").is_file());
+    assert!(output.join("preview-h264-srgb-bt709.mp4").is_file());
 }
 
 #[test]
@@ -1087,4 +1088,350 @@ fn fractional_applied_ev_survives_sidecar_precision() {
     );
     assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
     assert!(output.join("frames/frame_000001.png").is_file());
+}
+
+// ---------------------------------------------------------------------------
+// Preview output colour/Log profiles
+// ---------------------------------------------------------------------------
+
+/// Build a 64x48 three-frame sequence whose frames are a uniform RGB16 ACEScg
+/// code triple. The fake producer copies the fixtures at EV 0.
+fn profile_material(
+    name: &str,
+    rgb: [u16; 3],
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    require_ffmpeg();
+    let root = test_dir(name);
+    let input = root.join("material");
+    let names: Vec<String> = (0..3)
+        .map(|index| format!("frame_{index:04}.DNG"))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    make_input(&input, &refs);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("create fixtures");
+    let mut frames = Vec::new();
+    for index in 0..3 {
+        let path = fixtures.join(format!("patch_{index}.png"));
+        write_rgb48_png(&path, 64, 48, &vec![rgb; 64 * 48]);
+        let mut frame = FakeFrame::new(&format!("frame_{index:04}.DNG"), 0.0);
+        frame.fixture = Some(path);
+        frame.capture_time = Some(format!("2026:11:08 20:00:{:02}", index + 1));
+        frames.push(frame);
+    }
+    let tool = fake_native_sequence(&fixtures, &frames, None, false, 64, 48);
+    (root, input, tool)
+}
+
+fn run_profile(root: &Path, input: &Path, tool: &Path, id: &str) -> Output {
+    let output = root.join("run");
+    let mut args = base_args(input, &output, tool);
+    args.push("--preview-profile");
+    args.push(id);
+    run_cli(&args)
+}
+
+#[test]
+fn preview_profiles_emit_their_declared_colour_contract() {
+    let cases: [(&str, &str, &str, &[&str], bool, &str, &str); 6] = [
+        (
+            "srgb-preview",
+            "preview-h264-srgb-bt709.mp4",
+            "tv",
+            &["yuv420p"],
+            false,
+            "bt709",
+            "iec.ch",
+        ),
+        (
+            "sony-slog3-sgamut3",
+            "preview-h264-slog3-sgamut3.mp4",
+            "pc",
+            &["yuv420p", "yuvj420p"],
+            true,
+            "bt2020nc",
+            "sony.jp",
+        ),
+        (
+            "sony-slog3-sgamut3-cine",
+            "preview-h264-slog3-sgamut3cine.mp4",
+            "pc",
+            &["yuv420p", "yuvj420p"],
+            true,
+            "bt2020nc",
+            "sony.jp",
+        ),
+        (
+            "canon-log2-cinema-gamut",
+            "preview-h264-clog2-cgamut.mp4",
+            "pc",
+            &["yuv420p", "yuvj420p"],
+            true,
+            "bt2020nc",
+            "canon.com",
+        ),
+        (
+            "nikon-nlog-bt2020",
+            "preview-h264-nlog-bt2020.mp4",
+            "pc",
+            &["yuv420p", "yuvj420p"],
+            true,
+            "bt2020nc",
+            "nikon",
+        ),
+        (
+            "dji-dlog-dgamut",
+            "preview-h264-dlog-dgamut.mp4",
+            "pc",
+            &["yuv420p", "yuvj420p"],
+            true,
+            "bt2020nc",
+            "djicdn",
+        ),
+    ];
+
+    for (id, filename, range, pix_fmts, unspecified, matrix, source_marker) in cases {
+        let (root, input, fixtures) = run_success_setup(&format!("profile-contract-{id}"));
+        let frames = standard_frames(&fixtures);
+        let tool = fake_native_tool(&fixtures, &frames, None, false);
+        let result = run_profile(&root, &input, &tool, id);
+        assert!(
+            result.status.success(),
+            "{id} run failed\nstdout:\n{}\nstderr:\n{}",
+            stdout(&result),
+            stderr(&result)
+        );
+        let output = root.join("run");
+        let preview = output.join(filename);
+        assert!(preview.is_file(), "{id}: missing {filename}");
+
+        let probe = ffprobe_color(&preview);
+        for expected in ["codec_name=h264", "width=8", "height=6", "nb_read_frames=3"] {
+            assert!(probe.contains(expected), "{id}: {probe}");
+        }
+        assert!(
+            probe.contains(&format!("color_range={range}")),
+            "{id}: {probe}"
+        );
+        let pix_fmt = probe
+            .lines()
+            .find_map(|line| line.strip_prefix("pix_fmt="))
+            .expect("pix_fmt");
+        assert!(
+            pix_fmts.contains(&pix_fmt),
+            "{id}: pix_fmt {pix_fmt:?} not in {pix_fmts:?}"
+        );
+        if unspecified {
+            for tag in ["color_space", "color_primaries", "color_transfer"] {
+                assert!(
+                    probe.contains(&format!("{tag}=unknown")),
+                    "{id}: {tag} must stay unspecified: {probe}"
+                );
+            }
+        } else {
+            for expected in [
+                "color_space=bt709",
+                "color_primaries=bt709",
+                "color_transfer=iec61966-2-1",
+            ] {
+                assert!(probe.contains(expected), "{id}: {probe}");
+            }
+        }
+
+        let manifest = fs::read_to_string(output.join("manifest.json")).expect("manifest");
+        for expected in [
+            format!("\"file\": \"{filename}\""),
+            format!("\"profile\": \"{id}\""),
+            "\"dither\": false".to_string(),
+            format!("\"range\": \"{range}\""),
+            format!("\"ycbcr_matrix\": \"{matrix}\""),
+            "\"full_decode\": \"pass\"".to_string(),
+        ] {
+            assert!(
+                manifest.contains(&expected),
+                "{id}: manifest missing {expected:?}"
+            );
+        }
+        assert!(
+            manifest.contains(source_marker),
+            "{id}: manifest must cite the vendor source ({source_marker})"
+        );
+        assert!(
+            manifest.contains("\"reference_codes\""),
+            "{id}: manifest must record official reference codes"
+        );
+    }
+}
+
+/// The known patch goes through the real render -> encode -> decode path. The
+/// expected triples are independently derived (reference_derive.py); they are
+/// separated by >=25 codes so the observation rejects a wrong or bypassed
+/// profile, and the two Sony gamuts differ by 59 codes in red.
+#[test]
+fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
+    const TOLERANCE: i32 = 12;
+    let cases: [(&str, &str, &str, &str, [u8; 3]); 6] = [
+        (
+            "srgb-preview",
+            "preview-h264-srgb-bt709.mp4",
+            "bt709",
+            "tv",
+            [0, 255, 0],
+        ),
+        (
+            "sony-slog3-sgamut3",
+            "preview-h264-slog3-sgamut3.mp4",
+            "bt2020",
+            "pc",
+            [59, 147, 20],
+        ),
+        (
+            "sony-slog3-sgamut3-cine",
+            "preview-h264-slog3-sgamut3cine.mp4",
+            "bt2020",
+            "pc",
+            [0, 145, 49],
+        ),
+        (
+            "canon-log2-cinema-gamut",
+            "preview-h264-clog2-cgamut.mp4",
+            "bt2020",
+            "pc",
+            [48, 140, 96],
+        ),
+        (
+            "nikon-nlog-bt2020",
+            "preview-h264-nlog-bt2020.mp4",
+            "bt2020",
+            "pc",
+            [0, 154, 0],
+        ),
+        (
+            "dji-dlog-dgamut",
+            "preview-h264-dlog-dgamut.mp4",
+            "bt2020",
+            "pc",
+            [0, 145, 74],
+        ),
+    ];
+
+    let mut observed = Vec::new();
+    for (id, filename, matrix, range, expected) in cases {
+        // AP1/D60 pure green: 0.0, 1.0, 0.0 in PNG RGB16 codes.
+        let (root, input, tool) = profile_material(&format!("profile-patch-{id}"), [0, 16384, 0]);
+        let result = run_profile(&root, &input, &tool, id);
+        assert!(
+            result.status.success(),
+            "{id} run failed\nstdout:\n{}\nstderr:\n{}",
+            stdout(&result),
+            stderr(&result)
+        );
+        let preview = root.join("run").join(filename);
+        let decoded = decode_first_pixel(&preview, matrix, range);
+        let difference = (0..3)
+            .map(|channel| (decoded[channel] as i32 - expected[channel] as i32).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            difference <= TOLERANCE,
+            "{id}: decoded {decoded:?} vs independent reference {expected:?} (tolerance {TOLERANCE})"
+        );
+        observed.push((id, expected));
+    }
+
+    // A wrong profile cannot pass: the independent references are far apart.
+    for left in 0..observed.len() {
+        for right in left + 1..observed.len() {
+            let (left_id, left_code) = observed[left];
+            let (right_id, right_code) = observed[right];
+            let distance = (0..3)
+                .map(|channel| (left_code[channel] as i32 - right_code[channel] as i32).abs())
+                .max()
+                .unwrap_or(0);
+            assert!(
+                distance > TOLERANCE,
+                "{left_id} and {right_id} references are not distinguishable: {left_code:?} vs {right_code:?}"
+            );
+        }
+    }
+
+    // The two Sony gamuts are separated by 59 codes in red.
+    let sony = observed
+        .iter()
+        .find(|(id, _)| *id == "sony-slog3-sgamut3")
+        .expect("sony")
+        .1;
+    let cine = observed
+        .iter()
+        .find(|(id, _)| *id == "sony-slog3-sgamut3-cine")
+        .expect("cine")
+        .1;
+    assert!((sony[0] as i32 - cine[0] as i32).abs() >= 25);
+}
+
+/// Decoding with the wrong YCbCr matrix must visibly disagree with the declared
+/// reference, so the end-to-end check is not satisfied by a decoder default.
+#[test]
+fn wrong_ycbcr_matrix_is_rejected_by_the_patch_check() {
+    // N-Log compresses highlights least in this range, so AP1/D60 red 3.5 maps
+    // to a maximally chromatic coded triple [202,0,0]; the BT.709 inverse
+    // differs by 11 codes from the declared BT.2020 matrix, while H.264 error
+    // on the uniform patch stays well below that.
+    const CORRECT_TOLERANCE: i32 = 8;
+    let (root, input, tool) = profile_material("profile-wrong-matrix", [57344, 0, 0]);
+    let result = run_profile(&root, &input, &tool, "nikon-nlog-bt2020");
+    assert!(
+        result.status.success(),
+        "run failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&result),
+        stderr(&result)
+    );
+    let preview = root.join("run").join("preview-h264-nlog-bt2020.mp4");
+    let expected = [202u8, 0, 0];
+    let decoded = decode_first_pixel(&preview, "bt2020", "pc");
+    let difference = (0..3)
+        .map(|channel| (decoded[channel] as i32 - expected[channel] as i32).abs())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        difference <= CORRECT_TOLERANCE,
+        "declared matrix: {decoded:?} vs {expected:?}"
+    );
+
+    let wrong = decode_first_pixel(&preview, "bt709", "pc");
+    let wrong_difference = (0..3)
+        .map(|channel| (wrong[channel] as i32 - expected[channel] as i32).abs())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        wrong_difference > CORRECT_TOLERANCE,
+        "decoding with the wrong matrix must be rejected: {wrong:?} vs {expected:?}"
+    );
+}
+
+#[test]
+fn rejects_unknown_or_empty_preview_profile_with_exit_usage() {
+    let (root, input, fixtures) = run_success_setup("profile-unknown");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_tool(&fixtures, &frames, None, false);
+    let output = root.join("run");
+    for value in ["no-such-profile", ""] {
+        let mut args = base_args(&input, &output, &tool);
+        args.push("--preview-profile");
+        args.push(value);
+        let result = run_cli(&args);
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "value {value:?} must be EXIT_USAGE\nstdout:\n{}\nstderr:\n{}",
+            stdout(&result),
+            stderr(&result)
+        );
+        assert!(
+            stderr(&result).contains("--preview-profile"),
+            "{}",
+            stderr(&result)
+        );
+        assert!(!output.exists(), "usage rejection must not create output");
+    }
 }
