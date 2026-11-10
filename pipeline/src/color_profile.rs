@@ -55,15 +55,52 @@ impl PreviewRange {
     }
 }
 
-/// Generic colour-tag policy for the preview stream.
+/// Accurate per-field H.273 code points; 2 means unspecified, not a fallback
+/// to the primaries or transfer of the selected YCbCr coding matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TagPolicy {
-    /// Write the declared display-referred sRGB tags.
-    Standard,
-    /// Leave primaries/transfer/matrix unspecified: the camera Log signal is
-    /// not a display-referred standard signal and §6.4 forbids fabricating a
-    /// generic colour tag when the relevant metadata is absent.
-    Unspecified,
+pub struct TagPolicy {
+    pub primaries: u16,
+    pub transfer: u16,
+    pub matrix: u16,
+}
+
+impl TagPolicy {
+    pub const SRGB: Self = Self {
+        primaries: 1,
+        transfer: 13,
+        matrix: 1,
+    };
+    pub const VENDOR_LOG: Self = Self {
+        primaries: 2,
+        transfer: 2,
+        matrix: 9,
+    };
+    pub const NIKON_LOG: Self = Self {
+        primaries: 9,
+        transfer: 2,
+        matrix: 9,
+    };
+
+    pub fn primaries_token(self) -> &'static str {
+        match self.primaries {
+            1 => "bt709",
+            9 => "bt2020",
+            _ => "unknown",
+        }
+    }
+    pub fn transfer_token(self) -> &'static str {
+        match self.transfer {
+            13 => "iec61966-2-1",
+            _ => "unknown",
+        }
+    }
+    pub fn matrix_token(self) -> &'static str {
+        match self.matrix {
+            1 => "bt709",
+            9 => "bt2020nc",
+            _ => "unknown",
+        }
+    }
 }
 
 /// One official reference code point published with a transfer curve.
@@ -406,13 +443,12 @@ const CINEMA_GAMUT: Gamut = Gamut {
         [-0.458166574469, 1.261627783050, 0.159623631630],
         [-0.070349667723, 0.221557667226, 0.776181603627],
     ],
-    provenance: "Canon wide-colour-gamut white paper (WhitePaper_WideColorGamutsC500.pdf) \
-                 defines Cinema Gamut but does not print primaries; the primaries were \
-                 cross-checked against colour-science (canon_cinema_gamut.py, citing Canon's \
-                 EOS C500 firmware page) and Canon's ACES linear Cinema Gamut IDT distributed \
-                 by ASWF OCIO Config ACES. Matrix derived with D65 white by the standard \
-                 normalised-primary-matrix construction; white point D65, not the D55 used as \
-                 the Canon ACES IDT calibration illuminant",
+    provenance: "Canon Color Gamut Conversion for DCI-P3+ and Cinema Gamut, PUB. DIM-1102-000 \
+                 (2013), English p.2 (https://gdlp01.c-wss.com/gds/8/0200003438/01/colorgamutinfo-dim1102.pdf): \
+                 D65 white (0.3127,0.3290), R(0.7400,0.2700), G(0.1700,1.1400), B(0.0800,-0.1000). \
+                 Unchanged primaries cross-validated against colour-science and Canon's ACES \
+                 linear Cinema Gamut IDT distributed by ASWF OCIO Config ACES. Matrices derived \
+                 with D65 by normalised-primary-matrix construction, not the IDT's D55 calibration",
 };
 
 /// ITU-R BT.2020 primaries and D65 white (the N-Log specification repeats them).
@@ -550,22 +586,16 @@ impl ColorProfile {
     /// `-vf` colour conversion half of the preview filter chain (without the
     /// optional lanczos resize prefix).
     pub fn color_filter(&self) -> String {
-        match self.tag_policy {
-            TagPolicy::Standard => format!(
-                "scale=out_color_matrix={}:out_range={},\
-                 setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range={}",
-                self.scale_filter_token(),
-                self.range.filter_token(),
-                self.range.filter_token()
-            ),
-            TagPolicy::Unspecified => format!(
-                "scale=out_color_matrix={}:out_range={},\
-                 setparams=color_primaries=unknown:color_trc=unknown:colorspace=unknown:range={}",
-                self.scale_filter_token(),
-                self.range.filter_token(),
-                self.range.filter_token()
-            ),
-        }
+        format!(
+            "scale=out_color_matrix={}:out_range={},\
+             setparams=color_primaries={}:color_trc={}:colorspace={}:range={}",
+            self.scale_filter_token(),
+            self.range.filter_token(),
+            self.tag_policy.primaries_token(),
+            self.tag_policy.transfer_token(),
+            self.tag_policy.matrix_token(),
+            self.range.filter_token()
+        )
     }
 
     /// The complete per-profile colour contract written into `manifest.json`.
@@ -722,6 +752,7 @@ impl ColorProfile {
                     ("range_reason", Json::Str(self.range_reason.to_string())),
                     ("ycbcr_matrix", Json::Str(self.ycbcr_matrix.to_string())),
                     ("ycbcr_reason", Json::Str(self.ycbcr_reason.to_string())),
+                    ("delivery_background", self.delivery_background_json()),
                     (
                         "scale_matrix_token",
                         Json::Str(self.scale_filter_token().to_string()),
@@ -740,36 +771,79 @@ impl ColorProfile {
         ])
     }
 
+    pub fn emitted_tags_json(&self) -> Json {
+        let fields = || {
+            Json::obj(vec![
+                (
+                    "colour_primaries",
+                    Json::Int(self.tag_policy.primaries as i64),
+                ),
+                (
+                    "transfer_characteristics",
+                    Json::Int(self.tag_policy.transfer as i64),
+                ),
+                (
+                    "matrix_coefficients",
+                    Json::Int(self.tag_policy.matrix as i64),
+                ),
+                (
+                    "video_full_range_flag",
+                    Json::Int(if self.range == PreviewRange::Pc { 1 } else { 0 }),
+                ),
+            ])
+        };
+        Json::obj(vec![
+            ("h264_sps_vui", fields()),
+            ("mp4_colr_nclx", fields()),
+        ])
+    }
+
     fn tag_policy_json(&self) -> Json {
-        match self.tag_policy {
-            TagPolicy::Standard => Json::obj(vec![
-                ("mode", Json::Str("standard".to_string())),
-                ("color_primaries", Json::Str("bt709".to_string())),
-                ("color_trc", Json::Str("iec61966-2-1".to_string())),
-                ("colorspace", Json::Str("bt709".to_string())),
-                ("range", Json::Str(self.range.as_str().to_string())),
-                (
-                    "reason",
-                    Json::Str("declared display-referred sRGB preview contract".to_string()),
+        Json::obj(vec![
+            ("mode", Json::Str("per-field".to_string())),
+            (
+                "color_primaries",
+                Json::Str(self.tag_policy.primaries_token().to_string()),
+            ),
+            (
+                "color_trc",
+                Json::Str(self.tag_policy.transfer_token().to_string()),
+            ),
+            (
+                "colorspace",
+                Json::Str(self.tag_policy.matrix_token().to_string()),
+            ),
+            ("range", Json::Str(self.range.as_str().to_string())),
+            ("emitted_tags", self.emitted_tags_json()),
+            (
+                "reason",
+                Json::Str(
+                    "Per-field tag policy: write accurate code points in both layers; vendor Log \
+                transfer and non-standard primaries have no accurate generic code point and \
+                remain unspecified; matrix tags describe coding, not a gamut/transfer conversion"
+                        .to_string(),
                 ),
-            ]),
-            TagPolicy::Unspecified => Json::obj(vec![
-                ("mode", Json::Str("unspecified".to_string())),
-                ("color_primaries", Json::Str("unspecified".to_string())),
-                ("color_trc", Json::Str("unspecified".to_string())),
-                ("colorspace", Json::Str("unspecified".to_string())),
-                ("range", Json::Str(self.range.as_str().to_string())),
-                (
-                    "reason",
-                    Json::Str(
-                        "architecture §6.4: when the relevant colour metadata is absent, a \
-                         generic colour tag must not be fabricated; only the real signal range \
-                         is written"
-                            .to_string(),
-                    ),
-                ),
-            ]),
+            ),
+        ])
+    }
+
+    fn delivery_background_json(&self) -> Json {
+        if self.tag_policy == TagPolicy::SRGB {
+            return Json::Array(vec![]);
         }
+        Json::Array(vec![
+            Json::Str("Canon DP-V3010 Instruction Manual, dpv3010-im3-en, pp.47/50: automatic \
+                YCbCr matrix is BT.709 outside the BT.2020 setting; Cinema Gamut monitoring \
+                workflows therefore do not establish a universal BT.2020 delivery mandate \
+                (https://gdlp01.c-wss.com/gds/7/0300013757/06/dpv3010-im3-en.pdf)".to_string()),
+            Json::Str("Sony BVM-HX310 Operating Instructions, 4-748-188-13(1), software 1.2, \
+                pp.24-25: for other colour spaces the receiver's Transfer Matrix must match \
+                the signal output device (https://pro.sony/support/res/manuals/4748/2c99048095dffc320734089caca25c96/47481881M.pdf)".to_string()),
+            Json::Str("Nikon Z 9 TIPS, Using the N-Log 3D LUT (October 2021), step 7 documents \
+                both Limited/Video and Full/Full links; full range here is rawtl's convention \
+                (https://nps.nikonimaging.com/technical_info/technical_solutions/z9_tips/3d_lut/). \
+                The N-Log specification establishes BT.2020 primaries, not rawtl's NCL delivery choice".to_string()),
+        ])
     }
 }
 
@@ -784,20 +858,27 @@ pub fn quantize_signal(signal: f64) -> u8 {
     (signal.clamp(0.0, 1.0) * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
-// These sources corroborate the coding transform, not a vendor delivery mandate.
-// H.273 separates matrix coefficients from colour primaries and transfer;
-// Khronos independently derives the same NCL matrix in section 15.1.3.
+// The coefficient/code-point sources govern the transform, not the
+// project's choice of matrix for vendor Log RGB or its full-range delivery.
 const BT2020_NCL_CONTAINER_REASON: &str =
-    "Container-coding convention, corroborated by ITU-T H.273 (V4), Coding-independent code \
-     points for video signal type identification (07/2024), section 8.3/Table 4: \
-     MatrixCoefficients=9, Kr=0.2627, Kb=0.0593 \
-     (https://www.itu.int/rec/T-REC-H.273-202407-I/en); and the independent Khronos Data Format \
-     Specification v1.4.0 (02/2025), section 15.1.3, BT.2020 YCbCr conversion \
+    "Rawtl delivery convention, not a vendor requirement: bt2020nc. \
+     ITU-R BT.2020-2 (10/2015), Parameter values for ultra-high definition television systems \
+     for production and international programme exchange, Table 4 \
+     (https://www.itu.int/rec/R-REC-BT.2020-2-201510-I/en): \
+     Y'=0.2627*R'+0.6780*G'+0.0593*B', Cb=(B'-Y')/1.8814, Cr=(R'-Y')/1.4746. \
+     ITU-T H.273 (V4), Coding-independent code points for video signal type identification \
+     (07/2024), section 8.3/Table 4 (https://www.itu.int/rec/T-REC-H.273-202407-I/en), \
+     assigns matrix_coefficients=9. Khronos Data Format Specification v1.4.0 (02/2025), \
+     section 15.1.3 independently derives the transform \
      (https://registry.khronos.org/DataFormat/specs/1.4/dataformat.1.4.html). \
-     The sources corroborate the reversible BT.2020 non-constant-luminance coding equations, \
-     not this vendor's delivery coefficients: no consulted vendor document specifies those. \
-     Applying this matrix to vendor Log RGB is an implementation convention, not conversion \
-     to BT.2020 primaries or transfer; generic colour tags remain unspecified.";
+     Only the ideal matrix transform is reversible; actual 8-bit 4:2:0 delivery has \
+     quantization, chroma subsampling and lossy compression. This coding matrix does not \
+     change vendor primaries or transfer and implies no gamut-containment claim.";
+const LOG_RANGE_REASON: &str =
+    "Rawtl full-range (pc) delivery convention, not a vendor mandate. \
+     Nikon's N-Log LUT guide documents both limited and full links \
+     (https://nps.nikonimaging.com/technical_info/technical_solutions/z9_tips/3d_lut/); \
+     the transfer's code domain alone does not determine the delivery range.";
 
 pub static PROFILES: [ColorProfile; 6] = [
     ColorProfile {
@@ -808,7 +889,7 @@ pub static PROFILES: [ColorProfile; 6] = [
         ycbcr_matrix: "bt709",
         range_reason: "existing display-referred sRGB review delivery uses limited (tv) range",
         ycbcr_reason: "existing sRGB preview conversion uses the BT.709 matrix",
-        tag_policy: TagPolicy::Standard,
+        tag_policy: TagPolicy::SRGB,
         preview_filename: "preview-h264-srgb-bt709.mp4",
     },
     ColorProfile {
@@ -817,11 +898,9 @@ pub static PROFILES: [ColorProfile; 6] = [
         gamut: &SGAMUT3_GAMUT,
         range: PreviewRange::Pc,
         ycbcr_matrix: "bt2020nc",
-        range_reason: "Sony technical summary FAQ Q4: S-Log3 is recorded Full range on XAVC, \
-                       HDCAM SR and MPEG50, and SDI output is always Full range; Legal/Full \
-                       cannot be selected",
+        range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
-        tag_policy: TagPolicy::Unspecified,
+        tag_policy: TagPolicy::VENDOR_LOG,
         preview_filename: "preview-h264-slog3-sgamut3.mp4",
     },
     ColorProfile {
@@ -830,11 +909,9 @@ pub static PROFILES: [ColorProfile; 6] = [
         gamut: &SGAMUT3_CINE_GAMUT,
         range: PreviewRange::Pc,
         ycbcr_matrix: "bt2020nc",
-        range_reason: "Sony technical summary FAQ Q4: S-Log3 is recorded Full range on XAVC, \
-                       HDCAM SR and MPEG50, and SDI output is always Full range; Legal/Full \
-                       cannot be selected",
+        range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
-        tag_policy: TagPolicy::Unspecified,
+        tag_policy: TagPolicy::VENDOR_LOG,
         preview_filename: "preview-h264-slog3-sgamut3cine.mp4",
     },
     ColorProfile {
@@ -843,10 +920,9 @@ pub static PROFILES: [ColorProfile; 6] = [
         gamut: &CINEMA_GAMUT,
         range: PreviewRange::Pc,
         ycbcr_matrix: "bt2020nc",
-        range_reason: "Canon white paper FAQ Q6: clips are recorded on the card using full \
-                       range levels and SDI output also uses full range",
+        range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
-        tag_policy: TagPolicy::Unspecified,
+        tag_policy: TagPolicy::VENDOR_LOG,
         preview_filename: "preview-h264-clog2-cgamut.mp4",
     },
     ColorProfile {
@@ -855,25 +931,9 @@ pub static PROFILES: [ColorProfile; 6] = [
         gamut: &BT2020_GAMUT,
         range: PreviewRange::Pc,
         ycbcr_matrix: "bt2020nc",
-        range_reason: "N-Log Specification Document defines the curve over the full 10-bit \
-                       code domain (signal 0 at reflectance -0.0075) and states no legal-range \
-                       remap; full range is recorded",
-        ycbcr_reason:
-            "ITU-R BT.2020-2, Parameter values for ultra-high definition television systems \
-                       for production and international programme exchange (10/2015), Table 4 \
-                       (https://www.itu.int/rec/R-REC-BT.2020-2-201510-I/en), governs the \
-                       BT.2020 gamut's non-constant-luminance derivation: \
-                       Y'=0.2627*R'+0.6780*G'+0.0593*B', Cb=(B'-Y')/1.8814, \
-                       Cr=(R'-Y')/1.4746. ITU-T H.273 (V4), Coding-independent code points \
-                       for video signal type identification (07/2024), section 8.3/Table 4 \
-                       (https://www.itu.int/rec/T-REC-H.273-202407-I/en), identifies this \
-                       transform as MatrixCoefficients=9. The swscale bt2020 token implements \
-                       these bt2020nc coefficients (verified numerically). Nikon does not \
-                       separately specify delivery coefficients; selection of NCL coding for \
-                       N-Log and the existing 8-bit/full-range adaptation remain implementation \
-                       conventions, not a claim of full BT.2020 system conformance; tags stay \
-                       unspecified",
-        tag_policy: TagPolicy::Unspecified,
+        range_reason: LOG_RANGE_REASON,
+        ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
+        tag_policy: TagPolicy::NIKON_LOG,
         preview_filename: "preview-h264-nlog-bt2020.mp4",
     },
     ColorProfile {
@@ -882,11 +942,9 @@ pub static PROFILES: [ColorProfile; 6] = [
         gamut: &DGAMUT_GAMUT,
         range: PreviewRange::Pc,
         ycbcr_matrix: "bt2020nc",
-        range_reason: "DJI white paper publishes 10-bit D-Log code values on the full 10-bit \
-                       scale (0% = 95, 18% = 408, 90% = 586) with saturation at 1023 and states \
-                       no legal-range remap",
+        range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
-        tag_policy: TagPolicy::Unspecified,
+        tag_policy: TagPolicy::VENDOR_LOG,
         preview_filename: "preview-h264-dlog-dgamut.mp4",
     },
 ];
@@ -1192,41 +1250,34 @@ mod tests {
                     .and_then(|value| value.as_str()),
                 Some(profile.ycbcr_matrix)
             );
-            if profile.tag_policy == TagPolicy::Unspecified {
-                let reason = encoding
-                    .get("ycbcr_reason")
-                    .and_then(Json::as_str)
-                    .expect("YCbCr provenance");
-                assert!(reason.contains("https://www.itu.int/rec/T-REC-H.273-202407-I/en"));
-                if profile.id == "nikon-nlog-bt2020" {
-                    assert!(reason.contains("https://www.itu.int/rec/R-REC-BT.2020-2-201510-I/en"));
-                    assert!(reason.contains("0.2627") && reason.contains("1.8814"));
-                } else {
-                    assert!(reason.contains(
-                        "https://registry.khronos.org/DataFormat/specs/1.4/dataformat.1.4.html"
-                    ));
-                    assert!(reason.contains("no consulted vendor document"));
-                    assert!(reason.contains("implementation convention"));
-                }
-            }
-            let tags = encoding.get("tag_policy").expect("tag policy");
-            match profile.tag_policy {
-                TagPolicy::Standard => {
-                    assert_eq!(
-                        tags.get("mode").and_then(|value| value.as_str()),
-                        Some("standard")
-                    );
-                }
-                TagPolicy::Unspecified => {
-                    assert_eq!(
-                        tags.get("mode").and_then(|value| value.as_str()),
-                        Some("unspecified")
-                    );
-                    assert_eq!(
-                        tags.get("colorspace").and_then(|value| value.as_str()),
-                        Some("unspecified")
-                    );
-                }
+            let tags = encoding.get("tag_policy").expect("tags");
+            assert_eq!(tags.get("mode").and_then(Json::as_str), Some("per-field"));
+            assert_eq!(
+                tags.get("colorspace").and_then(Json::as_str),
+                Some(profile.ycbcr_matrix)
+            );
+            if profile.tag_policy != TagPolicy::SRGB {
+                assert!(profile.ycbcr_reason.contains("Rawtl delivery convention"));
+                assert!(profile.ycbcr_reason.contains("not a vendor requirement"));
+                assert!(profile.range_reason.contains("not a vendor mandate"));
+                assert_eq!(profile.tag_policy.transfer, 2);
+                assert_eq!(profile.tag_policy.matrix, 9);
+                assert_eq!(
+                    profile.tag_policy.primaries,
+                    if profile.id == "nikon-nlog-bt2020" {
+                        9
+                    } else {
+                        2
+                    }
+                );
+                assert_eq!(
+                    encoding
+                        .get("delivery_background")
+                        .and_then(Json::as_array)
+                        .unwrap()
+                        .len(),
+                    3
+                );
             }
         }
         let srgb = lookup("srgb-preview").expect("srgb").contract_json();

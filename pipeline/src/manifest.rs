@@ -297,19 +297,18 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                     Json::Str("-pix_fmt yuv420p".to_string()),
                     Json::Str(format!("-vf {}", preview_filter(preview_scale, profile))),
                 ];
-                encoder_parameters.push(match profile.tag_policy {
-                    crate::color_profile::TagPolicy::Standard => Json::Str(
-                        "-colorspace bt709 -color_primaries bt709 -color_trc iec61966-2-1 -color_range tv"
-                            .to_string(),
-                    ),
-                    crate::color_profile::TagPolicy::Unspecified => Json::Str(format!(
-                        "-color_range {} (no generic colour tags: primaries/transfer/matrix unspecified)",
-                        profile.range.as_str()
-                    )),
-                });
+                encoder_parameters.push(Json::Str(format!(
+                    "-colorspace {} -color_primaries {} -color_trc {} -color_range {}",
+                    profile.tag_policy.matrix_token(), profile.tag_policy.primaries_token(),
+                    profile.tag_policy.transfer_token(), profile.range.as_str()
+                )));
+                if profile.tag_policy != crate::color_profile::TagPolicy::SRGB {
+                    encoder_parameters.push(Json::Str("-movflags +faststart+write_colr".to_string()));
+                }
                 Json::obj(vec![
                     ("file", Json::Str(preview_final_name(profile).to_string())),
                     ("profile", Json::Str(profile.id.to_string())),
+                    ("emitted_tags", profile.emitted_tags_json()),
                     ("bytes", Json::Int(input.preview_bytes as i64)),
                     (
                         "purpose",

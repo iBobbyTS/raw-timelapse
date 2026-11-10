@@ -1190,7 +1190,7 @@ fn preview_profiles_emit_their_declared_colour_contract() {
         ),
     ];
 
-    for (id, filename, range, pix_fmts, unspecified, matrix, source_marker) in cases {
+    for (id, filename, range, pix_fmts, vendor, matrix, source_marker) in cases {
         let (root, input, fixtures) = run_success_setup(&format!("profile-contract-{id}"));
         let frames = standard_frames(&fixtures);
         let tool = fake_native_tool(&fixtures, &frames, None, false);
@@ -1221,24 +1221,69 @@ fn preview_profiles_emit_their_declared_colour_contract() {
             pix_fmts.contains(&pix_fmt),
             "{id}: pix_fmt {pix_fmt:?} not in {pix_fmts:?}"
         );
-        if unspecified {
-            for tag in ["color_space", "color_primaries", "color_transfer"] {
-                assert!(
-                    probe.contains(&format!("{tag}=unknown")),
-                    "{id}: {tag} must stay unspecified: {probe}"
-                );
+        let expected = if !vendor {
+            ColorCodes {
+                primaries: 1,
+                transfer: 13,
+                matrix: 1,
+                full: 0,
             }
         } else {
-            for expected in [
-                "color_space=bt709",
-                "color_primaries=bt709",
-                "color_transfer=iec61966-2-1",
-            ] {
-                assert!(probe.contains(expected), "{id}: {probe}");
+            ColorCodes {
+                primaries: if id == "nikon-nlog-bt2020" { 9 } else { 2 },
+                transfer: 2,
+                matrix: 9,
+                full: 1,
             }
+        };
+        let primaries = if !vendor {
+            "bt709"
+        } else if id == "nikon-nlog-bt2020" {
+            "bt2020"
+        } else {
+            "unknown"
+        };
+        for tag in [
+            format!("color_space={matrix}"),
+            format!("color_primaries={primaries}"),
+            format!(
+                "color_transfer={}",
+                if vendor { "unknown" } else { "iec61966-2-1" }
+            ),
+        ] {
+            assert!(probe.contains(&tag), "{id}: {probe}");
         }
+        let container = mp4_nclx(&preview);
+        let bitstream = h264_sps_vui(&preview);
+        assert_eq!(container, expected, "{id}: container");
+        assert_eq!(bitstream, expected, "{id}: SPS VUI");
+        assert_eq!(container, bitstream, "{id}: layers disagree");
+        println!(
+            "tags {id}: MP4 nclx {container:?}; H.264 SPS VUI {bitstream:?}; ffprobe\n{probe}"
+        );
 
         let manifest = fs::read_to_string(output.join("manifest.json")).expect("manifest");
+        let json = rawtl_linear_video::json::parse(&manifest).expect("manifest JSON");
+        let tags = json
+            .get("preview")
+            .unwrap()
+            .get("emitted_tags")
+            .expect("emitted_tags");
+        for layer in ["h264_sps_vui", "mp4_colr_nclx"] {
+            let fields = tags.get(layer).expect(layer);
+            for (field, value) in [
+                ("colour_primaries", expected.primaries),
+                ("transfer_characteristics", expected.transfer),
+                ("matrix_coefficients", expected.matrix),
+                ("video_full_range_flag", expected.full),
+            ] {
+                assert_eq!(
+                    fields.get(field).and_then(|v| v.as_u64()),
+                    Some(value as u64),
+                    "{id} {layer} {field}"
+                );
+            }
+        }
         for expected in [
             format!("\"file\": \"{filename}\""),
             format!("\"profile\": \"{id}\""),
@@ -1491,6 +1536,105 @@ fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
         .expect("cine")
         .1;
     assert!((sony[0] as i32 - cine[0] as i32).abs() >= 25);
+}
+
+/// No decoder colour/range overrides: tags must select the same conversion as
+/// the forced-correct path. Uniform 64x48 patches isolate matrix/range errors
+/// from edge chroma sampling. Correct hardware-codec error is <=3 codes; wrong
+/// matrix green-patch error is >=5. Keep the same three-code acceptance margin.
+#[test]
+fn vendor_previews_auto_decode_from_their_own_tags() {
+    for (id, filename, expected) in [
+        (
+            "sony-slog3-sgamut3",
+            "preview-h264-slog3-sgamut3.mp4",
+            [59u8, 147, 20],
+        ),
+        (
+            "sony-slog3-sgamut3-cine",
+            "preview-h264-slog3-sgamut3cine.mp4",
+            [0, 145, 49],
+        ),
+        (
+            "canon-log2-cinema-gamut",
+            "preview-h264-clog2-cgamut.mp4",
+            [48, 140, 96],
+        ),
+        (
+            "nikon-nlog-bt2020",
+            "preview-h264-nlog-bt2020.mp4",
+            [0, 154, 0],
+        ),
+        (
+            "dji-dlog-dgamut",
+            "preview-h264-dlog-dgamut.mp4",
+            [0, 145, 74],
+        ),
+    ] {
+        let (root, input, tool) = profile_material(&format!("auto-tags-{id}"), [0, 16384, 0]);
+        let result = run_profile(&root, &input, &tool, id);
+        assert!(result.status.success(), "{id}: {}", stderr(&result));
+        let preview = root.join("run").join(filename);
+        let auto = decode_first_pixel_auto(&preview);
+        let correct = decode_first_pixel(&preview, "bt2020", "pc");
+        let wrong_matrix = decode_first_pixel(&preview, "bt709", "pc");
+        // On this FFmpeg build a scale in_range hint on a tagged yuvj420p
+        // stream is not a reliable counterfactual. Change the actual range
+        // declarations in BOTH layers, then decode without overrides again.
+        let limited = root.join("wrong-range-tags.mp4");
+        let retag = std::process::Command::new(FFMPEG)
+            .args(["-v", "error", "-nostdin", "-i"])
+            .arg(&preview)
+            .args([
+                "-c:v",
+                "copy",
+                "-color_range",
+                "tv",
+                "-bsf:v",
+                "h264_metadata=video_full_range_flag=0",
+                "-movflags",
+                "+faststart+write_colr",
+            ])
+            .arg(&limited)
+            .output()
+            .expect("retag range");
+        assert!(retag.status.success(), "{id}: {}", stderr(&retag));
+        assert_eq!(mp4_nclx(&limited).full, 0, "{id} limited nclx");
+        assert_eq!(h264_sps_vui(&limited).full, 0, "{id} limited SPS");
+        let wrong_range = decode_first_pixel_auto(&limited);
+        let distance = |a: [u8; 3], b: [u8; 3]| {
+            (0..3)
+                .map(|c| (a[c] as i32 - b[c] as i32).abs())
+                .max()
+                .unwrap()
+        };
+        assert!(
+            distance(auto, expected) <= 3,
+            "{id} auto {auto:?} vs reference {expected:?}"
+        );
+        assert!(
+            distance(auto, correct) <= 1,
+            "{id} auto {auto:?} vs forced {correct:?}"
+        );
+        assert!(
+            distance(auto, wrong_matrix) >= 4,
+            "{id} auto {auto:?} vs wrong matrix {wrong_matrix:?}"
+        );
+        assert!(
+            distance(auto, wrong_range) > 3,
+            "{id} auto {auto:?} vs wrong range {wrong_range:?}"
+        );
+        // Judge decoder selection against the forced-correct decode: codec
+        // error can cancel a wrong inverse's error against the pre-encode RGB
+        // reference (observed for Sony). The separate encode mutations below
+        // remain checked against that independent reference for every vendor.
+        assert!(
+            distance(wrong_range, expected) > 3,
+            "{id}: wrong range passes reference"
+        );
+        println!("auto {id}: reference={expected:?} auto={auto:?} forced={correct:?} wrong-matrix={wrong_matrix:?} wrong-range={wrong_range:?}; errors auto/ref={} auto/forced={} auto/wrong-matrix={} auto/wrong-range={}",
+            distance(auto,expected),distance(auto,correct),distance(auto,wrong_matrix),distance(auto,wrong_range));
+    }
 }
 
 /// Decoding with the wrong YCbCr matrix must visibly disagree with the declared
