@@ -29,10 +29,19 @@ struct Config {
     grid_nx: usize,
     grid_ny: usize,
     ignore_override: bool,
+    /// Report `override` with a fixed neutral even when no --white-balance was
+    /// passed (models a producer that invents an override).
+    override_when_unset: bool,
+    /// Report `as-shot` while applying a neutral that differs from the frame's
+    /// own as_shot_neutral (models a producer that lies about what it applied).
+    as_shot_mismatch: bool,
     fail_on: Option<String>,
     gain_scale: f64,
     frames: Vec<FrameSpec>,
 }
+
+/// Neutral applied by the two lying knobs; never equal to a test frame's own.
+const LIE_NEUTRAL: &str = "0.42,1,0.66";
 
 struct Options {
     input: PathBuf,
@@ -76,9 +85,15 @@ fn run() -> Result<(), (i32, String)> {
         .iter()
         .find(|frame| frame.name == name)
         .ok_or_else(|| (4, format!("no fixture for {name}")))?;
-    let (applied, wb_source) = match (&options.white_balance, config.ignore_override) {
-        (Some(override_wb), false) => (override_wb.clone(), "override"),
-        _ => (spec.own_neutral.clone(), "as-shot"),
+    let (applied, wb_source) = if config.override_when_unset && options.white_balance.is_none() {
+        (LIE_NEUTRAL.to_string(), "override")
+    } else if config.as_shot_mismatch && options.white_balance.is_none() {
+        (LIE_NEUTRAL.to_string(), "as-shot")
+    } else {
+        match (&options.white_balance, config.ignore_override) {
+            (Some(override_wb), false) => (override_wb.clone(), "override"),
+            _ => (spec.own_neutral.clone(), "as-shot"),
+        }
     };
     let source_sha = format!("fake-{:016x}", fnv1a(read_file(&options.input)?));
     let gain = options.exposure_ev.exp2();
@@ -212,6 +227,8 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
         grid_nx: 4,
         grid_ny: 2,
         ignore_override: false,
+        override_when_unset: false,
+        as_shot_mismatch: false,
         fail_on: None,
         gain_scale: 1.0,
         frames: vec![],
@@ -258,6 +275,8 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
             "grid_nx" => config.grid_nx = value.parse().map_err(|_| (2, "bad grid_nx".into()))?,
             "grid_ny" => config.grid_ny = value.parse().map_err(|_| (2, "bad grid_ny".into()))?,
             "ignore_override" => config.ignore_override = value == "1",
+            "override_when_unset" => config.override_when_unset = value == "1",
+            "as_shot_mismatch" => config.as_shot_mismatch = value == "1",
             "fail_on" => config.fail_on = Some(value.to_string()),
             "gain_scale" => {
                 config.gain_scale = value.parse().map_err(|_| (2, "bad gain_scale".into()))?

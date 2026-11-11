@@ -30,6 +30,9 @@ REQUIRED:
 
 OPTIONS:
     --fps <N[/D]>              Frame rate as an integer or rational (default: 30)
+    --white-balance <MODE>     first-frame | per-frame (default: first-frame)
+                               first-frame freezes frame 1's as-shot neutral for the sequence;
+                               per-frame decodes every frame with its own RAW as-shot neutral
     --dng-linear-frame <PATH>  Native single-frame producer (default: native/build/dng-linear-frame)
     --ffmpeg <PATH>            ffmpeg executable (default: /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg)
     --ffprobe <PATH>           ffprobe executable (default: /opt/homebrew/opt/ffmpeg-full/bin/ffprobe)
@@ -199,6 +202,43 @@ impl TemporalQuality {
     }
 }
 
+/// How the sequence derives its camera neutral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhiteBalance {
+    /// Freeze the first numerically ordered frame's as-shot neutral for every
+    /// later frame (the historical, default behaviour).
+    FirstFrame,
+    /// Decode every frame with its own RAW as-shot neutral.
+    PerFrame,
+}
+
+impl WhiteBalance {
+    pub const DEFAULT: WhiteBalance = WhiteBalance::FirstFrame;
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WhiteBalance::FirstFrame => "first-frame",
+            WhiteBalance::PerFrame => "per-frame",
+        }
+    }
+
+    /// Whether the pipeline passes a frozen `--white-balance` override.
+    pub fn freezes_reference(self) -> bool {
+        matches!(self, WhiteBalance::FirstFrame)
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "first-frame" => Ok(WhiteBalance::FirstFrame),
+            "per-frame" => Ok(WhiteBalance::PerFrame),
+            other => Err(Error::new(
+                EXIT_USAGE,
+                format!("invalid --white-balance {other:?}: expected first-frame or per-frame"),
+            )),
+        }
+    }
+}
+
 /// Frozen legacy V4 defaults (REQ-011): the deflicker node is ON by default.
 #[derive(Debug, Clone)]
 pub struct DeflickerConfig {
@@ -243,6 +283,7 @@ pub struct Options {
     pub output: PathBuf,
     pub fps: Fps,
     pub fps_explicit: bool,
+    pub white_balance: WhiteBalance,
     pub native_tool: PathBuf,
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
@@ -264,6 +305,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut output: Option<PathBuf> = None;
     let mut fps = Fps::DEFAULT;
     let mut fps_explicit = false;
+    let mut white_balance = WhiteBalance::DEFAULT;
     let mut native_tool = PathBuf::from(DEFAULT_NATIVE_TOOL);
     let mut ffmpeg = PathBuf::from(DEFAULT_FFMPEG);
     let mut ffprobe = PathBuf::from(DEFAULT_FFPROBE);
@@ -305,6 +347,10 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
             "--fps" => {
                 fps = Fps::parse(&take_value(args, &mut index, flag, inline_value)?)?;
                 fps_explicit = true;
+            }
+            "--white-balance" => {
+                white_balance =
+                    WhiteBalance::parse(&take_value(args, &mut index, flag, inline_value)?)?
             }
             "--dng-linear-frame" => {
                 native_tool = PathBuf::from(take_value(args, &mut index, flag, inline_value)?)
@@ -414,6 +460,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         output,
         fps,
         fps_explicit,
+        white_balance,
         native_tool,
         ffmpeg,
         ffprobe,
@@ -627,6 +674,68 @@ mod tests {
             assert!(parse_run(&args).is_err(), "must reject fps {value}");
         }
         assert!(parse_run(&["--input", "in", "--output", "out", "--fps", "1000"]).is_ok());
+    }
+
+    #[test]
+    fn white_balance_defaults_to_first_frame_and_parses_both_modes() {
+        let options = parse_run(&["--input", "in", "--output", "out"]).expect("parse");
+        assert_eq!(options.white_balance, WhiteBalance::FirstFrame);
+        assert_eq!(WhiteBalance::DEFAULT, WhiteBalance::FirstFrame);
+        assert!(options.white_balance.freezes_reference());
+
+        let explicit = parse_run(&[
+            "--input",
+            "in",
+            "--output",
+            "out",
+            "--white-balance",
+            "first-frame",
+        ])
+        .expect("parse");
+        assert_eq!(explicit.white_balance, WhiteBalance::FirstFrame);
+
+        let per_frame = parse_run(&[
+            "--input",
+            "in",
+            "--output",
+            "out",
+            "--white-balance",
+            "per-frame",
+        ])
+        .expect("parse");
+        assert_eq!(per_frame.white_balance, WhiteBalance::PerFrame);
+        assert!(!per_frame.white_balance.freezes_reference());
+
+        let inline =
+            parse_run(&["--input=in", "--output=out", "--white-balance=per-frame"]).expect("parse");
+        assert_eq!(inline.white_balance, WhiteBalance::PerFrame);
+
+        assert_eq!(WhiteBalance::FirstFrame.as_str(), "first-frame");
+        assert_eq!(WhiteBalance::PerFrame.as_str(), "per-frame");
+        assert!(USAGE.contains("--white-balance"));
+        assert!(USAGE.contains("first-frame"));
+        assert!(USAGE.contains("per-frame"));
+    }
+
+    #[test]
+    fn rejects_invalid_white_balance_modes() {
+        let base = ["--input", "in", "--output", "out"];
+        for extra in [
+            vec!["--white-balance", "bogus"],
+            vec!["--white-balance", ""],
+            vec!["--white-balance="],
+            vec!["--white-balance"],
+        ] {
+            let mut args: Vec<&str> = base.to_vec();
+            args.extend(extra.iter());
+            let error = parse_run(&args).expect_err("must reject the white balance value");
+            assert_eq!(error.code, EXIT_USAGE, "{:?}", error.message);
+            assert!(
+                error.message.contains("--white-balance"),
+                "error must name the flag: {}",
+                error.message
+            );
+        }
     }
 
     #[test]
