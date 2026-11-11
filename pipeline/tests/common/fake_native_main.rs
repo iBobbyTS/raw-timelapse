@@ -37,6 +37,13 @@ struct Config {
     as_shot_mismatch: bool,
     fail_on: Option<String>,
     gain_scale: f64,
+    /// Emit an empty `source_sha256` in the metadata sidecar. Models a forged
+    /// frame sidecar that fails the typed semantic contract.
+    empty_source_sha256: bool,
+    /// Omit `kind` from the analysis sidecar.
+    analysis_omit_kind: bool,
+    /// Report an analysis source hash that differs from the frame metadata.
+    analysis_sha_mismatch: bool,
     frames: Vec<FrameSpec>,
 }
 
@@ -95,7 +102,11 @@ fn run() -> Result<(), (i32, String)> {
             _ => (spec.own_neutral.clone(), "as-shot"),
         }
     };
-    let source_sha = format!("fake-{:016x}", fnv1a(read_file(&options.input)?));
+    let source_sha = if config.empty_source_sha256 {
+        String::new()
+    } else {
+        format!("fake-{:016x}", fnv1a(read_file(&options.input)?))
+    };
     let gain = options.exposure_ev.exp2();
     let tiles = tile_levels(&config, spec, options.exposure_ev, options.no_png);
 
@@ -231,6 +242,9 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
         as_shot_mismatch: false,
         fail_on: None,
         gain_scale: 1.0,
+        empty_source_sha256: false,
+        analysis_omit_kind: false,
+        analysis_sha_mismatch: false,
         frames: vec![],
     };
     for line in text.lines() {
@@ -281,6 +295,9 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
             "gain_scale" => {
                 config.gain_scale = value.parse().map_err(|_| (2, "bad gain_scale".into()))?
             }
+            "empty_source_sha256" => config.empty_source_sha256 = value == "1",
+            "analysis_omit_kind" => config.analysis_omit_kind = value == "1",
+            "analysis_sha_mismatch" => config.analysis_sha_mismatch = value == "1",
             other => return Err((2, format!("unknown config key: {other}"))),
         }
     }
@@ -334,8 +351,16 @@ fn sidecar_json(
     gain: f64,
 ) -> String {
     let mut out = String::new();
-    out.push_str("{\"schema_version\":1,\"kind\":\"rawtl-analysis-sidecar\",");
-    out.push_str(&format!("\"source_sha256\":{},", json_string(source_sha)));
+    out.push_str("{\"schema_version\":1,");
+    if !config.analysis_omit_kind {
+        out.push_str("\"kind\":\"rawtl-analysis-sidecar\",");
+    }
+    let sidecar_hash = if config.analysis_sha_mismatch {
+        "fake-mismatched-source"
+    } else {
+        source_sha
+    };
+    out.push_str(&format!("\"source_sha256\":{},", json_string(sidecar_hash)));
     // The accepted producer serializes sidecar numbers with 10 significant
     // digits; model that seam (the metadata JSON keeps full precision).
     let sidecar_ev = format!("{:.9e}", options.exposure_ev);

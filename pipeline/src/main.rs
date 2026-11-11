@@ -22,14 +22,16 @@ mod video;
 pub use rawtl_linear_video::color_profile;
 pub use rawtl_linear_video::deflicker;
 pub use rawtl_linear_video::json;
+pub use rawtl_linear_video::transport;
 
 use cli::{Options, Parsed};
-use error::{Error, Result, EXIT_PUBLISH, EXIT_TOOL};
+use error::{Error, Result, EXIT_PREVIEW, EXIT_PUBLISH, EXIT_TOOL, EXIT_VALIDATION};
 use order::SourceFrame;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use transport::DataEnvelope;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -92,6 +94,9 @@ pub struct EncodedStage {
     pub linear_bytes: u64,
     pub preview_bytes: u64,
     pub timings: BTreeMap<String, Duration>,
+    /// Typed handoffs consumed by the audit and publication stages.
+    pub linear_artifact: DataEnvelope,
+    pub preview_artifact: DataEnvelope,
 }
 
 /// Encode the accepted frame directory, validate the stream, prove the lossless
@@ -244,6 +249,33 @@ pub fn encode_and_validate(
         )
     })?;
 
+    let linear_artifact = video::video_envelope(
+        &temp_linear,
+        video::LINEAR_MEDIA_TYPE,
+        &linear_probe.codec_name,
+        linear_probe.frames,
+        "ffmpeg ffv1 encoder",
+    )
+    .map_err(|err| {
+        Error::new(
+            EXIT_VALIDATION,
+            format!("linear video does not satisfy its typed artifact contract: {err}"),
+        )
+    })?;
+    let preview_artifact = video::video_envelope(
+        &temp_preview,
+        video::PREVIEW_MEDIA_TYPE,
+        &preview_probe.codec_name,
+        preview_probe.frames,
+        "ffmpeg h264 preview encoder",
+    )
+    .map_err(|err| {
+        Error::new(
+            EXIT_PREVIEW,
+            format!("preview video does not satisfy its typed artifact contract: {err}"),
+        )
+    })?;
+
     Ok(EncodedStage {
         temp_linear,
         temp_preview,
@@ -253,6 +285,8 @@ pub fn encode_and_validate(
         linear_bytes,
         preview_bytes,
         timings,
+        linear_artifact,
+        preview_artifact,
     })
 }
 
@@ -289,9 +323,9 @@ pub fn publish_run(
     let final_linear = output.join(video::LINEAR_FINAL_NAME);
     let final_preview = output.join(video::preview_final_name(options.preview_profile));
     video::publish(
-        &stage.temp_linear,
+        &stage.linear_artifact,
         &final_linear,
-        &stage.temp_preview,
+        &stage.preview_artifact,
         &final_preview,
     )?;
 
