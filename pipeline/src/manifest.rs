@@ -4,10 +4,9 @@ use crate::cli::{Options, LEGACY_FPS_PROVENANCE};
 use crate::error::{Error, Result, EXIT_PUBLISH};
 use crate::frame::FrameSequence;
 use crate::json::{self, Json};
-use crate::preview;
 use crate::video::{
-    preview_filter, preview_geometry, ProbeInfo, RoundtripReport, LINEAR_FINAL_NAME,
-    PREVIEW_FINAL_NAME,
+    preview_filter, preview_final_name, preview_geometry, ProbeInfo, RoundtripReport,
+    LINEAR_FINAL_NAME,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -288,31 +287,85 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
         ),
         (
             "preview",
-            Json::obj(vec![
-                ("file", Json::Str(PREVIEW_FINAL_NAME.to_string())),
-                ("bytes", Json::Int(input.preview_bytes as i64)),
-                ("purpose", Json::Str("display-referred review preview; not a measurement source".to_string())),
-                ("codec", Json::Str("h264".to_string())),
-                ("pix_fmt", Json::Str("yuv420p".to_string())),
-                ("scale", Json::obj(vec![
-                    ("applied", Json::Bool(preview_scale.scaled)),
-                    ("algorithm", if preview_scale.scaled { Json::Str("lanczos".to_string()) } else { Json::Null }),
-                    ("source", Json::Array(vec![Json::Int(sequence.width as i64), Json::Int(sequence.height as i64)])),
-                    ("preview", Json::Array(vec![Json::Int(preview_scale.width as i64), Json::Int(preview_scale.height as i64)])),
-                ])),
-                ("encoder_parameters", Json::Array(vec![
+            {
+                let profile = input.options.preview_profile;
+                let mut encoder_parameters = vec![
                     Json::Str("-c:v h264_videotoolbox".to_string()),
                     Json::Str("-allow_sw 0".to_string()),
                     Json::Str("-profile:v high".to_string()),
                     Json::Str("-b:v 0 -q:v 65".to_string()),
                     Json::Str("-pix_fmt yuv420p".to_string()),
-                    Json::Str(format!("-vf {}", preview_filter(preview_scale))),
-                    Json::Str("-colorspace bt709 -color_primaries bt709 -color_trc iec61966-2-1 -color_range tv".to_string()),
-                ])),
-                ("color_contract", preview::color_contract_json()),
-                ("probe", input.preview_probe.to_json()),
-                ("full_decode", Json::Str("pass".to_string())),
-            ]),
+                    Json::Str(format!("-vf {}", preview_filter(preview_scale, profile))),
+                ];
+                encoder_parameters.push(Json::Str(format!(
+                    "-colorspace {} -color_primaries {} -color_trc {} -color_range {}",
+                    profile.tag_policy.matrix_token(), profile.tag_policy.primaries_token(),
+                    profile.tag_policy.transfer_token(), profile.range.as_str()
+                )));
+                if profile.tag_policy != crate::color_profile::TagPolicy::SRGB {
+                    encoder_parameters.push(Json::Str("-movflags +faststart+write_colr".to_string()));
+                }
+                Json::obj(vec![
+                    ("file", Json::Str(preview_final_name(profile).to_string())),
+                    ("profile", Json::Str(profile.id.to_string())),
+                    ("emitted_tags", profile.emitted_tags_json()),
+                    ("bytes", Json::Int(input.preview_bytes as i64)),
+                    (
+                        "purpose",
+                        Json::Str(
+                            "review preview (display-referred sRGB or camera Log); \
+                             not a measurement source"
+                                .to_string(),
+                        ),
+                    ),
+                    ("codec", Json::Str("h264".to_string())),
+                    ("pix_fmt", Json::Str("yuv420p".to_string())),
+                    (
+                        "decoder_pix_fmt",
+                        Json::Str(input.preview_probe.pix_fmt.clone()),
+                    ),
+                    (
+                        "range",
+                        Json::Str(profile.range.as_str().to_string()),
+                    ),
+                    (
+                        "ycbcr_matrix",
+                        Json::Str(profile.ycbcr_matrix.to_string()),
+                    ),
+                    (
+                        "scale",
+                        Json::obj(vec![
+                            ("applied", Json::Bool(preview_scale.scaled)),
+                            (
+                                "algorithm",
+                                if preview_scale.scaled {
+                                    Json::Str("lanczos".to_string())
+                                } else {
+                                    Json::Null
+                                },
+                            ),
+                            (
+                                "source",
+                                Json::Array(vec![
+                                    Json::Int(sequence.width as i64),
+                                    Json::Int(sequence.height as i64),
+                                ]),
+                            ),
+                            (
+                                "preview",
+                                Json::Array(vec![
+                                    Json::Int(preview_scale.width as i64),
+                                    Json::Int(preview_scale.height as i64),
+                                ]),
+                            ),
+                        ]),
+                    ),
+                    ("encoder_parameters", Json::Array(encoder_parameters)),
+                    ("color_contract", profile.contract_json()),
+                    ("probe", input.preview_probe.to_json()),
+                    ("full_decode", Json::Str("pass".to_string())),
+                ])
+            },
         ),
         (
             "publication",
@@ -328,7 +381,9 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                     "final_names",
                     Json::Array(vec![
                         Json::Str(LINEAR_FINAL_NAME.to_string()),
-                        Json::Str(PREVIEW_FINAL_NAME.to_string()),
+                        Json::Str(
+                            preview_final_name(input.options.preview_profile).to_string(),
+                        ),
                     ]),
                 ),
             ]),

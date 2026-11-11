@@ -1,6 +1,6 @@
-//! Display-referred sRGB preview conversion.
+//! Shared preview matrix and sRGB transfer helpers.
 //!
-//! Declared colour contract for the secondary H.264 review preview:
+//! The sRGB output profile uses the following conversion:
 //!
 //! * each RGB16 integer code is interpreted as `code / 16384` scene-linear
 //!   ACEScg (AP1 primaries, D60 white);
@@ -39,9 +39,6 @@ pub const XYZ_D65_TO_LINEAR_SRGB: [[f64; 3]; 3] = [
     [-0.969243636280879, 1.875967501507720, 0.041555057407175],
     [0.055630079696993, -0.203976958888976, 1.056971514242878],
 ];
-
-pub const D60_WHITE_XY: [f64; 2] = [0.32168, 0.33767];
-pub const D65_WHITE_XY: [f64; 2] = [0.3127, 0.3290];
 
 pub fn mat3_mul(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
     let mut out = [[0.0; 3]; 3];
@@ -92,114 +89,16 @@ pub fn srgb_oetf(value: f64) -> f64 {
     }
 }
 
-/// Clip a linear sRGB triple to [0, 1], apply the sRGB OETF and quantize.
-pub fn encode_display_pixel(linear_srgb: [f64; 3]) -> [u8; 3] {
-    let mut out = [0u8; 3];
-    for channel in 0..3 {
-        let clipped = linear_srgb[channel].clamp(0.0, 1.0);
-        let encoded = srgb_oetf(clipped);
-        out[channel] = (encoded * 255.0).round().clamp(0.0, 255.0) as u8;
+/// IEC 61966-2-1 sRGB electro-optical transfer function (inverse OETF).
+pub fn srgb_eotf(value: f64) -> f64 {
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
     }
-    out
 }
 
-/// Convert one frame of little-endian RGB16 ACEScg codes into packed RGB24.
-pub fn convert_frame(
-    rgb48le: &[u8],
-    width: usize,
-    height: usize,
-    out: &mut Vec<u8>,
-) -> Result<(), String> {
-    let expected = width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(6))
-        .ok_or_else(|| "frame size overflow".to_string())?;
-    if rgb48le.len() != expected {
-        return Err(format!(
-            "frame byte length {} does not match {}x{} RGB16 ({} bytes)",
-            rgb48le.len(),
-            width,
-            height,
-            expected
-        ));
-    }
-    let matrix = ap1_to_linear_srgb_matrix();
-    out.clear();
-    out.reserve(width * height * 3);
-    for pixel in rgb48le.chunks_exact(6) {
-        let scene = [
-            u16::from_le_bytes([pixel[0], pixel[1]]) as f64 / SCENE_SCALE,
-            u16::from_le_bytes([pixel[2], pixel[3]]) as f64 / SCENE_SCALE,
-            u16::from_le_bytes([pixel[4], pixel[5]]) as f64 / SCENE_SCALE,
-        ];
-        let linear_srgb = mat3_vec(&matrix, scene);
-        out.extend_from_slice(&encode_display_pixel(linear_srgb));
-    }
-    Ok(())
-}
-
-pub fn color_contract_json() -> Json {
-    Json::obj(vec![
-        (
-            "input_interpretation",
-            Json::Str(
-                "16-bit RGB codes interpreted as code/16384 scene-linear ACEScg AP1/D60; no OETF in the source PNG"
-                    .to_string(),
-            ),
-        ),
-        (
-            "matrices",
-            Json::obj(vec![
-                (
-                    "acescg_ap1_d60_to_xyz_d60",
-                    matrix_json(&AP1_D60_TO_XYZ_D60),
-                ),
-                (
-                    "bradford_cat_d60_to_d65",
-                    matrix_json(&BRADFORD_D60_TO_D65),
-                ),
-                (
-                    "xyz_d65_to_linear_srgb",
-                    matrix_json(&XYZ_D65_TO_LINEAR_SRGB),
-                ),
-                (
-                    "composed_ap1_d60_to_linear_srgb_d65",
-                    matrix_json(&ap1_to_linear_srgb_matrix()),
-                ),
-            ]),
-        ),
-        (
-            "white_points_xy",
-            Json::obj(vec![
-                (
-                    "d60",
-                    Json::Array(D60_WHITE_XY.iter().map(|v| Json::Float(*v)).collect()),
-                ),
-                (
-                    "d65",
-                    Json::Array(D65_WHITE_XY.iter().map(|v| Json::Float(*v)).collect()),
-                ),
-            ]),
-        ),
-        (
-            "transfer",
-            Json::Str("IEC 61966-2-1 sRGB opto-electronic transfer function".to_string()),
-        ),
-        (
-            "clipping",
-            Json::Str(
-                "per-channel linear sRGB clipped to [0,1] before transfer; negatives and out-of-gamut colours clip; no tone mapping"
-                    .to_string(),
-            ),
-        ),
-        (
-            "quantization",
-            Json::Str("8-bit, round(value*255) with ties away from zero".to_string()),
-        ),
-    ])
-}
-
-fn matrix_json(matrix: &[[f64; 3]; 3]) -> Json {
+pub fn matrix_json(matrix: &[[f64; 3]; 3]) -> Json {
     Json::Array(
         matrix
             .iter()
@@ -211,6 +110,17 @@ fn matrix_json(matrix: &[[f64; 3]; 3]) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clip a linear sRGB triple to [0, 1], apply the sRGB OETF and quantize.
+    fn encode_display_pixel(linear_srgb: [f64; 3]) -> [u8; 3] {
+        let mut out = [0u8; 3];
+        for channel in 0..3 {
+            let clipped = linear_srgb[channel].clamp(0.0, 1.0);
+            let encoded = srgb_oetf(clipped);
+            out[channel] = (encoded * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        out
+    }
 
     fn close(a: f64, b: f64, tolerance: f64) -> bool {
         (a - b).abs() <= tolerance
@@ -316,44 +226,5 @@ mod tests {
         assert!(close(12.92 * x, 1.055 * x.powf(1.0 / 2.4) - 0.055, 1e-7));
         assert_eq!(srgb_oetf(0.0), 0.0);
         assert!(close(srgb_oetf(1.0), 1.0, 1e-15));
-    }
-
-    #[test]
-    fn frame_conversion_reads_little_endian_rgb16() {
-        // Two pixels: neutral 0.18 (code 2949) and black.
-        let mut input = Vec::new();
-        for _ in 0..3 {
-            input.extend_from_slice(&2949u16.to_le_bytes());
-        }
-        for _ in 0..3 {
-            input.extend_from_slice(&0u16.to_le_bytes());
-        }
-        let mut out = Vec::new();
-        convert_frame(&input, 2, 1, &mut out).expect("convert");
-        assert_eq!(out.len(), 6);
-        let expected = encode_display_pixel(convert_scene_linear([2949.0 / 16384.0; 3]));
-        assert_eq!(&out[0..3], &expected);
-        assert_eq!(&out[3..6], &[0, 0, 0]);
-
-        // A truncated frame is rejected rather than silently padded.
-        let error = convert_frame(&input[..11], 2, 1, &mut out).expect_err("must reject");
-        assert!(error.contains("does not match"));
-    }
-
-    #[test]
-    fn contract_json_records_all_matrices() {
-        let contract = color_contract_json();
-        let matrices = contract.get("matrices").expect("matrices");
-        for key in [
-            "acescg_ap1_d60_to_xyz_d60",
-            "bradford_cat_d60_to_d65",
-            "xyz_d65_to_linear_srgb",
-            "composed_ap1_d60_to_linear_srgb_d65",
-        ] {
-            assert_eq!(
-                matrices.get(key).expect(key).as_array().expect(key).len(),
-                3
-            );
-        }
     }
 }
