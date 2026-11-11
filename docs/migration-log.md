@@ -457,3 +457,27 @@ native 新增回归覆盖：非 TIFF 输入与 TIFF 无 DNGVersion（CR2/NEF/ARW
 - 真实原生工具与真实 RAW 素材未在本任务重跑（`native/**` 零改动，两模式均依赖其既有合同）；per-frame 的真实素材端到端运行与色温漂移的主观观感未验证。
 - gain probe 内暴露的白平衡谎言沿用既有 81 包装，仅由代码路径保证，无独立集成负例（既有 probe 失败路径未改动）。
 - Windows/Linux 未测（与既有管线一致，仅 macOS）。
+
+## 阶段间类型化传输契约层（2026-11-11）
+
+- 权威：用户指定的三种载体与元数据；`docs/architecture-v2.6.md` §2.1–§2.6，按现有进程内流水线裁剪；纯 std、持久格式与 CLI 行为保持。
+- 新增：`pipeline/src/transport/mod.rs` 与模块内 `tests.rs`；`pipeline/src/lib.rs` 仅注册模块并修正库说明。包含 `DiskArtifact`、`MemoryFile`、Host `NdArray`、不可变 `DataEnvelope`、命名空间 `MetadataDoc` / `MetadataPatch`、provenance、六项产品语义注册表，以及显式 `persist` / `load`。无 Cargo 依赖变更。
+- 语义 ID：`rawtl.frame-png@1`、`rawtl.frame-metadata@1`、`rawtl.analysis-sidecar@1`、`rawtl.rgb48-frame@1`、`rawtl.rgb24-frame@1`、`rawtl.video-artifact@1`。注册表检查允许载体、必需元数据及其基本类型；RGB 另检查 dtype、HWC interleaved 布局、三通道、元数据宽高与 shape 一致，RGB48 要求 little endian。sidecar 内容仍须由既有解析器检查，注册表不替代其字段语义。
+- 不可变性：所有已发布元数据字段均按权威证据处理；冲突覆盖被拒绝，相同值可重复。patch 返回新 value ID、保留源 hash / 原有 lineage、追加直接 parent 并记录新 producer；载荷字节通过 `Arc<[u8]>` 共享，无 mutable accessor。若附带 `source.sha256`，它必须存在于 provenance 的 source hashes。
+- 数组合同：四种 dtype（U8/U16/I16/F32）；rank 1–8、非空轴、正向对齐且不重叠的 strides。rank-three 的 shape 坐标统一为 `[height,width,channels]`，planar 只改变存储顺序。构造期拒绝乘法/跨度溢出、offset 越界及 byte_length 不符；允许前缀与行间 padding，要求 backing 长度恰为 offset + 最后可访问跨度，不接受尾部无关字节。`read_only=false` 只描述生产意图，也不开放共享可写访问。
+- 文件合同：DiskArtifact 构造只检查非空路径和 media type，不隐式访问磁盘；MemoryFile 保留 content type 与不可变长度。persist 显式写入且拒绝覆盖已有路径；load 显式读取并检查可选声明 size。可选 hash 是引用声明，未在 load 中重新计算；调用方保留其既有 hash 校验政策。persist 写入中途失败可能留下新建的部分文件，不返回成功产物；本层不提供事务或缓存管理。
+
+### 检查与证据（实测）
+
+- 环境：macOS arm64；`rustc 1.99.1`、`cargo 1.99.1`；FFmpeg/FFprobe 8.0.1。全部命令从仓库根执行，PATH 前置 `/opt/homebrew/opt/ffmpeg-full/bin`；完整版本与 PATH 见 `.agent-work/tmp/pipeline-typed-transports/transport-environment.json`。
+- `cargo clean --manifest-path pipeline/Cargo.toml`：真实退出码 **0**，完整 stdout/stderr 见 `.agent-work/tmp/pipeline-typed-transports/transport-cargo-clean.log`，退出码见同名前缀 `.exit-code`。
+- `cargo test --manifest-path pipeline/Cargo.toml`：真实退出码 **0**；141 lib + 57 bin + 28 集成 = **226 passed, 0 failed**（原有 193 + 新增 33）；另有 **3 个 compile-fail doctest 全绿**。完整 stdout/stderr 见 `.agent-work/tmp/pipeline-typed-transports/transport-cargo-test.log`，真实进程退出码见同名前缀 `.exit-code`。
+- 新增负例逐项断言具体错误变体：shape/stride 溢出、offset 越界、字节长度不符、非法 dtype、空路径/content type、persist/load I/O 失败、声明 size 不符、六个语义的载体和每个必需字段缺失、RGB dtype/几何/布局/端序不符、元数据冲突及 provenance hash 不符。编译失败示例检查文件载体无隐式互转、已发布元数据不能原地修改。
+- 初次格式检查：`rustfmt --edition 2021 --check pipeline/src/lib.rs pipeline/src/transport/mod.rs pipeline/src/transport/tests.rs`，退出码 **1**；rustfmt 递归检查 lib 的既有模块，发现未改动的 `color_profile.rs` 常量换行差异；未修改该文件。原始输出与退出码保留为 `.agent-work/tmp/pipeline-typed-transports/transport-rustfmt-check.*`。
+- 限定本次文件的格式检查：`rustfmt --edition 2021 --config skip_children=true --check pipeline/src/lib.rs pipeline/src/transport/mod.rs pipeline/src/transport/tests.rs`，退出码 **0**；`git diff --check` 退出码 **0**。原始输出与退出码分别见 `.agent-work/tmp/pipeline-typed-transports/transport-rustfmt-check-local.*`、`transport-diff-check.*`。
+
+### 未覆盖 / 边界
+
+- `NOT_TESTED`：真实流水线接入三种载体后的端到端旅程及真实素材等价对照，属于下一实施单元；本次新模块仅由测试消费，未改 frame/deflicker_run/video/audit/manifest/cli/main 的运行行为。
+- `NOT_TESTED`：Windows/Linux、其它 FFmpeg/VideoToolbox 版本、磁盘写满时的部分写入故障注入。未实现 GPU/IPC/插件 ABI、自动转换、hash 重算、租约或事务持久化。
+- 本条目记录实现与执行证据，不代表独立评审或 Feature 验收；提交由 Main 负责。
