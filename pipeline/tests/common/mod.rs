@@ -437,11 +437,24 @@ fn fake_native_binary() -> PathBuf {
         .clone()
 }
 
+/// White-balance reporting defects the fake producer can simulate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakeWbLie {
+    None,
+    /// Report `override` with a fixed neutral although no --white-balance was
+    /// passed (a producer that invents its own override).
+    OverrideWhenUnset,
+    /// Report `as-shot` while applying a neutral different from the frame's own
+    /// as_shot_neutral.
+    AsShotMismatch,
+}
+
 fn write_fake_native(
     dir: &Path,
     frames: &[FakeFrame],
     fail_on: Option<&str>,
     ignore_override: bool,
+    lie: FakeWbLie,
     width: u32,
     height: u32,
     gain_scale: f64,
@@ -458,6 +471,12 @@ fn write_fake_native(
         "ignore_override={}\n",
         if ignore_override { 1 } else { 0 }
     ));
+    if lie == FakeWbLie::OverrideWhenUnset {
+        config.push_str("override_when_unset=1\n");
+    }
+    if lie == FakeWbLie::AsShotMismatch {
+        config.push_str("as_shot_mismatch=1\n");
+    }
     if let Some(name) = fail_on {
         config.push_str(&format!("fail_on={name}\n"));
     }
@@ -505,7 +524,16 @@ pub fn fake_native_tool(
     fail_on: Option<&str>,
     ignore_override: bool,
 ) -> PathBuf {
-    write_fake_native(dir, frames, fail_on, ignore_override, WIDTH, HEIGHT, 1.0)
+    write_fake_native(
+        dir,
+        frames,
+        fail_on,
+        ignore_override,
+        FakeWbLie::None,
+        WIDTH,
+        HEIGHT,
+        1.0,
+    )
 }
 
 /// Synthetic sequence with an explicit geometry (deflicker tests).
@@ -517,7 +545,27 @@ pub fn fake_native_sequence(
     width: u32,
     height: u32,
 ) -> PathBuf {
-    write_fake_native(dir, frames, fail_on, ignore_override, width, height, 1.0)
+    write_fake_native(
+        dir,
+        frames,
+        fail_on,
+        ignore_override,
+        FakeWbLie::None,
+        width,
+        height,
+        1.0,
+    )
+}
+
+/// Same sequence, but the producer reports white balance dishonestly.
+pub fn fake_native_sequence_wb_lie(
+    dir: &Path,
+    frames: &[FakeFrame],
+    lie: FakeWbLie,
+    width: u32,
+    height: u32,
+) -> PathBuf {
+    write_fake_native(dir, frames, None, false, lie, width, height, 1.0)
 }
 
 /// Same sequence, but the producer executes only `scale` of the requested EV
@@ -531,7 +579,16 @@ pub fn fake_native_sequence_gain_scale(
     height: u32,
     scale: f64,
 ) -> PathBuf {
-    write_fake_native(dir, frames, fail_on, ignore_override, width, height, scale)
+    write_fake_native(
+        dir,
+        frames,
+        fail_on,
+        ignore_override,
+        FakeWbLie::None,
+        width,
+        height,
+        scale,
+    )
 }
 
 pub fn fake_failing_encoder(dir: &Path) -> PathBuf {

@@ -76,6 +76,67 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
         })
     };
 
+    let white_balance = if input.options.white_balance.freezes_reference() {
+        Json::obj(vec![
+            (
+                "strategy",
+                Json::Str("sequence-frozen (REQ-008)".to_string()),
+            ),
+            (
+                "reference_frame",
+                Json::Str(sequence.reference_frame.clone()),
+            ),
+            ("reference_source", Json::Str("as-shot".to_string())),
+            ("reference", number_triple(sequence.reference_wb)),
+            (
+                "propagation",
+                Json::Str(
+                    "first numerically ordered frame decoded with its as-shot neutral; \
+                     those three camera-neutral values passed as --white-balance to every \
+                     later frame"
+                        .to_string(),
+                ),
+            ),
+            ("all_applied_equal", Json::Bool(all_applied_equal)),
+            (
+                "per_frame_as_shot_neutral",
+                Json::Str(
+                    "each frame keeps its own source as_shot_neutral for provenance".to_string(),
+                ),
+            ),
+        ])
+    } else {
+        // No frozen reference exists in per-frame mode: the reference fields
+        // are explicitly null instead of naming a frame the pipeline never
+        // propagates.
+        Json::obj(vec![
+            (
+                "strategy",
+                Json::Str(input.options.white_balance.as_str().to_string()),
+            ),
+            ("reference_frame", Json::Null),
+            ("reference_source", Json::Null),
+            ("reference", Json::Null),
+            (
+                "propagation",
+                Json::Str(
+                    "every numerically ordered frame decoded with its own as-shot neutral; \
+                     no --white-balance override is passed to the native producer in any pass"
+                        .to_string(),
+                ),
+            ),
+            ("all_applied_equal", Json::Bool(all_applied_equal)),
+            (
+                "per_frame_as_shot_neutral",
+                Json::Str(
+                    "each frame is decoded with its own source as_shot_neutral; its sidecar \
+                     must report applied_white_balance equal to that neutral"
+                        .to_string(),
+                ),
+            ),
+        ])
+    };
+
     Json::obj(vec![
         (
             "schema_version",
@@ -176,37 +237,7 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
         ),
         (
             "white_balance",
-            Json::obj(vec![
-                (
-                    "strategy",
-                    Json::Str("sequence-frozen (REQ-008)".to_string()),
-                ),
-                (
-                    "reference_frame",
-                    Json::Str(sequence.reference_frame.clone()),
-                ),
-                (
-                    "reference_source",
-                    Json::Str("as-shot".to_string()),
-                ),
-                ("reference", number_triple(sequence.reference_wb)),
-                (
-                    "propagation",
-                    Json::Str(
-                        "first numerically ordered frame decoded with its as-shot neutral; \
-                         those three camera-neutral values passed as --white-balance to every \
-                         later frame"
-                            .to_string(),
-                    ),
-                ),
-                ("all_applied_equal", Json::Bool(all_applied_equal)),
-                (
-                    "per_frame_as_shot_neutral",
-                    Json::Str(
-                        "each frame keeps its own source as_shot_neutral for provenance".to_string(),
-                    ),
-                ),
-            ]),
+            white_balance,
         ),
         (
             "quantization_policy",

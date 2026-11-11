@@ -118,6 +118,74 @@ fn publishes_lossless_linear_video_and_srgb_preview() {
         assert!(manifest.contains(expected), "manifest missing {expected:?}");
     }
 
+    // The default mode is the historical sequence-frozen contract: the full
+    // white-balance block is deterministic, so assert its literal seven fields.
+    let expected_white_balance = Json::obj(vec![
+        (
+            "strategy",
+            Json::Str("sequence-frozen (REQ-008)".to_string()),
+        ),
+        ("reference_frame", Json::Str("IMG_1.DNG".to_string())),
+        ("reference_source", Json::Str("as-shot".to_string())),
+        (
+            "reference",
+            Json::Array(vec![Json::Float(0.5), Json::Int(1), Json::Float(0.8)]),
+        ),
+        (
+            "propagation",
+            Json::Str(
+                "first numerically ordered frame decoded with its as-shot neutral; those \
+                 three camera-neutral values passed as --white-balance to every later frame"
+                    .to_string(),
+            ),
+        ),
+        ("all_applied_equal", Json::Bool(true)),
+        (
+            "per_frame_as_shot_neutral",
+            Json::Str("each frame keeps its own source as_shot_neutral for provenance".to_string()),
+        ),
+    ]);
+    let manifest_json = read_json(&output.join("manifest.json"));
+    assert_eq!(
+        manifest_json.get("white_balance"),
+        Some(&expected_white_balance),
+        "the default white_balance block must stay byte-identical"
+    );
+
+    // The frozen summary line and the override argv shape of the baseline pass
+    // are part of the default run's observable contract.
+    let run_stdout = stdout(&result);
+    assert!(
+        run_stdout.contains(
+            "frozen white balance: 0.5,1,0.8 from IMG_1.DNG (applied to every later frame)"
+        ),
+        "{run_stdout}"
+    );
+    assert!(
+        !run_stdout.contains("per-frame white balance"),
+        "the default run must not claim per-frame decoding: {run_stdout}"
+    );
+    let baseline_command = |index: usize| {
+        let text = fs::read_to_string(output.join(format!("logs/analysis/frame_{index:06}.log")))
+            .expect("baseline transcript");
+        text.lines()
+            .find(|line| line.starts_with("command:"))
+            .expect("command line")
+            .to_string()
+    };
+    assert!(
+        !baseline_command(1).contains("--white-balance"),
+        "frame 1 must be decoded with its own as-shot neutral: {}",
+        baseline_command(1)
+    );
+    for index in [2, 3] {
+        assert!(
+            baseline_command(index).contains("--white-balance 0.5,1,0.8"),
+            "frame {index} must receive the frozen triple: {}",
+            baseline_command(index)
+        );
+    }
+
     let linear_probe = ffprobe(&linear);
     for expected in [
         "codec_name=ffv1",
@@ -966,6 +1034,28 @@ fn strength_zero_is_the_single_pass_regression_path() {
     for index in 0..3 {
         assert_eq!(frame_status(&report, index), "DISABLED");
     }
+    // The disabled (historical) path keeps the frozen argument shape: frame 1
+    // decodes with its own as-shot neutral, later frames carry the override.
+    let disabled_command = |index: usize| {
+        let text = fs::read_to_string(first.join(format!("logs/frame_{index:06}.log")))
+            .expect("frame transcript");
+        text.lines()
+            .find(|line| line.starts_with("command:"))
+            .expect("command line")
+            .to_string()
+    };
+    assert!(
+        !disabled_command(1).contains("--white-balance"),
+        "{}",
+        disabled_command(1)
+    );
+    for index in [2, 3] {
+        assert!(
+            disabled_command(index).contains("--white-balance 0.5,1,0.8"),
+            "{}",
+            disabled_command(index)
+        );
+    }
     assert_eq!(
         report
             .get("encoded_temporal_quality")
@@ -1701,5 +1791,372 @@ fn rejects_unknown_or_empty_preview_profile_with_exit_usage() {
             stderr(&result)
         );
         assert!(!output.exists(), "usage rejection must not create output");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// White balance modes
+// ---------------------------------------------------------------------------
+
+fn white_balance_triple(value: &Json) -> [f64; 3] {
+    let values = value.as_array().expect("white balance array");
+    assert_eq!(values.len(), 3, "white balance must have three channels");
+    [
+        values[0].as_f64().expect("channel 0"),
+        values[1].as_f64().expect("channel 1"),
+        values[2].as_f64().expect("channel 2"),
+    ]
+}
+
+/// `command:` lines of every per-frame native transcript under `logs_dir`.
+fn frame_commands(logs_dir: &Path) -> Vec<(std::path::PathBuf, String)> {
+    fn walk(dir: &Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("frame_") && name.ends_with(".log"))
+                .unwrap_or(false)
+            {
+                let text = fs::read_to_string(&path).expect("read frame transcript");
+                let command = text
+                    .lines()
+                    .find(|line| line.starts_with("command:"))
+                    .unwrap_or_else(|| panic!("no command line in {}", path.display()));
+                out.push((path, command.to_string()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(logs_dir, &mut out);
+    out
+}
+
+fn assert_commands_without_white_balance(logs_dir: &Path) -> usize {
+    let commands = frame_commands(logs_dir);
+    assert!(
+        !commands.is_empty(),
+        "expected native frame transcripts under {}",
+        logs_dir.display()
+    );
+    for (path, command) in &commands {
+        assert!(
+            !command.contains("--white-balance"),
+            "{} passed an override: {command}",
+            path.display()
+        );
+    }
+    commands.len()
+}
+
+/// Every sidecar under `dir` must report `as-shot` and apply exactly its own
+/// `as_shot_neutral`; returns the applied triples in filename order.
+fn as_shot_sidecars(dir: &Path) -> Vec<[f64; 3]> {
+    let mut files: Vec<std::path::PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("cannot read {}: {err}", dir.display()))
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "no sidecars under {}", dir.display());
+    let mut triples = Vec::with_capacity(files.len());
+    for path in files {
+        let sidecar = read_json(&path);
+        assert_eq!(
+            sidecar.get("white_balance_source").and_then(Json::as_str),
+            Some("as-shot"),
+            "{} must report as-shot",
+            path.display()
+        );
+        let applied = white_balance_triple(
+            sidecar
+                .get("applied_white_balance")
+                .unwrap_or_else(|| panic!("{} has no applied_white_balance", path.display())),
+        );
+        let own = white_balance_triple(
+            sidecar
+                .get("as_shot_neutral")
+                .unwrap_or_else(|| panic!("{} has no as_shot_neutral", path.display())),
+        );
+        assert_eq!(
+            applied,
+            own,
+            "{} must apply its own as-shot neutral",
+            path.display()
+        );
+        triples.push(applied);
+    }
+    triples
+}
+
+fn assert_per_frame_manifest(output: &Path) {
+    let manifest = read_json(&output.join("manifest.json"));
+    let block = manifest
+        .get("white_balance")
+        .expect("manifest white_balance block");
+    assert_eq!(
+        block.get("strategy").and_then(Json::as_str),
+        Some("per-frame")
+    );
+    assert_eq!(block.get("reference_frame"), Some(&Json::Null));
+    assert_eq!(block.get("reference_source"), Some(&Json::Null));
+    assert_eq!(block.get("reference"), Some(&Json::Null));
+    let propagation = block
+        .get("propagation")
+        .and_then(Json::as_str)
+        .expect("propagation");
+    assert!(
+        propagation.contains("own as-shot neutral") && propagation.contains("no --white-balance"),
+        "per-frame propagation must describe the per-frame contract: {propagation}"
+    );
+    let provenance = block
+        .get("per_frame_as_shot_neutral")
+        .and_then(Json::as_str)
+        .expect("per_frame_as_shot_neutral");
+    assert!(
+        provenance.contains("applied_white_balance"),
+        "per-frame provenance must state the applied/own equality: {provenance}"
+    );
+    let text = fs::read_to_string(output.join("manifest.json")).expect("manifest text");
+    assert!(
+        !text.contains("all_applied_equal\": true"),
+        "a per-frame run must not claim one frozen triple: {text}"
+    );
+    assert!(
+        !text.contains("applied to every later frame"),
+        "a per-frame manifest must not claim frozen propagation: {text}"
+    );
+}
+
+/// Flicker fixture with a distinct as-shot neutral per frame.
+fn per_frame_flicker_sequence(count: usize) -> Vec<FakeFrame> {
+    (0..count)
+        .map(|index| {
+            let gain = if index % 2 == 0 { -0.3 } else { 0.3 };
+            let red = 0.40 + 0.005 * index as f64;
+            let blue = 0.60 + 0.004 * index as f64;
+            FakeFrame::new(&format!("frame_{:04}.DNG", index), 0.18f64.log2() + gain)
+                .neutral(&format!("{red:.3},1,{blue:.3}"))
+                .capture(&format!(
+                    "2026:11:08 20:{:02}:{:02}",
+                    index / 60,
+                    index % 60
+                ))
+        })
+        .collect()
+}
+
+#[test]
+fn per_frame_mode_decodes_every_frame_with_its_own_as_shot_neutral() {
+    let root = test_dir("wb-per-frame");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("create fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_tool(&fixtures, &frames, None, false);
+    let output = root.join("run");
+
+    let mut args = base_args(&input, &output, &tool);
+    args.extend_from_slice(&["--white-balance", "per-frame", "--strength", "0"]);
+    let result = run_cli(&args);
+    assert!(
+        result.status.success(),
+        "run failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&result),
+        stderr(&result)
+    );
+
+    // Every frame decodes with its own RAW as-shot neutral; the three neutrals
+    // differ, so a producer that froze one triple would fail this assertion.
+    let applied = as_shot_sidecars(&output.join("frames"));
+    assert_eq!(applied.len(), 3);
+    assert_ne!(applied[0], applied[1]);
+    assert_ne!(applied[0], applied[2]);
+    assert_ne!(applied[1], applied[2]);
+
+    assert_commands_without_white_balance(&output.join("logs"));
+    assert_per_frame_manifest(&output);
+
+    let run_stdout = stdout(&result);
+    assert!(
+        run_stdout
+            .contains("per-frame white balance: every frame decoded with its own as-shot neutral"),
+        "{run_stdout}"
+    );
+    assert!(
+        !run_stdout.contains("applied to every later frame"),
+        "the per-frame summary must not claim frozen propagation: {run_stdout}"
+    );
+    assert!(!run_stdout.contains("frozen white balance"), "{run_stdout}");
+
+    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
+    assert!(output.join("preview-h264-srgb-bt709.mp4").is_file());
+}
+
+#[test]
+fn per_frame_mode_runs_the_activated_probe_and_renders_without_an_override() {
+    let frames = per_frame_flicker_sequence(30);
+    let material = synthetic_material("wb-per-frame-deflicker", frames);
+    let (result, output) = run_synthetic(&material, "run", &["--white-balance", "per-frame"]);
+    assert!(
+        result.status.success(),
+        "run failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&result),
+        stderr(&result)
+    );
+
+    let report = read_json(&output.join("exposure_report.json"));
+    assert_eq!(report.get("run_status").and_then(Json::as_str), Some("OK"));
+    let probe = report.get("gain_probe").expect("gain probe block");
+    assert_eq!(
+        probe.get("status").and_then(Json::as_str),
+        Some("PASS"),
+        "the gain probe must really run and pass: {probe:?}"
+    );
+    assert_eq!(probe.get("passed"), Some(&Json::Bool(true)));
+    let tested = probe
+        .get("tested_frames")
+        .and_then(Json::as_array)
+        .expect("tested frames");
+    assert!(
+        !tested.is_empty(),
+        "the probe must test real frames: {probe:?}"
+    );
+    assert!(
+        probe
+            .get("observations")
+            .and_then(Json::as_u64)
+            .unwrap_or(0)
+            > 0,
+        "the probe must produce observations: {probe:?}"
+    );
+
+    // Every pass (baseline, render, probe) ran without an override.
+    assert_commands_without_white_balance(&output.join("logs"));
+    let probe_commands = frame_commands(&output.join("logs/probe"));
+    assert!(
+        probe_commands.len() >= 2,
+        "both probe gain directions must leave real transcripts, found {}",
+        probe_commands.len()
+    );
+
+    let baseline = as_shot_sidecars(&output.join("analysis/baseline/meta"));
+    assert_eq!(baseline.len(), 30);
+    let probe_meta = as_shot_sidecars(&output.join("analysis/probe/meta"));
+    assert!(!probe_meta.is_empty());
+    let rendered = as_shot_sidecars(&output.join("frames"));
+    assert_eq!(rendered.len(), 30);
+    let mut distinct = std::collections::BTreeSet::new();
+    for triple in &rendered {
+        assert!(
+            distinct.insert(triple.map(f64::to_bits)),
+            "the fixture must keep distinct own neutrals, duplicate {triple:?}"
+        );
+    }
+    for index in 0..30 {
+        assert_eq!(frame_status(&report, index), "OK");
+    }
+
+    assert_per_frame_manifest(&output);
+    let run_stdout = stdout(&result);
+    assert!(
+        !run_stdout.contains("applied to every later frame"),
+        "{run_stdout}"
+    );
+    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
+    assert!(output.join("preview-h264-srgb-bt709.mp4").is_file());
+}
+
+#[test]
+fn per_frame_mode_rejects_a_producer_that_invents_an_override() {
+    let root = test_dir("wb-per-frame-override-lie");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("create fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_sequence_wb_lie(
+        &fixtures,
+        &frames,
+        FakeWbLie::OverrideWhenUnset,
+        WIDTH,
+        HEIGHT,
+    );
+    let output = root.join("run");
+
+    let mut args = base_args(&input, &output, &tool);
+    args.extend_from_slice(&["--white-balance", "per-frame", "--strength", "0"]);
+    let result = run_cli(&args);
+    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
+    let text = stderr(&result);
+    assert!(
+        text.contains("should use its as-shot white balance"),
+        "the error must name the required as-shot contract: {text}"
+    );
+    assert!(text.contains("frame 1/3"), "{text}");
+    assert!(text.contains("override"), "{text}");
+    assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
+    assert!(!output.join("preview-h264-srgb-bt709.mp4").exists());
+}
+
+#[test]
+fn rejects_a_producer_that_reports_as_shot_but_applies_another_neutral() {
+    let root = test_dir("wb-as-shot-lie");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("create fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool =
+        fake_native_sequence_wb_lie(&fixtures, &frames, FakeWbLie::AsShotMismatch, WIDTH, HEIGHT);
+    let output = root.join("run");
+
+    let mut args = base_args(&input, &output, &tool);
+    args.extend_from_slice(&["--white-balance", "per-frame", "--strength", "0"]);
+    let result = run_cli(&args);
+    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
+    let text = stderr(&result);
+    assert!(
+        text.contains("reports as-shot white balance but applied"),
+        "the error must reject the applied/own mismatch: {text}"
+    );
+    assert!(text.contains("as_shot_neutral"), "{text}");
+    assert!(text.contains("frame 1/3"), "{text}");
+    assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
+}
+
+#[test]
+fn rejects_invalid_white_balance_mode_values() {
+    let root = test_dir("wb-invalid-mode");
+    let input = root.join("material");
+    let output = root.join("run");
+    let tool = root.join("unused-native-tool");
+    for extra in [
+        vec!["--white-balance", "bogus"],
+        vec!["--white-balance", ""],
+        vec!["--white-balance="],
+    ] {
+        let mut args = base_args(&input, &output, &tool);
+        args.extend(extra.iter());
+        let result = run_cli(&args);
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "must reject {extra:?}: {}",
+            stderr(&result)
+        );
+        assert!(
+            stderr(&result).contains("--white-balance"),
+            "the usage error must name the flag: {}",
+            stderr(&result)
+        );
     }
 }
