@@ -4,17 +4,33 @@
 use crate::cli::Fps;
 use crate::color_profile::{ColorProfile, TagPolicy};
 use crate::error::{Error, Result, EXIT_ENCODE, EXIT_PREVIEW, EXIT_PUBLISH, EXIT_VALIDATION};
+use crate::json::Json;
 use crate::proc;
+use crate::transport::{
+    self, ArrayDescriptor, ArrayLayout, ByteOrder, DType, DataEnvelope, DiskArtifact, MetadataDoc,
+    NdArray, Payload, Provenance, RGB24_FRAME, RGB48_FRAME, VIDEO_ARTIFACT,
+};
 use std::fs;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const LINEAR_CODEC: &str = "ffv1";
 pub const LINEAR_PIX_FMT: &str = "gbrp16le";
 pub const PREVIEW_CODEC: &str = "h264";
 pub const PREVIEW_PIX_FMT: &str = "yuv420p";
+pub const LINEAR_MEDIA_TYPE: &str = "video/x-matroska";
+pub const PREVIEW_MEDIA_TYPE: &str = "video/mp4";
+
+/// The preview pipe decodes the linear master into scene-linear ACEScg codes.
+/// RGB24 frames leaving the CPU conversion are described by the profile's
+/// transfer and gamut names.
+const SCENE_LINEAR_SPACE: &str = "ACEScg AP1/D60 scene-linear";
+const SCENE_LINEAR_TRANSFER: &str = "linear";
+const RGB48_PRODUCER: &str = "ffmpeg rgb48le decoder";
+const RGB24_PRODUCER: &str = "rawtl preview colour conversion";
 
 pub const LINEAR_FINAL_NAME: &str = "linear-acescg-16bit-ffv1.mkv";
 
@@ -73,6 +89,138 @@ pub fn preview_filter(geometry: PreviewGeometry, profile: &ColorProfile) -> Stri
         )
     } else {
         convert
+    }
+}
+
+/// One tightly packed HWC frame descriptor. Shape coordinates are always
+/// `[height, width, channels]`; the declared byte length is the backing length,
+/// so a decoder buffer that does not match the declared geometry is rejected at
+/// construction time instead of reaching the pixel converter.
+fn rgb_frame_descriptor(
+    dtype: DType,
+    width: usize,
+    height: usize,
+    byte_length: usize,
+) -> ArrayDescriptor {
+    let sample = dtype.byte_width();
+    ArrayDescriptor {
+        dtype,
+        shape: vec![height, width, 3],
+        byte_strides: vec![width * 3 * sample, 3 * sample, sample],
+        offset: 0,
+        byte_length,
+        layout: ArrayLayout::HwcInterleaved,
+        byte_order: ByteOrder::LittleEndian,
+        read_only: true,
+    }
+}
+
+fn rgb_metadata(
+    width: u32,
+    height: u32,
+    space: &str,
+    transfer: &str,
+) -> transport::Result<MetadataDoc> {
+    MetadataDoc::new(vec![
+        ("source.width".to_string(), Json::Int(width as i64)),
+        ("source.height".to_string(), Json::Int(height as i64)),
+        ("color.space".to_string(), Json::Str(space.to_string())),
+        (
+            "color.transfer".to_string(),
+            Json::Str(transfer.to_string()),
+        ),
+    ])
+}
+
+/// Wrap one decoded little-endian RGB16 frame as a validated `RGB48_FRAME`.
+fn rgb48_frame_envelope(
+    bytes: Arc<[u8]>,
+    width: u32,
+    height: u32,
+    producer: &str,
+) -> transport::Result<DataEnvelope> {
+    let byte_length = bytes.len();
+    let array = NdArray::new(
+        bytes,
+        rgb_frame_descriptor(DType::U16, width as usize, height as usize, byte_length),
+    )?;
+    let metadata = rgb_metadata(width, height, SCENE_LINEAR_SPACE, SCENE_LINEAR_TRANSFER)?;
+    let provenance = Provenance::new(producer, Vec::new(), Vec::new())?;
+    DataEnvelope::new(RGB48_FRAME, Payload::NdArray(array), metadata, provenance)
+}
+
+/// Wrap one converted preview frame as a validated `RGB24_FRAME`.
+fn rgb24_frame_envelope(
+    bytes: Arc<[u8]>,
+    width: u32,
+    height: u32,
+    profile: &ColorProfile,
+    producer: &str,
+) -> transport::Result<DataEnvelope> {
+    let byte_length = bytes.len();
+    let array = NdArray::new(
+        bytes,
+        rgb_frame_descriptor(DType::U8, width as usize, height as usize, byte_length),
+    )?;
+    let metadata = rgb_metadata(width, height, profile.gamut.name, profile.transfer.name())?;
+    let provenance = Provenance::new(producer, Vec::new(), Vec::new())?;
+    DataEnvelope::new(RGB24_FRAME, Payload::NdArray(array), metadata, provenance)
+}
+
+fn array_bytes(envelope: &DataEnvelope) -> &[u8] {
+    match envelope.payload() {
+        Payload::NdArray(array) => array.bytes(),
+        _ => unreachable!("RGB frame envelopes always carry an NdArray payload"),
+    }
+}
+
+fn typed_frame_error(
+    err: transport::TransportError,
+    stream: &str,
+    index: usize,
+    count: usize,
+) -> Error {
+    Error::new(
+        EXIT_VALIDATION,
+        format!(
+            "decoded frame {}/{count} from {stream} is not a valid RGB48 typed frame: {err}",
+            index + 1
+        ),
+    )
+}
+
+/// Build the typed handoff for an encoded deliverable. `audit` consumes the
+/// same envelope, and `publish` renames the referenced file.
+pub fn video_envelope(
+    path: &Path,
+    media_type: &str,
+    codec: &str,
+    frame_count: u64,
+    producer: &str,
+) -> transport::Result<DataEnvelope> {
+    let artifact = DiskArtifact::new(path, media_type, file_size(path), None)?;
+    let metadata = MetadataDoc::new(vec![
+        ("audit.codec".to_string(), Json::Str(codec.to_string())),
+        (
+            "source.frame_count".to_string(),
+            Json::Int(frame_count as i64),
+        ),
+    ])?;
+    let provenance = Provenance::new(producer, Vec::new(), Vec::new())?;
+    DataEnvelope::new(
+        VIDEO_ARTIFACT,
+        Payload::DiskArtifact(artifact),
+        metadata,
+        provenance,
+    )
+}
+
+/// Resolve the file behind a validated video handoff. `None` means the caller
+/// did not receive a `VIDEO_ARTIFACT` disk reference.
+pub fn video_artifact_path(envelope: &DataEnvelope) -> Option<&Path> {
+    match (envelope.semantic_type(), envelope.payload()) {
+        (VIDEO_ARTIFACT, Payload::DiskArtifact(artifact)) => Some(artifact.path()),
+        _ => None,
     }
 }
 
@@ -518,8 +666,31 @@ pub fn render_preview(
             result = Err(err);
             break;
         }
-        if let Err(err) = profile.convert_frame(&frame, width as usize, height as usize, &mut rgb24)
-        {
+        let sent = match rgb48_frame_envelope(
+            Arc::from(frame.as_slice()),
+            width,
+            height,
+            RGB48_PRODUCER,
+        ) {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                result = Err(Error::new(
+                    EXIT_PREVIEW,
+                    format!(
+                        "preview conversion failed at frame {} ({}): rgb48 input is not a valid typed frame: {err}",
+                        index + 1,
+                        profile.id
+                    ),
+                ));
+                break;
+            }
+        };
+        if let Err(err) = profile.convert_frame(
+            array_bytes(&sent),
+            width as usize,
+            height as usize,
+            &mut rgb24,
+        ) {
             result = Err(Error::new(
                 EXIT_PREVIEW,
                 format!(
@@ -530,7 +701,27 @@ pub fn render_preview(
             ));
             break;
         }
-        if let Err(err) = writer.write_all(&rgb24) {
+        let converted = match rgb24_frame_envelope(
+            Arc::from(rgb24.as_slice()),
+            width,
+            height,
+            profile,
+            RGB24_PRODUCER,
+        ) {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                result = Err(Error::new(
+                    EXIT_PREVIEW,
+                    format!(
+                        "preview conversion failed at frame {} ({}): rgb24 output is not a valid typed frame: {err}",
+                        index + 1,
+                        profile.id
+                    ),
+                ));
+                break;
+            }
+        };
+        if let Err(err) = writer.write_all(array_bytes(&converted)) {
             result = Err(Error::new(
                 EXIT_PREVIEW,
                 format!(
@@ -822,8 +1013,32 @@ pub fn verify_roundtrip(
             failure = Some(err);
             break;
         }
-        if sent != encoded {
-            failure = Some(describe_mismatch(index, &sent, &encoded));
+        // Both decoded streams pass through the same typed RGB48 construction
+        // and semantic validation before the byte comparison.
+        let sent_frame =
+            match rgb48_frame_envelope(Arc::from(sent.as_slice()), width, height, RGB48_PRODUCER) {
+                Ok(envelope) => envelope,
+                Err(err) => {
+                    failure = Some(typed_frame_error(err, "PNG sequence", index, count));
+                    break;
+                }
+            };
+        let encoded_frame = match rgb48_frame_envelope(
+            Arc::from(encoded.as_slice()),
+            width,
+            height,
+            RGB48_PRODUCER,
+        ) {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                failure = Some(typed_frame_error(err, "FFV1 video", index, count));
+                break;
+            }
+        };
+        let sent_bytes = array_bytes(&sent_frame);
+        let encoded_bytes = array_bytes(&encoded_frame);
+        if sent_bytes != encoded_bytes {
+            failure = Some(describe_mismatch(index, sent_bytes, encoded_bytes));
             break;
         }
     }
@@ -1008,12 +1223,26 @@ fn kill_and_wait(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Publish both validated deliverables. The temporary names are taken from the
+/// already validated `VIDEO_ARTIFACT` handoffs; the final names are unchanged.
 pub fn publish(
-    temp_linear: &Path,
+    temp_linear: &DataEnvelope,
     final_linear: &Path,
-    temp_preview: &Path,
+    temp_preview: &DataEnvelope,
     final_preview: &Path,
 ) -> Result<()> {
+    let temp_linear = video_artifact_path(temp_linear).ok_or_else(|| {
+        Error::new(
+            EXIT_PUBLISH,
+            "linear video handoff is not a validated video artifact",
+        )
+    })?;
+    let temp_preview = video_artifact_path(temp_preview).ok_or_else(|| {
+        Error::new(
+            EXIT_PUBLISH,
+            "preview video handoff is not a validated video artifact",
+        )
+    })?;
     for final_path in [final_linear, final_preview] {
         if final_path.exists() {
             return Err(Error::new(
@@ -1255,5 +1484,104 @@ mod tests {
             "scale=out_color_matrix=bt2020:out_range=pc,\
              setparams=color_primaries=unknown:color_trc=unknown:colorspace=bt2020nc:range=pc"
         );
+    }
+
+    #[test]
+    fn rgb48_typed_frame_rejects_a_buffer_that_does_not_match_the_geometry() {
+        let width = 8u32;
+        let height = 6u32;
+        let shortened: Arc<[u8]> = vec![0u8; (width * height * 6 - 2) as usize].into();
+        match rgb48_frame_envelope(shortened, width, height, "test") {
+            Err(transport::TransportError::ByteLengthMismatch { expected, actual }) => {
+                assert_eq!(expected, (width * height * 6) as usize);
+                assert_eq!(actual, expected - 2);
+            }
+            other => panic!("unexpected constructor outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rgb24_typed_frame_carries_the_profile_colour_metadata() {
+        let profile = crate::color_profile::lookup("srgb-preview").expect("srgb");
+        let bytes: Arc<[u8]> = vec![0u8; 8 * 6 * 3].into();
+        let envelope =
+            rgb24_frame_envelope(bytes, 8, 6, profile, RGB24_PRODUCER).expect("valid RGB24 frame");
+        assert_eq!(envelope.semantic_type(), RGB24_FRAME);
+        assert_eq!(envelope.transport_kind(), transport::TransportKind::NdArray);
+        assert_eq!(
+            envelope
+                .metadata()
+                .get("color.space")
+                .and_then(Json::as_str),
+            Some(profile.gamut.name)
+        );
+        assert_eq!(
+            envelope
+                .metadata()
+                .get("color.transfer")
+                .and_then(Json::as_str),
+            Some(profile.transfer.name())
+        );
+        match envelope.payload() {
+            Payload::NdArray(array) => {
+                assert_eq!(array.shape(), &[6, 8, 3]);
+                assert_eq!(array.byte_strides(), &[24, 3, 1]);
+                assert_eq!(array.dtype(), DType::U8);
+            }
+            other => panic!("unexpected payload {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn render_preview_converts_through_validated_typed_frames() {
+        use crate::color_profile::lookup;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp")
+            .join(format!("preview-typed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create test dir");
+        let raw = dir.join("preview.rgb");
+        let log = dir.join("render.log");
+        let count = 2usize;
+        let frame_bytes = 8 * 6 * 6;
+        let script = dir.join("fake-ffmpeg.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ni=0\nwhile [ $i -lt {count} ]; do head -c {frame_bytes} /dev/zero; i=$((i+1)); done\nexit 0\n"
+            ),
+        )
+        .expect("write fake decoder");
+        let mut permissions = fs::metadata(&script).expect("stat").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("chmod");
+
+        let profile = lookup("srgb-preview").expect("srgb");
+        render_preview(
+            &script,
+            &dir,
+            8,
+            6,
+            count,
+            Fps { num: 30, den: 1 },
+            &raw,
+            &log,
+            profile,
+        )
+        .expect("render preview");
+
+        let mut expected = Vec::new();
+        profile
+            .convert_frame(&vec![0u8; frame_bytes], 8, 6, &mut expected)
+            .expect("reference conversion");
+        let actual = fs::read(&raw).expect("read raw preview");
+        assert_eq!(actual.len(), expected.len() * count);
+        for frame in actual.chunks_exact(expected.len()) {
+            assert_eq!(frame, expected.as_slice());
+        }
     }
 }

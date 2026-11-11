@@ -19,7 +19,8 @@
 use crate::error::{Error, Result, EXIT_AUDIT};
 use crate::json::{self, Json};
 use crate::proc;
-use crate::video::ProbeInfo;
+use crate::transport::DataEnvelope;
+use crate::video::{video_artifact_path, ProbeInfo};
 use rawtl_linear_video::deflicker::photometry::{
     analysis_geometry, audit_features, resolve_transfer, tile_statistics, AuditSegment, TileStats,
 };
@@ -50,12 +51,16 @@ pub struct AuditOutcome {
 pub fn audit_video(
     ffmpeg: &Path,
     ffprobe: &Path,
-    video: &Path,
+    video: &DataEnvelope,
     probe: &ProbeInfo,
     count: usize,
     config: &AuditConfig<'_>,
     output_dir: &Path,
 ) -> Result<AuditOutcome> {
+    // The encoded master reached this stage as a typed `VIDEO_ARTIFACT`
+    // handoff. Only a validated disk reference is auditable.
+    let video = video_artifact_path(video)
+        .ok_or_else(|| audit_error("audit input is not a validated video artifact"))?;
     let width = probe.width as usize;
     let height = probe.height as usize;
     if width == 0 || height == 0 {

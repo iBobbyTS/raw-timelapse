@@ -449,12 +449,25 @@ pub enum FakeWbLie {
     AsShotMismatch,
 }
 
+/// Sidecar defects the fake producer can simulate to exercise the typed
+/// stage-handoff validation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FakeSidecarDefects {
+    /// Emit an empty `source_sha256` in the frame metadata sidecar.
+    pub empty_source_sha256: bool,
+    /// Omit `kind` from the analysis sidecar.
+    pub analysis_omit_kind: bool,
+    /// Report an analysis source hash that differs from the frame metadata.
+    pub analysis_sha_mismatch: bool,
+}
+
 fn write_fake_native(
     dir: &Path,
     frames: &[FakeFrame],
     fail_on: Option<&str>,
     ignore_override: bool,
     lie: FakeWbLie,
+    defects: FakeSidecarDefects,
     width: u32,
     height: u32,
     gain_scale: f64,
@@ -482,6 +495,15 @@ fn write_fake_native(
     }
     if (gain_scale - 1.0).abs() > f64::EPSILON {
         config.push_str(&format!("gain_scale={gain_scale}\n"));
+    }
+    if defects.empty_source_sha256 {
+        config.push_str("empty_source_sha256=1\n");
+    }
+    if defects.analysis_omit_kind {
+        config.push_str("analysis_omit_kind=1\n");
+    }
+    if defects.analysis_sha_mismatch {
+        config.push_str("analysis_sha_mismatch=1\n");
     }
     for frame in frames {
         let fixture = frame
@@ -530,6 +552,7 @@ pub fn fake_native_tool(
         fail_on,
         ignore_override,
         FakeWbLie::None,
+        FakeSidecarDefects::default(),
         WIDTH,
         HEIGHT,
         1.0,
@@ -551,6 +574,7 @@ pub fn fake_native_sequence(
         fail_on,
         ignore_override,
         FakeWbLie::None,
+        FakeSidecarDefects::default(),
         width,
         height,
         1.0,
@@ -565,7 +589,17 @@ pub fn fake_native_sequence_wb_lie(
     width: u32,
     height: u32,
 ) -> PathBuf {
-    write_fake_native(dir, frames, None, false, lie, width, height, 1.0)
+    write_fake_native(
+        dir,
+        frames,
+        None,
+        false,
+        lie,
+        FakeSidecarDefects::default(),
+        width,
+        height,
+        1.0,
+    )
 }
 
 /// Same sequence, but the producer executes only `scale` of the requested EV
@@ -585,9 +619,32 @@ pub fn fake_native_sequence_gain_scale(
         fail_on,
         ignore_override,
         FakeWbLie::None,
+        FakeSidecarDefects::default(),
         width,
         height,
         scale,
+    )
+}
+
+/// Same sequence, but sidecar fields are forged to exercise the typed
+/// stage-handoff rejection paths.
+pub fn fake_native_sequence_sidecar_defect(
+    dir: &Path,
+    frames: &[FakeFrame],
+    defects: FakeSidecarDefects,
+    width: u32,
+    height: u32,
+) -> PathBuf {
+    write_fake_native(
+        dir,
+        frames,
+        None,
+        false,
+        FakeWbLie::None,
+        defects,
+        width,
+        height,
+        1.0,
     )
 }
 
