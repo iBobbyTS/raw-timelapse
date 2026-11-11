@@ -6,7 +6,7 @@ Converter can parse, call the accepted `dng-linear-frame` producer,
 freeze the sequence white balance, run the legacy V4 deflicker node (enabled by
 default), encode a lossless 16-bit scene-linear FFV1 video, validate it by full
 decode roundtrip, audit the encoded result independently, render a
-display-referred sRGB review preview, and publish both deliverables atomically.
+display-referred sRGB or camera-Log review preview, and publish both deliverables atomically.
 
 The crate has no external Rust dependencies, no async runtime and no Python in
 the product path. Child processes are invoked with `std::process::Command`
@@ -31,6 +31,7 @@ rawtl-linear-video --input <RAW_DIR> --output <RUN_DIR> \
   [--dng-linear-frame /abs/path/to/dng-linear-frame] \
   [--ffmpeg /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg] \
   [--ffprobe /opt/homebrew/opt/ffmpeg-full/bin/ffprobe] \
+  [--preview-profile <ID>] \
   [--converter "/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter"] \
   [--converter-timeout 120] \
   [--strength 1.0] [--period 60] [--brightness smooth|uniform] \
@@ -45,6 +46,10 @@ Defaults:
   build location; pass the matched build path when using a work-directory build)
 - `--ffmpeg /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg`
 - `--ffprobe /opt/homebrew/opt/ffmpeg-full/bin/ffprobe`
+- `--preview-profile srgb-preview` — one of `srgb-preview`,
+  `dji-dlog-dgamut`, `canon-log2-cinema-gamut`, `sony-slog3-sgamut3`,
+  `sony-slog3-sgamut3-cine`, `nikon-nlog-bt2020`; unknown or empty ids are
+  `EXIT_USAGE`
 - `--fps 30` — the frozen legacy default (`legacy/python/src/rawtl/cli.py:91`,
   `Fraction(30)`). Rational rates such as `30000/1001` are accepted; the
   positive-rate and `<= 1000` bounds match the legacy parser.
@@ -82,7 +87,8 @@ contain each other in either direction. The input directory is only read.
                           parameters, probe results, roundtrip/preview checks and
                           the deflicker block (config, status counts, audit summary)
   linear-acescg-16bit-ffv1.mkv
-  srgb-preview-h264.mp4
+  preview-h264-<transfer>-<gamut>.mp4
+                          (default: preview-h264-srgb-bt709.mp4)
 ```
 
 Intermediate encoder outputs are written under `<output>/.rawtl-partial/` and
@@ -144,30 +150,65 @@ Validation before publication:
    decoded by ffmpeg to `rgb48le`; the frames are compared byte-for-byte and
    the first differing frame/byte/channel/value is reported on failure.
 
-## sRGB preview (declared colour contract)
+## 预览输出色彩/Log profile
 
-The preview is display-referred and is not a measurement source:
+`--preview-profile <ID>` 选择预览输出，默认 `srgb-preview`。预览是 sRGB 或厂商
+Log 检视信号，不是测量源。编码器仍为 `h264_videotoolbox`、8bit `yuv420p`、
+`-b:v 0 -q:v 65`；FFV1 母版、RAW 显影、去闪、审计均不改变。
 
-1. `code / 16384` is scene-linear ACEScg (AP1, D60).
-2. AP1/D60 → XYZ(D60) → Bradford CAT → XYZ(D65) → linear sRGB(D65), using the
-   explicit matrices recorded in `manifest.json`:
-   - AP1/D60 → XYZ/D60;
-   - Bradford D60 → D65 (D60 `xy = 0.32168, 0.33767`, D65 `xy = 0.3127, 0.3290`);
-   - XYZ/D65 → linear sRGB.
-3. Per-channel linear sRGB is clipped to `[0, 1]` (negatives and out-of-gamut
-   colours clip; no tone mapping or highlight roll-off).
-4. The IEC 61966-2-1 sRGB transfer function is applied, then quantized to 8 bit
-   with `round(value * 255)` (ties away from zero).
+| id | 预览文件 | transfer / gamut | range | YCbCr | 标签 primaries / transfer / matrix / full |
+| --- | --- | --- | --- | --- | --- |
+| `srgb-preview` | `preview-h264-srgb-bt709.mp4` | sRGB / Rec.709 | tv | bt709 | 1 / 13 / 1 / 0（既有行为） |
+| `sony-slog3-sgamut3` | `preview-h264-slog3-sgamut3.mp4` | S-Log3 / S-Gamut3 | pc | bt2020nc | 2 / 2 / 9 / 1 |
+| `sony-slog3-sgamut3-cine` | `preview-h264-slog3-sgamut3cine.mp4` | S-Log3 / S-Gamut3.Cine | pc | bt2020nc | 2 / 2 / 9 / 1 |
+| `canon-log2-cinema-gamut` | `preview-h264-clog2-cgamut.mp4` | Canon Log 2 / Cinema Gamut | pc | bt2020nc | 2 / 2 / 9 / 1 |
+| `nikon-nlog-bt2020` | `preview-h264-nlog-bt2020.mp4` | N-Log / BT.2020 | pc | bt2020nc | 9 / 2 / 9 / 1 |
+| `dji-dlog-dgamut` | `preview-h264-dlog-dgamut.mp4` | D-Log / D-Gamut | pc | bt2020nc | 2 / 2 / 9 / 1 |
 
-Conversion runs in Rust on frames decoded by ffmpeg from the sent PNG
-sequence. ffmpeg then converts RGB24 to `yuv420p` with an explicit
-`scale=out_color_matrix=bt709:out_range=tv` plus
-`setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv`,
-encodes with macOS VideoToolbox H.264
-(`-c:v h264_videotoolbox -allow_sw 0 -profile:v high -b:v 0 -q:v 65`) and tags
-`bt709`/`bt709`/`iec61966-2-1`/`tv`. The preview is validated with ffprobe
-(`h264`, `yuv420p`, dimensions, frame count, frame rate) and a full decode to
-`null`.
+每个 profile 的矩阵、公式、来源和交付约定均记录在 `manifest.json` 的
+`preview.color_contract` 中；`preview.emitted_tags` 逐字段记录 H.264 SPS VUI 与
+MP4 `colr/nclx` 两层的实际码点。2 表示 unspecified；Nikon 的 9 表示其真实
+BT.2020 primaries，matrix 的 9 表示实际采用的 BT.2020 非恒定亮度编码矩阵。
+
+转换顺序不变：PNG RGB16 的 `code/16384` 为 ACEScg AP1/D60 场景线性值，经
+XYZ(D60) → Bradford CAT → XYZ(D65) → 目标线性 RGB；逐通道裁切到官方反函数
+signal 0/1 的端点，再应用官方 transfer 和 `round(signal*255)`、ties away from
+zero 的 8bit 量化。不做 tone/gamut mapping，不加抖动。8bit Log 可能出现 banding；
+无 dither 是 owner 决定，10bit/HEVC/ProRes/HLG/PQ 等更丰富输出仅记录为未来方向。
+
+本次交付标签修订（2026-11-09）将厂商 profile 的标签策略从「一律不写通用色彩字段」改为逐字段：写真实
+matrix/range，Nikon 另写真实 primaries；没有准确通用码点的厂商 transfer 和其它
+primaries 保持 unspecified。`scale=out_color_matrix=bt2020:out_range=pc` 后的
+`setparams` 和编码参数保持这些真实字段一致。本机 FFmpeg 8.0.1/VideoToolbox 能直接
+写入 SPS VUI；封装用 `-movflags +faststart+write_colr`，确保部分字段未知时仍写 nclx。
+sRGB 的滤镜、编码参数和 `+faststart` 保持原样，解码 framemd5 和图像 NAL 回归不变。
+`pc` 流允许解码器报告 `yuv420p` 或 `yuvj420p`，仍校验 range 和逐字段标签。
+
+厂商 profile 统一 `bt2020nc` 和 full range 是 **rawtl 交付约定，不是厂商强制要求**。
+系数采用 [ITU-R BT.2020-2 (10/2015) Table 4](https://www.itu.int/rec/R-REC-BT.2020-2-201510-I/en)，
+码点采用 [H.273 (V4), 07/2024, Table 4](https://www.itu.int/rec/T-REC-H.273-202407-I/en)，
+并以 [Khronos Data Format v1.4.0 §15.1.3](https://registry.khronos.org/DataFormat/specs/1.4/dataformat.1.4.html)
+交叉核对理想矩阵变换；只有该理想变换可逆，实际 8bit 4:2:0 包含量化、色度下采样和
+压缩损失。矩阵标签不代表把厂商 primaries/transfer 转成 BT.2020，也不依据色域包含
+关系作选择。
+
+背景证据：[Canon DP-V3010 手册 pp.47/50](https://gdlp01.c-wss.com/gds/7/0300013757/06/dpv3010-im3-en.pdf)
+的 Cinema Gamut 监看工作流采用 BT.709 YCbCr；[Sony BVM-HX310 手册 pp.24–25](https://pro.sony/support/res/manuals/4748/2c99048095dffc320734089caca25c96/47481881M.pdf)
+要求接收端矩阵匹配信号输出设备；[Nikon N-Log LUT 指南 step 7](https://nps.nikonimaging.com/technical_info/technical_solutions/z9_tips/3d_lut/)
+同时说明 limited/full 链路。Nikon 规格给出 BT.2020 primaries，但 NCL/full 交付选择
+属于 rawtl；Nikon/DJI 的曲线码域不能证明 full range 是厂商规定。
+
+| profile | 官方公式/色域出处 | 转写与核对 |
+| --- | --- | --- |
+| Sony S-Gamut3 / S-Gamut3.Cine / S-Log3 | [Technical Summary V1.0](https://www.sony.jp/ls-camera/knowledge/pdf/TechnicalSummary_for-S-Gamut3Cine_S-Gamut3_S-Log3_V1_00.pdf) | S-Log3 正反公式、0/18/90% 码 95/420/598、primaries 与 D65 |
+| Canon Log 2 / Cinema Gamut | [Canon Log Gamma Curves (2018-11-01)](https://downloads.canon.com/nw/learn/white-papers/cinema-eos/white-paper-canon-log-gamma-curves.pdf)；[Color Gamut Conversion for DCI-P3+ and Cinema Gamut, PUB. DIM-1102-000 (2013), EN p.2](https://gdlp01.c-wss.com/gds/8/0200003438/01/colorgamutinfo-dim1102.pdf) | 官方 Cinema Gamut 白点 (0.3127,0.3290)、R(0.7400,0.2700)、G(0.1700,1.1400)、B(0.0800,-0.1000)，现有数值不变；colour-science/Canon ACES IDT 保留为交叉核对 |
+| Nikon N-Log / BT.2020 | [N-Log Specification Document 1.0.0 (2018-09-01)](http://download.nikonimglib.com/archive3/hDCmK00m9JDI03RPruD74xpoU905/N-Log_Specification_(En)01.pdf) | N-Log 公式、BT.2020 primaries 与 D65，参考码从官方公式推导 |
+| DJI D-Log / D-Gamut | [D-Log and D-Gamut White Paper (2017-10-10)](https://dl.djicdn.com/downloads/zenmuse+x7/20171010/D-Log_D-Gamut_Whitepaper.pdf) | 官方公式、0/18/90% 码 95/408/586、primaries/D65；使用由官方原色推导的矩阵，与打印四位小数矩阵差≤1.84e-4，保持中性灰 |
+
+测试逐项覆盖官方参考码、中性灰、往返、独立非中性色块、Sony 双色域差异、两层
+标签的独立读取及一致性。每个厂商 profile 均从文件自身标签自动解码到 RGB，和
+强制正确矩阵/范围及独立色块参考比较；错误矩阵和错误范围仍须被数值断言拒绝。
+真实 NLE/播放器的 Log 解释与显示效果仍需使用者核验，不声称校准显示匹配。
 
 The macOS hardware H.264 encoder rejects source widths above 4096 (measured:
 4096x2304 succeeds, 5000x3000 fails with `cannot create compression session:
@@ -181,12 +222,12 @@ algorithm and the exact `-vf` chain are recorded in `manifest.json`
 (`preview.scale`, `preview.encoder_parameters`), and preview validation checks
 the computed preview dimensions, not the master dimensions.
 
-Unit tests assert neutral (`0.18 → 118,118,118`), a non-neutral reference
-(`[0.5,0.25,0.125] → [216,129,89]`), the two-sided clipping policy, the sRGB
-transfer, that treating AP1 values as display sRGB is rejected by the
-non-neutral test, and the preview downscale geometry/filter policy (no scale at
-or below 4096, proportional lanczos scale above it, even-height chroma
-alignment).
+The sRGB reference unit tests assert neutral (`0.18 → 118,118,118`), a
+non-neutral reference (`[0.5,0.25,0.125] → [216,129,89]`), the two-sided
+clipping policy, the sRGB transfer, that treating AP1 values as display sRGB is
+rejected by the non-neutral test, and the preview downscale geometry/filter
+policy (no scale at or below 4096, proportional lanczos scale above it,
+even-height chroma alignment).
 
 ## Deflicker node (legacy V4)
 
@@ -308,7 +349,7 @@ possible.
 | 30 | Frame production or frame-metadata verification failure |
 | 40 | FFV1 encoder failure |
 | 50 | ffprobe validation or lossless-roundtrip failure |
-| 60 | sRGB preview render/encode/validation failure |
+| 60 | Preview render/encode/validation failure |
 | 70 | Manifest publication or final rename failure |
 | 81 | Gain-probe tool failure (probe verdicts themselves are recorded flags) |
 | 82 | Render-validation internal error (target misses are recorded flags) |

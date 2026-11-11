@@ -1,9 +1,9 @@
 //! Linear video encoding, probe validation, lossless roundtrip and atomic
-//! publication, plus the display-referred sRGB preview pipeline.
+//! publication, plus the display-referred/camera-Log preview pipeline.
 
 use crate::cli::Fps;
+use crate::color_profile::{ColorProfile, TagPolicy};
 use crate::error::{Error, Result, EXIT_ENCODE, EXIT_PREVIEW, EXIT_PUBLISH, EXIT_VALIDATION};
-use crate::preview;
 use crate::proc;
 use std::fs;
 use std::io::{BufWriter, Read, Write};
@@ -17,7 +17,10 @@ pub const PREVIEW_CODEC: &str = "h264";
 pub const PREVIEW_PIX_FMT: &str = "yuv420p";
 
 pub const LINEAR_FINAL_NAME: &str = "linear-acescg-16bit-ffv1.mkv";
-pub const PREVIEW_FINAL_NAME: &str = "srgb-preview-h264.mp4";
+
+pub fn preview_final_name(profile: &ColorProfile) -> &'static str {
+    profile.preview_filename
+}
 
 /// macOS VideoToolbox hardware H.264 rejects source widths above 4096
 /// (`cannot create compression session: -12903`), so the display-referred
@@ -60,17 +63,16 @@ pub fn preview_geometry(width: u32, height: u32) -> PreviewGeometry {
 
 /// The `-vf` value used by the preview encoder. The unscaled chain is the
 /// historical one; a scaled preview prepends RGB lanczos resampling before the
-/// existing colour-matrix conversion.
-pub fn preview_filter(geometry: PreviewGeometry) -> String {
-    const CONVERT: &str = "scale=out_color_matrix=bt709:out_range=tv,\
-setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv";
+/// profile's colour-matrix conversion.
+pub fn preview_filter(geometry: PreviewGeometry, profile: &ColorProfile) -> String {
+    let convert = profile.color_filter();
     if geometry.scaled {
         format!(
-            "scale={}:{}:flags=lanczos,{CONVERT}",
+            "scale={}:{}:flags=lanczos,{convert}",
             geometry.width, geometry.height
         )
     } else {
-        CONVERT.to_string()
+        convert
     }
 }
 
@@ -290,6 +292,7 @@ pub fn validate_preview(
     height: u32,
     count: usize,
     fps: Fps,
+    profile: &ColorProfile,
 ) -> Result<ProbeInfo> {
     let expected = preview_geometry(width, height);
     let probe = probe_stream(ffprobe, file)?;
@@ -302,12 +305,16 @@ pub fn validate_preview(
             ),
         ));
     }
-    if probe.pix_fmt != PREVIEW_PIX_FMT {
+    let accepted_pix_fmts = profile.range.accepted_decoder_pix_fmts();
+    if !accepted_pix_fmts.contains(&probe.pix_fmt.as_str()) {
         return Err(Error::new(
             EXIT_PREVIEW,
             format!(
-                "preview pixel format is {:?}, expected {:?}",
-                probe.pix_fmt, PREVIEW_PIX_FMT
+                "preview pixel format is {:?}, expected one of {:?} for {} range ({})",
+                probe.pix_fmt,
+                accepted_pix_fmts,
+                profile.range.as_str(),
+                profile.id
             ),
         ));
     }
@@ -336,22 +343,30 @@ pub fn validate_preview(
         ));
     }
 
-    // The declared colour contract is only meaningful if the tags reach the
-    // container and bitstream; reject a silently untagged preview.
-    let expected_tags = [
-        ("color_space", "bt709", &probe.color_space),
-        ("color_primaries", "bt709", &probe.color_primaries),
-        ("color_transfer", "iec61966-2-1", &probe.color_transfer),
-        ("color_range", "tv", &probe.color_range),
-    ];
-    for (field, expected, observed) in expected_tags {
-        if observed != expected {
-            return Err(Error::new(
-                EXIT_PREVIEW,
-                format!(
-                    "preview {field} is {observed:?}, expected {expected:?} (declared colour contract)"
-                ),
-            ));
+    // Validate every accurate field; unknown Log transfer/primaries stay unknown.
+    for (field, expected, observed) in [
+        (
+            "color_space",
+            profile.tag_policy.matrix_token(),
+            &probe.color_space,
+        ),
+        (
+            "color_primaries",
+            profile.tag_policy.primaries_token(),
+            &probe.color_primaries,
+        ),
+        (
+            "color_transfer",
+            profile.tag_policy.transfer_token(),
+            &probe.color_transfer,
+        ),
+        ("color_range", profile.range.as_str(), &probe.color_range),
+    ] {
+        let matches = observed == expected || (expected == "unknown" && observed.is_empty());
+        if !matches {
+            return Err(Error::new(EXIT_PREVIEW, format!(
+                "preview {field} is {observed:?}, expected {expected:?} for {} (per-field colour contract)", profile.id
+            )));
         }
     }
 
@@ -455,6 +470,7 @@ pub fn render_preview(
     fps: Fps,
     raw_output: &Path,
     log_path: &Path,
+    profile: &ColorProfile,
 ) -> Result<()> {
     let pattern = frames_dir.join("frame_%06d.png");
     let args = vec![
@@ -502,12 +518,15 @@ pub fn render_preview(
             result = Err(err);
             break;
         }
-        if let Err(err) =
-            preview::convert_frame(&frame, width as usize, height as usize, &mut rgb24)
+        if let Err(err) = profile.convert_frame(&frame, width as usize, height as usize, &mut rgb24)
         {
             result = Err(Error::new(
                 EXIT_PREVIEW,
-                format!("preview conversion failed at frame {}: {err}", index + 1),
+                format!(
+                    "preview conversion failed at frame {} ({}): {err}",
+                    index + 1,
+                    profile.id
+                ),
             ));
             break;
         }
@@ -554,7 +573,7 @@ pub fn render_preview(
     let _ = write_log(
         log_path,
         &format!(
-            "command: {command}\nframes: {}x{} x{}\nelapsed: {:.3}s\nexit: {}\nnote: linear RGB16 codes decoded by ffmpeg to rgb48le, then converted to sRGB RGB24 in Rust\n",
+            "command: {command}\nframes: {}x{} x{}\nelapsed: {:.3}s\nexit: {}\nnote: linear RGB16 codes decoded by ffmpeg to rgb48le, then converted to the selected preview profile's RGB24 in Rust\n",
             width,
             height,
             count,
@@ -593,9 +612,10 @@ pub fn encode_preview(
     fps: Fps,
     output: &Path,
     log_path: &Path,
+    profile: &ColorProfile,
 ) -> Result<()> {
     let geometry = preview_geometry(width, height);
-    let args = vec![
+    let mut args = vec![
         "-hide_banner".to_string(),
         "-nostdin".to_string(),
         "-v".to_string(),
@@ -613,7 +633,7 @@ pub fn encode_preview(
         "-frames:v".to_string(),
         count.to_string(),
         "-vf".to_string(),
-        preview_filter(geometry),
+        preview_filter(geometry, profile),
         "-c:v".to_string(),
         "h264_videotoolbox".to_string(),
         "-allow_sw".to_string(),
@@ -626,24 +646,46 @@ pub fn encode_preview(
         "65".to_string(),
         "-pix_fmt".to_string(),
         PREVIEW_PIX_FMT.to_string(),
-        "-colorspace".to_string(),
-        "bt709".to_string(),
-        "-color_primaries".to_string(),
-        "bt709".to_string(),
-        "-color_trc".to_string(),
-        "iec61966-2-1".to_string(),
-        "-color_range".to_string(),
-        "tv".to_string(),
-        "-movflags".to_string(),
-        "+faststart".to_string(),
-        "-f".to_string(),
-        "mp4".to_string(),
-        output.display().to_string(),
     ];
+    if profile.tag_policy == TagPolicy::SRGB {
+        // The historical sRGB argument sequence, kept byte-identical.
+        for (flag, value) in [
+            ("-colorspace", "bt709"),
+            ("-color_primaries", "bt709"),
+            ("-color_trc", "iec61966-2-1"),
+            ("-color_range", profile.range.as_str()),
+        ] {
+            args.push(flag.to_string());
+            args.push(value.to_string());
+        }
+    } else {
+        // VideoToolbox on the supported build propagates these fields to SPS
+        // VUI. Partial colour information needs write_colr for MP4 nclx.
+        for (flag, value) in [
+            ("-colorspace", profile.tag_policy.matrix_token()),
+            ("-color_primaries", profile.tag_policy.primaries_token()),
+            ("-color_trc", profile.tag_policy.transfer_token()),
+            ("-color_range", profile.range.as_str()),
+        ] {
+            args.push(flag.to_string());
+            args.push(value.to_string());
+        }
+    }
+    let movflags = if profile.tag_policy == TagPolicy::SRGB {
+        "+faststart"
+    } else {
+        "+faststart+write_colr"
+    };
+    for (flag, value) in [("-movflags", movflags), ("-f", "mp4")] {
+        args.push(flag.to_string());
+        args.push(value.to_string());
+    }
+    args.push(output.display().to_string());
+
     let command = proc::display_command(ffmpeg, &args);
     let captured = proc::run_capture(ffmpeg, &args, EXIT_PREVIEW)?;
-    // Keep the unscaled log byte-identical; scaled runs record the applied
-    // geometry alongside the source size.
+    // Keep the unscaled sRGB log byte-identical; scaled runs and non-sRGB
+    // profiles record the applied geometry/profile alongside the source size.
     let scale_note = if geometry.scaled {
         format!(
             "\npreview scale: {}x{} -> {}x{} (lanczos; VideoToolbox max width {})",
@@ -652,15 +694,26 @@ pub fn encode_preview(
     } else {
         String::new()
     };
+    let profile_note = if profile.id == "srgb-preview" {
+        String::new()
+    } else {
+        format!(
+            "\npreview profile: {} (range {}, ycbcr matrix {}, per-field colour tags)",
+            profile.id,
+            profile.range.as_str(),
+            profile.ycbcr_matrix
+        )
+    };
     write_log(
         log_path,
         &format!(
-            "command: {command}\ninput: {}x{} rgb24 x{} @ {}{}\nexit: {} ({:.3}s)\nstdout:\n{}\nstderr:\n{}\n",
+            "command: {command}\ninput: {}x{} rgb24 x{} @ {}{}{}\nexit: {} ({:.3}s)\nstdout:\n{}\nstderr:\n{}\n",
             width,
             height,
             count,
             fps.arg(),
             scale_note,
+            profile_note,
             proc::exit_description(&captured.status),
             captured.duration.as_secs_f64(),
             captured.stdout,
@@ -668,10 +721,15 @@ pub fn encode_preview(
         ),
     )?;
     if !captured.status.success() {
+        let label = if profile.id == "srgb-preview" {
+            "sRGB preview encoder failed".to_string()
+        } else {
+            format!("{} preview encoder failed", profile.id)
+        };
         return Err(Error::new(
             EXIT_PREVIEW,
             format!(
-                "sRGB preview encoder failed: {}; stderr: {}; transcript {}",
+                "{label}: {}; stderr: {}; transcript {}",
                 proc::exit_description(&captured.status),
                 proc::tail(&captured.stderr, 1200),
                 log_path.display()
@@ -1177,12 +1235,25 @@ mod tests {
 
     #[test]
     fn preview_filter_only_prepends_lanczos_when_scaled() {
-        const CONVERT: &str = "scale=out_color_matrix=bt709:out_range=tv,\
-setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv";
-        assert_eq!(preview_filter(preview_geometry(8, 6)), CONVERT);
+        let srgb = crate::color_profile::lookup("srgb-preview").expect("srgb");
         assert_eq!(
-            preview_filter(preview_geometry(5000, 3000)),
-            format!("scale=4096:2458:flags=lanczos,{CONVERT}")
+            preview_filter(preview_geometry(8, 6), srgb),
+            "scale=out_color_matrix=bt709:out_range=tv,\
+             setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv"
+        );
+        assert_eq!(
+            preview_filter(preview_geometry(5000, 3000), srgb),
+            format!("scale=4096:2458:flags=lanczos,{}", srgb.color_filter())
+        );
+    }
+
+    #[test]
+    fn vendor_preview_filter_writes_known_fields() {
+        let profile = crate::color_profile::lookup("dji-dlog-dgamut").expect("dji");
+        assert_eq!(
+            preview_filter(preview_geometry(8, 6), profile),
+            "scale=out_color_matrix=bt2020:out_range=pc,\
+             setparams=color_primaries=unknown:color_trc=unknown:colorspace=bt2020nc:range=pc"
         );
     }
 }

@@ -1,5 +1,6 @@
 //! Command-line parsing for `rawtl-linear-video`.
 
+use crate::color_profile;
 use crate::deflicker::ExposureStep;
 use crate::error::{Error, Result, EXIT_USAGE};
 use std::path::PathBuf;
@@ -16,7 +17,7 @@ unreliable frames fall back to the global-reference curve; the temporal \
 audit records but never blocks (temporal_quality=report)";
 
 pub const USAGE: &str = "\
-rawtl-linear-video — DNG frame sequence -> scene-linear ACEScg FFV1 video + sRGB preview
+rawtl-linear-video — DNG frame sequence -> scene-linear ACEScg FFV1 video + colour/Log preview
 (default: V4 deflicker enabled with legacy default parameters)
 
 USAGE:
@@ -32,6 +33,10 @@ OPTIONS:
     --dng-linear-frame <PATH>  Native single-frame producer (default: native/build/dng-linear-frame)
     --ffmpeg <PATH>            ffmpeg executable (default: /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg)
     --ffprobe <PATH>           ffprobe executable (default: /opt/homebrew/opt/ffmpeg-full/bin/ffprobe)
+    --preview-profile <ID>     Preview colour/Log profile (default: srgb-preview)
+                               one of: srgb-preview, dji-dlog-dgamut,
+                               canon-log2-cinema-gamut, sony-slog3-sgamut3,
+                               sony-slog3-sgamut3-cine, nikon-nlog-bt2020
     --converter <PATH>         Adobe DNG Converter override passed to the native tool
     --converter-timeout <SEC>  Converter timeout override (1-3600 seconds)
     --strength <0..1>          Correction strength (default: 1.0; 0 disables deflicker)
@@ -55,7 +60,9 @@ OUTPUT LAYOUT:
     <output>/temporal_audit.json          independent encoded-video audit (when enabled)
     <output>/pairs.csv, frames.csv        audit pair/frame evidence
     <output>/linear-acescg-16bit-ffv1.mkv FFV1 gbrp16le lossless linear video
-    <output>/srgb-preview-h264.mp4        display-referred sRGB/H.264 review preview
+    <output>/preview-h264-<transfer>-<gamut>.mp4
+                                          display-referred H.264 review preview
+                                          (default: preview-h264-srgb-bt709.mp4)
     <output>/manifest.json                run provenance and validation record
 ";
 
@@ -239,6 +246,7 @@ pub struct Options {
     pub native_tool: PathBuf,
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
+    pub preview_profile: &'static color_profile::ColorProfile,
     pub converter: Option<String>,
     pub converter_timeout: Option<u64>,
     pub deflicker: DeflickerConfig,
@@ -259,6 +267,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut native_tool = PathBuf::from(DEFAULT_NATIVE_TOOL);
     let mut ffmpeg = PathBuf::from(DEFAULT_FFMPEG);
     let mut ffprobe = PathBuf::from(DEFAULT_FFPROBE);
+    let mut preview_profile = color_profile::default_profile();
     let mut converter: Option<String> = None;
     let mut converter_timeout: Option<u64> = None;
     let mut deflicker = DeflickerConfig::default();
@@ -303,6 +312,22 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
             "--ffmpeg" => ffmpeg = PathBuf::from(take_value(args, &mut index, flag, inline_value)?),
             "--ffprobe" => {
                 ffprobe = PathBuf::from(take_value(args, &mut index, flag, inline_value)?)
+            }
+            "--preview-profile" => {
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                preview_profile = color_profile::lookup(&value).ok_or_else(|| {
+                    Error::new(
+                        EXIT_USAGE,
+                        format!(
+                            "invalid --preview-profile {value:?}: expected one of {}",
+                            color_profile::PROFILES
+                                .iter()
+                                .map(|profile| profile.id)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    )
+                })?;
             }
             "--converter" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
@@ -392,6 +417,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         native_tool,
         ffmpeg,
         ffprobe,
+        preview_profile,
         converter,
         converter_timeout,
         deflicker,
@@ -560,6 +586,7 @@ fn parse_step(value: &str) -> Result<ExposureStep> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color_profile;
 
     fn parse_run(args: &[&str]) -> Result<Options> {
         let owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
@@ -710,6 +737,53 @@ mod tests {
         assert_eq!(d.steps[0].delta_ev, 0.5);
         assert_eq!(d.steps[1].start_frame, 20);
         assert_eq!(d.temporal_quality, TemporalQuality::Off);
+    }
+
+    #[test]
+    fn parses_preview_profile_and_defaults_to_srgb() {
+        let options = parse_run(&["--input", "in", "--output", "out"]).expect("parse");
+        assert_eq!(options.preview_profile.id, "srgb-preview");
+        for id in color_profile::PROFILES.iter().map(|profile| profile.id) {
+            let options = parse_run(&["--input", "in", "--output", "out", "--preview-profile", id])
+                .expect("parse");
+            assert_eq!(options.preview_profile.id, id);
+        }
+        let options = parse_run(&[
+            "--input",
+            "in",
+            "--output",
+            "out",
+            "--preview-profile=nikon-nlog-bt2020",
+        ])
+        .expect("parse");
+        assert_eq!(options.preview_profile.id, "nikon-nlog-bt2020");
+    }
+
+    #[test]
+    fn rejects_unknown_or_empty_preview_profile() {
+        for value in ["dlog-dgamut", "srgb", "", "srgb-preview "] {
+            let args = [
+                "--input",
+                "in",
+                "--output",
+                "out",
+                "--preview-profile",
+                value,
+            ];
+            let error = parse_run(&args).expect_err("must reject");
+            assert_eq!(error.code, EXIT_USAGE);
+            assert!(
+                error.message.contains("--preview-profile"),
+                "{}",
+                error.message
+            );
+        }
+        let error = parse_run(&["--input", "in", "--output", "out", "--preview-profile"])
+            .expect_err("missing value");
+        assert!(error.message.contains("missing value"));
+        let error = parse_run(&["--input", "in", "--output", "out", "--preview-profile="])
+            .expect_err("empty inline value");
+        assert_eq!(error.code, EXIT_USAGE);
     }
 
     #[test]
