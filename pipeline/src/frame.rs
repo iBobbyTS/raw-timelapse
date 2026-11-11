@@ -12,7 +12,7 @@
 //! applied exactly that frame's `as_shot_neutral`.
 
 use crate::cli::WhiteBalance;
-use crate::error::{Error, Result, EXIT_FRAME};
+use crate::error::{Error, Result, EXIT_FRAME, EXIT_PUBLISH};
 use crate::json::{self, Json};
 use crate::order::SourceFrame;
 use crate::proc;
@@ -78,17 +78,112 @@ pub struct FrameSequence {
 }
 
 impl FrameSequence {
-    /// Rewrite the recorded relative output paths after a pass directory is
-    /// adopted as the final `frames/` directory.
-    pub fn remap_output_paths(mut self, log_dir_rel: &str) -> FrameSequence {
+    /// Rewrite the recorded relative output paths and re-point the typed disk
+    /// references after a pass directory is adopted as the final `frames/`
+    /// directory. A move is not an in-place conversion: the producer
+    /// references are immutable, so adoption builds new references/envelopes at
+    /// the adopted absolute paths while keeping the same semantic type,
+    /// metadata and payload kind; the producer envelope becomes their lineage
+    /// parent.
+    pub fn adopt_output_locations(
+        mut self,
+        frames_dir: &Path,
+        analysis_dir: Option<&Path>,
+        log_dir_rel: &str,
+    ) -> Result<FrameSequence> {
         for frame in &mut self.frames {
             let stem = format!("frame_{:06}", frame.index);
+            let png = frames_dir.join(format!("{stem}.png"));
+            let metadata = frames_dir.join(format!("{stem}.json"));
             frame.png_relative = format!("frames/{stem}.png");
             frame.metadata_relative = format!("frames/{stem}.json");
             frame.log_relative = format!("{log_dir_rel}/{stem}.log");
+
+            if let Some(artifact) = frame.png_artifact.take() {
+                let moved = relocate_artifact(&artifact, &png)?;
+                frame.png_envelope = match frame.png_envelope.take() {
+                    Some(envelope) => Some(repoint_envelope(
+                        &envelope,
+                        Payload::DiskArtifact(moved.clone()),
+                    )?),
+                    None => None,
+                };
+                frame.png_artifact = Some(moved);
+            }
+            frame.metadata_artifact = relocate_artifact(&frame.metadata_artifact, &metadata)?;
+
+            match (&frame.analysis_artifact, analysis_dir) {
+                (Some(artifact), Some(dir)) => {
+                    let path = dir.join(format!("{stem}.analysis.json"));
+                    frame.analysis_artifact = Some(relocate_artifact(artifact, &path)?);
+                    frame.analysis_path = Some(path);
+                }
+                (None, _) => frame.analysis_path = None,
+                (Some(artifact), None) => {
+                    return Err(Error::new(
+                        EXIT_PUBLISH,
+                        format!(
+                            "cannot adopt analysis sidecar reference {}: no adopted analysis directory",
+                            artifact.path().display()
+                        ),
+                    ))
+                }
+            }
         }
-        self
+        Ok(self)
     }
+}
+
+fn relocate_artifact(artifact: &DiskArtifact, path: &Path) -> Result<DiskArtifact> {
+    DiskArtifact::new(
+        path,
+        artifact.media_type(),
+        artifact.size(),
+        artifact.hash().map(str::to_string),
+    )
+    .map_err(|err| {
+        Error::new(
+            EXIT_PUBLISH,
+            format!(
+                "cannot re-point adopted artifact {} -> {}: {err}",
+                artifact.path().display(),
+                path.display()
+            ),
+        )
+    })
+}
+
+/// Rebuild one envelope around a re-pointed payload. The new envelope keeps
+/// the semantic type and immutable metadata verbatim and records the producer
+/// envelope as an additional lineage parent, mirroring `DataEnvelope::patch`.
+fn repoint_envelope(envelope: &DataEnvelope, payload: Payload) -> Result<DataEnvelope> {
+    let mut parents = envelope.provenance().parent_value_ids().to_vec();
+    if !parents.iter().any(|id| id == envelope.value_id()) {
+        parents.push(envelope.value_id().to_string());
+    }
+    let provenance = Provenance::new(
+        envelope.provenance().producer(),
+        envelope.provenance().source_hashes().to_vec(),
+        parents,
+    )
+    .map_err(|err| {
+        Error::new(
+            EXIT_PUBLISH,
+            format!("cannot re-point adopted envelope provenance: {err}"),
+        )
+    })?;
+    DataEnvelope::new(
+        envelope.semantic_type().to_string(),
+        payload,
+        envelope.metadata().clone(),
+        provenance,
+    )
+    .map_err(|err| {
+        Error::new(
+            EXIT_PUBLISH,
+            format!("cannot re-point adopted envelope: {err}"),
+        )
+    })
 }
 
 pub struct ProduceConfig<'a> {
@@ -1246,20 +1341,29 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn produce_returns_validated_handoff_envelopes() {
-        use crate::transport::{TransportKind, ANALYSIS_SIDECAR, FRAME_METADATA, FRAME_PNG};
+    struct HandoffFixture {
+        root: PathBuf,
+        frames_dir: PathBuf,
+        analysis_dir: PathBuf,
+        analysis_text: String,
+        sequence: FrameSequence,
+    }
+
+    /// Produce one frame with a real metadata/analysis sidecar and a PNG through
+    /// a fake native producer, returning the producer-layout artifacts.
+    #[cfg(unix)]
+    fn produce_handoff_fixture(label: &str) -> HandoffFixture {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("test-tmp")
-            .join(format!("frame-handoff-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let input_dir = dir.join("input");
-        let frames_dir = dir.join("frames");
-        let logs_dir = dir.join("logs");
-        let analysis_dir = dir.join("analysis");
+            .join(format!("{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let input_dir = root.join("input");
+        let frames_dir = root.join("frames");
+        let logs_dir = root.join("logs");
+        let analysis_dir = root.join("analysis");
         fs::create_dir_all(&input_dir).expect("create input dir");
         let source_path = input_dir.join("IMG_0001.DNG");
         fs::write(&source_path, b"placeholder").expect("write source frame");
@@ -1285,7 +1389,7 @@ mod tests {
             analysis,
             analysis_path.display()
         );
-        let tool = dir.join("fake-native.sh");
+        let tool = root.join("fake-native.sh");
         fs::write(&tool, script).expect("write fake producer");
         let mut permissions = fs::metadata(&tool).expect("stat producer").permissions();
         permissions.set_mode(0o755);
@@ -1309,9 +1413,27 @@ mod tests {
             log_relative_dir: "logs",
         };
         let sequence = produce(&tool, &sources, &config).expect("produce one frame");
-        let frame = &sequence.frames[0];
+        HandoffFixture {
+            root,
+            frames_dir,
+            analysis_dir,
+            analysis_text: analysis.to_string(),
+            sequence,
+        }
+    }
 
-        assert_eq!(frame.metadata_artifact.path(), metadata_path);
+    #[cfg(unix)]
+    #[test]
+    fn produce_returns_validated_handoff_envelopes() {
+        use crate::transport::{TransportKind, ANALYSIS_SIDECAR, FRAME_METADATA, FRAME_PNG};
+
+        let fixture = produce_handoff_fixture("frame-handoff");
+        let frame = &fixture.sequence.frames[0];
+
+        assert_eq!(
+            frame.metadata_artifact.path(),
+            fixture.frames_dir.join("frame_000001.json")
+        );
         assert_eq!(frame.metadata_envelope.semantic_type(), FRAME_METADATA);
         assert_eq!(
             frame.metadata_envelope.transport_kind(),
@@ -1327,14 +1449,17 @@ mod tests {
         }
 
         let png_artifact = frame.png_artifact.as_ref().expect("png artifact");
-        assert_eq!(png_artifact.path(), png_path);
+        assert_eq!(png_artifact.path(), fixture.frames_dir.join("frame_000001.png"));
         assert_eq!(png_artifact.media_type(), "image/png");
         let png_envelope = frame.png_envelope.as_ref().expect("png envelope");
         assert_eq!(png_envelope.semantic_type(), FRAME_PNG);
         assert_eq!(png_envelope.transport_kind(), TransportKind::DiskArtifact);
 
         let analysis_artifact = frame.analysis_artifact.as_ref().expect("analysis artifact");
-        assert_eq!(analysis_artifact.path(), analysis_path);
+        assert_eq!(
+            analysis_artifact.path(),
+            fixture.analysis_dir.join("frame_000001.analysis.json")
+        );
         let loaded = analysis_sidecar_envelope(analysis_artifact, frame.source_sha256.as_deref())
             .expect("validated analysis envelope");
         assert_eq!(loaded.envelope.semantic_type(), ANALYSIS_SIDECAR);
@@ -1348,5 +1473,90 @@ mod tests {
             Err(other) => panic!("unexpected mismatch error: {other:?}"),
             Ok(_) => panic!("mismatched source hash was accepted"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopted_sequence_repoints_every_typed_reference() {
+        use crate::transport::{TransportKind, FRAME_PNG};
+
+        let fixture = produce_handoff_fixture("frame-adoption");
+        let original_metadata =
+            fs::read(fixture.frames_dir.join("frame_000001.json")).expect("producer metadata");
+        let original_analysis = fs::read(fixture.analysis_dir.join("frame_000001.analysis.json"))
+            .expect("producer analysis sidecar");
+        let before_png = fixture.sequence.frames[0]
+            .png_envelope
+            .clone()
+            .expect("producer png envelope");
+
+        // The adoption flow moves the producer round and its analysis directory
+        // to the final names before the sequence is remapped.
+        let adopted_frames = fixture.root.join("output/frames");
+        let adopted_analysis = fixture.root.join("output/analysis/applied");
+        fs::create_dir_all(adopted_frames.parent().expect("frames parent"))
+            .expect("create output dir");
+        fs::create_dir_all(adopted_analysis.parent().expect("analysis parent"))
+            .expect("create analysis parent");
+        fs::rename(&fixture.frames_dir, &adopted_frames).expect("adopt frames");
+        fs::rename(&fixture.analysis_dir, &adopted_analysis).expect("adopt analysis");
+
+        let adopted = fixture
+            .sequence
+            .adopt_output_locations(&adopted_frames, Some(&adopted_analysis), "logs/applied")
+            .expect("adopt output locations");
+        let frame = &adopted.frames[0];
+
+        let png_path = adopted_frames.join("frame_000001.png");
+        let metadata_path = adopted_frames.join("frame_000001.json");
+        let analysis_path = adopted_analysis.join("frame_000001.analysis.json");
+
+        assert_eq!(frame.png_relative, "frames/frame_000001.png");
+        assert_eq!(frame.metadata_relative, "frames/frame_000001.json");
+        assert_eq!(frame.log_relative, "logs/applied/frame_000001.log");
+
+        let png_artifact = frame.png_artifact.as_ref().expect("adopted png artifact");
+        assert_eq!(png_artifact.path(), png_path);
+        assert!(png_artifact.path().is_file(), "adopted PNG must exist");
+        assert_eq!(png_artifact.media_type(), "image/png");
+
+        let png_envelope = frame.png_envelope.as_ref().expect("adopted png envelope");
+        assert_eq!(png_envelope.semantic_type(), FRAME_PNG);
+        assert_eq!(png_envelope.transport_kind(), TransportKind::DiskArtifact);
+        match png_envelope.payload() {
+            Payload::DiskArtifact(artifact) => {
+                assert_eq!(artifact.path(), png_path);
+                assert!(artifact.path().is_file(), "envelope payload must exist");
+            }
+            other => panic!("unexpected png payload {other:?}"),
+        }
+        assert_eq!(png_envelope.metadata(), before_png.metadata());
+        assert!(png_envelope
+            .provenance()
+            .parent_value_ids()
+            .iter()
+            .any(|id| id == before_png.value_id()));
+        assert_ne!(png_envelope.value_id(), before_png.value_id());
+
+        assert_eq!(frame.metadata_artifact.path(), metadata_path);
+        assert!(metadata_path.is_file(), "adopted metadata must exist");
+        assert_eq!(
+            fs::read(&metadata_path).expect("read metadata"),
+            original_metadata
+        );
+
+        let analysis_artifact = frame.analysis_artifact.as_ref().expect("analysis artifact");
+        assert_eq!(analysis_artifact.path(), analysis_path);
+        assert!(analysis_path.is_file(), "adopted analysis sidecar must exist");
+        assert_eq!(frame.analysis_path.as_deref(), Some(analysis_path.as_path()));
+
+        let loaded = transport::load(analysis_artifact).expect("adopted analysis artifact loads");
+        assert_eq!(loaded.bytes(), original_analysis.as_slice());
+        let envelope = analysis_sidecar_envelope(analysis_artifact, frame.source_sha256.as_deref())
+            .expect("adopted analysis envelope");
+        assert_eq!(
+            std::str::from_utf8(envelope.bytes()).expect("analysis bytes"),
+            fixture.analysis_text
+        );
     }
 }

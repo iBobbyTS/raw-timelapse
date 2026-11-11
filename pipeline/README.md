@@ -394,7 +394,13 @@ path/argv based; only the handoff between pipeline stages is typed.
   renames exactly the validated references.
 
 The typed layer only adds rejections: argv, sidecar/manifest byte formats, exit
-codes, log-line semantics and deliverable content are unchanged.
+codes, log-line semantics and deliverable content are unchanged. When a
+deflicker application round is adopted as the final `frames/` directory (and its
+analysis directory as `analysis/applied`), the sequence re-points every typed
+disk reference and rebuilds the PNG envelope at the adopted absolute paths:
+semantic type, metadata and payload kind stay identical, the producer envelope
+is recorded as a lineage parent, and the recorded relative paths are rewritten
+as before.
 
 ## Failure semantics and exit codes
 

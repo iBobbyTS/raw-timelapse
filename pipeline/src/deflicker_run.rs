@@ -625,10 +625,16 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
             ),
         )
     })?;
+    let mut adopted_analysis_dir: Option<PathBuf> = None;
     if let Some(analysis_dir) = round_analysis_dir(context, best.state.iteration) {
         let final_dir = output.join("analysis/applied");
         let _ = fs::remove_dir_all(&final_dir);
-        let _ = fs::rename(&analysis_dir, &final_dir);
+        // If the rename fails the round directory is still the real location;
+        // the adopted references must point at existing files either way.
+        adopted_analysis_dir = Some(match fs::rename(&analysis_dir, &final_dir) {
+            Ok(()) => final_dir,
+            Err(_) => analysis_dir,
+        });
     }
     let applied_logs = context
         .output
@@ -638,7 +644,11 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         let _ = fs::remove_dir_all(&final_logs);
         let _ = fs::rename(&applied_logs, &final_logs);
     }
-    let final_sequence = best.sequence.clone().remap_output_paths("logs/applied");
+    let final_sequence = best.sequence.clone().adopt_output_locations(
+        &frames_dir,
+        adopted_analysis_dir.as_deref(),
+        "logs/applied",
+    )?;
     println!(
         "accepted render round {} with {} frame(s)",
         best.state.iteration + 1,
