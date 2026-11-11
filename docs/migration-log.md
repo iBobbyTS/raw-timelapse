@@ -374,3 +374,32 @@ native 新增回归覆盖：非 TIFF 输入与 TIFF 无 DNGVersion（CR2/NEF/ARW
 - **NOT_TESTED**：Windows/Linux（本适配器与预览编码均 macOS）；TIFF 系厂商 RAW 真机样本（CR2/NEF/ARW/PEF/3FR/FFF）——AC1 用合成"经典 TIFF 无 DNGVersion"最小目录覆盖判型，未验证各厂商真实文件的 ADC 产物；非 TIFF 真机样本仅 CR3 用于 AC3/AC4；>4096 素材的预览仅由 cr3/dxo 两类真实素材覆盖，未覆盖极端宽高比真机素材（退化宽高比仅有单测）。
 - **UNKNOWN**：普通 TIFF/JPEG 图像交 ADC 的失败文案/耗时（无专门支持承诺，仅要求显式报错）；ADC 对厂商 RAW 的裁剪/元数据烘焙细节沿用既有声明；不同 VideoToolbox/ffmpeg 版本对 SEI 时间戳与压缩行为的一致性。
 - 未改动：`frame.rs`/`manifest.rs` 的其余语义、`video.rs` 的 FFV1/往返/发布路径、去闪引擎语义、ADC 调用参数与验证逻辑、白平衡冻结、错误码家族；未新增 fallback/LibRaw/白名单/分辨率预检。`manifest.rs` 仅新增 preview.scale 并把 `preview.encoder_parameters` 的 `-vf` 改为实际链。
+
+## 白平衡模式选择：`--white-balance first-frame|per-frame`（2026-11-11，普通流程）
+
+- 日期：2026-11-11
+- 权威：用户请求（每帧按 RAW 内白平衡数据 / 整段按第一帧白平衡，两模式均可选）；现行冻结合同（README 白平衡节 + `frame.rs` 校验）；原生生产者合同（`native/dng-linear-frame/src/decode.cpp` 的 `applied = wb.value_or(as_shot)` 与 `src/main.cpp` 的 `white_balance_source = wb ? "override" : "as-shot"`，本次 SOURCE_INSPECTED，零改动）。
+- 提交物：`pipeline/src/{cli,frame,deflicker_run,manifest}.rs`、`pipeline/tests/{pipeline_cli.rs,common/{mod.rs,fake_native_main.rs}}`、`pipeline/README.md`、本文件。
+
+### 行为变更
+
+- 新增 CLI 选项 `--white-balance <first-frame|per-frame>`（含 `--white-balance=per-frame` 内联形式），默认 `first-frame`。`cli.rs` 的 USAGE 同步记录两模式。
+- **默认路径承诺**：`first-frame` 与改动前逐字节一致——第 1 帧原生 argv 无 `--white-balance`，后续帧携带冻结三元组 `--white-balance R,G,B`；`manifest.json` 的 `white_balance` 七个字段（`strategy`/`reference_frame`/`reference_source`/`reference`/`propagation`/`all_applied_equal`/`per_frame_as_shot_neutral`）字面不变；运行摘要仍打印 `frozen white balance: … from … (applied to every later frame)`。
+- **`per-frame` 语义**：每个数字序帧以自身 RAW 的 as-shot neutral 显影。任何 pass——`--strength 0` 单程、baseline analysis、final render、gain probe——都不向原生工具传 `--white-balance`。每帧 sidecar 必须报 `white_balance_source: "as-shot"`，且 `applied_white_balance` 与该帧自身 `as_shot_neutral` 严格相等（逐位 f64，复用既有严格比较）。per-frame 无跨帧相等要求；`first-frame` 的冻结告警检测（override 缺失或 applied 漂移）全部保留。
+- **校验共享强化**：任何报 `as-shot` 的帧，其 applied 必须等于自身 `as_shot_neutral`。该分支覆盖 `first-frame` 的第 1 帧、`per-frame` 的每一帧以及所有 probe。
+- **错误码**：非法或空 `--white-balance` 值 → `EXIT_USAGE`(2)，消息点名 `--white-balance`；谎报（未传覆盖却报 `override`、报 `as-shot` 但 applied ≠ own）在单程/baseline/render pass 暴露 → `EXIT_FRAME`(30)；若同类谎言仅在 gain probe pass 暴露，沿用现行 `EXIT_GAIN_PROBE`(81) 包装与 `GAIN_PROBE_FAILED` 状态，错误码家族不变。
+- **默认路径失败行为收紧（行为变更）**：此前第 1 帧 sidecar 只校验来源标签 `as-shot`；若它同时谎报 `applied_white_balance` ≠ 自身 `as_shot_neutral`，该假值会被当作冻结引用传给后续帧。现在共享强化会在同一帧层校验中拒绝该帧。真实原生合同下该状态不可达，但伪生产者或回归会被 fail-fast 拦下。
+- **记录**：`manifest.json` 的 `white_balance.strategy` 为 `sequence-frozen (REQ-008)`（默认，字段不变）或 `per-frame`；后者 `reference_frame`/`reference_source`/`reference` 为 `null`（不宣称冻结引用），`propagation` 说明每帧用自身 as-shot 且任何 pass 不传覆盖。per-frame 运行摘要打印 `per-frame white balance: every frame decoded with its own as-shot neutral (no --white-balance override)`，不出现 `applied to every later frame`。
+- **去闪交互**：per-frame 下帧间色温差异是设计行为；去闪节点只测量并校正曝光亮度，不追白平衡漂移、不做平滑/插值。不支持任意 R,G,B 自定义白平衡数值，也不实施额外的"自动"白平衡（as-shot 即 RAW 内记录的白平衡数据）。
+- 未改动：`native/**`、FFV1 母版、预览/色彩 profile、审计、RAW 路由、帧 PNG 语义、去闪算法与错误码家族。
+
+### 检查（实测）
+
+- `cargo clean` + `cargo test`（仓库根，`--manifest-path pipeline/Cargo.toml`）：**173 passed, 0 failed**（90 lib + 61 bin + 22 集成），真实退出码 0。证据：`.agent-work/tmp/rawtl-white-balance-modes/impl-cargo-clean.log`、`impl-cargo-test.log`、`impl-cargo-test.exit-code`。
+- 新增 7 个测试：CLI 单测覆盖两模式、内联形式、默认值与非法/空值拒绝（错误点名旗标）；集成覆盖 per-frame 单程（逐帧 different as-shot、argv 无覆盖、manifest/摘要措辞、FFV1+预览）、per-frame 默认去闪（30 帧、gain probe 真实激活且 PASS、baseline/probe/render 全部无覆盖且报 as-shot）、两类谎报负例（exit 30）、默认运行冻结回归（第 1 帧无覆盖/后续帧冻结三元组、七字段字面块、冻结摘要行）。
+
+### 未覆盖 / 边界
+
+- 真实原生工具与真实 RAW 素材未在本任务重跑（`native/**` 零改动，两模式均依赖其既有合同）；per-frame 的真实素材端到端运行与色温漂移的主观观感未验证。
+- gain probe 内暴露的白平衡谎言沿用既有 81 包装，仅由代码路径保证，无独立集成负例（既有 probe 失败路径未改动）。
+- Windows/Linux 未测（与既有管线一致，仅 macOS）。

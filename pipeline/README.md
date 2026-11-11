@@ -3,7 +3,8 @@
 Rust driver for the end-to-end linear time-lapse system: enumerate a directory
 of DNG frames (LinearRaw or CFA) or of any other RAW format the Adobe DNG
 Converter can parse, call the accepted `dng-linear-frame` producer,
-freeze the sequence white balance, run the legacy V4 deflicker node (enabled by
+apply the selected white balance mode (sequence-frozen first frame by default),
+run the legacy V4 deflicker node (enabled by
 default), encode a lossless 16-bit scene-linear FFV1 video, validate it by full
 decode roundtrip, audit the encoded result independently, render a
 display-referred sRGB review preview, and publish both deliverables atomically.
@@ -28,6 +29,7 @@ The binary is `pipeline/target/release/rawtl-linear-video`.
 ```sh
 rawtl-linear-video --input <RAW_DIR> --output <RUN_DIR> \
   [--fps 30] \
+  [--white-balance first-frame|per-frame] \
   [--dng-linear-frame /abs/path/to/dng-linear-frame] \
   [--ffmpeg /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg] \
   [--ffprobe /opt/homebrew/opt/ffmpeg-full/bin/ffprobe] \
@@ -48,6 +50,10 @@ Defaults:
 - `--fps 30` — the frozen legacy default (`legacy/python/src/rawtl/cli.py:91`,
   `Fraction(30)`). Rational rates such as `30000/1001` are accepted; the
   positive-rate and `<= 1000` bounds match the legacy parser.
+- `--white-balance first-frame` — the default and the historical behaviour: the
+  first numerically ordered frame's as-shot neutral is frozen for the whole
+  sequence. `per-frame` decodes every frame with its own RAW as-shot neutral
+  (see *White balance modes* below).
 - Deflicker defaults (`legacy/python/src/rawtl/cli.py:95-114`, amended
   2026-11-11): strength 1.0, period 60, brightness smooth, estimator
   pairwise, unbounded EV, full-frame ROI, no exclusions or confirmed steps.
@@ -78,9 +84,10 @@ contain each other in either direction. The input directory is only read.
   exposure-curve.csv      legacy write_curve fields, one row per frame
   temporal_audit.json     independent encoded-video audit (when executed)
   pairs.csv, frames.csv   audit pair/frame evidence
-  manifest.json           run provenance, frozen WB, fps provenance, encoder
-                          parameters, probe results, roundtrip/preview checks and
-                          the deflicker block (config, status counts, audit summary)
+  manifest.json           run provenance, white-balance mode/provenance, fps
+                          provenance, encoder parameters, probe results,
+                          roundtrip/preview checks and the deflicker block
+                          (config, status counts, audit summary)
   linear-acescg-16bit-ffv1.mkv
   srgb-preview-h264.mp4
 ```
@@ -116,15 +123,35 @@ non-TIFF containers such as CR3, TIFF containers without DNGVersion such as
 CR2/NEF/ARW, or ordinary images — the Converter decides). All frames must share
 one resolution; a mismatch is a hard decode-time error with no video produced.
 
-## Sequence-frozen white balance (REQ-008)
+## White balance modes (--white-balance)
 
-The first numerically ordered frame is decoded with its own AsShotNeutral
-(`white_balance_source: "as-shot"`). Its `applied_white_balance` triple is then
-passed to every later frame as `--white-balance R,G,B` (camera-neutral domain,
-not reciprocal gains). Each later sidecar must report
-`white_balance_source: "override"` and exactly the same applied triple; a
-mismatch stops the run. Every frame keeps its own `as_shot_neutral` for
-provenance. No per-frame auto white balance is performed.
+`--white-balance` selects how the scene-linear decode derives its camera
+neutral. The default, `first-frame`, keeps the historical sequence-frozen
+contract and produces byte-identical arguments, manifest and log lines to
+earlier runs; `per-frame` follows each RAW frame's own as-shot neutral.
+
+- `first-frame` (default, REQ-008): the first numerically ordered frame is
+  decoded with its own AsShotNeutral (`white_balance_source: "as-shot"`). Its
+  `applied_white_balance` triple is then passed to every later frame as
+  `--white-balance R,G,B` (camera-neutral domain, not reciprocal gains). Each
+  later sidecar must report `white_balance_source: "override"` and exactly the
+  same applied triple; a mismatch stops the run.
+- `per-frame`: every frame is decoded with its own RAW AsShotNeutral. The
+  pipeline passes no `--white-balance` to the native producer in any pass —
+  deflicker-disabled single pass, baseline analysis, render and gain probe
+  alike. Each sidecar must report `white_balance_source: "as-shot"` with
+  `applied_white_balance` exactly equal to that frame's `as_shot_neutral`.
+
+In both modes every frame keeps its own `as_shot_neutral`, and any sidecar that
+reports `as-shot` must have applied exactly that neutral: a producer that lies
+about its source or its applied value is rejected at the frame layer instead of
+becoming the frozen reference. `per-frame` renders the camera's per-frame white
+balance by design, so colour temperature may drift between frames. The
+deflicker node measures and corrects exposure brightness only; it never smooths
+or corrects white balance. The chosen mode is recorded in `manifest.json`
+(`white_balance.strategy`, with `reference*` fields null in `per-frame` mode)
+and in the run summary. No per-frame "auto" white balance is performed:
+as-shot *is* the white balance data stored in the RAW.
 
 ## Linear video
 
@@ -203,7 +230,9 @@ Enabled path:
 
 1. **Analysis pass** — every frame is decoded at 0 EV with
    `--no-png --emit-analysis`, using the accepted native producer and the
-   unchanged sequence-frozen white balance. Only measurements are kept. The
+   selected white balance mode (the frozen frame-1 override in `first-frame`;
+   each frame's own as-shot neutral, with no override, in `per-frame`). Only
+   measurements are kept. The
    native metadata `exposure_ev` is checked at full precision; the analysis
    sidecar's `exposure_ev` is checked at the producer's 10-significant-digit
    decimal precision (exact 10-digit representation or half a decimal ulp), so

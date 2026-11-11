@@ -1,10 +1,17 @@
 //! Per-frame production: invoke the accepted native producer, verify its
-//! outputs, and enforce the sequence-frozen white balance.
+//! outputs, and enforce the selected white balance mode.
 //!
 //! One function serves every pass: the deflicker-disabled single pass uses the
 //! exact historical argument shape (no optional flags), while deflicker passes
 //! add `--exposure-ev`, `--emit-analysis` and optionally `--no-png`.
+//!
+//! White balance modes: `first-frame` decodes frame 1 with its as-shot neutral
+//! and passes that triple to every later frame as `--white-balance`;
+//! `per-frame` never passes the flag, so every frame decodes with its own RAW
+//! as-shot neutral. In both modes a sidecar that reports `as-shot` must have
+//! applied exactly that frame's `as_shot_neutral`.
 
+use crate::cli::WhiteBalance;
 use crate::error::{Error, Result, EXIT_FRAME};
 use crate::json::{self, Json};
 use crate::order::SourceFrame;
@@ -76,6 +83,10 @@ pub struct ProduceConfig<'a> {
     pub no_png: bool,
     pub echo: bool,
     pub echo_tag: &'a str,
+    /// How the sequence derives its camera neutral. `first-frame` passes the
+    /// frozen frame-1 triple to later frames; `per-frame` never passes
+    /// `--white-balance`.
+    pub white_balance: WhiteBalance,
     pub converter: Option<&'a str>,
     pub converter_timeout: Option<u64>,
     /// Recorded relative frame directory (for the manifest).
@@ -152,6 +163,7 @@ fn produce_inner(
     let total = sources.len();
     let mut infos = Vec::with_capacity(total);
     let mut reference_wb: Option<[f64; 3]> = None;
+    let freezes_reference = config.white_balance.freezes_reference();
     let mut width = 0u32;
     let mut height = 0u32;
     let run_start = std::time::Instant::now();
@@ -162,7 +174,14 @@ fn produce_inner(
             Some(evs) => Some(evs[offset]),
             None => config.exposure_ev,
         };
-        let info = run_frame(native_tool, source, index, total, reference_wb, ev, config)?;
+        // `per-frame` decodes every frame with its own as-shot neutral, so the
+        // producer never receives an override in any pass.
+        let override_wb = if freezes_reference {
+            reference_wb
+        } else {
+            None
+        };
+        let info = run_frame(native_tool, source, index, total, override_wb, ev, config)?;
         if index == 1 {
             width = info.width;
             height = info.height;
@@ -177,24 +196,28 @@ fn produce_inner(
                     ),
                 ));
             }
-            let reference = reference_wb.expect("reference set by first frame");
-            if info.wb_source != WB_SOURCE_OVERRIDE {
-                return Err(Error::new(
-                    EXIT_FRAME,
-                    format!(
-                        "frame {index}/{total} ({}) should use the frozen override white balance, metadata reports {:?}",
-                        source.name, info.wb_source
-                    ),
-                ));
-            }
-            if !wb_close(info.applied_wb, reference) {
-                return Err(Error::new(
-                    EXIT_FRAME,
-                    format!(
-                        "frame {index}/{total} ({}) applied white balance {:?} differs from the frozen reference {:?}",
-                        source.name, info.applied_wb, reference
-                    ),
-                ));
+            // Only the frozen mode requires cross-frame equality; `per-frame`
+            // already validated as-shot equality per frame in `run_frame`.
+            if freezes_reference {
+                let reference = reference_wb.expect("reference set by first frame");
+                if info.wb_source != WB_SOURCE_OVERRIDE {
+                    return Err(Error::new(
+                        EXIT_FRAME,
+                        format!(
+                            "frame {index}/{total} ({}) should use the frozen override white balance, metadata reports {:?}",
+                            source.name, info.wb_source
+                        ),
+                    ));
+                }
+                if !wb_close(info.applied_wb, reference) {
+                    return Err(Error::new(
+                        EXIT_FRAME,
+                        format!(
+                            "frame {index}/{total} ({}) applied white balance {:?} differs from the frozen reference {:?}",
+                            source.name, info.applied_wb, reference
+                        ),
+                    ));
+                }
             }
         }
         if config.echo {
@@ -230,12 +253,14 @@ fn produce_inner(
     })
 }
 
-/// Produce one frame with an already frozen white balance (analysis probes).
+/// Produce one frame for an analysis probe. `override_wb` is `Some` only in
+/// `first-frame` mode (the frozen triple); `per-frame` passes `None`, so the
+/// probe decodes with the frame's own as-shot neutral like every other pass.
 /// `stem_index` names the outputs, so consecutive probes never collide.
 pub fn produce_single(
     native_tool: &Path,
     source: &SourceFrame,
-    reference_wb: [f64; 3],
+    override_wb: Option<[f64; 3]>,
     stem_index: usize,
     config: &ProduceConfig<'_>,
 ) -> Result<FrameInfo> {
@@ -270,7 +295,7 @@ pub fn produce_single(
         source,
         stem_index,
         1,
-        Some(reference_wb),
+        override_wb,
         config.exposure_ev,
         config,
     )
@@ -281,7 +306,7 @@ fn run_frame(
     source: &SourceFrame,
     index: usize,
     total: usize,
-    reference_wb: Option<[f64; 3]>,
+    override_wb: Option<[f64; 3]>,
     exposure_ev: Option<f64>,
     config: &ProduceConfig<'_>,
 ) -> Result<FrameInfo> {
@@ -298,7 +323,7 @@ fn run_frame(
         png.display().to_string(),
         metadata.display().to_string(),
     ];
-    if let Some(reference) = reference_wb {
+    if let Some(reference) = override_wb {
         args.push("--white-balance".to_string());
         args.push(format_wb(reference));
     }
@@ -463,7 +488,7 @@ fn run_frame(
         .ok_or_else(|| missing_field(index, total, &source.name, "white_balance_source"))?
         .to_string();
 
-    if reference_wb.is_none() {
+    if override_wb.is_none() {
         if wb_source != WB_SOURCE_AS_SHOT {
             return Err(Error::new(
                 EXIT_FRAME,
@@ -479,6 +504,21 @@ fn run_frame(
             format!(
                 "frame {index}/{total} ({}) should use the frozen override white balance, metadata reports {wb_source:?}",
                 source.name
+            ),
+        ));
+    }
+
+    // A producer that reports `as-shot` must have applied exactly that frame's
+    // as_shot_neutral. This covers the first frame of `first-frame` mode, every
+    // frame of `per-frame` mode and every probe: a lying sidecar can never
+    // smuggle a different neutral into the sequence or into the frozen
+    // reference.
+    if wb_source == WB_SOURCE_AS_SHOT && !wb_close(applied_wb, as_shot_neutral) {
+        return Err(Error::new(
+            EXIT_FRAME,
+            format!(
+                "frame {index}/{total} ({}) reports as-shot white balance but applied {:?} differs from its own as_shot_neutral {:?}",
+                source.name, applied_wb, as_shot_neutral
             ),
         ));
     }
