@@ -11,7 +11,7 @@
 //! validation or audit) and records DISABLED frame statuses.
 
 use crate::audit::{self, AuditConfig};
-use crate::cli::{DeflickerConfig, Estimator, TemporalQuality};
+use crate::cli::{DeflickerConfig, Estimator, TemporalQuality, WhiteBalance};
 use crate::error::{
     Error, Result, EXIT_FRAME, EXIT_GAIN_PROBE, EXIT_PUBLISH, EXIT_RENDER_VALIDATION,
 };
@@ -152,13 +152,14 @@ fn run_disabled(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         no_png: false,
         echo: true,
         echo_tag: "frame ",
+        white_balance: options.white_balance,
         converter: options.converter.as_deref(),
         converter_timeout: options.converter_timeout,
         frames_relative_dir: "frames",
         log_relative_dir: "logs",
     };
     let sequence = frame::produce(&options.native_tool, context.sources, &config)?;
-    print_sequence_summary(&sequence);
+    print_sequence_summary(&sequence, options.white_balance);
     state.capture_times = sequence
         .frames
         .iter()
@@ -204,6 +205,7 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         no_png: true,
         echo: true,
         echo_tag: "analysis ",
+        white_balance: options.white_balance,
         converter: options.converter.as_deref(),
         converter_timeout: options.converter_timeout,
         frames_relative_dir: "analysis/baseline/meta",
@@ -211,7 +213,7 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
     };
     println!("\nanalysis pass (0 EV, tile measurements only)...");
     let baseline = frame::produce(&options.native_tool, context.sources, &analysis_config)?;
-    print_sequence_summary(&baseline);
+    print_sequence_summary(&baseline, options.white_balance);
     let n = baseline.frames.len();
 
     state.filenames = baseline
@@ -779,6 +781,7 @@ fn apply_pass(
         no_png: false,
         echo: true,
         echo_tag: "render ",
+        white_balance: options.white_balance,
         converter: options.converter.as_deref(),
         converter_timeout: options.converter_timeout,
         frames_relative_dir: "frames",
@@ -862,16 +865,25 @@ fn run_gain_probe(
                 no_png: true,
                 echo: false,
                 echo_tag: "probe ",
+                white_balance: options.white_balance,
                 converter: options.converter.as_deref(),
                 converter_timeout: options.converter_timeout,
                 frames_relative_dir: "analysis/probe/meta",
                 log_relative_dir: "logs/probe",
             };
             let stem_index = index * 2 + if ev > 0.0 { 2 } else { 1 };
+            // `first-frame` probes the gain with the frozen reference; the
+            // `per-frame` probe passes no override and decodes with the frame's
+            // own as-shot neutral, exactly like every other pass.
+            let probe_wb = if options.white_balance.freezes_reference() {
+                Some(baseline.reference_wb)
+            } else {
+                None
+            };
             let info = frame::produce_single(
                 &options.native_tool,
                 &context.sources[index],
-                baseline.reference_wb,
+                probe_wb,
                 stem_index,
                 &config,
             )
@@ -1970,12 +1982,19 @@ fn status_for_exit(code: i32) -> &'static str {
     }
 }
 
-fn print_sequence_summary(sequence: &FrameSequence) {
-    println!(
-        "frozen white balance: {} from {} (applied to every later frame)",
-        frame::format_wb(sequence.reference_wb),
-        sequence.reference_frame
-    );
+fn print_sequence_summary(sequence: &FrameSequence, white_balance: WhiteBalance) {
+    if white_balance.freezes_reference() {
+        println!(
+            "frozen white balance: {} from {} (applied to every later frame)",
+            frame::format_wb(sequence.reference_wb),
+            sequence.reference_frame
+        );
+    } else {
+        println!(
+            "per-frame white balance: every frame decoded with its own as-shot neutral \
+             (no --white-balance override)"
+        );
+    }
     println!(
         "frames complete: {} frames of {}x{} in {:.2}s",
         sequence.frames.len(),
