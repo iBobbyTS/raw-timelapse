@@ -500,3 +500,11 @@ native 新增回归覆盖：非 TIFF 输入与 TIFF 无 DNGVersion（CR2/NEF/ARW
   - `NOT_TESTED`：Windows/Linux 与其它 FFmpeg/VideoToolbox 版本；容器字节级一致性不作为等价条件（Matroska 元数据可变），逐帧解码内容与 manifest 语义才是 oracle。
   - `NOT_TESTED`：CLI 级无法在不改变外部格式的前提下制造内部 `NdArray` 几何不匹配；该拒绝由构造层单测直接覆盖，真实路径的成功运行证明同一构造/校验函数被执行。
   - 本条目记录实现与执行证据，不代表独立评审或 Feature 验收；提交由 Main 负责。
+
+### 修复（adoption 后的类型化引用，2026-11-11）
+
+- 问题（评审发现，P2）：去闪 adopt 应用轮时，旧的 `remap_output_paths` 只改写相对字符串；`png_artifact`、`png_envelope` 内的 DiskArtifact、`metadata_artifact` 与 `analysis_artifact` 仍指向 rename 前的 producer 路径。接受后的 FrameSequence 因此携带失效的 typed 引用（路径不存在；对 adopted analysis 引用执行 `transport::load` 得到 ENOENT）。CLI 产物仍正确仅因为编码阶段独立重建 `frames/` 路径，类型化交接未通过自身正常生命周期。
+- 修复：以 `FrameSequence::adopt_output_locations(frames_dir, analysis_dir, log_dir_rel)` 取代 `remap_output_paths`。adoption 后按最终绝对路径重建 PNG / metadata / analysis 的 `DiskArtifact`（保留 media type、size、hash）与 PNG envelope（保留语义类型、元数据与 payload 类型；新 envelope 以 producer envelope 为 lineage parent，语义同 `DataEnvelope::patch`），并同步 `analysis_path`。analysis 目录 rename 失败时引用回退到仍然存在的 round 目录，保证引用可解析。契约层构造器与 transport 语义未改动；未新增隐式 persist/load、CLI 旗标、argv/日志/manifest 字段或错误码。
+- 新增测试：`adopted_sequence_repoints_every_typed_reference` 在真实 rename 后断言四个 disk 引用均指向存在文件、PNG envelope 的元数据与 lineage 正确、对 adopted analysis 引用执行 `transport::load` 成功且字节等于原 sidecar。该测试在临时还原为旧 remap 行为时以路径断言失败（真实退出码 101），证明其对目标缺陷敏感。
+- 检查（实测）：`cargo clean` + `cargo test` 真实退出码 **0**，141 lib + 62 bin + 31 集成 = **234 passed**，3 个 compile-fail doctest 通过；默认参数真实素材重跑真实退出码 **0**，FFV1 解码 framemd5 与冻结基线 diff 退出码 **0**，manifest 语义比较 0 差异；`git diff --check` 退出码 **0**。证据：`.agent-work/tmp/pipeline-typed-transports/` 下 `repair-cargo-clean.*`、`repair-cargo-test.*`、`repair-pre-repair-test.*`、`repair-run-default.*`、`repair-default-framemd5.*`、`repair-manifest-default.compare.*`、`repair-adopted-artifacts.*`、`repair-diff-check.*`、`repair-protected-paths.*`、`repair-source-hashes.*`。
+- 未覆盖：与前节相同（Windows/Linux、其它 FFmpeg/VideoToolbox 版本）。analysis 目录 rename 失败的运行期分支未做故障注入，仅由“回退到实际 round 目录”的代码路径保证。
