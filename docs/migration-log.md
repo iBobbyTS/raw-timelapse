@@ -457,3 +457,54 @@ native 新增回归覆盖：非 TIFF 输入与 TIFF 无 DNGVersion（CR2/NEF/ARW
 - 真实原生工具与真实 RAW 素材未在本任务重跑（`native/**` 零改动，两模式均依赖其既有合同）；per-frame 的真实素材端到端运行与色温漂移的主观观感未验证。
 - gain probe 内暴露的白平衡谎言沿用既有 81 包装，仅由代码路径保证，无独立集成负例（既有 probe 失败路径未改动）。
 - Windows/Linux 未测（与既有管线一致，仅 macOS）。
+
+## 阶段间类型化传输契约层（2026-11-11）
+
+- 权威：用户指定的三种载体与元数据；`docs/architecture-v2.6.md` §2.1–§2.6，按现有进程内流水线裁剪；纯 std、持久格式与 CLI 行为保持。
+- 新增：`pipeline/src/transport/mod.rs` 与模块内 `tests.rs`；`pipeline/src/lib.rs` 仅注册模块并修正库说明。包含 `DiskArtifact`、`MemoryFile`、Host `NdArray`、不可变 `DataEnvelope`、命名空间 `MetadataDoc` / `MetadataPatch`、provenance、六项产品语义注册表，以及显式 `persist` / `load`。无 Cargo 依赖变更。
+- 语义 ID：`rawtl.frame-png@1`、`rawtl.frame-metadata@1`、`rawtl.analysis-sidecar@1`、`rawtl.rgb48-frame@1`、`rawtl.rgb24-frame@1`、`rawtl.video-artifact@1`。注册表检查允许载体、必需元数据及其基本类型；RGB 另检查 dtype、HWC interleaved 布局、三通道、元数据宽高与 shape 一致，RGB48 要求 little endian。sidecar 内容仍须由既有解析器检查，注册表不替代其字段语义。
+- 不可变性：所有已发布元数据字段均按权威证据处理；冲突覆盖被拒绝，相同值可重复。patch 返回新 value ID、保留源 hash / 原有 lineage、追加直接 parent 并记录新 producer；载荷字节通过 `Arc<[u8]>` 共享，无 mutable accessor。若附带 `source.sha256`，它必须存在于 provenance 的 source hashes。
+- 数组合同：四种 dtype（U8/U16/I16/F32）；rank 1–8、非空轴、正向对齐且不重叠的 strides。rank-three 的 shape 坐标统一为 `[height,width,channels]`，planar 只改变存储顺序。构造期拒绝乘法/跨度溢出、offset 越界及 byte_length 不符；允许前缀与行间 padding，要求 backing 长度恰为 offset + 最后可访问跨度，不接受尾部无关字节。`read_only=false` 只描述生产意图，也不开放共享可写访问。
+- 文件合同：DiskArtifact 构造只检查非空路径和 media type，不隐式访问磁盘；MemoryFile 保留 content type 与不可变长度。persist 显式写入且拒绝覆盖已有路径；load 显式读取并检查可选声明 size。可选 hash 是引用声明，未在 load 中重新计算；调用方保留其既有 hash 校验政策。persist 写入中途失败可能留下新建的部分文件，不返回成功产物；本层不提供事务或缓存管理。
+
+### 检查与证据（实测）
+
+- 环境：macOS arm64；`rustc 1.99.1`、`cargo 1.99.1`；FFmpeg/FFprobe 8.0.1。全部命令从仓库根执行，PATH 前置 `/opt/homebrew/opt/ffmpeg-full/bin`；完整版本与 PATH 见 `.agent-work/tmp/pipeline-typed-transports/transport-environment.json`。
+- `cargo clean --manifest-path pipeline/Cargo.toml`：真实退出码 **0**，完整 stdout/stderr 见 `.agent-work/tmp/pipeline-typed-transports/transport-cargo-clean.log`，退出码见同名前缀 `.exit-code`。
+- `cargo test --manifest-path pipeline/Cargo.toml`：真实退出码 **0**；141 lib + 57 bin + 28 集成 = **226 passed, 0 failed**（原有 193 + 新增 33）；另有 **3 个 compile-fail doctest 全绿**。完整 stdout/stderr 见 `.agent-work/tmp/pipeline-typed-transports/transport-cargo-test.log`，真实进程退出码见同名前缀 `.exit-code`。
+- 新增负例逐项断言具体错误变体：shape/stride 溢出、offset 越界、字节长度不符、非法 dtype、空路径/content type、persist/load I/O 失败、声明 size 不符、六个语义的载体和每个必需字段缺失、RGB dtype/几何/布局/端序不符、元数据冲突及 provenance hash 不符。编译失败示例检查文件载体无隐式互转、已发布元数据不能原地修改。
+- 初次格式检查：`rustfmt --edition 2021 --check pipeline/src/lib.rs pipeline/src/transport/mod.rs pipeline/src/transport/tests.rs`，退出码 **1**；rustfmt 递归检查 lib 的既有模块，发现未改动的 `color_profile.rs` 常量换行差异；未修改该文件。原始输出与退出码保留为 `.agent-work/tmp/pipeline-typed-transports/transport-rustfmt-check.*`。
+- 限定本次文件的格式检查：`rustfmt --edition 2021 --config skip_children=true --check pipeline/src/lib.rs pipeline/src/transport/mod.rs pipeline/src/transport/tests.rs`，退出码 **0**；`git diff --check` 退出码 **0**。原始输出与退出码分别见 `.agent-work/tmp/pipeline-typed-transports/transport-rustfmt-check-local.*`、`transport-diff-check.*`。
+
+### 未覆盖 / 边界
+
+- `NOT_TESTED`：真实流水线接入三种载体后的端到端旅程及真实素材等价对照，属于下一实施单元；本次新模块仅由测试消费，未改 frame/deflicker_run/video/audit/manifest/cli/main 的运行行为。
+- `NOT_TESTED`：Windows/Linux、其它 FFmpeg/VideoToolbox 版本、磁盘写满时的部分写入故障注入。未实现 GPU/IPC/插件 ABI、自动转换、hash 重算、租约或事务持久化。
+- 本条目记录实现与执行证据，不代表独立评审或 Feature 验收；提交由 Main 负责。
+
+## 真实阶段边界的类型化交接接入（2026-11-11）
+
+- 权威：用户指定的三种载体+元数据、`docs/architecture-v2.6.md` §2.5/§2.6 与现行仓库合同。本条目消费既有 `pipeline/src/transport` 契约层（其语义未改动），在真实顺序流水线的阶段边界接入；原生工具与 FFmpeg 子进程边界继续使用文件路径与既有 argv。
+- 变更：
+  - 帧生产：产出的 PNG、metadata 与 analysis sidecar 以 `DiskArtifact` 引用交接（`image/png`、`application/json; charset=utf-8`）。metadata/analysis 内容先经 `transport::load` 成为 `MemoryFile`，再构造 `FRAME_METADATA` / `ANALYSIS_SIDECAR` envelope 做语义校验；`source.sha256` 必须同时出现在 provenance 的 source hashes 中，因此 sidecar 声明的源哈希与帧不匹配会被拒绝。校验通过后才运行既有 JSON 字段检查；`FrameInfo` 原字段、错误码与消息语义保持，另携带已校验的 envelope 引用。
+  - 测量消费：去闪 baseline/applied/probe 的 analysis sidecar 解析改为消费上述 envelope 的已校验字节，估计、回退、渲染与探针逻辑未改动。
+  - 预览与回环：预览 `rgb48le` 管道帧按 `U16`、`[height,width,3]`、HWC interleaved、little endian、offset 0 构造 `NdArray` 并做 `RGB48_FRAME` 校验（宽高取自声明尺寸、色彩元数据为 scene-linear ACEScg）；既有 `ColorProfile` 转换在同一数组上运行，输出构造 `RGB24_FRAME`（色彩元数据取自 profile 的 gamut/transfer 名称）后写出。无损回环的两路解码器帧同样先构造并校验 `RGB48_FRAME`，再逐字节比较。
+  - 编码产物：FFV1 母版与预览视频以 `DiskArtifact` + `VIDEO_ARTIFACT`（`audit.codec`、`source.frame_count`）交接给独立审计与发布；审计与发布只消费已校验的引用。argv、日志行、manifest 字段与退出码均未改动。
+- 行为保持与安全中间态：未新增 CLI 旗标；sidecar/metadata/manifest 字节格式不变；校验只增不减——既有的假白平衡、逐字节回环、manifest 断言与错误码家族全部保留。新增拒绝示例：metadata 的 `source_sha256` 为空字符串时，此前会被接受，现在按 `EXIT_FRAME`(30) 拒绝并沿用字段错误消息家族。
+- 检查（实测，均在仓库根执行，PATH 前置 `/opt/homebrew/opt/ffmpeg-full/bin`）：
+  - `cargo clean --manifest-path pipeline/Cargo.toml`：真实退出码 **0**；`cargo test --manifest-path pipeline/Cargo.toml`：真实退出码 **0**；141 lib + 61 bin + 31 集成 = **233 passed, 0 failed**，另有 3 个 compile-fail doctest 通过。完整输出与退出码见 `.agent-work/tmp/pipeline-typed-transports/s02-cargo-clean.log` / `.exit-code`、`s02-cargo-test.log` / `.exit-code`。
+  - 新增测试：三个集成负例（伪造 metadata 空源哈希、analysis 缺少 `kind`、analysis 源哈希不匹配）断言 `EXIT_FRAME`(30) 与既有消息家族；另在模块内直接断言生产返回的已校验 envelope、`rgb48` 数组长度/几何不符的构造期拒绝、`rgb24` 色彩元数据与预览转换路径。
+  - 真实素材 `/Users/ibobby/Temp/tl/pair/test`（2 帧）以与冻结基线相同的两组参数各运行一次（默认；`--white-balance per-frame --preview-profile canon-log2-cinema-gamut --strength 0`），真实退出码均为 **0**。日志与退出码见 `s02-final-run-default.log` / `.exit-code`、`s02-final-run-perframe-clog2.log` / `.exit-code`。
+  - 等价性：两次运行的 FFV1 解码回读 `framemd5` 与冻结基线逐帧一致（diff 退出码 0，见 `s02-final-default-framemd5.*`、`s02-final-perframe-clog2-framemd5.*`）。manifest 语义比较为 **0 差异**（脚本 `s02-manifest-compare.py`，结果见 `s02-final-manifest-default.compare.*`、`s02-final-manifest-perframe-clog2.compare.*`）；排除的运行期字段为：`timings_s`、`run.output`、`deflicker.config.output`、`linear_video.bytes`、`linear_video.roundtrip.elapsed_s`、`preview.bytes`、`frames.entries[*].duration_s`。其余字段（schema、工具/环境、输入、帧身份与几何、白平衡、fps、量化策略、编码参数、probe、发布信息、去闪配置与状态）全部相等。
+- 未覆盖 / 边界：
+  - `NOT_TESTED`：Windows/Linux 与其它 FFmpeg/VideoToolbox 版本；容器字节级一致性不作为等价条件（Matroska 元数据可变），逐帧解码内容与 manifest 语义才是 oracle。
+  - `NOT_TESTED`：CLI 级无法在不改变外部格式的前提下制造内部 `NdArray` 几何不匹配；该拒绝由构造层单测直接覆盖，真实路径的成功运行证明同一构造/校验函数被执行。
+  - 本条目记录实现与执行证据，不代表独立评审或 Feature 验收；提交由 Main 负责。
+
+### 修复（adoption 后的类型化引用，2026-11-11）
+
+- 问题（评审发现，P2）：去闪 adopt 应用轮时，旧的 `remap_output_paths` 只改写相对字符串；`png_artifact`、`png_envelope` 内的 DiskArtifact、`metadata_artifact` 与 `analysis_artifact` 仍指向 rename 前的 producer 路径。接受后的 FrameSequence 因此携带失效的 typed 引用（路径不存在；对 adopted analysis 引用执行 `transport::load` 得到 ENOENT）。CLI 产物仍正确仅因为编码阶段独立重建 `frames/` 路径，类型化交接未通过自身正常生命周期。
+- 修复：以 `FrameSequence::adopt_output_locations(frames_dir, analysis_dir, log_dir_rel)` 取代 `remap_output_paths`。adoption 后按最终绝对路径重建 PNG / metadata / analysis 的 `DiskArtifact`（保留 media type、size、hash）与 PNG envelope（保留语义类型、元数据与 payload 类型；新 envelope 以 producer envelope 为 lineage parent，语义同 `DataEnvelope::patch`），并同步 `analysis_path`。analysis 目录 rename 失败时引用回退到仍然存在的 round 目录，保证引用可解析。契约层构造器与 transport 语义未改动；未新增隐式 persist/load、CLI 旗标、argv/日志/manifest 字段或错误码。
+- 新增测试：`adopted_sequence_repoints_every_typed_reference` 在真实 rename 后断言四个 disk 引用均指向存在文件、PNG envelope 的元数据与 lineage 正确、对 adopted analysis 引用执行 `transport::load` 成功且字节等于原 sidecar。该测试在临时还原为旧 remap 行为时以路径断言失败（真实退出码 101），证明其对目标缺陷敏感。
+- 检查（实测）：`cargo clean` + `cargo test` 真实退出码 **0**，141 lib + 62 bin + 31 集成 = **234 passed**，3 个 compile-fail doctest 通过；默认参数真实素材重跑真实退出码 **0**，FFV1 解码 framemd5 与冻结基线 diff 退出码 **0**，manifest 语义比较 0 差异；`git diff --check` 退出码 **0**。证据：`.agent-work/tmp/pipeline-typed-transports/` 下 `repair-cargo-clean.*`、`repair-cargo-test.*`、`repair-pre-repair-test.*`、`repair-run-default.*`、`repair-default-framemd5.*`、`repair-manifest-default.compare.*`、`repair-adopted-artifacts.*`、`repair-diff-check.*`、`repair-protected-paths.*`、`repair-source-hashes.*`。
+- 未覆盖：与前节相同（Windows/Linux、其它 FFmpeg/VideoToolbox 版本）。analysis 目录 rename 失败的运行期分支未做故障注入，仅由“回退到实际 round 目录”的代码路径保证。

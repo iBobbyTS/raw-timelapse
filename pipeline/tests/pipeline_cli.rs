@@ -363,6 +363,73 @@ fn lossless_roundtrip_mismatch_is_rejected() {
 }
 
 #[test]
+fn forged_metadata_source_hash_is_rejected_by_the_typed_boundary() {
+    let result = run_sidecar_defect(
+        "forged-metadata-hash",
+        FakeSidecarDefects {
+            empty_source_sha256: true,
+            ..FakeSidecarDefects::default()
+        },
+    );
+    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
+    let text = stderr(&result);
+    assert!(text.contains("frame 1/2"), "{text}");
+    assert!(
+        text.contains("metadata is missing or invalid field \"source_sha256\""),
+        "{text}"
+    );
+}
+
+#[test]
+fn forged_analysis_sidecar_without_kind_is_rejected() {
+    let result = run_sidecar_defect(
+        "forged-analysis-kind",
+        FakeSidecarDefects {
+            analysis_omit_kind: true,
+            ..FakeSidecarDefects::default()
+        },
+    );
+    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
+    let text = stderr(&result);
+    assert!(text.contains("frame 1/2"), "{text}");
+    assert!(
+        text.contains("analysis sidecar has an unsupported schema"),
+        "{text}"
+    );
+}
+
+#[test]
+fn forged_analysis_sidecar_hash_mismatch_is_rejected() {
+    let result = run_sidecar_defect(
+        "forged-analysis-hash",
+        FakeSidecarDefects {
+            analysis_sha_mismatch: true,
+            ..FakeSidecarDefects::default()
+        },
+    );
+    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
+    let text = stderr(&result);
+    assert!(text.contains("frame 1/2"), "{text}");
+    assert!(
+        text.contains("analysis sidecar source_sha256 does not match the frame metadata"),
+        "{text}"
+    );
+}
+
+fn run_sidecar_defect(name: &str, defects: FakeSidecarDefects) -> Output {
+    let root = test_dir(name);
+    let input = root.join("material");
+    let frames = synthetic_sequence(&[0.0, 0.1]);
+    let names: Vec<&str> = frames.iter().map(|frame| frame.name.as_str()).collect();
+    make_input(&input, &names);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("create fixtures");
+    let tool = fake_native_sequence_sidecar_defect(&fixtures, &frames, defects, WIDTH, HEIGHT);
+    let output = root.join("run");
+    run_cli(&base_args(&input, &output, &tool))
+}
+
+#[test]
 fn rejects_overlapping_input_and_output_directories() {
     let root = test_dir("overlap");
     let tool = root.join("unused-native-tool");

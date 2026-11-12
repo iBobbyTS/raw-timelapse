@@ -359,6 +359,49 @@ historical native argument shape (no analysis, probe, validation or audit),
 `DISABLED` frame records in the report and a disabled manifest block. It
 reproduces the pre-deflicker PNG/video content byte-for-byte.
 
+## Stage handoffs (typed transports)
+
+Every in-process stage boundary hands its data on through the transport
+contract in `pipeline/src/transport/`: a `DiskArtifact`, `MemoryFile` or
+`NdArray` payload inside an immutable `DataEnvelope` with a product semantic
+type and provenance. Subprocess boundaries (native producer, FFmpeg) remain
+path/argv based; only the handoff between pipeline stages is typed.
+
+- **Native producer -> pipeline.** The producer still receives the historical
+  argv paths. Its outputs are referenced as `DiskArtifact` (`image/png` for the
+  frame PNG, `application/json; charset=utf-8` for the metadata and analysis
+  sidecars). Sidecar content is read with `transport::load`, wrapped as a
+  `MemoryFile` and validated as `rawtl.frame-metadata@1` /
+  `rawtl.analysis-sidecar@1` before the existing parsers run. The envelope
+  metadata carries `source.schema_version`, `source.width`, `source.height` and
+  (when present) `source.sha256`; the source hash must also appear in the
+  provenance, so a sidecar whose declared hash does not match the frame is
+  rejected. The measurement consumers receive the bytes of that same validated
+  envelope instead of re-reading an untyped file.
+- **Preview RGB48 pipe and lossless roundtrip.** Each `rgb48le` frame read from
+  the decoder pipe is constructed as an `NdArray` (`U16`, `[height, width, 3]`,
+  HWC interleaved, little endian, offset 0) and validated as
+  `rawtl.rgb48-frame@1` against the declared width/height and colour metadata;
+  a buffer whose length does not match the declared geometry is rejected before
+  conversion. The existing `ColorProfile` conversion runs on that validated
+  array, and its packed output is validated as `rawtl.rgb24-frame@1` before it
+  is written. `verify_roundtrip` constructs and validates the frames from both
+  decoders the same way before the byte comparison.
+- **Encoded deliverables -> audit/publish.** The FFV1 master and preview video
+  are handed on as `DiskArtifact` references (`video/x-matroska`, `video/mp4`)
+  validated as `rawtl.video-artifact@1` (`audit.codec`,
+  `source.frame_count`). The audit decodes the referenced file, and publication
+  renames exactly the validated references.
+
+The typed layer only adds rejections: argv, sidecar/manifest byte formats, exit
+codes, log-line semantics and deliverable content are unchanged. When a
+deflicker application round is adopted as the final `frames/` directory (and its
+analysis directory as `analysis/applied`), the sequence re-points every typed
+disk reference and rebuilds the PNG envelope at the adopted absolute paths:
+semantic type, metadata and payload kind stay identical, the producer envelope
+is recorded as a lineage parent, and the recorded relative paths are rewritten
+as before.
+
 ## Failure semantics and exit codes
 
 Any frame failure stops the run immediately: the failing frame name, exit code,
