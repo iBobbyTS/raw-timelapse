@@ -721,7 +721,8 @@ fn apply_pass(
     iteration: usize,
 ) -> Result<(FrameSequence, Vec<FrameMeasurement>)> {
     let options = context.options;
-    let logs_dir = context.output.join(format!("logs/applied-iter{iteration}"));
+    let log_relative_dir = format!("logs/applied-iter{iteration}");
+    let logs_dir = context.output.join(&log_relative_dir);
     let baseline = state
         .baseline
         .clone()
@@ -745,7 +746,7 @@ fn apply_pass(
         white_balance: options.white_balance,
         converter: options.converter.as_deref(),
         converter_timeout: options.converter_timeout,
-        log_relative_dir: "logs/applied",
+        log_relative_dir: &log_relative_dir,
     };
     let sequence = frame::produce_with_evs(&options.native_tool, context.sources, &evs, &config)?;
     let mut rendered = Vec::with_capacity(sequence.frames.len());
