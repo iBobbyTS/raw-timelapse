@@ -41,6 +41,8 @@ struct Config {
     /// Emit an empty `source_sha256` in the metadata sidecar. Models a forged
     /// frame sidecar that fails the typed semantic contract.
     empty_source_sha256: bool,
+    /// Corrupt only final-frame metadata; analysis/application records stay valid.
+    frame_source_sha256_defect: Option<String>,
     /// Omit `kind` from the analysis sidecar.
     analysis_omit_kind: bool,
     /// Report an analysis source hash that differs from the frame metadata.
@@ -174,6 +176,19 @@ fn run() -> Result<(), (i32, String)> {
     );
     let metadata = if config.omit_metadata {
         metadata.replace(&format!("\"width\":{},", config.width), "")
+    } else {
+        metadata
+    };
+    let metadata = if options.stdout_mode.as_deref() == Some("--stdout-frame") {
+        let field = format!("\"source_sha256\":{},", json_string(&source_sha));
+        match config.frame_source_sha256_defect.as_deref() {
+            Some("omit") => metadata.replace(&field, ""),
+            Some("null") => metadata.replace(&field, "\"source_sha256\":null,"),
+            Some("non-string") => metadata.replace(&field, "\"source_sha256\":7,"),
+            Some("empty") => metadata.replace(&field, "\"source_sha256\":\"\","),
+            None => metadata,
+            Some(other) => return Err((2, format!("unknown frame source hash defect: {other}"))),
+        }
     } else {
         metadata
     };
@@ -360,6 +375,7 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
         fail_on: None,
         gain_scale: 1.0,
         empty_source_sha256: false,
+        frame_source_sha256_defect: None,
         analysis_omit_kind: false,
         analysis_sha_mismatch: false,
         bad_magic: false,
@@ -426,6 +442,7 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
             "gain_scale" => {
                 config.gain_scale = value.parse().map_err(|_| (2, "bad gain_scale".into()))?
             }
+            "frame_source_sha256_defect" => config.frame_source_sha256_defect = Some(value.into()),
             "empty_source_sha256" => config.empty_source_sha256 = value == "1",
             "analysis_omit_kind" => config.analysis_omit_kind = value == "1",
             "analysis_sha_mismatch" => config.analysis_sha_mismatch = value == "1",
