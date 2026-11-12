@@ -655,20 +655,6 @@ pub fn fake_failing_encoder(dir: &Path) -> PathBuf {
     path
 }
 
-/// Delegates real encoding to ffmpeg, but feeds zeroed frames for the MKV
-/// decode step so the lossless roundtrip comparison must fail.
-pub fn fake_ffmpeg_zeroed_video_decode(dir: &Path, frame_bytes: usize, count: usize) -> PathBuf {
-    let path = dir.join("fake-ffmpeg-roundtrip-mismatch");
-    let script = format!(
-        "#!/bin/sh\ncase \"$*\" in\n  *'-f matroska'*) exec {} \"$@\" ;;\n  *linear.mkv*) head -c {} /dev/zero; exit 0 ;;\n  *) exec {} \"$@\" ;;\nesac\n",
-        shell_quote(FFMPEG),
-        frame_bytes * count,
-        shell_quote(FFMPEG)
-    );
-    write_executable(&path, &script);
-    path
-}
-
 pub fn fake_ffprobe_wrong_codec(dir: &Path) -> PathBuf {
     let path = dir.join("fake-ffprobe-wrong-codec");
     let script = format!(
@@ -771,48 +757,6 @@ pub fn read_json(path: &Path) -> rawtl_linear_video::json::Json {
         .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
     rawtl_linear_video::json::parse(&text)
         .unwrap_or_else(|err| panic!("invalid JSON {}: {err}", path.display()))
-}
-
-/// Decode the first pixel of a PNG through the real ffmpeg.
-pub fn framemd5(path: &Path) -> String {
-    let output = Command::new(FFMPEG)
-        .args(["-v", "error", "-i"])
-        .arg(path)
-        .args(["-f", "framemd5", "-"])
-        .output()
-        .expect("run framemd5");
-    assert!(
-        output.status.success(),
-        "framemd5 failed for {}: {}",
-        path.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-pub fn png_first_code(path: &Path) -> u16 {
-    let output = Command::new(FFMPEG)
-        .args(["-v", "error", "-i"])
-        .arg(path)
-        .args([
-            "-frames:v",
-            "1",
-            "-pix_fmt",
-            "rgb48le",
-            "-f",
-            "rawvideo",
-            "-",
-        ])
-        .output()
-        .expect("decode PNG pixel");
-    assert!(
-        output.status.success(),
-        "ffmpeg failed for {}: {}",
-        path.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.stdout.len() >= 6, "no decoded pixel");
-    u16::from_le_bytes([output.stdout[0], output.stdout[1]])
 }
 
 pub fn frame_record(
