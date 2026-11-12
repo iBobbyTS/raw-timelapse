@@ -6,6 +6,8 @@
 //! --converter-timeout, --exposure-ev, --emit-analysis, --analysis-roi,
 //! --no-png. The analysis sidecar follows the frozen S01 schema.
 
+#[path = "../../src/digest.rs"]
+mod digest;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -47,6 +49,7 @@ struct Config {
     analysis_omit_kind: bool,
     /// Report an analysis source hash that differs from the frame metadata.
     analysis_sha_mismatch: bool,
+    rev_defect: Option<String>,
     bad_magic: bool,
     short_pixels: bool,
     stall_pixels: bool,
@@ -70,6 +73,7 @@ struct Options {
     analysis_roi: [f64; 4],
     no_png: bool,
     stdout_mode: Option<String>,
+    camera_method: String,
 }
 
 fn main() {
@@ -128,6 +132,8 @@ fn run() -> Result<(), (i32, String)> {
     };
     let source_sha = if config.empty_source_sha256 {
         String::new()
+    } else if options.camera_method == "dng-camera-to-pcs" {
+        digest::sha256(&read_file(&options.input)?)
     } else {
         format!("fake-{:016x}", fnv1a(read_file(&options.input)?))
     };
@@ -192,10 +198,38 @@ fn run() -> Result<(), (i32, String)> {
     } else {
         metadata
     };
+    let is_f32 = options.stdout_mode.as_deref() == Some("--stdout-frame-f32");
+    let mut metadata = metadata;
+    if options.camera_method == "dng-camera-to-pcs" {
+        let defect = config.rev_defect.as_deref();
+        let model = if defect == Some("mixed-model") && name.contains("2") {
+            "Canon EOS R6"
+        } else if defect == Some("non-canon") {
+            "Nikon Z9"
+        } else {
+            "Canon EOS R7"
+        };
+        let method = if defect == Some("method") {
+            "legacy-inverse-cm"
+        } else {
+            "dng-camera-to-pcs"
+        };
+        let effective = if defect == Some("effective") {
+            "bogus"
+        } else {
+            "dng-camera-to-pcs-forward-matrix"
+        };
+        let contract = format!("\"color_contract_version\":1,\"color\":{{\"profile_fingerprint\":\"controlled-test-profile\",\"camera_to_xyz_d50\":[[1,0,0],[0,1,0],[0,0,1]],\"camera_to_acescg\":[[1,0,0],[0,1,0],[0,0,1]],\"method_requested\":\"{method}\",\"method_effective\":\"{effective}\",\"camera_model\":\"{model}\"}},");
+        if defect != Some("missing-contract") {
+            metadata.insert_str(1, &contract);
+        }
+    }
     if let Some(mode) = &options.stdout_mode {
         let mut out = std::io::stdout().lock();
         out.write_all(if config.bad_magic {
             b"BADMAGIC"
+        } else if is_f32 && config.rev_defect.as_deref() != Some("version") {
+            b"RAWTLST2"
         } else {
             b"RAWTLST1"
         })
@@ -209,7 +243,10 @@ fn run() -> Result<(), (i32, String)> {
             )?;
         } else {
             let desc = format!("{{\"width\":{},\"height\":{},\"pixel_format\":\"rgb48le\",\"pixels_sha256\":\"{}\"}}", if config.descriptor_geometry_mismatch {config.width+1} else {config.width}, config.height, "a".repeat(64));
-            record(&mut out, 3, desc.as_bytes())?;
+
+            if !is_f32 {
+                record(&mut out, 3, desc.as_bytes())?;
+            }
             if config.stall_pixels {
                 out.flush().unwrap();
                 std::thread::sleep(std::time::Duration::from_secs(60));
@@ -245,6 +282,36 @@ fn run() -> Result<(), (i32, String)> {
                     }
                 }
             }
+            if is_f32 {
+                let mut floats = Vec::new();
+                for code in pixels.chunks_exact(2) {
+                    let value = u16::from_le_bytes(code.try_into().unwrap()) as f32 / 16384.0;
+                    floats.extend_from_slice(&value.to_le_bytes());
+                }
+                match config.rev_defect.as_deref() {
+                    Some("nan") => floats[..4].copy_from_slice(&f32::NAN.to_le_bytes()),
+                    Some("infinity") => floats[..4].copy_from_slice(&f32::INFINITY.to_le_bytes()),
+                    _ => (),
+                }
+                pixels = floats;
+                let hash = if config.rev_defect.as_deref() == Some("hash") {
+                    "0".repeat(64)
+                } else {
+                    digest::sha256(&pixels)
+                };
+                let format = if config.rev_defect.as_deref() == Some("format") {
+                    "rgb48le"
+                } else {
+                    "rgbf32le"
+                };
+                let width = if config.descriptor_geometry_mismatch {
+                    config.width + 1
+                } else {
+                    config.width
+                };
+                let desc = format!("{{\"width\":{width},\"height\":{},\"pixel_format\":\"{format}\",\"byte_length\":{},\"color_contract_version\":1,\"space\":\"AP1/D60\",\"transfer\":\"linear\",\"pixels_sha256\":\"{hash}\"}}", config.height, pixels.len());
+                record(&mut out, 3, desc.as_bytes())?;
+            }
             if config.short_pixels {
                 out.write_all(&[4, 0, 0, 0]).unwrap();
                 out.write_all(&(pixels.len() as u64).to_le_bytes()).unwrap();
@@ -274,7 +341,11 @@ fn parse_args() -> Result<Options, (i32, String)> {
     let args: Vec<String> = env::args().skip(1).collect();
     let stdout_mode = args
         .first()
-        .filter(|s| s.as_str() == "--stdout-analysis" || s.as_str() == "--stdout-frame")
+        .filter(|s| {
+            s.as_str() == "--stdout-analysis"
+                || s.as_str() == "--stdout-frame"
+                || s.as_str() == "--stdout-frame-f32"
+        })
         .cloned();
     let (input, png, json, start) = if stdout_mode.is_some() {
         (
@@ -294,6 +365,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
             3,
         )
     };
+    let mut camera_method = "legacy-inverse-cm".to_string();
     let mut white_balance = None;
     let mut exposure_ev = 0.0;
     let mut emit_analysis = None;
@@ -302,6 +374,10 @@ fn parse_args() -> Result<Options, (i32, String)> {
     let mut index = start;
     while index < args.len() {
         match args[index].as_str() {
+            "--camera-color-method" => {
+                camera_method = value(&args, &mut index)?;
+                index += 1;
+            }
             "--white-balance" => {
                 white_balance = Some(value(&args, &mut index)?);
                 index += 1;
@@ -351,6 +427,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
         analysis_roi,
         no_png,
         stdout_mode,
+        camera_method,
     })
 }
 
@@ -378,6 +455,7 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
         frame_source_sha256_defect: None,
         analysis_omit_kind: false,
         analysis_sha_mismatch: false,
+        rev_defect: None,
         bad_magic: false,
         short_pixels: false,
         stall_pixels: false,
@@ -424,6 +502,7 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
             return Err((2, format!("invalid config line: {line}")));
         };
         match key {
+            "rev_defect" => config.rev_defect = Some(value.into()),
             "bad_magic" => config.bad_magic = value == "1",
             "stall_pixels" => config.stall_pixels = value == "1",
             "short_pixels" => config.short_pixels = value == "1",

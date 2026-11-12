@@ -7,7 +7,7 @@ use crate::json::Json;
 use crate::proc;
 use crate::transport::{
     self, ArrayDescriptor, ArrayLayout, ByteOrder, DType, DataEnvelope, DiskArtifact, MetadataDoc,
-    NdArray, Payload, Provenance, RGB24_FRAME, RGB48_FRAME, VIDEO_ARTIFACT,
+    NdArray, Payload, Provenance, AP1_F32_FRAME, RGB24_FRAME, RGB48_FRAME, VIDEO_ARTIFACT,
 };
 use std::fs;
 use std::io::Write;
@@ -138,6 +138,24 @@ fn rgb48_frame_envelope(
     DataEnvelope::new(RGB48_FRAME, Payload::NdArray(array), metadata, provenance)
 }
 
+fn f32_frame_envelope(
+    bytes: Arc<[u8]>,
+    width: u32,
+    height: u32,
+) -> transport::Result<DataEnvelope> {
+    let length = bytes.len();
+    let array = NdArray::new(
+        bytes,
+        rgb_frame_descriptor(DType::F32, width as usize, height as usize, length),
+    )?;
+    DataEnvelope::new(
+        AP1_F32_FRAME,
+        Payload::NdArray(array),
+        rgb_metadata(width, height, SCENE_LINEAR_SPACE, SCENE_LINEAR_TRANSFER)?,
+        Provenance::new("dng-linear-frame FP32 stdout", vec![], vec![])?,
+    )
+}
+
 /// Wrap one converted preview frame as a validated `RGB24_FRAME`.
 fn rgb24_frame_envelope(
     bytes: Arc<[u8]>,
@@ -165,6 +183,7 @@ fn array_bytes(envelope: &DataEnvelope) -> &[u8] {
 
 /// Build the typed handoff for an encoded deliverable. `audit` consumes the
 /// same envelope, and `publish` renames the referenced file.
+#[cfg(test)]
 pub fn video_envelope(
     path: &Path,
     media_type: &str,
@@ -173,9 +192,30 @@ pub fn video_envelope(
     producer: &str,
     profile: &ColorProfile,
 ) -> transport::Result<DataEnvelope> {
+    video_envelope_with_gain(path, media_type, codec, frame_count, producer, profile, 1.0)
+}
+
+pub fn video_envelope_with_gain(
+    path: &Path,
+    media_type: &str,
+    codec: &str,
+    frame_count: u64,
+    producer: &str,
+    profile: &ColorProfile,
+    reference_gain: f64,
+) -> transport::Result<DataEnvelope> {
     let artifact = DiskArtifact::new(path, media_type, file_size(path), None)?;
     let metadata = MetadataDoc::new(vec![
         ("color.profile".into(), Json::Str(profile.id.into())),
+        (
+            "color.display_name".into(),
+            Json::Str(profile.display_name().into()),
+        ),
+        ("color.reference_gain".into(), Json::Float(reference_gain)),
+        (
+            "color.reference_status".into(),
+            Json::Str("unverified".into()),
+        ),
         (
             "color.transfer".into(),
             Json::Str(profile.transfer.name().into()),
@@ -492,12 +532,14 @@ pub fn encode_stream(
         echo: true,
         echo_tag: "encode ",
         white_balance: options.white_balance,
+        rev_eng: options.preview_profile.is_rev_eng(),
         converter: options.converter.as_deref(),
         converter_timeout: options.converter_timeout,
         log_relative_dir: "logs/encode",
     };
     let active: proc::ActiveNative = Default::default();
     let mut encoder: Option<StreamingEncoder> = None;
+    let mut clipping = Vec::new();
     let result = crate::frame::stream_frames(
         &options.native_tool,
         context.sources,
@@ -529,28 +571,42 @@ pub fn encode_stream(
                 ));
             }
             let rgb48 = native.pixels(info.width, info.height)?;
-            let sent =
+            let sent = (if options.preview_profile.is_rev_eng() {
+                f32_frame_envelope(rgb48, info.width, info.height)
+            } else {
                 rgb48_frame_envelope(rgb48, info.width, info.height, "dng-linear-frame stdout")
-                    .map_err(|e| {
-                        Error::new(
-                            crate::error::EXIT_FRAME,
-                            format!("invalid RGB48 frame: {e}"),
-                        )
-                    })?;
+            })
+            .map_err(|e| {
+                Error::new(
+                    crate::error::EXIT_FRAME,
+                    format!("invalid scene-linear frame: {e}"),
+                )
+            })?;
             // The output backing is initialized and unique until envelope creation.
             let mut rgb24 = unsafe {
                 Arc::<[u8]>::new_zeroed_slice(info.width as usize * info.height as usize * 3)
                     .assume_init()
             };
-            options
-                .preview_profile
-                .convert_frame(
+            let conversion = if options.preview_profile.is_rev_eng() {
+                options
+                    .preview_profile
+                    .convert_f32_frame(
+                        array_bytes(&sent),
+                        info.width as usize,
+                        info.height as usize,
+                        options.log_reference_gain,
+                        &mut rgb24,
+                    )
+                    .map(|counts| clipping.push(counts))
+            } else {
+                options.preview_profile.convert_frame(
                     array_bytes(&sent),
                     info.width as usize,
                     info.height as usize,
                     &mut rgb24,
                 )
-                .map_err(|e| Error::new(EXIT_PREVIEW, format!("colour conversion: {e}")))?;
+            };
+            conversion.map_err(|e| Error::new(EXIT_PREVIEW, format!("colour conversion: {e}")))?;
             let converted = rgb24_frame_envelope(
                 rgb24,
                 info.width,
@@ -601,7 +657,12 @@ pub fn encode_stream(
             ));
         }
     }
-    let sequence = result?;
+    let mut sequence = result?;
+    if options.preview_profile.is_rev_eng() {
+        for (frame, counts) in sequence.frames.iter_mut().zip(clipping) {
+            frame.log_clip_counts = Some(counts);
+        }
+    }
     ensure_nonempty(output, EXIT_PREVIEW, "streaming encoder produced no video")?;
     Ok(sequence)
 }

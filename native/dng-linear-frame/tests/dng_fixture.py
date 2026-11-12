@@ -17,11 +17,13 @@ def blob(typ,values):
 
 
 # 16x16 is small enough for checked-in generator-only regression coverage.
-def make_dng(work,name,*,pi=34892,black=None,white=1000,pixels=None,table=None,baseline=0,opcodes=None,ab=None,cc=None,neutral=None,w=16,h=16,datetime_original=None,exif_case=None):
+def make_dng(work,name,*,pi=34892,black=None,white=1000,pixels=None,table=None,baseline=0,opcodes=None,ab=None,cc=None,neutral=None,w=16,h=16,datetime_original=None,exif_case=None,forward=None,model=None):
     work=pathlib.Path(work)
     if pixels is None:pixels=[250,500,750]*(w*h)
     payload=struct.pack('<'+'H'*len(pixels),*pixels)
     tags={254:(4,[0]),256:(4,[w]),257:(4,[h]),258:(3,[16]*3),259:(3,[1]),271:(2,'Test'),272:(2,'LinearProbe'),273:(4,[0]),274:(3,[1]),277:(3,[3]),278:(4,[h]),279:(4,[len(payload)]),284:(3,[1]),339:(3,[1]*3),50706:(1,[1,4,0,0]),50707:(1,[1,3,0,0]),50708:(2,'Controlled LinearRaw Probe'),50713:(3,[2,2] if black else [1,1]),50714:(5,black if black else [0,0,0]),50717:(4,[white]*3),50718:(5,[1,1]),50719:(4,[0,0]),50720:(4,[w,h]),50721:(10,[1.843,-1.2288,.1003,-.5888,1.5271,.3387,-.0001,.0219,1.0795]),50728:(5,neutral or ['.6050808314',1,'.4825046041']),50730:(10,[baseline]),50778:(3,[17]),50829:(4,[0,0,h,w])}
+    if model is not None:tags[50708]=(2,model)
+    if forward is not None:tags[50964]=(10,forward)
     if pi is not None:tags[262]=(3,[pi])
     if table is not None:tags[50712]=(3,table)
     if ab is not None:tags[50727]=(5,ab)

@@ -44,6 +44,18 @@ pub fn audit_video(
     output_dir: &Path,
 ) -> Result<AuditOutcome> {
     let profile = resolve_profile(video, probe)?;
+    let reference_gain = if profile.is_rev_eng() {
+        video
+            .metadata()
+            .get("color.reference_gain")
+            .and_then(Json::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .ok_or_else(|| {
+                audit_error("TEMPORAL_AUDIT_UNOBSERVABLE: missing/invalid reference gain")
+            })?
+    } else {
+        1.0
+    };
     let video = video_artifact_path(video)
         .ok_or_else(|| audit_error("audit input is not a validated video artifact"))?;
     let width = probe.width as usize;
@@ -63,7 +75,16 @@ pub fn audit_video(
 
     let pts = read_pts(ffprobe, video)?;
     let stats = decode_features(
-        ffmpeg, video, width, height, aw, ah, count, output_dir, profile,
+        ffmpeg,
+        video,
+        width,
+        height,
+        aw,
+        ah,
+        count,
+        output_dir,
+        profile,
+        reference_gain,
     )?;
     if stats.len() != count {
         return Err(audit_error(&format!(
@@ -191,6 +212,7 @@ pub fn audit_video(
             Json::obj(vec![
                 ("path", Json::Str(video.display().to_string())),
                 ("profile", Json::Str(profile.id.into())),
+                ("reference_gain", Json::Float(reference_gain)),
                 ("bytes", Json::Int(bytes as i64)),
                 (
                     "sha256",
@@ -295,6 +317,7 @@ fn decode_features(
     count: usize,
     output_dir: &Path,
     profile: &ColorProfile,
+    reference_gain: f64,
 ) -> Result<Vec<TileStats>> {
     let args = vec![
         "-hide_banner".to_string(),
@@ -384,7 +407,7 @@ fn decode_features(
             break;
         }
         fill_rgb48(&buffer, &mut rgb);
-        luminance(&rgb, &mut luma, profile);
+        luminance(&rgb, &mut luma, profile, reference_gain);
         saturation_mask(&rgb, &mut saturation);
         reduce(
             &luma,
@@ -473,14 +496,15 @@ fn fill_rgb48(bytes: &[u8], rgb: &mut [[u16; 3]]) {
     }
 }
 
-fn luminance(rgb: &[[u16; 3]], out: &mut [f64], profile: &ColorProfile) {
+fn luminance(rgb: &[[u16; 3]], out: &mut [f64], profile: &ColorProfile, reference_gain: f64) {
     let weights = profile.gamut.rgb_to_xyz[1];
     for (value, pixel) in out.iter_mut().zip(rgb) {
         *value = pixel
             .iter()
             .zip(weights)
             .map(|(code, weight)| profile.transfer.inverse(*code as f64 / 65535.0) * weight)
-            .sum();
+            .sum::<f64>()
+            / reference_gain;
     }
 }
 
@@ -492,6 +516,16 @@ fn resolve_profile(video: &DataEnvelope, probe: &ProbeInfo) -> Result<&'static C
     let profile = id.and_then(color_profile::lookup).ok_or_else(|| {
         audit_error("TEMPORAL_AUDIT_UNOBSERVABLE: missing or unresolved profile identity")
     })?;
+    for (key, expected) in [
+        ("color.transfer", profile.transfer.name()),
+        ("color.space", profile.gamut.name),
+    ] {
+        if video.metadata().get(key).and_then(Json::as_str) != Some(expected) {
+            return Err(audit_error(
+                "TEMPORAL_AUDIT_ERROR: conflicting transfer/gamut identity",
+            ));
+        }
+    }
     for (field, observed, expected) in [
         (
             "color_transfer",
@@ -872,6 +906,16 @@ mod tests {
         }
     }
     #[test]
+    fn rev_eng_audit_removes_reference_scale_exactly_once() {
+        let p = color_profile::lookup("canon-log2-cinema-gamut-rev-eng-crm-dev").unwrap();
+        let mut value = [0.0];
+        luminance(&[[128 * 257; 3]], &mut value, p, 2.0);
+        // Independently evaluated inverse CRD curve at 128/255 is .5015687810705871;
+        // Cinema Gamut neutral has Y equal to its RGB value.
+        assert!((value[0] - 0.5015687810705871 / 2.0).abs() < 1e-10);
+    }
+
+    #[test]
     fn all_profiles_measure_known_ev_changes_through_the_production_audit() {
         // This is the real audit_video -> decode_features -> luminance path,
         // with controlled decoded RGB48 signals from the actual frame converter.
@@ -890,9 +934,19 @@ mod tests {
                     .flatten()
                     .collect();
                 let mut converted = Vec::new();
-                profile
-                    .convert_frame(&rgb48, 192, 144, &mut converted)
-                    .unwrap();
+                if profile.is_rev_eng() {
+                    let f32_bytes: Vec<_> =
+                        std::iter::repeat_n((code as f32 / 16384.0).to_le_bytes(), 192 * 144 * 3)
+                            .flatten()
+                            .collect();
+                    profile
+                        .convert_f32_frame(&f32_bytes, 192, 144, 1.0, &mut converted)
+                        .unwrap();
+                } else {
+                    profile
+                        .convert_frame(&rgb48, 192, 144, &mut converted)
+                        .unwrap();
+                }
                 let decoded: Vec<_> = converted
                     .iter()
                     .flat_map(|v| (*v as u16 * 257).to_le_bytes())
@@ -911,6 +965,7 @@ mod tests {
                     ]],
                     &mut actual,
                     profile,
+                    1.0,
                 );
                 let weights = profile.gamut.rgb_to_xyz[1];
                 let expected: f64 = target.iter().zip(weights).map(|(v, w)| v * w).sum();

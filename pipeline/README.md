@@ -48,7 +48,8 @@ Defaults:
 - `--ffprobe /opt/homebrew/opt/ffmpeg-full/bin/ffprobe`
 - `--preview-profile srgb-preview` — one of `srgb-preview`,
   `dji-dlog-dgamut`, `canon-log2-cinema-gamut`, `sony-slog3-sgamut3`,
-  `sony-slog3-sgamut3-cine`, `nikon-nlog-bt2020`; unknown or empty ids are
+  `sony-slog3-sgamut3-cine`, `nikon-nlog-bt2020`,
+  `canon-log2-cinema-gamut-rev-eng-crm-dev`; unknown or empty ids are
   `EXIT_USAGE`
 - `--fps 30` — the frozen legacy default (`legacy/python/src/rawtl/cli.py:91`,
   `Fraction(30)`). Rational rates such as `30000/1001` are accepted; the
@@ -72,6 +73,24 @@ its own 120-second timeout.
 
 `--output` must be absent or empty. Input and output must not be equal or
 contain each other in either direction. The input directory is only read.
+
+## Canon Log 2 options
+
+- `canon-log2-cinema-gamut` — **clog2(white paper)**, historical matrix/quantization/curve.
+- `canon-log2-cinema-gamut-rev-eng-crm-dev` — **clog2(rev-eng crm-dev)**,
+  Canon CR3 only, SDK CameraToPCS and signed FP32 AP1/D60 handoff.
+
+The new option accepts `--log-reference-gain N` (positive finite; default 1,
+recorded unverified). This flag is rejected for the other profiles. It applies
+once after the Cinema Gamut transform; native user/deflicker EV is already
+applied. Every analysis/probe/application/encode pass uses the selected matrix
+strategy. The actual video audit divides the reference gain once after inverse
+transfer. Both options still deliver the existing 8-bit H.264 `output.mp4`.
+
+See [complete algorithm, protocol and evidence](../docs/canon-log2-rev-eng.md)
+and [validation record](../docs/canon-log2-validation.md). The new option has
+not been proven more accurate on a color chart or matched to Canon CR3 official
+photo rendering.
 
 ## Output layout
 
@@ -159,7 +178,7 @@ EV vector is restored before the final pass. Each final frame calls
 `--stdout-frame --exposure-ev <accepted>`; frame 1's metadata and descriptor
 establish source geometry and the WB reference before FFmpeg starts.
 
-Native RGB48LE codes (`code / 16384`, scene-linear ACEScg AP1/D60) cross a
+The legacy profiles use native RGB48LE codes (`code / 16384`, scene-linear ACEScg AP1/D60) across a
 validated RGB48 envelope. Rust converts directly into the RGB24 backing that
 crosses a validated RGB24 envelope and is written to FFmpeg stdin. The consumer
 holds one RGB48 and one RGB24 pixel buffer at a time; it never captures the
@@ -184,7 +203,8 @@ Log 信号；独立审计按所选 profile 反传递后测量。编码器为 `h2
 | `srgb-preview` | `output.mp4` | sRGB / Rec.709 | tv | bt709 | 1 / 13 / 1 / 0（既有行为） |
 | `sony-slog3-sgamut3` | `output.mp4` | S-Log3 / S-Gamut3 | pc | bt2020nc | 2 / 2 / 9 / 1 |
 | `sony-slog3-sgamut3-cine` | `output.mp4` | S-Log3 / S-Gamut3.Cine | pc | bt2020nc | 2 / 2 / 9 / 1 |
-| `canon-log2-cinema-gamut` | `output.mp4` | Canon Log 2 / Cinema Gamut | pc | bt2020nc | 2 / 2 / 9 / 1 |
+| `canon-log2-cinema-gamut` | `output.mp4` | clog2(white paper) / Cinema Gamut | pc | bt2020nc | 2 / 2 / 9 / 1 |
+| `canon-log2-cinema-gamut-rev-eng-crm-dev` | `output.mp4` | clog2(rev-eng crm-dev) / Cinema Gamut | pc | bt2020nc | 2 / 2 / 9 / 1 |
 | `nikon-nlog-bt2020` | `output.mp4` | N-Log / BT.2020 | pc | bt2020nc | 9 / 2 / 9 / 1 |
 | `dji-dlog-dgamut` | `output.mp4` | D-Log / D-Gamut | pc | bt2020nc | 2 / 2 / 9 / 1 |
 
@@ -193,7 +213,7 @@ Log 信号；独立审计按所选 profile 反传递后测量。编码器为 `h2
 MP4 `colr/nclx` 两层的实际码点。2 表示 unspecified；Nikon 的 9 表示其真实
 BT.2020 primaries，matrix 的 9 表示实际采用的 BT.2020 非恒定亮度编码矩阵。
 
-转换顺序不变：stdout RGB16 的 `code/16384` 为 ACEScg AP1/D60 场景线性值，经
+旧预设转换顺序不变：stdout RGB16 的 `code/16384` 为 ACEScg AP1/D60 场景线性值，经
 XYZ(D60) → Bradford CAT → XYZ(D65) → 目标线性 RGB；逐通道裁切到官方反函数
 signal 0/1 的端点，再应用官方 transfer 和 `round(signal*255)`、ties away from
 zero 的 8bit 量化。不做 tone/gamut mapping，不加抖动。8bit Log 可能出现 banding；
@@ -349,7 +369,7 @@ produces `TEMPORAL_AUDIT_UNOBSERVABLE`, never a guessed curve. Other decoder or
 measurement errors remain ERROR. The caller records either outcome in the
 report and `temporal_audit.json` without blocking publication.
 
-All six selected profiles use `color_profile::Transfer::inverse`, the same
+All seven selected profiles use `color_profile::Transfer::inverse`, the same
 curve owner as forward conversion. Linearization recovers target-gamut linear
 values within clipping, 8-bit quantization and H.264 losses; it does not undo
 those losses or the AP1-to-target transform. Audit luminance uses the target

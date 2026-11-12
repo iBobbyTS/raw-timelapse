@@ -1,0 +1,139 @@
+{
+  "date": "2026-11-12",
+  "baseline_head": "87df3aa56365f156bbba484f4ce4a7c5a0139d60",
+  "branch": "feature/streaming-encode-pipeline",
+  "scope": "Canon CR3 matrix/FP32/Log2; no WB strategy or RAW preprocessing algorithm change",
+  "input": {
+    "path": "/Users/ibobby/Temp/tl/pair/test/R7_L2219.CR3",
+    "sha256": "26c4447b73d85c0f03ba6511bd8c5ea3dcb9b6685a9ef7a526864100847ae868",
+    "camera": "Canon EOS R7"
+  },
+  "runs": [
+    {
+      "option": "white-paper",
+      "output_directory": "/private/tmp/rawtl-canon-log2-validation-20261112/white-paper",
+      "profile_id": "canon-log2-cinema-gamut",
+      "display_name": "clog2(white paper)",
+      "method": "legacy-inverse-cm",
+      "source_shape": [
+        4660,
+        6984,
+        3
+      ],
+      "video_shape": [
+        2734,
+        4096
+      ],
+      "frames": 1,
+      "video_bytes": 151122,
+      "video_sha256": "ba405ed88e94e3650295c21d9be394a6d41f6c03d6eb0b7a9229e4cc1f6fb828",
+      "native_pixels_sha256": "2ce5c121ec562b9f400758e742f55d436972741bc16a2ee67c9945c6becc836c",
+      "observed_scene_range": [
+        -0.011023623868823051,
+        2.987767457962036
+      ],
+      "linear_policy": {
+        "scale": 16384,
+        "rounding": "nearest; ties upward",
+        "negative_policy": "clip to 0",
+        "upper_policy": "above 65535/16384 clips to 65535",
+        "negative_samples": 70878,
+        "above_upper_samples": 0,
+        "transfer": "linear; no OETF"
+      },
+      "final_log_clipping": null,
+      "probe_matrix_max_errors": {
+        "camera_to_xyz_d50": 0.0,
+        "camera_to_acescg": 0.0
+      },
+      "full_decode": "pass",
+      "strength": 0,
+      "temporal_audit": "disabled by strength=0; all-pass/audit covered by integration tests"
+    },
+    {
+      "option": "rev-eng",
+      "output_directory": "/private/tmp/rawtl-canon-log2-validation-20261112/rev-eng-final",
+      "profile_id": "canon-log2-cinema-gamut-rev-eng-crm-dev",
+      "display_name": "clog2(rev-eng crm-dev)",
+      "method": "dng-camera-to-pcs-forward-matrix",
+      "source_shape": [
+        4660,
+        6984,
+        3
+      ],
+      "video_shape": [
+        2734,
+        4096
+      ],
+      "frames": 1,
+      "video_bytes": 142489,
+      "video_sha256": "b8fb4d473c8f21e190ae0da43a35f52ef3424f50a2129691378aebd9907e4962",
+      "native_pixels_sha256": "114167e19f1dd7a8d446cf69a7b406ee75803e5a42c2d0bc5aba947ecc7e7881",
+      "observed_scene_range": [
+        -1.944551695487462e-05,
+        2.340156078338623
+      ],
+      "linear_policy": {
+        "dtype": "f32",
+        "pixel_format": "rgbf32le",
+        "negative_policy": "preserve",
+        "upper_policy": "preserve",
+        "negative_samples": 445,
+        "above_legacy_upper_samples": 0,
+        "transfer": "linear; no OETF"
+      },
+      "final_log_clipping": {
+        "below_domain_samples": 0,
+        "above_domain_samples": 0
+      },
+      "probe_matrix_max_errors": {
+        "camera_to_xyz_d50": 0.0,
+        "camera_to_acescg": 0.0
+      },
+      "full_decode": "pass",
+      "strength": 0,
+      "temporal_audit": "disabled by strength=0; all-pass/audit covered by integration tests",
+      "input_interpretation": "signed FP32 AP1/D60; native EV already applied; reference gain applied once in target gamut"
+    }
+  ],
+  "limitations": [
+    "No reference gray calibration; gain=1 unverified",
+    "No color-chart Delta E or official Canon CR3 rendering match claim",
+    "H264 8bit 4:2:0 delivery; native pixel hashes are not video hashes",
+    "Single real CR3 frame per option; multi-frame/WB/deflicker integration uses controlled producers"
+  ],
+  "checks": {
+    "rust_full_suite": {
+      "library": 142,
+      "binary": 63,
+      "cli_integration": 38,
+      "doctests": 3,
+      "total": 246,
+      "status": "passed",
+      "log": "/private/tmp/rawtl-accepted-tests.log"
+    },
+    "final_input_contract_regression": {
+      "library": 142,
+      "status": "passed",
+      "log": "/private/tmp/rawtl-final-lib.log"
+    },
+    "native_ctest": {
+      "total": 4,
+      "status": "passed",
+      "log": "/private/tmp/rawtl-native-final.log"
+    },
+    "release_build": "passed",
+    "git_diff_check": "passed"
+  },
+  "source_sha256": {
+    "pipeline/src/color_profile.rs": "fdbfda7dcfc11f8350a98bbc04785b32b6f3964c087a833e886a124e1f83eea7",
+    "pipeline/src/frame.rs": "1813a2da888e5eb25236e54c133f2d47c335b1af38e9607785ccc343112fcd02",
+    "pipeline/src/audit.rs": "751e283a93ff535989aeb6e2e5ea599ed56058f5182430263847c8651f34c10e",
+    "native/dng-linear-frame/src/decode.cpp": "3aeab68a646cd7dd49e914bbc4736f2f335d4010a1ec8b45d48ce04be50b6efa",
+    "native/dng-linear-frame/src/main.cpp": "e1f18380d330e91356bdd76e39e31af584a8068f0c1b0d84e7392803f739d4fe"
+  },
+  "final_build_sha256": {
+    "pipeline/target/release/rawtl-linear-video": "95dc5855cbd418cef83d61d7315d98d11273b14ef01433badb4f2678d73a4fcd",
+    "native/build/dng-linear-frame": "d94f682d6ccde55d4bcaa9c292d0587fd7d7633af44450b6346d315833adf730"
+  }
+}

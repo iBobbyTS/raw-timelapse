@@ -6,6 +6,7 @@
 mod audit;
 mod cli;
 mod deflicker_run;
+mod digest;
 mod error;
 mod fallback;
 mod frame;
@@ -123,13 +124,14 @@ pub fn encode_and_validate(
     )?;
     let bytes = video::file_size(&output)
         .ok_or_else(|| Error::new(EXIT_PREVIEW, "validated video disappeared"))?;
-    let video_artifact = video::video_envelope(
+    let video_artifact = video::video_envelope_with_gain(
         &output,
         video::PREVIEW_MEDIA_TYPE,
         &probe.codec_name,
         probe.frames,
         "ffmpeg h264 streaming encoder",
         options.preview_profile,
+        options.log_reference_gain,
     )
     .map_err(|e| Error::new(EXIT_VALIDATION, e.to_string()))?;
     Ok((

@@ -1,4 +1,4 @@
-//! Streaming native protocol v1 consumption. JSON crosses validated MemoryFile
+//! Streaming native protocol v1/v2 consumption. JSON crosses validated MemoryFile
 //! envelopes; pixels are read one frame at a time and never written to disk.
 use crate::cli::WhiteBalance;
 use crate::error::{Error, Result, EXIT_FRAME};
@@ -23,6 +23,8 @@ const JSON_MEDIA_TYPE: &str = "application/json; charset=utf-8";
 pub struct FrameInfo {
     pub index: usize,
     pub source_name: String,
+    pub camera_color: Option<Json>,
+    pub log_clip_counts: Option<[usize; 2]>,
     pub source_sha256: Option<String>,
     pub pixels_sha256: Option<String>,
     pub width: u32,
@@ -50,6 +52,7 @@ pub struct FrameSequence {
     pub total_duration: Duration,
 }
 pub struct ProduceConfig<'a> {
+    pub rev_eng: bool,
     pub logs_dir: &'a Path,
     pub exposure_ev: Option<f64>,
     pub analysis_roi: Option<[f64; 4]>,
@@ -71,12 +74,16 @@ pub struct Protocol<R> {
     reader: R,
 }
 impl<R: Read> Protocol<R> {
-    pub fn new(mut reader: R) -> Result<Self> {
+    #[cfg(test)]
+    pub fn new(reader: R) -> Result<Self> {
+        Self::with_version(reader, false)
+    }
+    pub fn with_version(mut reader: R, f32: bool) -> Result<Self> {
         let mut magic = [0; 8];
         reader
             .read_exact(&mut magic)
             .map_err(|e| failure(format!("short stdout magic: {e}")))?;
-        if &magic != b"RAWTLST1" {
+        if &magic != if f32 { b"RAWTLST2" } else { b"RAWTLST1" } {
             return Err(failure("invalid stdout magic"));
         }
         Ok(Self { reader })
@@ -141,6 +148,8 @@ pub struct NativeStream {
     process: OwnedProcess,
     protocol: Option<Protocol<std::process::ChildStdout>>,
     pixel_bytes: usize,
+    f32: bool,
+    expected_digest: Option<String>,
     active: ActiveNative,
 }
 impl NativeStream {
@@ -160,15 +169,17 @@ impl NativeStream {
             process,
             protocol: None,
             pixel_bytes: 0,
+            expected_digest: None,
+            f32: args.first().is_some_and(|a| a == "--stdout-frame-f32"),
             active,
         };
-        stream.protocol = Some(Protocol::new(stdout)?);
+        stream.protocol = Some(Protocol::with_version(stdout, stream.f32)?);
         Ok(stream)
     }
     pub fn pixels(&mut self, width: u32, height: u32) -> Result<Arc<[u8]>> {
         let length = (width as usize)
             .checked_mul(height as usize)
-            .and_then(|n| n.checked_mul(6))
+            .and_then(|n| n.checked_mul(if self.f32 { 12 } else { 6 }))
             .ok_or_else(|| failure("pixel geometry overflow"))?;
         self.process
             .note(&format!("pixel bytes expected: {length}"));
@@ -182,6 +193,18 @@ impl NativeStream {
                     .note(&format!("pixel record failed: {}", e.message));
                 e
             })?;
+        if self.f32
+            && pixels
+                .chunks_exact(4)
+                .any(|b| !f32::from_le_bytes(b.try_into().unwrap()).is_finite())
+        {
+            return Err(failure("nonfinite FP32 pixel"));
+        }
+        if let Some(expected) = &self.expected_digest {
+            if crate::digest::sha256(&pixels) != expected.to_ascii_lowercase() {
+                return Err(failure("FP32 pixels_sha256 mismatch"));
+            }
+        }
         self.pixel_bytes = pixels.len();
         self.process
             .note(&format!("pixel bytes: {}", self.pixel_bytes));
@@ -303,6 +326,18 @@ fn produce_inner(
             active.clone(),
             &mut |info, stream| {
                 if let Some(first) = frames.first() {
+                    if config.rev_eng
+                        && info
+                            .camera_color
+                            .as_ref()
+                            .and_then(|c| c.get("camera_model"))
+                            != first
+                                .camera_color
+                                .as_ref()
+                                .and_then(|c| c.get("camera_model"))
+                    {
+                        return Err(failure("rev-eng Canon Log2 rejects mixed camera models"));
+                    }
                     if info.width != first.width || info.height != first.height {
                         return Err(failure(format!(
                             "frame {} ({}) has dimensions {}x{} but the sequence is {}x{}",
@@ -400,7 +435,9 @@ fn run_frame(
 ) -> Result<FrameInfo> {
     let started = Instant::now();
     let mut args = vec![
-        if pixels {
+        if pixels && config.rev_eng {
+            "--stdout-frame-f32"
+        } else if pixels {
             "--stdout-frame"
         } else {
             "--stdout-analysis"
@@ -408,6 +445,17 @@ fn run_frame(
         .to_string(),
         source.path.display().to_string(),
     ];
+    if config.rev_eng {
+        if source
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_none_or(|e| !e.eq_ignore_ascii_case("cr3"))
+        {
+            return Err(failure("rev-eng Canon Log2 requires Canon CR3 photos"));
+        }
+        args.extend(["--camera-color-method".into(), "dng-camera-to-pcs".into()]);
+    }
     if let Some(wb) = override_wb {
         args.extend(["--white-balance".into(), format_wb(wb)]);
     }
@@ -439,6 +487,47 @@ fn run_frame(
     )?;
     let bytes = stream.json(1)?;
     let sidecar = parse_json(&bytes)?;
+    if config.rev_eng {
+        let color = sidecar
+            .get("color")
+            .ok_or_else(|| failure("missing camera color contract"))?;
+        let effective = color.get("method_effective").and_then(Json::as_str);
+        let valid_matrix = |key| {
+            color.get(key).and_then(Json::as_array).is_some_and(|rows| {
+                rows.len() == 3
+                    && rows.iter().all(|r| {
+                        r.as_array().is_some_and(|r| {
+                            r.len() == 3 && r.iter().all(|x| x.as_f64().is_some_and(f64::is_finite))
+                        })
+                    })
+            })
+        };
+        if !valid_matrix("camera_to_xyz_d50")
+            || !valid_matrix("camera_to_acescg")
+            || color
+                .get("profile_fingerprint")
+                .and_then(Json::as_str)
+                .is_none_or(str::is_empty)
+        {
+            return Err(failure(
+                "missing/invalid CameraToPCS matrix/profile fingerprint",
+            ));
+        }
+
+        if sidecar.get("color_contract_version").and_then(Json::as_u64) != Some(1)
+            || color.get("method_requested").and_then(Json::as_str) != Some("dng-camera-to-pcs")
+            || !matches!(
+                effective,
+                Some("dng-camera-to-pcs-forward-matrix" | "dng-camera-to-pcs-inverse-fallback")
+            )
+            || !color
+                .get("camera_model")
+                .and_then(Json::as_str)
+                .is_some_and(|s| s.starts_with("Canon "))
+        {
+            return Err(failure("invalid Canon CameraToPCS contract"));
+        }
+    }
     let file =
         MemoryFile::new(bytes.into(), JSON_MEDIA_TYPE).map_err(|e| failure(e.to_string()))?;
     let frame_width = sidecar
@@ -473,6 +562,14 @@ fn run_frame(
         ));
     }
 
+    if config.rev_eng
+        && !sidecar
+            .get("source_sha256")
+            .and_then(Json::as_str)
+            .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(failure("invalid source_sha256 for Canon FP32 frame"));
+    }
     let source_sha256 = Some(
         sidecar
             .get("source_sha256")
@@ -615,6 +712,8 @@ fn run_frame(
     let mut info = FrameInfo {
         index,
         source_name: source.name.clone(),
+        camera_color: sidecar.get("color").cloned(),
+        log_clip_counts: None,
         source_sha256,
         pixels_sha256: None,
         width: frame_width,
@@ -636,7 +735,12 @@ fn run_frame(
         let descriptor = parse_json(&stream.json(3)?)?;
         if descriptor.get("width").and_then(Json::as_u32) != Some(info.width)
             || descriptor.get("height").and_then(Json::as_u32) != Some(info.height)
-            || descriptor.get("pixel_format").and_then(Json::as_str) != Some("rgb48le")
+            || descriptor.get("pixel_format").and_then(Json::as_str)
+                != Some(if config.rev_eng {
+                    "rgbf32le"
+                } else {
+                    "rgb48le"
+                })
         {
             return Err(failure("frame descriptor geometry/pixel_format mismatch"));
         }
@@ -646,6 +750,24 @@ fn run_frame(
             .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
             .ok_or_else(|| failure("invalid pixels_sha256"))?;
         info.pixels_sha256 = Some(digest.into());
+        if config.rev_eng {
+            let expected_bytes = u64::from(info.width)
+                .checked_mul(u64::from(info.height))
+                .and_then(|n| n.checked_mul(12))
+                .ok_or_else(|| failure("FP32 geometry overflow"))?;
+            if descriptor.get("space").and_then(Json::as_str) != Some("AP1/D60")
+                || descriptor.get("transfer").and_then(Json::as_str) != Some("linear")
+                || descriptor
+                    .get("color_contract_version")
+                    .and_then(Json::as_u64)
+                    != Some(1)
+                || descriptor.get("byte_length").and_then(Json::as_u64) != Some(expected_bytes)
+                || expected_bytes > 2_400_000_000
+            {
+                return Err(failure("invalid FP32 descriptor contract/allocation bound"));
+            }
+            stream.expected_digest = Some(digest.into());
+        }
     } else {
         let bytes = stream.json(2)?;
         let envelope =
@@ -964,6 +1086,13 @@ mod protocol_tests {
         bytes.extend(length.to_le_bytes());
         bytes.extend(payload);
         bytes
+    }
+    #[test]
+    fn versions_are_selected_by_strategy_not_guessed_from_payload() {
+        assert!(Protocol::with_version(Cursor::new(b"RAWTLST1"), true).is_err());
+        assert!(Protocol::with_version(Cursor::new(b"RAWTLST2"), false).is_err());
+        let mut p = Protocol::with_version(Cursor::new(b"RAWTLST2"), true).unwrap();
+        p.end().unwrap();
     }
     #[test]
     fn rejects_wrong_order_reserved_lengths_truncation_and_trailing_data() {

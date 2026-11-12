@@ -2431,3 +2431,177 @@ fn protocol_and_child_failures_reap_live_counterparts_and_never_publish() {
         }
     }
 }
+
+const REV_PROFILE: &str = "canon-log2-cinema-gamut-rev-eng-crm-dev";
+
+#[test]
+fn rev_eng_profile_streams_f32_through_every_pass_and_audits_the_actual_video() {
+    for wb in ["first-frame", "per-frame"] {
+        let frames = (0..28)
+            .map(|i| {
+                let mut f = FakeFrame::new(
+                    &format!("IMG_{i:04}.CR3"),
+                    0.18f64.log2() + if i % 2 == 0 { 0.2 } else { -0.2 },
+                );
+                f.own_neutral = if i % 2 == 0 { "0.5,1,0.8" } else { "0.6,1,0.7" }.into();
+                f
+            })
+            .collect();
+        let material = synthetic_material(&format!("rev-eng-{wb}"), frames);
+        let (result, output) = run_synthetic(
+            &material,
+            "run",
+            &[
+                "--preview-profile",
+                REV_PROFILE,
+                "--log-reference-gain",
+                "2",
+                "--white-balance",
+                wb,
+            ],
+        );
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            stdout(&result),
+            stderr(&result)
+        );
+        assert!(output.join("output.mp4").exists());
+        assert!(!output.join("frames").exists());
+        let manifest = read_json(&output.join("manifest.json"));
+        let contract = manifest
+            .get("video")
+            .unwrap()
+            .get("color_contract")
+            .unwrap();
+        assert_eq!(
+            contract.get("profile").and_then(Json::as_str),
+            Some(REV_PROFILE)
+        );
+        assert_eq!(
+            contract.get("display_name").and_then(Json::as_str),
+            Some("clog2(rev-eng crm-dev)")
+        );
+        let q = manifest.get("quantization_policy").unwrap();
+        assert_eq!(q.get("reference_gain").and_then(Json::as_f64), Some(2.));
+        let audit = fs::read_to_string(output.join("temporal_audit.json")).unwrap();
+        assert!(audit.contains(REV_PROFILE), "{audit}");
+        assert!(audit.contains("reference_gain"), "{audit}");
+        // Analysis, gain probe, application feedback, final encoding all carry
+        // and validate the same camera strategy. No RGB48 fallback is allowed.
+        for (path, command) in frame_commands(&output.join("logs")) {
+            assert!(
+                command.contains("--camera-color-method dng-camera-to-pcs"),
+                "{command}"
+            );
+            let log = fs::read_to_string(&path).unwrap();
+            if path.to_string_lossy().contains("/encode/") {
+                assert!(command.contains("--stdout-frame-f32"), "{command}");
+                assert!(log.contains("pixel bytes: 518400"));
+            } else {
+                assert!(command.contains("--stdout-analysis"), "{command}");
+            }
+            let m = metadata_from_log(&log);
+            assert_eq!(
+                m.get("color")
+                    .unwrap()
+                    .get("method_requested")
+                    .and_then(Json::as_str),
+                Some("dng-camera-to-pcs")
+            );
+        }
+    }
+}
+
+#[test]
+fn rev_eng_rejects_corrupt_or_mismatched_producer_contracts_without_publication() {
+    for (knob, expected) in [
+        ("rev_defect=version", "magic"),
+        ("rev_defect=method", "CameraToPCS"),
+        ("rev_defect=effective", "CameraToPCS"),
+        ("rev_defect=missing-contract", "color contract"),
+        ("rev_defect=non-canon", "Canon CameraToPCS"),
+        ("rev_defect=mixed-model", "mixed camera models"),
+        ("rev_defect=format", "pixel_format"),
+        ("rev_defect=hash", "pixels_sha256 mismatch"),
+        ("empty_source_sha256=1", "source_sha256"),
+        ("rev_defect=nan", "nonfinite FP32"),
+        ("rev_defect=infinity", "nonfinite FP32"),
+        ("short_pixels=1", "short record payload"),
+        ("descriptor_geometry_mismatch=1", "descriptor geometry"),
+        ("nonzero_after_records=1", "exit code 3"),
+    ] {
+        let root = test_dir(&format!("rev-contract-{knob}"));
+        let input = root.join("material");
+        make_input(&input, &["IMG_1.CR3", "IMG_2.CR3"]);
+        let fixtures = root.join("fixtures");
+        fs::create_dir_all(&fixtures).unwrap();
+        let frames = vec![
+            FakeFrame::new("IMG_1.CR3", 0.18f64.log2()),
+            FakeFrame::new("IMG_2.CR3", 0.18f64.log2()),
+        ];
+        let tool = fake_native_sequence(&fixtures, &frames, None, false, 240, 180);
+        use std::io::Write;
+        let config = fixtures.join(format!("fake-native-{}.config", std::process::id()));
+        writeln!(
+            fs::OpenOptions::new().append(true).open(config).unwrap(),
+            "{knob}"
+        )
+        .unwrap();
+        let output = root.join("run");
+        let mut args = base_args(&input, &output, &tool);
+        args.extend(["--strength", "0", "--preview-profile", REV_PROFILE]);
+        let result = run_cli(&args);
+        assert_eq!(
+            result.status.code(),
+            Some(30),
+            "{knob}: {}",
+            stderr(&result)
+        );
+        assert!(
+            stderr(&result).contains(expected),
+            "{knob}: {}",
+            stderr(&result)
+        );
+        assert!(!output.join("output.mp4").exists());
+    }
+}
+
+#[test]
+fn log_reference_gain_is_finite_positive_and_exclusive_to_new_profile() {
+    for gain in ["0", "-1", "NaN", "inf", "1e999", "oops"] {
+        let result = run_cli(&[
+            "--input",
+            "/tmp",
+            "--output",
+            "/tmp/unused",
+            "--preview-profile",
+            REV_PROFILE,
+            "--log-reference-gain",
+            gain,
+        ]);
+        assert_eq!(result.status.code(), Some(2), "{}", stderr(&result));
+    }
+    for profile in ["canon-log2-cinema-gamut", "srgb-preview"] {
+        let result = run_cli(&[
+            "--input",
+            "/tmp",
+            "--output",
+            "/tmp/unused",
+            "--preview-profile",
+            profile,
+            "--log-reference-gain",
+            "1",
+        ]);
+        assert_eq!(result.status.code(), Some(2), "{}", stderr(&result));
+    }
+    let (root, input, fixtures) = run_success_setup("rev-reject-dng");
+    let tool = fake_native_tool(&fixtures, &standard_frames(&fixtures), None, false);
+    let output = root.join("run");
+    let mut args = base_args(&input, &output, &tool);
+    args.extend(["--strength", "0", "--preview-profile", REV_PROFILE]);
+    let result = run_cli(&args);
+    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
+    assert!(stderr(&result).contains("requires Canon CR3"));
+    assert!(!output.join("output.mp4").exists());
+}
