@@ -417,7 +417,7 @@ mod tests {
                 .map(|tile| [(tile % 12) as f64 / 12.0, (tile / 12) as f64 / 8.0])
                 .collect(),
             saturation_fraction: vec![0.0; k],
-            output_clip_fraction: vec![0.0; k],
+            analysis_highlight_fraction: vec![0.0; k],
             width: 1024,
             height: 768,
             grid_nx: 12,

@@ -139,6 +139,8 @@ pub enum Transfer {
     /// Canon Log 2.
     CanonLog2,
     CanonLog2RevEng,
+    /// Recovered CRD three-segment Canon Log 3.
+    CanonLog3RevEng,
     /// Nikon N-Log.
     NikonNLog,
     /// DJI D-Log (original D-Log, not D-Log 2).
@@ -149,6 +151,7 @@ impl Transfer {
     pub fn name(self) -> &'static str {
         match self {
             Transfer::CanonLog2RevEng => "Canon Log 2 (rev-eng crm-dev)",
+            Transfer::CanonLog3RevEng => "Canon Log 3 (rev-eng crm-dev)",
             Transfer::Srgb => "IEC 61966-2-1 sRGB OETF",
             Transfer::SonySLog3 => "Sony S-Log3",
             Transfer::CanonLog2 => "Canon Log 2",
@@ -159,6 +162,7 @@ impl Transfer {
 
     pub fn formula(self) -> &'static str {
         match self {
+            Transfer::CanonLog3RevEng => "x=reflection/0.9; if x < -0.014: L=-0.42889912*ln(1-14.98325*x)/ln(10)+0.07623209; else if x < 0.014: L=2.3069815*x+0.073059361; else: L=0.42889912*ln(1+14.98325*x)/ln(10)+0.069886632; y=(L*56064+4096)/65472",
             Transfer::CanonLog2RevEng => "x=reflection/0.9; L=sign(x)*0.122411586*ln(1+87.09937546*abs(x))+0.035388128; y=(L*56064+4096)/65472",
             Transfer::Srgb => "if x <= 0.0031308: y = 12.92*x; else y = 1.055*x^(1/2.4) - 0.055",
             Transfer::SonySLog3 => {
@@ -182,6 +186,9 @@ impl Transfer {
 
     pub fn document(self) -> &'static str {
         match self {
+            Transfer::CanonLog3RevEng => {
+                "Cinema RAW Development reconstructed continuous Log3 (matrix-only CR3 adaptation)"
+            }
             Transfer::CanonLog2RevEng => {
                 "Cinema RAW Development reconstructed continuous Log2 (matrix-only CR3 adaptation)"
             }
@@ -197,7 +204,9 @@ impl Transfer {
 
     pub fn version(self) -> &'static str {
         match self {
-            Transfer::CanonLog2RevEng => "CRD 2.15.10.1 / CrmSdk 2.11.0.27; rawtl revision 1",
+            Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng => {
+                "CRD 2.15.10.1 / CrmSdk 2.11.0.27; rawtl revision 1"
+            }
             Transfer::Srgb => "1999",
             Transfer::SonySLog3 => "V1.0 (2013-12, Japanese edition)",
             Transfer::CanonLog2 => "2018-11-01",
@@ -209,6 +218,7 @@ impl Transfer {
     pub fn url(self) -> &'static str {
         match self {
             Transfer::CanonLog2RevEng => "docs/canon-log2-rev-eng.md",
+            Transfer::CanonLog3RevEng => "docs/canon-log3-rev-eng.md",
             Transfer::Srgb => "https://webstore.iec.ch/publication/6169",
             Transfer::SonySLog3 => {
                 "https://www.sony.jp/ls-camera/knowledge/pdf/\
@@ -232,6 +242,19 @@ impl Transfer {
     /// Forward transfer: linear target-gamut reflection -> normalized signal.
     pub fn forward(self, value: f64) -> f64 {
         match self {
+            Transfer::CanonLog3RevEng => {
+                let x = value / 0.9;
+                // Preserve the recovered SDK's separate multiply/divide/add
+                // operations and rounded constants (no FMA, smoothing or LUT).
+                let l = if x < -0.014 {
+                    (1.0 - 14.98325 * x).ln() * -0.42889912 / std::f64::consts::LN_10 + 0.07623209
+                } else if x < 0.014 {
+                    x * 2.3069815 + 0.073059361
+                } else {
+                    (1.0 + 14.98325 * x).ln() * 0.42889912 / std::f64::consts::LN_10 + 0.069886632
+                };
+                (l * 56064.0 + 4096.0) / 65472.0
+            }
             Transfer::CanonLog2RevEng => {
                 let x = value / 0.9;
                 let l = x.signum() * 0.122411586 * (87.09937546 * x.abs()).ln_1p() + 0.035388128;
@@ -274,6 +297,23 @@ impl Transfer {
     /// Inverse transfer: normalized signal -> linear target-gamut reflection.
     pub fn inverse(self, signal: f64) -> f64 {
         match self {
+            Transfer::CanonLog3RevEng => {
+                let l = (signal * 65472.0 - 4096.0) / 56064.0;
+                // Analytic inverse of the recovered forward curve, not a
+                // recovered SDK inverse LUT. Rounded SDK coefficients cause
+                // ~1.68e-10 downward jumps at the joins; prefer the central
+                // branch in the overlapping signal intervals.
+                let x = if l < 0.073059361 - 2.3069815 * 0.014 {
+                    (-((0.07623209 - l) * std::f64::consts::LN_10 / 0.42889912).exp_m1() / 14.98325)
+                        .min(-0.014)
+                } else if l < 0.073059361 + 2.3069815 * 0.014 {
+                    (l - 0.073059361) / 2.3069815
+                } else {
+                    (((l - 0.069886632) * std::f64::consts::LN_10 / 0.42889912).exp_m1() / 14.98325)
+                        .max(0.014)
+                };
+                0.9 * x
+            }
             Transfer::CanonLog2RevEng => {
                 let l = (signal * 65472.0 - 4096.0) / 56064.0 - 0.035388128;
                 0.9 * l.signum() * (l.abs() / 0.122411586).exp_m1() / 87.09937546
@@ -321,6 +361,7 @@ impl Transfer {
     pub fn references(self) -> &'static [ReferenceCode] {
         match self {
             Transfer::CanonLog2RevEng => &CANON_REFERENCES,
+            Transfer::CanonLog3RevEng => &CANON_LOG3_REFERENCES,
             Transfer::Srgb => &SRGB_REFERENCES,
             Transfer::SonySLog3 => &SONY_REFERENCES,
             Transfer::CanonLog2 => &CANON_REFERENCES,
@@ -332,6 +373,7 @@ impl Transfer {
     /// How the reference codes were established.
     pub fn reference_basis(self) -> &'static str {
         match self {
+            Transfer::CanonLog3RevEng => "independently reconstructed CRD Log3 curve; 589824 SDK forward LUT entries plus the effective 65536-entry output LUT matched exactly",
             Transfer::CanonLog2RevEng => "independently reconstructed CRD continuous curve; Canon appendix gray codes cross-check",
             Transfer::Srgb => "existing IEC 61966-2-1 8-bit reference value for 18% grey",
             Transfer::SonySLog3 => {
@@ -365,6 +407,14 @@ const CANON_REFERENCES: [ReferenceCode; 5] = [
     ReferenceCode::new(0.9, "90% white (100% scene linear)", 575),
     ReferenceCode::new(7.2, "800%", 797),
     ReferenceCode::new(14.4, "1600%", 871),
+];
+
+const CANON_LOG3_REFERENCES: [ReferenceCode; 5] = [
+    ReferenceCode::new(0.0, "0% black", 128),
+    ReferenceCode::new(0.18, "18% grey", 351),
+    ReferenceCode::new(0.9, "90% white (100% scene linear)", 577),
+    ReferenceCode::new(7.2, "800%", 908),
+    ReferenceCode::new(14.4, "1600%", 1020),
 ];
 
 const NIKON_REFERENCES: [ReferenceCode; 3] = [
@@ -572,12 +622,16 @@ impl ColorProfile {
         }
     }
     pub fn is_rev_eng(&self) -> bool {
-        self.transfer == Transfer::CanonLog2RevEng
+        matches!(
+            self.transfer,
+            Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng
+        )
     }
     pub fn display_name(&self) -> &'static str {
         match self.id {
             "canon-log2-cinema-gamut" => "clog2(white paper)",
             "canon-log2-cinema-gamut-rev-eng-crm-dev" => "clog2(rev-eng crm-dev)",
+            "canon-log3-cinema-gamut-rev-eng-crm-dev" => "clog3 (rev-eng crm-dev)",
             _ => self.id,
         }
     }
@@ -675,7 +729,7 @@ impl ColorProfile {
         out: &mut impl FrameOutput,
     ) -> Result<(), String> {
         if self.is_rev_eng() {
-            return Err("rev-eng Canon Log2 requires signed FP32 input".into());
+            return Err("rev-eng Canon Log requires signed FP32 input".into());
         }
 
         let expected = width
@@ -1003,7 +1057,7 @@ const LOG_RANGE_REASON: &str = "Rawtl full-range (pc) delivery convention, not a
      (https://nps.nikonimaging.com/technical_info/technical_solutions/z9_tips/3d_lut/); \
      the transfer's code domain alone does not determine the delivery range.";
 
-pub static PROFILES: [ColorProfile; 7] = [
+pub static PROFILES: [ColorProfile; 8] = [
     ColorProfile {
         id: "srgb-preview",
         transfer: Transfer::Srgb,
@@ -1080,6 +1134,17 @@ pub static PROFILES: [ColorProfile; 7] = [
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
         preview_filename: "preview-h264-clog2-rev-eng-crm-dev.mp4",
+    },
+    ColorProfile {
+        id: "canon-log3-cinema-gamut-rev-eng-crm-dev",
+        transfer: Transfer::CanonLog3RevEng,
+        gamut: &CINEMA_GAMUT,
+        range: PreviewRange::Pc,
+        ycbcr_matrix: "bt2020nc",
+        range_reason: LOG_RANGE_REASON,
+        ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
+        tag_policy: TagPolicy::VENDOR_LOG,
+        preview_filename: "preview-h264-clog3-rev-eng-crm-dev.mp4",
     },
 ];
 
@@ -1202,13 +1267,15 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_seven_profiles_and_srgb_default() {
-        assert_eq!(PROFILES.len(), 7);
+    fn registry_has_eight_profiles_and_srgb_default() {
+        assert_eq!(PROFILES.len(), 8);
         assert_eq!(default_profile().id, "srgb-preview");
         for id in [
             "srgb-preview",
             "dji-dlog-dgamut",
             "canon-log2-cinema-gamut",
+            "canon-log2-cinema-gamut-rev-eng-crm-dev",
+            "canon-log3-cinema-gamut-rev-eng-crm-dev",
             "sony-slog3-sgamut3",
             "sony-slog3-sgamut3-cine",
             "nikon-nlog-bt2020",

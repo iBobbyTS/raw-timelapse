@@ -916,6 +916,15 @@ mod tests {
     }
 
     #[test]
+    fn rev_eng_log3_audit_removes_reference_scale_exactly_once() {
+        let p = color_profile::lookup("canon-log3-cinema-gamut-rev-eng-crm-dev").unwrap();
+        let mut value = [0.0];
+        luminance(&[[128 * 257; 3]], &mut value, p, 2.0);
+        // Independent inverse from scripts/canon_log3.py, y=128/255.
+        assert!((value[0] - 0.5887039959607215 / 2.0).abs() < 1e-10);
+    }
+
+    #[test]
     fn all_profiles_measure_known_ev_changes_through_the_production_audit() {
         // This is the real audit_video -> decode_features -> luminance path,
         // with controlled decoded RGB48 signals from the actual frame converter.

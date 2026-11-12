@@ -7,6 +7,8 @@
 | `clog2(white paper)` | `canon-log2-cinema-gamut` | 历史 inverse(PCStoCamera) / RAWTLST2 signed FP32 AP1/D60 |
 | `clog2(rev-eng crm-dev)` | `canon-log2-cinema-gamut-rev-eng-crm-dev` | DNG SDK CameraToPCS / RAWTLST2 signed FP32 AP1/D60 |
 
+另有独立的 [clog3 (rev-eng crm-dev)](canon-log3-rev-eng.md)，复用相同 CameraToPCS/FP32 路线及 reference gain 合同，使用独立的三段式 Log3 正反曲线。
+
 默认仍为 `srgb-preview`。旧 ID、白皮书 Log2 函数及旧矩阵保持；所有 RAW profile（包含 sRGB 和其他厂商 Log）统一 FP32，不再保留中间 RGB48 量化，因此不保证与旧版本逐像素一致。新预设只接受 Canon CR3 序列，各帧必须为同一相机型号。每帧在像素交给编码器前校验颜色合同；混合型号或失败时不发布最终文件。`first-frame` 和 `per-frame` 继续决定相机 neutral 的来源。
 
 ## 构建和运行
@@ -30,7 +32,7 @@ pipeline/target/release/rawtl-linear-video --input /path/to/canon-cr3 \
 
 输出目录必须为空或尚不存在。Adobe DNG Converter 与授权 DNG SDK 的准备见 [native 文档](../native/dng-linear-frame/README.md)。`--strength 0` 可隔离去闪影响，仅执行最终单趟编码。
 
-`--log-reference-gain` 只允许搭配新预设；必须是正有限标量，默认 1。当前没有灰卡校准数据，任何手动数值均记录 `unverified`、`calibration_id=null`。不能把 SDK 白电平归一化理解为实拍灰卡天然得到 0.18。校准需要在基础 EV=0、固定照明/机型/ISO/读出模式/profile 下测中性灰 ROI；若测得线性 Y 为 m，可评估 `0.18/m`。不使用每通道增益替代该曝光标量。
+`--log-reference-gain` 只允许搭配 rev-eng Canon Log2 或 Log3 预设；必须是正有限标量，默认 1。当前没有灰卡校准数据，任何手动数值均记录 `unverified`、`calibration_id=null`。不能把 SDK 白电平归一化理解为实拍灰卡天然得到 0.18。校准需要在基础 EV=0、固定照明/机型/ISO/读出模式/profile 下测中性灰 ROI；若测得线性 Y 为 m，可评估 `0.18/m`。不使用每通道增益替代该曝光标量。
 
 ## 共用空间和曝光合同
 
