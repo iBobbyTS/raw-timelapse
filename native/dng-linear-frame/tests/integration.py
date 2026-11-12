@@ -141,14 +141,14 @@ assert not (work/'analysis-uniform.png').exists()
 assert meta0['exposure_ev']==0 and meta0['gain']==1
 assert meta0['capture_time']=='2026:11:08 20:09:53'
 assert meta0['analysis_sidecar']==str(path0)
-assert side0['schema_version']==1 and side0['kind']=='rawtl-analysis-sidecar'
+assert side0['schema_version']==2 and side0['kind']=='rawtl-analysis-sidecar'
 assert side0['source_sha256']==meta0['source_sha256']
 geometry=side0['analysis']
 assert (geometry['downsampled_width'],geometry['downsampled_height'])==(64,64)
 assert (geometry['grid_nx'],geometry['grid_ny'])==(4,4)
 assert geometry['roi']==[0,0,1,1] and geometry['roi_pixel_bounds']==[0,0,64,64]
 assert geometry['saturation_mask_quality']=='camera_domain'
-assert geometry['output_clip_code_threshold']==16057
+assert geometry['highlight_threshold_linear']==0.9800109863
 assert geometry['structure_stride']==4
 assert geometry['luma_weights']==[.2126,.7152,.0722]
 assert len(side0['tiles'])==16
@@ -160,7 +160,7 @@ for tile in side0['tiles']:
     assert tile['valid'] is True
     close(tile['log_luminance'],math.log2(luma),1e-6)
     assert tile['saturation_fraction']==0
-    assert tile['output_clip_fraction']==expected_clip
+    assert tile['analysis_highlight_fraction']==expected_clip
     for got,want in zip(tile['channel_log_means'],scene):close(got,math.log2(want),1e-6)
     assert len(tile['structure_samples'])==16
     for value in tile['structure_samples']:close(value,math.log2(luma),1e-6)
@@ -202,8 +202,8 @@ for a,b,c in zip(s0['tiles'],s1['tiles'],s2['tiles']):
     close(b['log_luminance']-a['log_luminance'],0.5,1e-4)
     close(c['log_luminance']-a['log_luminance'],-0.5,1e-4)
     assert a['saturation_fraction']==b['saturation_fraction']==c['saturation_fraction']==0
-    assert a['output_clip_fraction']==0 and b['output_clip_fraction']==1
-    assert c['output_clip_fraction']==0
+    assert a['analysis_highlight_fraction']==0 and b['analysis_highlight_fraction']==1
+    assert c['analysis_highlight_fraction']==0
 for key in ('observed_scene_min','observed_scene_max'):
     close(m1[key]/m0[key],2**.5,1e-6)
 

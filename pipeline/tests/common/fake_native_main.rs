@@ -105,7 +105,7 @@ fn run() -> Result<(), (i32, String)> {
             .unwrap();
         writeln!(f, "{}", std::process::id()).unwrap();
     }
-    if options.stdout_mode.as_deref() == Some("--stdout-frame")
+    if matches!(options.stdout_mode.as_deref(), Some("--stdout-frame" | "--stdout-frame-f32"))
         && config.frame_fail_on.as_deref() == Some(&name)
     {
         return Err((3, "synthetic mid-run frame failure".into()));
@@ -132,10 +132,8 @@ fn run() -> Result<(), (i32, String)> {
     };
     let source_sha = if config.empty_source_sha256 {
         String::new()
-    } else if options.camera_method == "dng-camera-to-pcs" {
-        digest::sha256(&read_file(&options.input)?)
     } else {
-        format!("fake-{:016x}", fnv1a(read_file(&options.input)?))
+        digest::sha256(&read_file(&options.input)?)
     };
     let gain = options.exposure_ev.exp2();
     let tiles = tile_levels(
@@ -185,7 +183,7 @@ fn run() -> Result<(), (i32, String)> {
     } else {
         metadata
     };
-    let metadata = if options.stdout_mode.as_deref() == Some("--stdout-frame") {
+    let metadata = if matches!(options.stdout_mode.as_deref(), Some("--stdout-frame" | "--stdout-frame-f32")) {
         let field = format!("\"source_sha256\":{},", json_string(&source_sha));
         match config.frame_source_sha256_defect.as_deref() {
             Some("omit") => metadata.replace(&field, ""),
@@ -200,7 +198,7 @@ fn run() -> Result<(), (i32, String)> {
     };
     let is_f32 = options.stdout_mode.as_deref() == Some("--stdout-frame-f32");
     let mut metadata = metadata;
-    if options.camera_method == "dng-camera-to-pcs" {
+    {
         let defect = config.rev_defect.as_deref();
         let model = if defect == Some("mixed-model") && name.contains("2") {
             "Canon EOS R6"
@@ -209,20 +207,22 @@ fn run() -> Result<(), (i32, String)> {
         } else {
             "Canon EOS R7"
         };
-        let method = if defect == Some("method") {
-            "legacy-inverse-cm"
-        } else {
-            "dng-camera-to-pcs"
-        };
+        let method = if defect == Some("method") { "bogus" } else { &options.camera_method };
         let effective = if defect == Some("effective") {
             "bogus"
-        } else {
+        } else if options.camera_method == "dng-camera-to-pcs" {
             "dng-camera-to-pcs-forward-matrix"
-        };
+        } else { "legacy-inverse-cm" };
         let contract = format!("\"color_contract_version\":1,\"color\":{{\"profile_fingerprint\":\"controlled-test-profile\",\"camera_to_xyz_d50\":[[1,0,0],[0,1,0],[0,0,1]],\"camera_to_acescg\":[[1,0,0],[0,1,0],[0,0,1]],\"method_requested\":\"{method}\",\"method_effective\":\"{effective}\",\"camera_model\":\"{model}\"}},");
         if defect != Some("missing-contract") {
             metadata.insert_str(1, &contract);
         }
+    }
+    if is_f32 {
+        metadata.insert_str(1, "\"linear_pixel_format\":\"rgbf32le\",");
+        let start = metadata.find("\"quantization\":{").unwrap();
+        let end = metadata[start..].find("},").unwrap() + start + 2;
+        metadata.replace_range(start..end, "\"quantization\":{\"dtype\":\"f32\",\"negative_policy\":\"preserve\",\"upper_policy\":\"preserve\"},");
     }
     if let Some(mode) = &options.stdout_mode {
         let mut out = std::io::stdout().lock();
@@ -247,10 +247,6 @@ fn run() -> Result<(), (i32, String)> {
             if !is_f32 {
                 record(&mut out, 3, desc.as_bytes())?;
             }
-            if config.stall_pixels {
-                out.flush().unwrap();
-                std::thread::sleep(std::time::Duration::from_secs(60));
-            }
             let mut pixels = Vec::new();
             if let Some(fixture) = &spec.fixture {
                 let decoded =
@@ -267,33 +263,31 @@ fn run() -> Result<(), (i32, String)> {
                 for code in decoded.stdout.chunks_exact(2) {
                     let value = u16::from_le_bytes([code[0], code[1]]) as f64
                         * (options.exposure_ev * config.gain_scale).exp2();
-                    pixels
-                        .extend_from_slice(&(value.round().clamp(0., 65535.) as u16).to_le_bytes());
+                    if is_f32 {
+                        pixels.extend_from_slice(&((value / 16384.0) as f32).to_le_bytes());
+                    } else {
+                        pixels.extend_from_slice(&(value.round().clamp(0., 65535.) as u16).to_le_bytes());
+                    }
                 }
             } else {
                 for y in 0..config.height {
                     for x in 0..config.width {
                         let j = y as usize * config.grid_ny / config.height as usize;
                         let i = x as usize * config.grid_nx / config.width as usize;
-                        let code = quantize(tiles[j * config.grid_nx + i].0.exp2());
+                        let value = tiles[j * config.grid_nx + i].0.exp2();
                         for _ in 0..3 {
-                            pixels.extend_from_slice(&code.to_le_bytes());
+                            if is_f32 { pixels.extend_from_slice(&(value as f32).to_le_bytes()); }
+                            else { pixels.extend_from_slice(&quantize(value).to_le_bytes()); }
                         }
                     }
                 }
             }
             if is_f32 {
-                let mut floats = Vec::new();
-                for code in pixels.chunks_exact(2) {
-                    let value = u16::from_le_bytes(code.try_into().unwrap()) as f32 / 16384.0;
-                    floats.extend_from_slice(&value.to_le_bytes());
-                }
                 match config.rev_defect.as_deref() {
-                    Some("nan") => floats[..4].copy_from_slice(&f32::NAN.to_le_bytes()),
-                    Some("infinity") => floats[..4].copy_from_slice(&f32::INFINITY.to_le_bytes()),
+                    Some("nan") => pixels[..4].copy_from_slice(&f32::NAN.to_le_bytes()),
+                    Some("infinity") => pixels[..4].copy_from_slice(&f32::INFINITY.to_le_bytes()),
                     _ => (),
                 }
-                pixels = floats;
                 let hash = if config.rev_defect.as_deref() == Some("hash") {
                     "0".repeat(64)
                 } else {
@@ -311,6 +305,10 @@ fn run() -> Result<(), (i32, String)> {
                 };
                 let desc = format!("{{\"width\":{width},\"height\":{},\"pixel_format\":\"{format}\",\"byte_length\":{},\"color_contract_version\":1,\"space\":\"AP1/D60\",\"transfer\":\"linear\",\"pixels_sha256\":\"{hash}\"}}", config.height, pixels.len());
                 record(&mut out, 3, desc.as_bytes())?;
+            }
+            if config.stall_pixels {
+                out.flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(60));
             }
             if config.short_pixels {
                 out.write_all(&[4, 0, 0, 0]).unwrap();
@@ -578,7 +576,7 @@ fn sidecar_json(
     gain: f64,
 ) -> String {
     let mut out = String::new();
-    out.push_str("{\"schema_version\":1,");
+    out.push_str("{\"schema_version\":2,");
     if !config.analysis_omit_kind {
         out.push_str("\"kind\":\"rawtl-analysis-sidecar\",");
     }
@@ -597,10 +595,9 @@ fn sidecar_json(
 \"grid_nx\":{},\"grid_ny\":{},\"roi\":[{},{},{},{}],\
 \"roi_pixel_bounds\":[0,0,{},{}],\"tile_layout\":\"row-major (j*grid_nx+i)\",\
 \"analysis_domain\":\"gained ACEScg AP1/D60 scene-linear FP32\",\
-\"luma_weights\":[0.2126,0.7152,0.0722],\"quantum_linear\":0.00006103515625,\
+\"luma_weights\":[0.2126,0.7152,0.0722],\"highlight_threshold_linear\":0.980010986328125,\
 \"floor\":0.00048828125,\"saturation_mask_quality\":\"camera_domain\",\
-\"saturation_threshold\":0.98,\"output_clip_code_threshold\":16057,\
-\"output_clip_quality\":\"delivered_domain\",\"structure_stride\":4,\
+\"saturation_threshold\":0.98,\"highlight_quality\":\"analysis_ap1_threshold\",\"structure_stride\":4,\
 \"exposure_ev\":{},\"gain\":{}",
         config.width,
         config.height,
@@ -616,7 +613,7 @@ fn sidecar_json(
         gain,
     ));
     out.push_str("},\"tiles\":[");
-    let clip_threshold = 16057.0 / 16384.0;
+    let clip_threshold = 0.980010986328125;
     for (index, (log_level, valid)) in tiles.iter().enumerate() {
         let i = index % config.grid_nx;
         let j = index / config.grid_nx;
@@ -643,7 +640,7 @@ fn sidecar_json(
         }
         out.push_str(&format!(
             "{{\"center\":[{center_x},{center_y}],\"log_luminance\":{luminance},\
-\"valid\":{valid},\"saturation_fraction\":0.0,\"output_clip_fraction\":{clip},\
+\"valid\":{valid},\"saturation_fraction\":0.0,\"analysis_highlight_fraction\":{clip},\
 \"structure_samples\":[{}],\"channel_log_means\":[{log_level},{log_level},{log_level}]}}",
             samples.join(",")
         ));

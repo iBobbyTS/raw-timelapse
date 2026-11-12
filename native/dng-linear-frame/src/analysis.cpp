@@ -79,7 +79,7 @@ double trimmed_linear_mean(std::vector<double> values, double fraction) {
                              values.end() - std::ptrdiff_t(n));
   return mean_of(std::move(middle));
 }
-bool delivered_clip(float value) { return quantize(value) >= kOutputClipCode; }
+bool analysis_highlight(float value) { return value >= kHighlightThreshold; }
 Analysis measure(const Decoded &d, const std::vector<float> &gained_scene,
                  const Roi &roi, double exposure_ev) {
   const size_t pixels = size_t(d.width) * size_t(d.height);
@@ -116,12 +116,12 @@ Analysis measure(const Decoded &d, const std::vector<float> &gained_scene,
                    ? 1.0
                    : 0.0;
       });
-  // Delivered-domain mask: quantized code >= 16057 on the gained data.
+  // Analysis-only AP1 highlight mask. Does not predict final profile clipping.
   auto clipping = box_downsample(
       int(d.width), int(d.height), width, height, [&](size_t i) {
         const float *p = &gained_scene[i * 3];
-        return (delivered_clip(p[0]) || delivered_clip(p[1]) ||
-                delivered_clip(p[2]))
+        return (analysis_highlight(p[0]) || analysis_highlight(p[1]) ||
+                analysis_highlight(p[2]))
                    ? 1.0
                    : 0.0;
       });
@@ -151,7 +151,7 @@ Analysis measure(const Decoded &d, const std::vector<float> &gained_scene,
       const double clip = count > 0 ? clipping_sum / count : 0.0;
       const double mean = trimmed_linear_mean(block);
       tile.saturation_fraction = coverage;
-      tile.output_clip_fraction = clip;
+      tile.analysis_highlight_fraction = clip;
       tile.valid = block.size() >= 256 && finite && std::isfinite(coverage) &&
                    std::isfinite(clip) && coverage <= 0.005 &&
                    std::isfinite(mean) && mean > kFloor;
@@ -198,12 +198,12 @@ Json sidecar_json(const Analysis &analysis, const std::string &source_sha256) {
          tile.has_log_luminance ? number(tile.log_luminance) : Json()},
         {"valid", tile.valid},
         {"saturation_fraction", number(tile.saturation_fraction)},
-        {"output_clip_fraction", number(tile.output_clip_fraction)},
+        {"analysis_highlight_fraction", number(tile.analysis_highlight_fraction)},
         {"structure_samples", samples},
         {"channel_log_means", channels}});
   }
   return Json{
-      {"schema_version", 1},
+      {"schema_version", 2},
       {"kind", "rawtl-analysis-sidecar"},
       {"source_sha256", source_sha256},
       {"analysis",
@@ -222,12 +222,11 @@ Json sidecar_json(const Analysis &analysis, const std::string &source_sha256) {
             {"analysis_domain", "gained ACEScg AP1/D60 scene-linear FP32"},
             {"luma_weights", std::vector<Json>{number(kLumaR), number(kLumaG),
                                                number(kLumaB)}},
-            {"quantum_linear", number(kQuantum)},
+            {"highlight_threshold_linear", number(kHighlightThreshold)},
             {"floor", number(kFloor)},
             {"saturation_mask_quality", "camera_domain"},
             {"saturation_threshold", number(kSaturationThreshold)},
-            {"output_clip_code_threshold", kOutputClipCode},
-            {"output_clip_quality", "delivered_domain"},
+            {"highlight_quality", "analysis_ap1_threshold"},
             {"structure_stride", kStructureStride},
             {"exposure_ev", number(analysis.exposure_ev)}}},
       {"tiles", tiles}};

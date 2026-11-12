@@ -74,7 +74,7 @@ is still validated. `--analysis-roi X,Y,W,H` selects a unit-ROI sub-rectangle
 for analysis (default `0,0,1,1`).
 
 `--emit-analysis PATH` writes the deterministic analysis sidecar consumed by
-the deflicker node (schema version 1). The analysis downsamples the long edge to
+the deflicker node (schema version 2). The analysis downsamples the long edge to
 at most 1024 by exact integer-weighted BOX area averaging, then measures a
 12x8 grid clipped to the ROI (at least 8 tiles of 16x16 analysis pixels, else
 exit 4). Luminance is `0.2126 R + 0.7152 G + 0.0722 B` on the **gained** ACEScg
@@ -82,10 +82,10 @@ samples. Each tile records `center` (unit ROI coordinates, row-major
 `tile_layout`), `log_luminance` (5%/5% trimmed linear mean, then log2; `null`
 when invalid), `valid` (>=256 downsampled samples, all finite, camera-domain
 saturation occupancy <= 0.005, mean > floor), `saturation_fraction`,
-`output_clip_fraction`, `structure_samples` (log2 domain, every fourth
+`analysis_highlight_fraction`, `structure_samples` (log2 domain, every fourth
 downsampled sample) and `channel_log_means` (log2 of each channel's trimmed
-mean, floored at 1e-9). `floor` is `max(1e-5, 8/16384)`; `quantum_linear` is
-`1/16384`.
+mean, floored at 1e-9). `floor=0.00048828125` is retained as an algorithm
+parameter, not derived from FP32 precision. There is no fixed `quantum_linear`.
 
 The two occupancy series are deliberately different and are not
 interchangeable:
@@ -94,22 +94,22 @@ interchangeable:
   (post-Linearize, pre white-balance/color; `1.0 = WhiteLevel`) with the
   threshold `any channel >= 0.98`, then downsampled. It is invariant to the
   applied EV. The quality label is `camera_domain`.
-- `output_clip_fraction` is evaluated in the **delivered domain**: the exact
-  quantization predicate `code >= 16057` (`code/16384 >= 0.98`) on any gained
-  channel, then downsampled. It changes with `--exposure-ev`.
+- `analysis_highlight_fraction` is the occupancy of any gained AP1 channel
+  >= `highlight_threshold_linear=0.980010986328125`, then downsampled. It
+  preserves the historical threshold without quantizing pixels. The quality
+  is `analysis_ap1_threshold`; this is neither sensor saturation nor final
+  encoded-profile clipping. It changes with `--exposure-ev`.
 
 The same input and options produce byte-identical sidecar JSON (fixed
 10-significant-digit formatting, no run provenance). The sidecar contains
 `source_sha256`, analysis geometry, `exposure_ev`, the fixed analysis constants,
 and the row-major tile list.
 
-Pipeline consumption: the `rawtl-linear-video` sequence driver invokes this tool
-with `--exposure-ev`, `--emit-analysis` and `--no-png` during its deflicker
-analysis pass and gain probes, and with `--exposure-ev` plus `--emit-analysis`
-during each application pass. See `pipeline/README.md` for the orchestration,
-report and audit flow. The two occupancy series feed distinct decisions:
-camera-domain occupancy gates tile validity/estimation, while delivered-domain
-occupancy drives the report's output-clipping delta.
+Pipeline consumption: all analysis/probe/application passes use stdout
+analysis; all final frames use stdout FP32 regardless of profile. Camera-domain
+occupancy gates estimation; analysis highlight occupancy produces the report's
+`analysis_highlight_increase_fraction`. Final signal-domain clipping is counted
+separately after the target gamut conversion, in Rust.
 
 ## Streaming stdout protocol (v1)
 
@@ -125,7 +125,7 @@ native/build/dng-linear-frame --stdout-frame input.dng \
   [--exposure-ev EV]
 ```
 
-The additional signed-float mode is selected explicitly:
+The pipeline uses signed-float mode for every profile (matrix choice is independent):
 
 ```sh
 native/build/dng-linear-frame --stdout-frame-f32 input.CR3 \
@@ -297,12 +297,12 @@ only test routing; they are not decode fallbacks.
 `analysis-measurement` covers the deflicker photometry on synthetic buffers:
 trimmed means (including unclamped negative noise), grid partitions/centers,
 identity and fractional BOX downsampling, saturation and floor gates, structure
-stride sampling, channel-mean flooring, the exact delivered-clip predicate, EV
+stride sampling, channel-mean flooring, the analysis-only highlight predicate, EV
 equivariance, camera-mask invariance and `+EV` clip growth. The integration
 script additionally checks the analysis sidecar contract on generated DNGs
 (golden values from the independent Decimal matrix, `--no-png`, capture-time
 presence/absence, deterministic sidecar bytes, non-finite EV/ROI rejections,
-nonzero-black camera-domain masking and delivered-domain clipping). The
+nonzero-black camera-domain masking and analysis-only AP1 highlight occupancy). The
 `stdout-protocol` test covers protocol v1: magic/record framing with zero
 reserved bytes, `0x01`/`0x02` byte equality against positional reference files
 (including `--exposure-ev` and `--analysis-roi`), the `0x03` descriptor and

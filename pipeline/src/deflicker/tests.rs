@@ -39,7 +39,7 @@ fn measurement(row: Vec<f64>, samples: bool) -> FrameMeasurement {
         valid: vec![true; K],
         centers: centers(),
         saturation_fraction: vec![0.; K],
-        output_clip_fraction: vec![0.; K],
+        analysis_highlight_fraction: vec![0.; K],
         width: 320,
         height: 240,
         grid_nx: 12,
@@ -1229,10 +1229,10 @@ mod contract_and_boundaries {
             assert_eq!(s.roi, [0., 0., 1., 1.]);
             assert_eq!(s.roi_pixel_bounds, [0, 0, 1024, 578]);
             assert_eq!(s.luma_weights, REC709_LUMA);
-            near(s.quantum_linear, 1. / 16384., 1e-14);
+            near(s.highlight_threshold_linear, 0.980010986328125, 1e-10);
             assert_eq!(s.floor, 8. / 16384.);
             assert_eq!(m.saturation_mask_quality, "camera_domain");
-            assert_eq!(s.output_clip_quality, "delivered_domain");
+            assert_eq!(s.highlight_quality, "analysis_ap1_threshold");
             assert!(s.analysis_domain.contains("ACEScg"));
             assert_eq!(m.source_sha256.len(), 64);
             let mut lengths = std::collections::BTreeSet::new();
@@ -1256,9 +1256,9 @@ mod contract_and_boundaries {
         assert_ne!(a.source_sha256, mid.source_sha256);
         assert_eq!(a.saturation_fraction, b.saturation_fraction);
         assert!(a
-            .output_clip_fraction
+            .analysis_highlight_fraction
             .iter()
-            .zip(&b.output_clip_fraction)
+            .zip(&b.analysis_highlight_fraction)
             .any(|(a, b)| b > a));
         let mut shared = 0;
         for i in 0..K {
@@ -1354,7 +1354,7 @@ mod contract_and_boundaries {
             "render_ev",
             "gain",
             "render_target_error_ev",
-            "new_output_clipping_fraction",
+            "analysis_highlight_increase_fraction",
             "measured_level_ev",
             "desired_level_ev",
             "segment_id",

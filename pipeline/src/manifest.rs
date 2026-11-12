@@ -52,9 +52,9 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                 ),
                 ("applied_ev", Json::Float(frame.exposure_ev)),
                 (
-                    "final_log_clipping",
+                    "final_signal_clipping",
                     frame
-                        .log_clip_counts
+                        .signal_clip_counts
                         .map(|counts| {
                             Json::obj(vec![
                                 ("below_domain_samples", Json::Int(counts[0] as i64)),
@@ -154,7 +154,7 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
     Json::obj(vec![
         (
             "schema_version",
-            Json::Int(1),
+            Json::Int(2),
         ),
         (
             "tool",
@@ -255,30 +255,14 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
         ),
         (
             "quantization_policy",
-            if input.options.preview_profile.is_rev_eng() { Json::obj(vec![
+            Json::obj(vec![
                 ("linear_dtype", Json::Str("signed f32 LE AP1/D60".into())),
                 ("linear_clipping", Json::Str("none after camera-to-AP1; upstream limits remain".into())),
                 ("final_denominator", Json::Int(255)),
                 ("reference_gain", Json::Float(input.options.log_reference_gain)),
-                ("reference_status", Json::Str("unverified".into())),
+                ("reference_status", Json::Str(if input.options.preview_profile.is_rev_eng() { "unverified" } else { "not-applicable" }.into())),
                 ("calibration_id", Json::Null),
-            ]) } else { Json::obj(vec![
-                ("scale", Json::Int(16384)),
-                ("rounding", Json::Str("nearest; ties upward".to_string())),
-                ("negative_policy", Json::Str("clip to 0".to_string())),
-                (
-                    "upper_policy",
-                    Json::Str("above 65535/16384 clips to 65535".to_string()),
-                ),
-                ("transfer", Json::Str("linear; no OETF".to_string())),
-                (
-                    "authority",
-                    Json::Str(
-                        "PLAN shared quantization policy; per-frame native JSON records counts"
-                            .to_string(),
-                    ),
-                ),
-            ]) },
+            ])
         ),
         (
             "video",

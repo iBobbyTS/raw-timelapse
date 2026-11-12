@@ -5,9 +5,11 @@ use crate::color_profile::{ColorProfile, TagPolicy};
 use crate::error::{Error, Result, EXIT_PREVIEW, EXIT_PUBLISH, EXIT_VALIDATION};
 use crate::json::Json;
 use crate::proc;
+#[cfg(test)]
+use crate::transport::RGB48_FRAME;
 use crate::transport::{
     self, ArrayDescriptor, ArrayLayout, ByteOrder, DType, DataEnvelope, DiskArtifact, MetadataDoc,
-    NdArray, Payload, Provenance, AP1_F32_FRAME, RGB24_FRAME, RGB48_FRAME, VIDEO_ARTIFACT,
+    NdArray, Payload, Provenance, AP1_F32_FRAME, RGB24_FRAME, VIDEO_ARTIFACT,
 };
 use std::fs;
 use std::io::Write;
@@ -122,6 +124,7 @@ fn rgb_metadata(
 }
 
 /// Wrap one decoded little-endian RGB16 frame as a validated `RGB48_FRAME`.
+#[cfg(test)]
 fn rgb48_frame_envelope(
     bytes: Arc<[u8]>,
     width: u32,
@@ -516,7 +519,7 @@ pub fn validate_preview(
 }
 
 /// Start with the first frame's validated metadata/descriptor, then retain only
-/// one RGB48 and one RGB24 backing allocation per frame. The encoder owns no
+/// one FP32 and one RGB24 backing allocation per frame. The encoder owns no
 /// input file; closing stdin is the end-of-sequence signal.
 pub fn encode_stream(
     context: &crate::RunContext<'_>,
@@ -532,7 +535,7 @@ pub fn encode_stream(
         echo: true,
         echo_tag: "encode ",
         white_balance: options.white_balance,
-        rev_eng: options.preview_profile.is_rev_eng(),
+        camera_color_method: options.preview_profile.camera_color_method(),
         converter: options.converter.as_deref(),
         converter_timeout: options.converter_timeout,
         log_relative_dir: "logs/encode",
@@ -570,13 +573,8 @@ pub fn encode_stream(
                     "encoder failed while native frame was active",
                 ));
             }
-            let rgb48 = native.pixels(info.width, info.height)?;
-            let sent = (if options.preview_profile.is_rev_eng() {
-                f32_frame_envelope(rgb48, info.width, info.height)
-            } else {
-                rgb48_frame_envelope(rgb48, info.width, info.height, "dng-linear-frame stdout")
-            })
-            .map_err(|e| {
+            let pixels = native.pixels(info.width, info.height)?;
+            let sent = f32_frame_envelope(pixels, info.width, info.height).map_err(|e| {
                 Error::new(
                     crate::error::EXIT_FRAME,
                     format!("invalid scene-linear frame: {e}"),
@@ -587,25 +585,16 @@ pub fn encode_stream(
                 Arc::<[u8]>::new_zeroed_slice(info.width as usize * info.height as usize * 3)
                     .assume_init()
             };
-            let conversion = if options.preview_profile.is_rev_eng() {
-                options
-                    .preview_profile
-                    .convert_f32_frame(
-                        array_bytes(&sent),
-                        info.width as usize,
-                        info.height as usize,
-                        options.log_reference_gain,
-                        &mut rgb24,
-                    )
-                    .map(|counts| clipping.push(counts))
-            } else {
-                options.preview_profile.convert_frame(
+            let conversion = options
+                .preview_profile
+                .convert_f32_frame(
                     array_bytes(&sent),
                     info.width as usize,
                     info.height as usize,
+                    options.log_reference_gain,
                     &mut rgb24,
                 )
-            };
+                .map(|counts| clipping.push(counts));
             conversion.map_err(|e| Error::new(EXIT_PREVIEW, format!("colour conversion: {e}")))?;
             let converted = rgb24_frame_envelope(
                 rgb24,
@@ -658,10 +647,8 @@ pub fn encode_stream(
         }
     }
     let mut sequence = result?;
-    if options.preview_profile.is_rev_eng() {
-        for (frame, counts) in sequence.frames.iter_mut().zip(clipping) {
-            frame.log_clip_counts = Some(counts);
-        }
+    for (frame, counts) in sequence.frames.iter_mut().zip(clipping) {
+        frame.signal_clip_counts = Some(counts);
     }
     ensure_nonempty(output, EXIT_PREVIEW, "streaming encoder produced no video")?;
     Ok(sequence)

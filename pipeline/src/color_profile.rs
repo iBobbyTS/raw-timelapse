@@ -546,7 +546,31 @@ impl FrameOutput for std::sync::Arc<[u8]> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraColorMethod {
+    LegacyInverseCm,
+    DngCameraToPcs,
+}
+impl CameraColorMethod {
+    pub fn native_token(self) -> &'static str {
+        match self {
+            Self::LegacyInverseCm => "legacy-inverse-cm",
+            Self::DngCameraToPcs => "dng-camera-to-pcs",
+        }
+    }
+    pub fn requires_canon_cr3(self) -> bool {
+        self == Self::DngCameraToPcs
+    }
+}
+
 impl ColorProfile {
+    pub fn camera_color_method(&self) -> CameraColorMethod {
+        if self.is_rev_eng() {
+            CameraColorMethod::DngCameraToPcs
+        } else {
+            CameraColorMethod::LegacyInverseCm
+        }
+    }
     pub fn is_rev_eng(&self) -> bool {
         self.transfer == Transfer::CanonLog2RevEng
     }
@@ -567,7 +591,10 @@ impl ColorProfile {
         reference_gain: f64,
         out: &mut impl FrameOutput,
     ) -> Result<[usize; 2], String> {
-        if !self.is_rev_eng() || !reference_gain.is_finite() || reference_gain <= 0.0 {
+        if !reference_gain.is_finite()
+            || reference_gain <= 0.0
+            || (!self.is_rev_eng() && reference_gain != 1.0)
+        {
             return Err("invalid FP32 profile/reference gain".into());
         }
         let n = width
@@ -638,7 +665,8 @@ impl ColorProfile {
         out
     }
 
-    /// Convert one frame of little-endian RGB16 ACEScg codes into packed RGB24.
+    /// Compatibility utility for explicit RGB16 ACEScg inputs. The RAW pipeline
+    /// uses convert_f32_frame for every profile.
     pub fn convert_frame(
         &self,
         rgb48le: &[u8],
@@ -733,7 +761,7 @@ impl ColorProfile {
         Json::obj(vec![
             ("profile", Json::Str(self.id.to_string())),
             ("display_name", Json::Str(self.display_name().into())),
-            ("pipeline_revision", Json::Int(1)),
+            ("pipeline_revision", Json::Int(2)),
             (
                 "transfer",
                 Json::obj(vec![
@@ -804,11 +832,7 @@ impl ColorProfile {
                     ),
                     (
                         "interpretation",
-                        Json::Str(if self.is_rev_eng() {
-                            "signed FP32 AP1/D60; native EV already applied; reference gain applied once in target gamut".to_string()
-                        } else {
-                            "16-bit RGB codes interpreted as code/16384 scene-linear ACEScg AP1/D60; no OETF in the source PNG".to_string()
-                        }),
+                        Json::Str("signed FP32 AP1/D60; native EV already applied; reference gain applied once in target gamut (1 for profiles without reference scaling)".to_string()),
                     ),
                 ]),
             ),
@@ -1123,6 +1147,57 @@ mod tests {
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let bytes: Vec<_> = [bad; 3].into_iter().flat_map(f32::to_le_bytes).collect();
             assert!(p.convert_f32_frame(&bytes, 1, 1, 1., &mut output).is_err());
+        }
+    }
+
+    #[test]
+    fn every_profile_accepts_signed_f32_without_legacy_linear_clipping() {
+        for p in &PROFILES {
+            let bytes: Vec<_> = [-0.005f32, 0.5, 0.05]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            let mut out = vec![];
+            p.convert_f32_frame(&bytes, 1, 1, 1., &mut out).unwrap();
+            assert_eq!(out.len(), 3);
+            let input = p.contract_json();
+            let input = input
+                .get("input_domain")
+                .unwrap()
+                .get("interpretation")
+                .and_then(Json::as_str)
+                .unwrap();
+            assert!(
+                input.contains("signed FP32") && !input.contains("16384"),
+                "{}",
+                p.id
+            );
+            if p.transfer == Transfer::CanonLog2 || p.transfer == Transfer::CanonLog2RevEng {
+                assert_eq!(out, [38, 122, 90], "independent Canon negative-AP1 vector");
+            }
+            let bytes: Vec<_> = [8f32; 3].into_iter().flat_map(f32::to_le_bytes).collect();
+            p.convert_f32_frame(&bytes, 1, 1, 1., &mut out).unwrap();
+            if p.transfer != Transfer::Srgb {
+                assert_ne!(
+                    out,
+                    p.encode_linear([65535. / 16384.; 3]),
+                    "{} lost high range",
+                    p.id
+                );
+            }
+            if !p.is_rev_eng() {
+                assert!(p.convert_f32_frame(&bytes, 1, 1, 2., &mut out).is_err());
+                assert_eq!(p.camera_color_method(), CameraColorMethod::LegacyInverseCm);
+            } else {
+                assert_eq!(p.camera_color_method(), CameraColorMethod::DngCameraToPcs);
+            }
+            assert!(p
+                .convert_f32_frame(&bytes[..11], 1, 1, 1., &mut out)
+                .is_err());
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let bytes: Vec<_> = [bad; 3].into_iter().flat_map(f32::to_le_bytes).collect();
+                assert!(p.convert_f32_frame(&bytes, 1, 1, 1., &mut out).is_err());
+            }
         }
     }
 

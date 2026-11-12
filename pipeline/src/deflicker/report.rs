@@ -49,8 +49,8 @@ impl ReportFrame {
             ("gain", opt(f.gain())),
             ("render_target_error_ev", opt(f.render_target_error_ev)),
             (
-                "new_output_clipping_fraction",
-                opt(f.new_output_clipping_fraction),
+                "analysis_highlight_increase_fraction",
+                opt(f.analysis_highlight_increase_fraction),
             ),
             ("measured_level_ev", opt(f.measured_level_ev)),
             ("desired_level_ev", opt(f.desired_level_ev)),
@@ -160,6 +160,7 @@ impl ExposureReport {
             *counts.entry(f.estimate.status.clone()).or_default() += 1;
         }
         finite_json(&Json::obj(vec![
+            ("schema_version", Json::Int(2)),
             ("run_status", Json::Str(self.run_status.clone())),
             ("config", self.config.clone()),
             (

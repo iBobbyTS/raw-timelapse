@@ -85,15 +85,10 @@ fn publishes_one_streamed_video_with_manifest_and_no_frame_files() {
     for (offset, name) in ["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"].iter().enumerate() {
         let frame = &entries[offset];
         assert_eq!(frame.get("source").and_then(Json::as_str), Some(*name));
-        assert_eq!(
-            frame.get("pixels_sha256").and_then(Json::as_str),
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        );
-        assert!(frame
-            .get("source_sha256")
-            .and_then(Json::as_str)
-            .unwrap()
-            .starts_with("fake-"));
+        for key in ["pixels_sha256", "source_sha256"] {
+            let hash = frame.get(key).and_then(Json::as_str).unwrap();
+            assert!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
         for removed in [
             "png",
             "metadata",
@@ -106,8 +101,8 @@ fn publishes_one_streamed_video_with_manifest_and_no_frame_files() {
         }
         let log = fs::read_to_string(output.join(frame.get("log").and_then(Json::as_str).unwrap()))
             .unwrap();
-        assert!(log.contains("--stdout-frame"));
-        assert!(log.contains("pixel bytes: 288"));
+        assert!(log.contains("--stdout-frame-f32"));
+        assert!(log.contains("pixel bytes: 576"));
         assert!(log.contains("exit: exit code 0"));
         let metadata = metadata_from_log(&log);
         assert_eq!(
@@ -1399,6 +1394,26 @@ fn preview_profiles_emit_their_declared_colour_contract() {
             stderr(&result)
         );
         let output = root.join("run");
+        let manifest = read_json(&output.join("manifest.json"));
+        assert_eq!(
+            manifest
+                .get("quantization_policy")
+                .unwrap()
+                .get("linear_dtype")
+                .and_then(Json::as_str),
+            Some("signed f32 LE AP1/D60")
+        );
+        for (path, command) in frame_commands(&output.join("logs")) {
+            assert!(
+                command.contains("--camera-color-method legacy-inverse-cm"),
+                "{command}"
+            );
+            if path.to_string_lossy().contains("/encode/") {
+                assert!(command.contains("--stdout-frame-f32"), "{command}");
+            } else {
+                assert!(command.contains("--stdout-analysis"), "{command}");
+            }
+        }
         let preview = output.join(filename);
         assert!(preview.is_file(), "{id}: missing {filename}");
 
@@ -2514,59 +2529,65 @@ fn rev_eng_profile_streams_f32_through_every_pass_and_audits_the_actual_video() 
 }
 
 #[test]
-fn rev_eng_rejects_corrupt_or_mismatched_producer_contracts_without_publication() {
-    for (knob, expected) in [
-        ("rev_defect=version", "magic"),
-        ("rev_defect=method", "CameraToPCS"),
-        ("rev_defect=effective", "CameraToPCS"),
-        ("rev_defect=missing-contract", "color contract"),
-        ("rev_defect=non-canon", "Canon CameraToPCS"),
-        ("rev_defect=mixed-model", "mixed camera models"),
-        ("rev_defect=format", "pixel_format"),
-        ("rev_defect=hash", "pixels_sha256 mismatch"),
-        ("empty_source_sha256=1", "source_sha256"),
-        ("rev_defect=nan", "nonfinite FP32"),
-        ("rev_defect=infinity", "nonfinite FP32"),
-        ("short_pixels=1", "short record payload"),
-        ("descriptor_geometry_mismatch=1", "descriptor geometry"),
-        ("nonzero_after_records=1", "exit code 3"),
-    ] {
-        let root = test_dir(&format!("rev-contract-{knob}"));
-        let input = root.join("material");
-        make_input(&input, &["IMG_1.CR3", "IMG_2.CR3"]);
-        let fixtures = root.join("fixtures");
-        fs::create_dir_all(&fixtures).unwrap();
-        let frames = vec![
-            FakeFrame::new("IMG_1.CR3", 0.18f64.log2()),
-            FakeFrame::new("IMG_2.CR3", 0.18f64.log2()),
-        ];
-        let tool = fake_native_sequence(&fixtures, &frames, None, false, 240, 180);
-        use std::io::Write;
-        let config = fixtures.join(format!("fake-native-{}.config", std::process::id()));
-        writeln!(
-            fs::OpenOptions::new().append(true).open(config).unwrap(),
-            "{knob}"
-        )
-        .unwrap();
-        let output = root.join("run");
-        let mut args = base_args(&input, &output, &tool);
-        args.extend(["--strength", "0", "--preview-profile", REV_PROFILE]);
-        let result = run_cli(&args);
-        assert_eq!(
-            result.status.code(),
-            Some(30),
-            "{knob}: {}",
-            stderr(&result)
-        );
-        assert!(
-            stderr(&result).contains(expected),
-            "{knob}: {}",
-            stderr(&result)
-        );
-        assert!(!output.join("output.mp4").exists());
+fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
+    for profile in &rawtl_linear_video::color_profile::PROFILES {
+        for (knob, expected) in [
+            ("rev_defect=version", "magic"),
+            ("rev_defect=method", "camera color contract"),
+            ("rev_defect=effective", "camera color contract"),
+            ("rev_defect=missing-contract", "color contract"),
+            ("rev_defect=non-canon", "camera color contract"),
+            ("rev_defect=mixed-model", "mixed camera models"),
+            ("rev_defect=format", "pixel_format"),
+            ("rev_defect=hash", "pixels_sha256 mismatch"),
+            ("empty_source_sha256=1", "source_sha256"),
+            ("rev_defect=nan", "nonfinite FP32"),
+            ("rev_defect=infinity", "nonfinite FP32"),
+            ("short_pixels=1", "short record payload"),
+            ("descriptor_geometry_mismatch=1", "descriptor geometry"),
+            ("nonzero_after_records=1", "exit code 3"),
+        ] {
+            if !profile.is_rev_eng()
+                && ["rev_defect=non-canon", "rev_defect=mixed-model"].contains(&knob)
+            {
+                continue;
+            }
+            let root = test_dir(&format!("float-contract-{}-{knob}", profile.id));
+            let input = root.join("material");
+            make_input(&input, &["IMG_1.CR3", "IMG_2.CR3"]);
+            let fixtures = root.join("fixtures");
+            fs::create_dir_all(&fixtures).unwrap();
+            let frames = vec![
+                FakeFrame::new("IMG_1.CR3", 0.18f64.log2()),
+                FakeFrame::new("IMG_2.CR3", 0.18f64.log2()),
+            ];
+            let tool = fake_native_sequence(&fixtures, &frames, None, false, 240, 180);
+            use std::io::Write;
+            let config = fixtures.join(format!("fake-native-{}.config", std::process::id()));
+            writeln!(
+                fs::OpenOptions::new().append(true).open(config).unwrap(),
+                "{knob}"
+            )
+            .unwrap();
+            let output = root.join("run");
+            let mut args = base_args(&input, &output, &tool);
+            args.extend(["--strength", "0", "--preview-profile", profile.id]);
+            let result = run_cli(&args);
+            assert_eq!(
+                result.status.code(),
+                Some(30),
+                "{knob}: {}",
+                stderr(&result)
+            );
+            assert!(
+                stderr(&result).contains(expected),
+                "{knob}: {}",
+                stderr(&result)
+            );
+            assert!(!output.join("output.mp4").exists());
+        }
     }
 }
-
 #[test]
 fn log_reference_gain_is_finite_positive_and_exclusive_to_new_profile() {
     for gain in ["0", "-1", "NaN", "inf", "1e999", "oops"] {

@@ -21,11 +21,12 @@ constexpr int kStructureStride = 4;
 constexpr double kLumaR = 0.2126;
 constexpr double kLumaG = 0.7152;
 constexpr double kLumaB = 0.0722;
-// 16-bit delivered scale; floor = max(1e-5, 8 * quantum).
-constexpr double kQuantum = 1.0 / 16384.0;
+// Fixed photometry floor retained as an algorithm parameter, not FP32 precision.
 constexpr double kFloor = 0.00048828125;
 constexpr double kSaturationThreshold = 0.98;
-constexpr int kOutputClipCode = 16057; // smallest code with code/16384 >= 0.98
+// Historical highlight predicate expressed directly in linear AP1. This is
+// neither sensor saturation nor clipping in the final encoded profile.
+constexpr double kHighlightThreshold = 0.980010986328125;
 struct Roi {
   double x = 0, y = 0, w = 1, h = 1;
 };
@@ -43,8 +44,8 @@ Grid make_grid(int source_width, int source_height, const Roi &roi);
 // 5%/5% trimmed mean in the linear domain. Negative noise is not clamped.
 // Returns NaN for empty input or any non-finite value.
 double trimmed_linear_mean(std::vector<double> values, double fraction = 0.05);
-// Delivered-domain clip: the exact quantization-code predicate code >= 16057.
-bool delivered_clip(float value);
+// Analysis-only highlight occupancy; no quantization or clipping of pixels.
+bool analysis_highlight(float value);
 namespace detail {
 inline std::vector<std::vector<std::pair<int, int>>>
 box_weights(int source, int dest) {
@@ -106,7 +107,7 @@ struct Tile {
   bool has_log_luminance = false;
   double log_luminance = 0;
   double saturation_fraction = 1;
-  double output_clip_fraction = 0;
+  double analysis_highlight_fraction = 0;
   std::vector<double> structure_samples; // log2 domain, tile ::4 stride
   std::array<std::optional<double>, 3> channel_log_means;
 };
@@ -119,7 +120,7 @@ struct Analysis {
 };
 // d.camera must be the normalized camera-domain FP32 data (post Linearize,
 // pre white balance / color transform). gained_scene is the post-gain ACEScg
-// FP32 delivery data, size width*height*3.
+// FP32 analysis data, size width*height*3.
 Analysis measure(const Decoded &d, const std::vector<float> &gained_scene,
                  const Roi &roi, double exposure_ev);
 Json sidecar_json(const Analysis &analysis, const std::string &source_sha256);

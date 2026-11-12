@@ -78,7 +78,7 @@ contain each other in either direction. The input directory is only read.
 
 - `canon-log2-cinema-gamut` — **clog2(white paper)**, historical matrix/quantization/curve.
 - `canon-log2-cinema-gamut-rev-eng-crm-dev` — **clog2(rev-eng crm-dev)**,
-  Canon CR3 only, SDK CameraToPCS and signed FP32 AP1/D60 handoff.
+  Canon CR3 only, SDK CameraToPCS; all profiles share signed FP32 AP1/D60 handoff.
 
 The new option accepts `--log-reference-gain N` (positive finite; default 1,
 recorded unverified). This flag is rejected for the other profiles. It applies
@@ -175,14 +175,18 @@ as-shot *is* the white balance data stored in the RAW.
 Analysis, gain probes and feedback application passes call
 `--stdout-analysis` (with the requested `--exposure-ev` and ROI). The accepted
 EV vector is restored before the final pass. Each final frame calls
-`--stdout-frame --exposure-ev <accepted>`; frame 1's metadata and descriptor
+`--stdout-frame-f32 --exposure-ev <accepted>`; frame 1's metadata and descriptor
 establish source geometry and the WB reference before FFmpeg starts.
 
-The legacy profiles use native RGB48LE codes (`code / 16384`, scene-linear ACEScg AP1/D60) across a
-validated RGB48 envelope. Rust converts directly into the RGB24 backing that
-crosses a validated RGB24 envelope and is written to FFmpeg stdin. The consumer
-holds one RGB48 and one RGB24 pixel buffer at a time; it never captures the
-whole pixel stream. Native source/pixel SHA-256 values remain authoritative.
+All seven profiles use signed FP32 AP1/D60 (`RAWTLST2`, 12 bytes/pixel)
+across the validated `rawtl.ap1-f32-frame@1` envelope. Rust uses f64 matrix/curve
+arithmetic and fills the final RGB24 backing immediately before FFmpeg stdin.
+Negative AP1 and values above 65535/16384 are preserved until target conversion
+and final signal clipping. Camera matrix strategy is independent of transport:
+only rev-eng selects CameraToPCS and Canon restrictions; other profiles retain
+legacy-inverse-cm. One FP32 and one RGB24 frame are held, never the whole sequence.
+The existing native RGB48/PNG tools remain explicit compatibility interfaces.
+Old outputs may change because early linear quantization/clipping is removed.
 
 The encoder uses `-f rawvideo -pixel_format rgb24 -video_size WxH -framerate FPS
 -i pipe:0`, the profile's existing `-vf` filter, `h264_videotoolbox -allow_sw 0
@@ -213,7 +217,7 @@ Log 信号；独立审计按所选 profile 反传递后测量。编码器为 `h2
 MP4 `colr/nclx` 两层的实际码点。2 表示 unspecified；Nikon 的 9 表示其真实
 BT.2020 primaries，matrix 的 9 表示实际采用的 BT.2020 非恒定亮度编码矩阵。
 
-旧预设转换顺序不变：stdout RGB16 的 `code/16384` 为 ACEScg AP1/D60 场景线性值，经
+所有预设由stdout signed FP32 ACEScg AP1/D60场景线性值开始，经
 XYZ(D60) → Bradford CAT → XYZ(D65) → 目标线性 RGB；逐通道裁切到官方反函数
 signal 0/1 的端点，再应用官方 transfer 和 `round(signal*255)`、ties away from
 zero 的 8bit 量化。不做 tone/gamut mapping，不加抖动。8bit Log 可能出现 banding；
@@ -280,7 +284,7 @@ the analysis projection `0.2126/0.7152/0.0722` over ACEScg AP1/D60 scene-linear
 pixels (the same frozen WB as the delivery chain), not legacy's linear-sRGB
 render. The two per-tile occupancy series in the analysis sidecar remain
 distinct: `saturation_fraction` is the camera-domain gate (EV-invariant) and
-`output_clip_fraction` is the delivered-domain clip series (EV-dependent).
+`analysis_highlight_fraction` is analysis-only AP1 threshold occupancy (EV-dependent), not final video clipping. Analysis schema is 2, with no fixed FP32 quantum; the historical floor remains an estimator parameter.
 
 Enabled path:
 
@@ -328,9 +332,9 @@ Enabled path:
    gate; probe-side tool failures remain operational errors (exit 81).
 6. **Application pass** — frames are re-decoded with `--exposure-ev <applied>`
    and `--stdout-analysis`, retaining only in-memory metadata and applied-EV
-   measurements. `new_output_clipping_fraction` is the per-tile positive
-   increase of `output_clip_fraction` over the 0 EV baseline divided by tile
-   count.
+   measurements. `analysis_highlight_increase_fraction` is the per-tile positive
+   increase of `analysis_highlight_fraction` over the 0 EV baseline divided by tile
+   count. The threshold is 0.980010986328125, quality `analysis_ap1_threshold`.
 7. **Render validation and feedback** — the applied measurements are compared
    with the frozen targets (`median <= 0.01 EV`, `P95 <= 0.03 EV`, no severe
    frame) using one shared offset. At most two feedback updates change
@@ -380,7 +384,7 @@ assert known EV changes for every profile, alongside encoded-output tests.
 The audit records artifact path, byte length, ffprobe tags and profile identity.
 Encoded artifact SHA-256 is honestly `NOT_COMPUTED_STD_ONLY`; no pixel digest is
 substituted for an artifact digest, and no lossless-content proof is claimed.
-Native `pixels_sha256` identifies each RGB48 payload before conversion.
+Native `pixels_sha256` is verified against each FP32 payload before conversion. Manifest and color pipeline revision are 2; `final_signal_clipping` records final transfer-domain clipping for every profile.
 
 `--strength 0` uses one streaming frame pass at 0 EV, skips analysis/probe/
 feedback/audit, and records DISABLED statuses. The native positional PNG mode
@@ -397,12 +401,12 @@ payload it validates.
   requires metadata (0x01) then analysis (0x02). Their bytes become
   `MemoryFile` envelopes, `rawtl.frame-metadata@1` and
   `rawtl.analysis-sidecar@1`; source hash/provenance, geometry, WB and EV
-  checks run before the existing measurement parser. No sidecar is persisted.
+  checks run before the schema-2 measurement parser. Transport envelope @1 is retained; source.schema_version is 2. No sidecar is persisted.
 - **Native pixels -> encoder:** frame mode requires 0x01, descriptor 0x03,
-  then 0x04 RGB48LE. Types, reserved fields, ordering, geometry-derived length,
+  then 0x04 signed FP32 AP1/D60 (`RAWTLST2`). Types, reserved fields, ordering, geometry-derived length,
   truncation and trailing bytes are rejected. The descriptor's native pixel
-  digest is recorded. Pixels become a U16 HWC little-endian
-  `rawtl.rgb48-frame@1` NdArray; `ColorProfile::convert_frame` fills a unique
+  digest is independently verified. Pixels become an F32 HWC little-endian
+  `rawtl.ap1-f32-frame@1` NdArray; `ColorProfile::convert_f32_frame` fills a unique
   backing for the U8 `rawtl.rgb24-frame@1` envelope written to stdin. Neither
   envelope requires a full-frame copy. Complete records followed by a nonzero
   native exit still fail before encoder writes.

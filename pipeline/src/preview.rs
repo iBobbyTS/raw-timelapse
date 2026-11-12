@@ -2,8 +2,8 @@
 //!
 //! The sRGB output profile uses the following conversion:
 //!
-//! * each RGB16 integer code is interpreted as `code / 16384` scene-linear
-//!   ACEScg (AP1 primaries, D60 white);
+//! * RAW streaming supplies signed FP32 scene-linear ACEScg (AP1/D60);
+//!   SCENE_SCALE remains for explicit legacy RGB16 utilities and fixtures;
 //! * AP1/D60 -> XYZ(D60) -> Bradford CAT -> XYZ(D65) -> linear sRGB(D65);
 //! * linear sRGB is clipped per channel to [0, 1] (display clipping; no tone
 //!   mapping, no highlight roll-off, negatives and out-of-gamut colours clip);

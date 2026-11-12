@@ -441,7 +441,7 @@ mod tests {
             residual_mad_ev: None,
             warnings: vec![],
             render_target_error_ev: None,
-            new_output_clipping_fraction: None,
+            analysis_highlight_increase_fraction: None,
             render_ev: None,
             measured_level_ev: measured,
             desired_level_ev: measured,

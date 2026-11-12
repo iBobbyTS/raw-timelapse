@@ -24,7 +24,7 @@ pub struct FrameInfo {
     pub index: usize,
     pub source_name: String,
     pub camera_color: Option<Json>,
-    pub log_clip_counts: Option<[usize; 2]>,
+    pub signal_clip_counts: Option<[usize; 2]>,
     pub source_sha256: Option<String>,
     pub pixels_sha256: Option<String>,
     pub width: u32,
@@ -52,7 +52,7 @@ pub struct FrameSequence {
     pub total_duration: Duration,
 }
 pub struct ProduceConfig<'a> {
-    pub rev_eng: bool,
+    pub camera_color_method: crate::color_profile::CameraColorMethod,
     pub logs_dir: &'a Path,
     pub exposure_ev: Option<f64>,
     pub analysis_roi: Option<[f64; 4]>,
@@ -110,7 +110,7 @@ impl<R: Read> Protocol<R> {
             return Err(failure("JSON record exceeds 16 MiB limit"));
         }
         // Allocate the final NdArray backing directly, avoiding a Vec -> Arc
-        // copy of a full RGB48 frame. Every u8 bit pattern is valid.
+        // copy of a full FP32 frame. Every u8 bit pattern is valid.
         let mut bytes = unsafe { Arc::<[u8]>::new_zeroed_slice(length).assume_init() };
         let mut received = 0;
         while received < length {
@@ -326,7 +326,7 @@ fn produce_inner(
             active.clone(),
             &mut |info, stream| {
                 if let Some(first) = frames.first() {
-                    if config.rev_eng
+                    if config.camera_color_method.requires_canon_cr3()
                         && info
                             .camera_color
                             .as_ref()
@@ -435,17 +435,15 @@ fn run_frame(
 ) -> Result<FrameInfo> {
     let started = Instant::now();
     let mut args = vec![
-        if pixels && config.rev_eng {
+        if pixels {
             "--stdout-frame-f32"
-        } else if pixels {
-            "--stdout-frame"
         } else {
             "--stdout-analysis"
         }
         .to_string(),
         source.path.display().to_string(),
     ];
-    if config.rev_eng {
+    if config.camera_color_method.requires_canon_cr3() {
         if source
             .path
             .extension()
@@ -454,8 +452,11 @@ fn run_frame(
         {
             return Err(failure("rev-eng Canon Log2 requires Canon CR3 photos"));
         }
-        args.extend(["--camera-color-method".into(), "dng-camera-to-pcs".into()]);
     }
+    args.extend([
+        "--camera-color-method".into(),
+        config.camera_color_method.native_token().into(),
+    ]);
     if let Some(wb) = override_wb {
         args.extend(["--white-balance".into(), format_wb(wb)]);
     }
@@ -487,7 +488,7 @@ fn run_frame(
     )?;
     let bytes = stream.json(1)?;
     let sidecar = parse_json(&bytes)?;
-    if config.rev_eng {
+    {
         let color = sidecar
             .get("color")
             .ok_or_else(|| failure("missing camera color contract"))?;
@@ -509,23 +510,27 @@ fn run_frame(
                 .and_then(Json::as_str)
                 .is_none_or(str::is_empty)
         {
-            return Err(failure(
-                "missing/invalid CameraToPCS matrix/profile fingerprint",
-            ));
+            return Err(failure("missing/invalid camera matrix/profile fingerprint"));
         }
 
         if sidecar.get("color_contract_version").and_then(Json::as_u64) != Some(1)
-            || color.get("method_requested").and_then(Json::as_str) != Some("dng-camera-to-pcs")
-            || !matches!(
-                effective,
-                Some("dng-camera-to-pcs-forward-matrix" | "dng-camera-to-pcs-inverse-fallback")
-            )
-            || !color
-                .get("camera_model")
-                .and_then(Json::as_str)
-                .is_some_and(|s| s.starts_with("Canon "))
+            || color.get("method_requested").and_then(Json::as_str)
+                != Some(config.camera_color_method.native_token())
+            || !(if config.camera_color_method.requires_canon_cr3() {
+                matches!(
+                    effective,
+                    Some("dng-camera-to-pcs-forward-matrix" | "dng-camera-to-pcs-inverse-fallback")
+                )
+            } else {
+                effective == Some("legacy-inverse-cm")
+            })
+            || (config.camera_color_method.requires_canon_cr3()
+                && !color
+                    .get("camera_model")
+                    .and_then(Json::as_str)
+                    .is_some_and(|s| s.starts_with("Canon ")))
         {
-            return Err(failure("invalid Canon CameraToPCS contract"));
+            return Err(failure("invalid camera color contract"));
         }
     }
     let file =
@@ -562,13 +567,16 @@ fn run_frame(
         ));
     }
 
-    if config.rev_eng
+    if sidecar
+        .get("source_sha256")
+        .and_then(Json::as_str)
+        .is_some_and(|s| !s.is_empty())
         && !sidecar
             .get("source_sha256")
             .and_then(Json::as_str)
             .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
     {
-        return Err(failure("invalid source_sha256 for Canon FP32 frame"));
+        return Err(failure("invalid source_sha256 for FP32 frame"));
     }
     let source_sha256 = Some(
         sidecar
@@ -713,7 +721,7 @@ fn run_frame(
         index,
         source_name: source.name.clone(),
         camera_color: sidecar.get("color").cloned(),
-        log_clip_counts: None,
+        signal_clip_counts: None,
         source_sha256,
         pixels_sha256: None,
         width: frame_width,
@@ -733,14 +741,12 @@ fn run_frame(
     };
     if pixels {
         let descriptor = parse_json(&stream.json(3)?)?;
+        if sidecar.get("linear_pixel_format").and_then(Json::as_str) != Some("rgbf32le") {
+            return Err(failure("metadata linear_pixel_format must be rgbf32le"));
+        }
         if descriptor.get("width").and_then(Json::as_u32) != Some(info.width)
             || descriptor.get("height").and_then(Json::as_u32) != Some(info.height)
-            || descriptor.get("pixel_format").and_then(Json::as_str)
-                != Some(if config.rev_eng {
-                    "rgbf32le"
-                } else {
-                    "rgb48le"
-                })
+            || descriptor.get("pixel_format").and_then(Json::as_str) != Some("rgbf32le")
         {
             return Err(failure("frame descriptor geometry/pixel_format mismatch"));
         }
@@ -750,7 +756,7 @@ fn run_frame(
             .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
             .ok_or_else(|| failure("invalid pixels_sha256"))?;
         info.pixels_sha256 = Some(digest.into());
-        if config.rev_eng {
+        {
             let expected_bytes = u64::from(info.width)
                 .checked_mul(u64::from(info.height))
                 .and_then(|n| n.checked_mul(12))
@@ -790,7 +796,7 @@ pub fn analysis_sidecar_envelope(
     ev: f64,
 ) -> Result<DataEnvelope> {
     let sidecar = parse_json(&bytes)?;
-    if sidecar.get("schema_version").and_then(Json::as_u64) != Some(1)
+    if sidecar.get("schema_version").and_then(Json::as_u64) != Some(2)
         || sidecar.get("kind").and_then(Json::as_str) != Some("rawtl-analysis-sidecar")
     {
         return Err(failure("analysis sidecar has an unsupported schema"));
@@ -815,7 +821,7 @@ pub fn analysis_sidecar_envelope(
         return Err(failure("analysis sidecar exposure_ev mismatch"));
     }
     let metadata = MetadataDoc::new(vec![
-        ("source.schema_version".into(), Json::Int(1)),
+        ("source.schema_version".into(), Json::Int(2)),
         (
             "source.kind".into(),
             Json::Str("rawtl-analysis-sidecar".into()),

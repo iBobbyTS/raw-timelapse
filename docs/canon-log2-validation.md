@@ -1,5 +1,7 @@
 # 双 Canon Log 2 实施验证
 
+> 当前实现已统一所有 profile 为 FP32，最新结果见本文末尾“统一 FP32 验证”。下方原始双路线结果是迁移前基线，不代表当前 white paper 的数据格式。机器可读记录的 `fp32_migration` 保存最新证据。
+
 日期：2026-11-12。直接在当前分支实施，起始 HEAD 为 `87df3aa56365f156bbba484f4ce4a7c5a0139d60`，未创建 worktree 或切换分支。
 
 完整算法、输入尺度、协议和可复现命令见 [接入说明](canon-log2-rev-eng.md)。结构化结果、源文件哈希和最终构建哈希见 [验证数据](canon-log2-validation.json)。测试和临时实拍产物路径也记录在该 JSON。
@@ -60,3 +62,32 @@ Rust 合计246个测试。完整测试之后修正了新预设 manifest 输入�
 实拍验证为同一张R7照片，两预设各完成一帧视频交付。多帧去闪、增益探测、反馈和两种WB选取通过受控生产者及真实编码器集成测试覆盖；它们不构成完整实拍时序或色卡测量。
 
 负通道数量差异首先反映两种相机矩阵的不同，不能直接换算为画质收益。尚未测量色卡ΔE、参考灰定标或Canon官方照片显影的匹配程度。H264仍为8bit 4:2:0有损交付，浮点交接改善不等于高位深母版交付。
+
+## 统一 FP32 验证（2026-11-12）
+
+基线提交 `5d8b152743fa022b08c8b2a1fed7b96202ea3338`，当前分支 `feature/streaming-encode-pipeline`。所有7个profile均走 signed FP32 AP1/D60 → 目标色域/曲线 → RGB8 → 原硬件编码器。完整 Rust 回归：143库 + 63主程序 + 38 CLI + 3文档 = 247通过；native 4组通过。全profile的86个协议/颜色合同破坏案例均拒绝发布；现有固定/逐帧WB、去闪probe/application/audit、异常取消/子进程回收测试通过。
+
+重复命令：
+
+```sh
+cmake --build native/build -j4
+ctest --test-dir native/build --output-on-failure
+cargo test --manifest-path pipeline/Cargo.toml -- --test-threads=1
+cargo build --release --manifest-path pipeline/Cargo.toml
+pipeline/target/release/rawtl-linear-video --input /path/to/canon-cr3 \
+  --output /path/to/empty-output --preview-profile canon-log2-cinema-gamut \
+  --strength 0
+```
+
+同一只读R7原片（哈希见上文）分别运行两个Log2及sRGB，输出位于 `/private/tmp/rawtl-fp32-validation-20261112/{white-paper,rev-eng,srgb}`。三次均经实际ffprobe和完整解码验证为1帧4096×2734 H264。native每份帧390545280字节；输入格式均为RAWTLST2/rgbf32le。
+
+| 观测 | white paper | rev-eng crm-dev | sRGB |
+| --- | --- | --- | --- |
+| 矩阵 | legacy-inverse-cm | SDK ForwardMatrix | legacy-inverse-cm |
+| 负通道样本，全部保留到目标转换 | 70878 | 445 | 70878 |
+| 最终transfer定义域裁切：低/高 | 0/0 | 0/0 | 294239/7815 |
+| MP4字节数 | 151338 | 142489 | 261163 |
+
+white paper和sRGB的native像素SHA256一致，为 `9bd5688b5faf231c551704bdb81948a0e3731f10ce88ba0343929ce6e3b28f06`。rev-eng仍为 `114167e19f1dd7a8d446cf69a7b406ee75803e5a42c2d0bc5aba947ecc7e7881`，与迁移前的FP32结果一致。旧white paper原先提前裁掉的负数现在保留，因此旧MP4不保证逐像素兼容。sRGB最终裁切属于其目标色域/显示范围，不是AP1提前裁切。
+
+manifest、exposure report和analysis JSON schema为2，颜色pipeline_revision为2；上游metadata/颜色contract本身仍为1，传输记录版本和JSON schema独立。统计字段迁移详见算法文档，native/Rust须配套更新。三次真实样片均为strength=0，不声称验证了实拍时序稳定性、参考灰标定或色卡ΔE；这些限制与原基线一致。
