@@ -336,7 +336,7 @@ fn produce_inner(
                                 .as_ref()
                                 .and_then(|c| c.get("camera_model"))
                     {
-                        return Err(failure("rev-eng Canon Log2 rejects mixed camera models"));
+                        return Err(failure("rev-eng Canon Log rejects mixed camera models"));
                     }
                     if info.width != first.width || info.height != first.height {
                         return Err(failure(format!(
@@ -450,7 +450,7 @@ fn run_frame(
             .and_then(|e| e.to_str())
             .is_none_or(|e| !e.eq_ignore_ascii_case("cr3"))
         {
-            return Err(failure("rev-eng Canon Log2 requires Canon CR3 photos"));
+            return Err(failure("rev-eng Canon Log requires Canon CR3 photos"));
         }
     }
     args.extend([

@@ -39,10 +39,12 @@ OPTIONS:
     --preview-profile <ID>     Preview colour/Log profile (default: srgb-preview)
                                one of: srgb-preview, dji-dlog-dgamut,
                                canon-log2-cinema-gamut, sony-slog3-sgamut3,
-                               sony-slog3-sgamut3-cine, nikon-nlog-bt2020
-                               canon-log2-cinema-gamut-rev-eng-crm-dev
-                               Canon names: clog2(white paper), clog2(rev-eng crm-dev)
-    --log-reference-gain <N>   Positive reference scale, new Canon profile only (default: 1, unverified)
+                               sony-slog3-sgamut3-cine, nikon-nlog-bt2020,
+                               canon-log2-cinema-gamut-rev-eng-crm-dev,
+                               canon-log3-cinema-gamut-rev-eng-crm-dev
+                               Canon names: clog2(white paper), clog2(rev-eng crm-dev),
+                               clog3 (rev-eng crm-dev)
+    --log-reference-gain <N>   Positive reference scale, rev-eng Canon profiles only (default: 1, unverified)
     --converter <PATH>         Adobe DNG Converter override passed to the native tool
     --converter-timeout <SEC>  Converter timeout override (1-3600 seconds)
     --strength <0..1>          Correction strength (default: 1.0; 0 disables deflicker)
@@ -471,7 +473,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     if log_reference_gain.is_some() && !preview_profile.is_rev_eng() {
         return Err(Error::new(
             EXIT_USAGE,
-            "--log-reference-gain requires canon-log2-cinema-gamut-rev-eng-crm-dev",
+            "--log-reference-gain requires a rev-eng Canon profile (canon-log2-cinema-gamut-rev-eng-crm-dev or canon-log3-cinema-gamut-rev-eng-crm-dev)",
         ));
     }
     Ok(Parsed::Run(Options {

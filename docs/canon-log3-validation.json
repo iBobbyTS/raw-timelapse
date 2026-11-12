@@ -1,0 +1,333 @@
+{
+  "baseline_commit": "e5008c7",
+  "input": "/Users/ibobby/Temp/tl/pair/test/R7_L2219.CR3",
+  "source_sha256": "26c4447b73d85c0f03ba6511bd8c5ea3dcb9b6685a9ef7a526864100847ae868",
+  "runs": [
+    {
+      "profile": "canon-log3-cinema-gamut-rev-eng-crm-dev",
+      "output": "/private/tmp/rawtl-clog3-validation-20261112/clog3",
+      "seconds": 6.689847708999878,
+      "manifest_schema": 2,
+      "pipeline_revision": 2,
+      "pixels_sha256": "114167e19f1dd7a8d446cf69a7b406ee75803e5a42c2d0bc5aba947ecc7e7881",
+      "method": "dng-camera-to-pcs-forward-matrix",
+      "negative_samples_preserved": 445,
+      "scene_min": -1.944551695487462e-05,
+      "scene_max": 2.340156078338623,
+      "final_signal_clipping": {
+        "below_domain_samples": 0,
+        "above_domain_samples": 0
+      },
+      "native_bytes": 390545280,
+      "video_sha256": "96824788839e2e8235b2148f2378a3ea4caf5f8e114fb0983dbdc76e2541e4dd",
+      "video_bytes": 130936,
+      "ffprobe": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "codec_name": "h264",
+            "width": 4096,
+            "height": 2734,
+            "pix_fmt": "yuvj420p",
+            "nb_frames": "1"
+          }
+        ]
+      },
+      "display_name": "clog3 (rev-eng crm-dev)",
+      "emitted_tags": {
+        "h264_sps_vui": {
+          "colour_primaries": 2,
+          "transfer_characteristics": 2,
+          "matrix_coefficients": 9,
+          "video_full_range_flag": 1
+        },
+        "mp4_colr_nclx": {
+          "colour_primaries": 2,
+          "transfer_characteristics": 2,
+          "matrix_coefficients": 9,
+          "video_full_range_flag": 1
+        }
+      },
+      "native_quantization": "signed FP32 AP1/D60; negative/upper preserve"
+    },
+    {
+      "profile": "canon-log2-cinema-gamut-rev-eng-crm-dev",
+      "output": "/private/tmp/rawtl-clog3-validation-20261112/clog2-control",
+      "seconds": 4.009483041998465,
+      "manifest_schema": 2,
+      "pipeline_revision": 2,
+      "pixels_sha256": "114167e19f1dd7a8d446cf69a7b406ee75803e5a42c2d0bc5aba947ecc7e7881",
+      "method": "dng-camera-to-pcs-forward-matrix",
+      "negative_samples_preserved": 445,
+      "scene_min": -1.944551695487462e-05,
+      "scene_max": 2.340156078338623,
+      "final_signal_clipping": {
+        "below_domain_samples": 0,
+        "above_domain_samples": 0
+      },
+      "native_bytes": 390545280,
+      "video_sha256": "ad801845340b2fa96e075fe899c8dc8317b94f976290c5d5141b526955cd617d",
+      "video_bytes": 142489,
+      "ffprobe": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "codec_name": "h264",
+            "width": 4096,
+            "height": 2734,
+            "pix_fmt": "yuvj420p",
+            "nb_frames": "1"
+          }
+        ]
+      },
+      "display_name": "clog2(rev-eng crm-dev)",
+      "emitted_tags": {
+        "h264_sps_vui": {
+          "colour_primaries": 2,
+          "transfer_characteristics": 2,
+          "matrix_coefficients": 9,
+          "video_full_range_flag": 1
+        },
+        "mp4_colr_nclx": {
+          "colour_primaries": 2,
+          "transfer_characteristics": 2,
+          "matrix_coefficients": 9,
+          "video_full_range_flag": 1
+        }
+      },
+      "native_quantization": "signed FP32 AP1/D60; negative/upper preserve"
+    }
+  ],
+  "date": "2026-11-12",
+  "source_policy": "read-only symlink input; source SHA256 checked before and after actual runs",
+  "real_run_command": "pipeline/target/release/rawtl-linear-video --input <directory-with-R7_L2219.CR3> --output <absent-or-empty-directory> --preview-profile <profile> --strength 0",
+  "real_run_options": {
+    "strength": 0,
+    "white_balance": "first-frame",
+    "reference_gain": 1,
+    "temporal_audit": "disabled by strength0/single frame"
+  },
+  "oracle": {
+    "sdk_sha256": "3fa4ae8e5d8e8a7ffc2aa93b6c952e5917cae99a80781e8bb90280ee21228a71",
+    "architecture": "arm64",
+    "version": "CRD 2.15.10.1 / CrmSdk 2.11.0.27",
+    "forward_symbol": "_Z25__calculateCanonLog3GammaiPt",
+    "forward_address": "0x40ca8",
+    "entries": 589824,
+    "mismatches": 0,
+    "parameters": [
+      -36,
+      -24,
+      -12,
+      -1,
+      0,
+      1,
+      12,
+      24,
+      36
+    ],
+    "effective_output_lut_entries": 65536,
+    "effective_output_lut_mismatches": 0,
+    "effective_output_parameter": 36,
+    "crm_output_sha256": "8e078465ef4605565d4e8d840d5b0185b2e4a5dffa6994d62a1b9ca612102e16",
+    "inverse": "analytic inverse of recovered forward, not an SDK inverse LUT"
+  },
+  "clog2_control": [
+    {
+      "video": "/private/tmp/rawtl-fp32-validation-20261112/rev-eng/output.mp4",
+      "decoded_rgb48le": "SHA256=786f82907b4a0d79fd2f54cb01465489d62ca7e06cc6a658eec1288cbb5da63e"
+    },
+    {
+      "video": "/private/tmp/rawtl-clog3-validation-20261112/clog2-control/output.mp4",
+      "decoded_rgb48le": "SHA256=786f82907b4a0d79fd2f54cb01465489d62ca7e06cc6a658eec1288cbb5da63e"
+    }
+  ],
+  "clog2_control_decoded_pixels_identical": true,
+  "fp32_ap1_hash_identical_between_profiles": true,
+  "limitations": [
+    "real photo run is one frame with deflicker disabled, not a real-photo time-series validation",
+    "28-frame controlled integration covers both WB modes, reference gain2 and actual audit; tests check operation/observability, not a temporal quality PASS guarantee",
+    "no color-chart DeltaE, reference gray calibration or official Canon CR3 rendering match",
+    "delivery remains 8-bit H264 4:2:0; FP32 intermediates do not make a high-bit-depth master",
+    "container hashes can vary; CLog2 control decoded RGB48LE hashes are identical"
+  ],
+  "build": {
+    "release_command": "cargo build --release --manifest-path pipeline/Cargo.toml",
+    "release_build_log": "/private/tmp/rawtl-clog3-final-build.log",
+    "binaries": [
+      {
+        "path": "/Users/ibobby/Projects/raw-timelapse/pipeline/target/release/rawtl-linear-video",
+        "sha256": "6add7be38563559007c0ac367b89ba140db7aa50f4348e81d3ce1daa60d3abb2"
+      },
+      {
+        "path": "/Users/ibobby/Projects/raw-timelapse/native/build/dng-linear-frame",
+        "sha256": "c0203d1779e7b081e49766bcad89874ef8f9647824cce4f47ea354fa54abd8df"
+      }
+    ],
+    "real_run_build_note": "Actual single-frame runs used the same production curve/FP32 code before final shared error-text wording changes; the final release build includes those wording changes and the final complete regression passed."
+  },
+  "files": [
+    {
+      "path": "pipeline/src/color_profile.rs",
+      "sha256": "4387b34a85229e7ed8ff2fc301827a53197a5f93e183b2e8698c497acb0c9e9d"
+    },
+    {
+      "path": "pipeline/src/cli.rs",
+      "sha256": "6685816de18da8bd7914403f786e22814d791b500cf3dbf7642cc07beb874c15"
+    },
+    {
+      "path": "pipeline/src/frame.rs",
+      "sha256": "3360959f6ac21515c3da900eb43b457d2d31226a8b29670c7ea06d64baa8050f"
+    },
+    {
+      "path": "pipeline/src/audit.rs",
+      "sha256": "6db5b1651ee73e734c4202f0a118d49d3524cb6f7031f5e7821cffd3c067499d"
+    },
+    {
+      "path": "pipeline/src/fallback.rs",
+      "sha256": "02abcbfe7c5a1d30a326c9ffaa62693274a550ac86a741872b0fad5d73bbba58"
+    },
+    {
+      "path": "pipeline/tests/canon_log3.rs",
+      "sha256": "b45b9d234d91e099d302a033f69f1efd553334edbfe40a2d825153d76a2e5a48"
+    },
+    {
+      "path": "pipeline/tests/pipeline_cli.rs",
+      "sha256": "1c3c085b03dc0b81f1047f38ef31f28a56c45604d344a78e1d1b49391e7042f0"
+    },
+    {
+      "path": "pipeline/tests/fixtures/canon-log3-sdk-oracle.json",
+      "sha256": "c5e5cbce1ea5c093449d1dc9080b7e14b60cbcfb4cfde5182f639423531733f0"
+    }
+  ],
+  "original_debug_note": "SDK oracle originally assumed +0x238 was the requested final curve; it is an intermediate Log2 table for this sample. Captured +0x248 matches requested Log3 exactly. See rev-crm-2/analysis/log3/investigation.md.",
+  "tests": {
+    "rust_command": "cargo test --manifest-path pipeline/Cargo.toml -- --test-threads=1",
+    "rust_log": "/private/tmp/rawtl-clog3-final-tests.log",
+    "rust_passed": 251,
+    "rust_groups": {
+      "library": 143,
+      "binary": 64,
+      "log3_oracle_integration": 3,
+      "cli": 38,
+      "doctest": 3
+    },
+    "native_command": "ctest --test-dir native/build --output-on-failure",
+    "native_log": "/private/tmp/rawtl-clog3-native-tests.log",
+    "native_groups_passed": 4,
+    "rust_profile_contract_fault_cases": 100,
+    "git_diff_check": "pass"
+  },
+  "controlled_audit_outcomes": [
+    {
+      "profile": "canon-log2-cinema-gamut-rev-eng-crm-dev",
+      "white_balance": "first-frame",
+      "reference_gain": 2,
+      "frames": 28,
+      "audit_path": "/Users/ibobby/Projects/raw-timelapse/pipeline/target/test-tmp/rev-eng-canon-log2-cinema-gamut-rev-eng-crm-dev-first-frame-82181/run/temporal_audit.json",
+      "status": "FAIL",
+      "metadata_warnings": [],
+      "segments": [
+        {
+          "start": 0,
+          "end_exclusive": 28,
+          "frames": 28,
+          "status": "FAIL",
+          "pairs": 27,
+          "usable_pairs": 27,
+          "median_abs_step_ev": 0,
+          "p95_abs_step_ev": 0.05555636056954287,
+          "max_abs_step_ev": 0.05563739532717493,
+          "curvature_rms_ev": 0.0172149206529682,
+          "lag2_residual_rms_ev": 0.01494934128984185,
+          "steps_over_0_02_ev": 5,
+          "steps_over_0_05_ev": 5,
+          "roi_metrics": {}
+        }
+      ]
+    },
+    {
+      "profile": "canon-log2-cinema-gamut-rev-eng-crm-dev",
+      "white_balance": "per-frame",
+      "reference_gain": 2,
+      "frames": 28,
+      "audit_path": "/Users/ibobby/Projects/raw-timelapse/pipeline/target/test-tmp/rev-eng-canon-log2-cinema-gamut-rev-eng-crm-dev-per-frame-82181/run/temporal_audit.json",
+      "status": "FAIL",
+      "metadata_warnings": [],
+      "segments": [
+        {
+          "start": 0,
+          "end_exclusive": 28,
+          "frames": 28,
+          "status": "FAIL",
+          "pairs": 27,
+          "usable_pairs": 27,
+          "median_abs_step_ev": 0,
+          "p95_abs_step_ev": 0.05555636056954287,
+          "max_abs_step_ev": 0.05563739532717493,
+          "curvature_rms_ev": 0.0172149206529682,
+          "lag2_residual_rms_ev": 0.01494934128984185,
+          "steps_over_0_02_ev": 5,
+          "steps_over_0_05_ev": 5,
+          "roi_metrics": {}
+        }
+      ]
+    },
+    {
+      "profile": "canon-log3-cinema-gamut-rev-eng-crm-dev",
+      "white_balance": "first-frame",
+      "reference_gain": 2,
+      "frames": 28,
+      "audit_path": "/Users/ibobby/Projects/raw-timelapse/pipeline/target/test-tmp/rev-eng-canon-log3-cinema-gamut-rev-eng-crm-dev-first-frame-82181/run/temporal_audit.json",
+      "status": "FAIL",
+      "metadata_warnings": [],
+      "segments": [
+        {
+          "start": 0,
+          "end_exclusive": 28,
+          "frames": 28,
+          "status": "FAIL",
+          "pairs": 27,
+          "usable_pairs": 27,
+          "median_abs_step_ev": 0,
+          "p95_abs_step_ev": 0.04165441959018139,
+          "max_abs_step_ev": 0.04189098156545912,
+          "curvature_rms_ev": 0.014640271966531001,
+          "lag2_residual_rms_ev": 0.012427463776052545,
+          "steps_over_0_02_ev": 7,
+          "steps_over_0_05_ev": 0,
+          "roi_metrics": {}
+        }
+      ]
+    },
+    {
+      "profile": "canon-log3-cinema-gamut-rev-eng-crm-dev",
+      "white_balance": "per-frame",
+      "reference_gain": 2,
+      "frames": 28,
+      "audit_path": "/Users/ibobby/Projects/raw-timelapse/pipeline/target/test-tmp/rev-eng-canon-log3-cinema-gamut-rev-eng-crm-dev-per-frame-82181/run/temporal_audit.json",
+      "status": "FAIL",
+      "metadata_warnings": [],
+      "segments": [
+        {
+          "start": 0,
+          "end_exclusive": 28,
+          "frames": 28,
+          "status": "FAIL",
+          "pairs": 27,
+          "usable_pairs": 27,
+          "median_abs_step_ev": 0,
+          "p95_abs_step_ev": 0.04165441959018139,
+          "max_abs_step_ev": 0.04189098156545912,
+          "curvature_rms_ev": 0.014640271966531001,
+          "lag2_residual_rms_ev": 0.012427463776052545,
+          "steps_over_0_02_ev": 7,
+          "steps_over_0_05_ev": 0,
+          "roi_metrics": {}
+        }
+      ]
+    }
+  ]
+}
