@@ -359,30 +359,17 @@ FrameOutput render(const Prepared &prepared,
   return out;
 }
 
-enum class Mode { positional, stdout_analysis, stdout_frame };
 } // namespace
 int main(int argc, char **argv) {
   using namespace frame;
   try {
-    Mode mode = Mode::positional;
-    const auto takes_value = [](const std::string &a) {
-      return a == "--white-balance" || a == "--converter" ||
-             a == "--converter-timeout" || a == "--exposure-ev" ||
-             a == "--emit-analysis" || a == "--analysis-roi";
-    };
-    for (int i = 1; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--stdout-analysis" || a == "--stdout-frame") {
-        if (mode != Mode::positional)
-          throw Error(2, "specify exactly one of --stdout-analysis or "
-                         "--stdout-frame");
-        mode = a == "--stdout-analysis" ? Mode::stdout_analysis
-                                        : Mode::stdout_frame;
-      } else if (takes_value(a) && i + 1 < argc) {
-        ++i; // skip the option value so it cannot look like a mode flag
-      }
-    }
-    if (mode == Mode::positional) {
+    // The stdout grammar is flag-first: only argv[1] selects a streaming mode,
+    // so the positional path slots stay paths even when a path is spelled like
+    // a mode flag.
+    const bool stdout_mode =
+        argc >= 2 && (std::string(argv[1]) == "--stdout-analysis" ||
+                      std::string(argv[1]) == "--stdout-frame");
+    if (!stdout_mode) {
       if (argc < 4)
         throw Error(2, "usage: dng-linear-frame <input.dng> <output.png> "
                        "<output.json> [--white-balance R,G,B] [--converter "
@@ -502,27 +489,22 @@ int main(int argc, char **argv) {
       return 0;
     }
     // ---- stdout streaming modes -------------------------------------------
-    const bool want_analysis = mode == Mode::stdout_analysis;
-    fs::path input;
-    bool have_input = false;
+    // argv[1] is the mode flag; argv[2] is the input path and options follow.
+    const bool want_analysis = std::string(argv[1]) == "--stdout-analysis";
+    if (argc < 3)
+      throw Error(2, "option value missing");
+    const fs::path input = fs::canonical(argv[2]);
     std::optional<Vec> wb;
     std::string converter = "/Applications/Adobe DNG "
                             "Converter.app/Contents/MacOS/Adobe DNG Converter";
     int timeout = 120;
     double exposure_ev = 0;
     analysis::Roi roi;
-    for (int i = 1; i < argc; ++i) {
+    for (int i = 3; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--stdout-analysis" || a == "--stdout-frame") {
-        if (have_input)
-          throw Error(2, "specify exactly one of --stdout-analysis or "
-                         "--stdout-frame");
-        if (i + 1 >= argc)
-          throw Error(2, "option value missing");
-        input = fs::canonical(argv[++i]);
-        have_input = true;
-        continue;
-      }
+      if (a == "--stdout-analysis" || a == "--stdout-frame")
+        throw Error(2, "specify exactly one of --stdout-analysis or "
+                       "--stdout-frame");
       if (a == "--no-png" || a == "--emit-analysis")
         throw Error(2, a + " is not applicable to stdout modes");
       if (i + 1 >= argc)
@@ -550,8 +532,6 @@ int main(int argc, char **argv) {
       } else
         throw Error(2, "unknown option: " + a);
     }
-    if (!have_input)
-      throw Error(2, "missing input");
     // A closed consumer pipe must surface as a write error, not a SIGPIPE
     // death: no record, artifact or success claim is published.
     std::signal(SIGPIPE, SIG_IGN);

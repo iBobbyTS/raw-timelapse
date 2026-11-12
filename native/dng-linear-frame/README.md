@@ -149,13 +149,15 @@ this tool over the exact `0x04` payload with the same authority as
 These modes write no PNG, metadata, analysis or pixel artifacts to disk; only
 the vendor-RAW Converter temporary-directory handling is unchanged. The human
 `decoded WxH` line moves to stderr, so stdout carries only the record stream.
-The modes are mutually exclusive with the three positional paths and with each
-other (exit 2), and `--analysis-roi` requires `--stdout-analysis` (or the
-positional `--emit-analysis`); `--no-png` and `--emit-analysis` are rejected in
-stdout modes (exit 2). A closed or failing stdout pipe (EPIPE/partial write)
-exits nonzero (50) without any success claim. Payloads are written
-incrementally in bounded chunks; the frame is never buffered into an extra
-full-size byte copy.
+The stdout grammar is flag-first: the mode flag must be the first argument, and
+the three positional path slots are always paths (a positional output file
+literally named `--stdout-frame` remains valid). The modes are mutually
+exclusive with the three positional paths and with each other (exit 2), and
+`--analysis-roi` requires `--stdout-analysis` (or the positional
+`--emit-analysis`); `--no-png` and `--emit-analysis` are rejected in stdout
+modes (exit 2). A closed or failing stdout pipe (EPIPE/partial write) exits
+nonzero (50) without any success claim. Payloads are written incrementally in
+bounded chunks; the frame is never buffered into an extra full-size byte copy.
 
 Routing reads classic TIFF directory metadata **before SDK entry**. The
 classification predicate is *recognized DNG*, not *is TIFF*: a classic TIFF
