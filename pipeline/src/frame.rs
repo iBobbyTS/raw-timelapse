@@ -12,16 +12,30 @@
 //! applied exactly that frame's `as_shot_neutral`.
 
 use crate::cli::WhiteBalance;
-use crate::error::{Error, Result, EXIT_FRAME};
+use crate::error::{Error, Result, EXIT_FRAME, EXIT_PUBLISH};
 use crate::json::{self, Json};
 use crate::order::SourceFrame;
 use crate::proc;
+use crate::transport::{
+    self, DataEnvelope, DiskArtifact, MemoryFile, MetadataDoc, Payload, Provenance,
+    ANALYSIS_SIDECAR, FRAME_METADATA, FRAME_PNG,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const WB_SOURCE_AS_SHOT: &str = "as-shot";
 pub const WB_SOURCE_OVERRIDE: &str = "override";
+
+/// Media types used when a stage hands a file artifact to the next stage.
+/// The transport contract only requires a nonempty type; these name the actual
+/// encoding of each produced file.
+const JSON_MEDIA_TYPE: &str = "application/json; charset=utf-8";
+const PNG_MEDIA_TYPE: &str = "image/png";
+/// Every produced PNG is scene-linear ACEScg (AP1 primaries, D60 white) with
+/// no OETF, independently of how the native producer encodes it on disk.
+const PNG_COLOR_SPACE: &str = "ACEScg AP1/D60 scene-linear";
+const PNG_COLOR_TRANSFER: &str = "linear";
 
 #[derive(Debug, Clone)]
 pub struct FrameInfo {
@@ -43,6 +57,14 @@ pub struct FrameInfo {
     pub metadata_relative: String,
     pub log_relative: String,
     pub duration: Duration,
+    /// Typed references handed to later stages. The PNG is absent for
+    /// `--no-png` measurement passes; the analysis sidecar is absent unless it
+    /// was requested. The metadata envelope holds the validated sidecar bytes.
+    pub png_artifact: Option<DiskArtifact>,
+    pub png_envelope: Option<DataEnvelope>,
+    pub metadata_artifact: DiskArtifact,
+    pub metadata_envelope: DataEnvelope,
+    pub analysis_artifact: Option<DiskArtifact>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,17 +78,112 @@ pub struct FrameSequence {
 }
 
 impl FrameSequence {
-    /// Rewrite the recorded relative output paths after a pass directory is
-    /// adopted as the final `frames/` directory.
-    pub fn remap_output_paths(mut self, log_dir_rel: &str) -> FrameSequence {
+    /// Rewrite the recorded relative output paths and re-point the typed disk
+    /// references after a pass directory is adopted as the final `frames/`
+    /// directory. A move is not an in-place conversion: the producer
+    /// references are immutable, so adoption builds new references/envelopes at
+    /// the adopted absolute paths while keeping the same semantic type,
+    /// metadata and payload kind; the producer envelope becomes their lineage
+    /// parent.
+    pub fn adopt_output_locations(
+        mut self,
+        frames_dir: &Path,
+        analysis_dir: Option<&Path>,
+        log_dir_rel: &str,
+    ) -> Result<FrameSequence> {
         for frame in &mut self.frames {
             let stem = format!("frame_{:06}", frame.index);
+            let png = frames_dir.join(format!("{stem}.png"));
+            let metadata = frames_dir.join(format!("{stem}.json"));
             frame.png_relative = format!("frames/{stem}.png");
             frame.metadata_relative = format!("frames/{stem}.json");
             frame.log_relative = format!("{log_dir_rel}/{stem}.log");
+
+            if let Some(artifact) = frame.png_artifact.take() {
+                let moved = relocate_artifact(&artifact, &png)?;
+                frame.png_envelope = match frame.png_envelope.take() {
+                    Some(envelope) => Some(repoint_envelope(
+                        &envelope,
+                        Payload::DiskArtifact(moved.clone()),
+                    )?),
+                    None => None,
+                };
+                frame.png_artifact = Some(moved);
+            }
+            frame.metadata_artifact = relocate_artifact(&frame.metadata_artifact, &metadata)?;
+
+            match (&frame.analysis_artifact, analysis_dir) {
+                (Some(artifact), Some(dir)) => {
+                    let path = dir.join(format!("{stem}.analysis.json"));
+                    frame.analysis_artifact = Some(relocate_artifact(artifact, &path)?);
+                    frame.analysis_path = Some(path);
+                }
+                (None, _) => frame.analysis_path = None,
+                (Some(artifact), None) => {
+                    return Err(Error::new(
+                        EXIT_PUBLISH,
+                        format!(
+                            "cannot adopt analysis sidecar reference {}: no adopted analysis directory",
+                            artifact.path().display()
+                        ),
+                    ))
+                }
+            }
         }
-        self
+        Ok(self)
     }
+}
+
+fn relocate_artifact(artifact: &DiskArtifact, path: &Path) -> Result<DiskArtifact> {
+    DiskArtifact::new(
+        path,
+        artifact.media_type(),
+        artifact.size(),
+        artifact.hash().map(str::to_string),
+    )
+    .map_err(|err| {
+        Error::new(
+            EXIT_PUBLISH,
+            format!(
+                "cannot re-point adopted artifact {} -> {}: {err}",
+                artifact.path().display(),
+                path.display()
+            ),
+        )
+    })
+}
+
+/// Rebuild one envelope around a re-pointed payload. The new envelope keeps
+/// the semantic type and immutable metadata verbatim and records the producer
+/// envelope as an additional lineage parent, mirroring `DataEnvelope::patch`.
+fn repoint_envelope(envelope: &DataEnvelope, payload: Payload) -> Result<DataEnvelope> {
+    let mut parents = envelope.provenance().parent_value_ids().to_vec();
+    if !parents.iter().any(|id| id == envelope.value_id()) {
+        parents.push(envelope.value_id().to_string());
+    }
+    let provenance = Provenance::new(
+        envelope.provenance().producer(),
+        envelope.provenance().source_hashes().to_vec(),
+        parents,
+    )
+    .map_err(|err| {
+        Error::new(
+            EXIT_PUBLISH,
+            format!("cannot re-point adopted envelope provenance: {err}"),
+        )
+    })?;
+    DataEnvelope::new(
+        envelope.semantic_type().to_string(),
+        payload,
+        envelope.metadata().clone(),
+        provenance,
+    )
+    .map_err(|err| {
+        Error::new(
+            EXIT_PUBLISH,
+            format!("cannot re-point adopted envelope: {err}"),
+        )
+    })
 }
 
 pub struct ProduceConfig<'a> {
@@ -421,26 +538,47 @@ fn run_frame(
         }
     }
 
-    let text = fs::read_to_string(&metadata).map_err(|err| {
-        Error::new(
+    // The metadata sidecar is produced on disk, but its content is handed to
+    // this stage as a typed envelope: reference -> load -> MemoryFile ->
+    // semantic validation, and only then the historical field parsing.
+    let metadata_artifact =
+        DiskArtifact::new(&metadata, JSON_MEDIA_TYPE, None, None).map_err(|err| {
+            Error::new(
+                EXIT_FRAME,
+                format!(
+                    "frame {index}/{total} ({}) metadata reference is invalid ({}): {err}",
+                    source.name,
+                    metadata.display()
+                ),
+            )
+        })?;
+    let loaded = load_json_sidecar(&metadata_artifact).map_err(|err| match err {
+        SidecarLoadError::Read(err) => Error::new(
             EXIT_FRAME,
             format!(
                 "frame {index}/{total} ({}) metadata is unreadable ({}): {err}",
                 source.name,
                 metadata.display()
             ),
-        )
-    })?;
-    let sidecar = json::parse(&text).map_err(|err| {
-        Error::new(
+        ),
+        SidecarLoadError::InvalidJson(err) => Error::new(
             EXIT_FRAME,
             format!(
                 "frame {index}/{total} ({}) metadata is not valid JSON ({}): {err}",
                 source.name,
                 metadata.display()
             ),
-        )
+        ),
+        SidecarLoadError::Semantic(err) => Error::new(
+            EXIT_FRAME,
+            format!(
+                "frame {index}/{total} ({}) metadata is unreadable ({}): {err}",
+                source.name,
+                metadata.display()
+            ),
+        ),
     })?;
+    let sidecar = loaded.json;
 
     let frame_width = sidecar
         .get("width")
@@ -473,6 +611,44 @@ fn run_frame(
             ),
         ));
     }
+
+    let source_sha256 = sidecar
+        .get("source_sha256")
+        .and_then(Json::as_str)
+        .map(str::to_string);
+    let metadata_envelope = frame_metadata_envelope(
+        loaded.file,
+        schema_version,
+        frame_width,
+        frame_height,
+        source_sha256.as_deref(),
+        index,
+        total,
+        &source.name,
+    )?;
+    let (png_artifact, png_envelope) = if config.no_png {
+        (None, None)
+    } else {
+        let artifact = DiskArtifact::new(&png, PNG_MEDIA_TYPE, None, None).map_err(|err| {
+            Error::new(
+                EXIT_FRAME,
+                format!(
+                    "frame {index}/{total} ({}) PNG reference is invalid ({}): {err}",
+                    source.name,
+                    png.display()
+                ),
+            )
+        })?;
+        let envelope = frame_png_envelope(
+            &artifact,
+            frame_width,
+            frame_height,
+            index,
+            total,
+            &source.name,
+        )?;
+        (Some(artifact), Some(envelope))
+    };
 
     let applied_wb = parse_wb(
         &sidecar,
@@ -550,10 +726,6 @@ fn run_frame(
         ));
     }
 
-    let source_sha256 = sidecar
-        .get("source_sha256")
-        .and_then(Json::as_str)
-        .map(str::to_string);
     let observed_min = sidecar.get("observed_scene_min").and_then(Json::as_f64);
     let observed_max = sidecar.get("observed_scene_max").and_then(Json::as_f64);
     let quantization = sidecar.get("quantization").cloned();
@@ -596,30 +768,45 @@ fn run_frame(
         }
     };
 
-    if let Some(path) = &analysis {
-        let reported = sidecar
-            .get("analysis_sidecar")
-            .and_then(Json::as_str)
-            .ok_or_else(|| missing_field(index, total, &source.name, "analysis_sidecar"))?;
-        if Path::new(reported) != path {
-            return Err(Error::new(
-                EXIT_FRAME,
-                format!(
-                    "frame {index}/{total} ({}) reports analysis_sidecar {reported:?} but {} was requested",
-                    source.name,
-                    path.display()
-                ),
-            ));
+    let analysis_artifact = match &analysis {
+        Some(path) => {
+            let reported = sidecar
+                .get("analysis_sidecar")
+                .and_then(Json::as_str)
+                .ok_or_else(|| missing_field(index, total, &source.name, "analysis_sidecar"))?;
+            if Path::new(reported) != path {
+                return Err(Error::new(
+                    EXIT_FRAME,
+                    format!(
+                        "frame {index}/{total} ({}) reports analysis_sidecar {reported:?} but {} was requested",
+                        source.name,
+                        path.display()
+                    ),
+                ));
+            }
+            let artifact =
+                DiskArtifact::new(path, JSON_MEDIA_TYPE, None, None).map_err(|err| {
+                    Error::new(
+                        EXIT_FRAME,
+                        format!(
+                            "frame {index}/{total} ({}) analysis sidecar reference is invalid ({}): {err}",
+                            source.name,
+                            path.display()
+                        ),
+                    )
+                })?;
+            verify_analysis_sidecar(
+                &artifact,
+                &source.name,
+                index,
+                total,
+                &source_sha256,
+                requested_ev,
+            )?;
+            Some(artifact)
         }
-        verify_analysis_sidecar(
-            path,
-            &source.name,
-            index,
-            total,
-            &source_sha256,
-            requested_ev,
-        )?;
-    }
+        None => None,
+    };
 
     Ok(FrameInfo {
         index,
@@ -640,38 +827,76 @@ fn run_frame(
         metadata_relative: format!("{}/frame_{:06}.json", config.frames_relative_dir, index),
         log_relative: format!("{}/{stem}.log", config.log_relative_dir),
         duration: captured.duration,
+        png_artifact,
+        png_envelope,
+        metadata_artifact,
+        metadata_envelope,
+        analysis_artifact,
     })
 }
 
 /// Cheap integrity checks for the analysis sidecar. Full measurement parsing is
 /// the engine's responsibility; here we prove the artifact belongs to this
-/// frame and this gain request.
+/// frame and this gain request. The content is first handed over as a typed
+/// `ANALYSIS_SIDECAR` envelope (loaded bytes plus metadata whose source hash is
+/// bound to the frame's provenance); the historical value checks then run on
+/// the same bytes.
 fn verify_analysis_sidecar(
-    path: &Path,
+    artifact: &DiskArtifact,
     name: &str,
     index: usize,
     total: usize,
     source_sha256: &Option<String>,
     requested_ev: f64,
 ) -> Result<()> {
-    let text = fs::read_to_string(path).map_err(|err| {
-        Error::new(
-            EXIT_FRAME,
-            format!(
-                "frame {index}/{total} ({name}) analysis sidecar is unreadable ({}): {err}",
-                path.display()
+    let path = artifact.path();
+    let loaded = analysis_sidecar_envelope(artifact, source_sha256.as_deref()).map_err(|err| {
+        match err {
+            SidecarLoadError::Read(err) => Error::new(
+                EXIT_FRAME,
+                format!(
+                    "frame {index}/{total} ({name}) analysis sidecar is unreadable ({}): {err}",
+                    path.display()
+                ),
             ),
-        )
-    })?;
-    let sidecar = json::parse(&text).map_err(|err| {
-        Error::new(
-            EXIT_FRAME,
-            format!(
-                "frame {index}/{total} ({name}) analysis sidecar is not valid JSON ({}): {err}",
-                path.display()
+            SidecarLoadError::InvalidJson(err) => Error::new(
+                EXIT_FRAME,
+                format!(
+                    "frame {index}/{total} ({name}) analysis sidecar is not valid JSON ({}): {err}",
+                    path.display()
+                ),
             ),
-        )
+            SidecarLoadError::Semantic(transport::TransportError::MissingMetadata(field))
+            | SidecarLoadError::Semantic(transport::TransportError::InvalidMetadataValue(field))
+                if field == "source.sha256" =>
+            {
+                analysis_sidecar_hash_mismatch(index, total, name)
+            }
+            SidecarLoadError::Semantic(transport::TransportError::SourceHashMismatch(_)) => {
+                analysis_sidecar_hash_mismatch(index, total, name)
+            }
+            SidecarLoadError::Semantic(transport::TransportError::MissingMetadata(_))
+            | SidecarLoadError::Semantic(transport::TransportError::InvalidMetadataValue(_)) => {
+                let text = fs::read_to_string(path).unwrap_or_default();
+                Error::new(
+                    EXIT_FRAME,
+                    format!(
+                        "frame {index}/{total} ({name}) analysis sidecar has an unsupported schema ({}): {}",
+                        path.display(),
+                        proc::tail(&text, 200)
+                    ),
+                )
+            }
+            SidecarLoadError::Semantic(err) => Error::new(
+                EXIT_FRAME,
+                format!(
+                    "frame {index}/{total} ({name}) analysis sidecar violates the transport contract ({}): {err}",
+                    path.display()
+                ),
+            ),
+        }
     })?;
+    let sidecar = &loaded.json;
     if sidecar.get("schema_version").and_then(Json::as_u64) != Some(1)
         || sidecar.get("kind").and_then(Json::as_str) != Some("rawtl-analysis-sidecar")
     {
@@ -680,21 +905,14 @@ fn verify_analysis_sidecar(
             format!(
                 "frame {index}/{total} ({name}) analysis sidecar has an unsupported schema ({}): {}",
                 path.display(),
-                proc::tail(&text, 200)
+                proc::tail(&loaded.text, 200)
             ),
         ));
     }
     let sidecar_sha = sidecar.get("source_sha256").and_then(Json::as_str);
     match (source_sha256, sidecar_sha) {
         (Some(expected), Some(actual)) if expected == actual => {}
-        _ => {
-            return Err(Error::new(
-                EXIT_FRAME,
-                format!(
-                    "frame {index}/{total} ({name}) analysis sidecar source_sha256 does not match the frame metadata"
-                ),
-            ))
-        }
+        _ => return Err(analysis_sidecar_hash_mismatch(index, total, name)),
     }
     let sidecar_ev = sidecar
         .get("analysis")
@@ -712,6 +930,235 @@ fn verify_analysis_sidecar(
         }
     }
     Ok(())
+}
+
+fn analysis_sidecar_hash_mismatch(index: usize, total: usize, name: &str) -> Error {
+    Error::new(
+        EXIT_FRAME,
+        format!(
+            "frame {index}/{total} ({name}) analysis sidecar source_sha256 does not match the frame metadata"
+        ),
+    )
+}
+
+/// Failure while turning a disk reference into validated in-memory sidecar
+/// content. Read/parse failures keep the historical per-call messages; the
+/// semantic variant is a transport-contract rejection that did not exist
+/// before the typed handoff.
+#[derive(Debug)]
+pub(crate) enum SidecarLoadError {
+    Read(std::io::Error),
+    InvalidJson(String),
+    Semantic(transport::TransportError),
+}
+
+struct LoadedSidecar {
+    file: MemoryFile,
+    text: String,
+    json: Json,
+}
+
+fn load_json_sidecar(
+    artifact: &DiskArtifact,
+) -> std::result::Result<LoadedSidecar, SidecarLoadError> {
+    let file = transport::load(artifact).map_err(|err| match err {
+        transport::TransportError::Io { message, .. } => {
+            SidecarLoadError::Read(std::io::Error::other(message))
+        }
+        other => SidecarLoadError::Semantic(other),
+    })?;
+    let text = std::str::from_utf8(file.bytes())
+        .map_err(|err| {
+            SidecarLoadError::Read(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        })?
+        .to_string();
+    let json = json::parse(&text).map_err(SidecarLoadError::InvalidJson)?;
+    Ok(LoadedSidecar { file, text, json })
+}
+
+/// Validate the native metadata sidecar as a typed `FRAME_METADATA` envelope.
+/// The envelope metadata carries the structural facts the sidecar promises and
+/// the source hash, which must also be present in provenance.
+fn frame_metadata_envelope(
+    file: MemoryFile,
+    schema_version: u64,
+    width: u32,
+    height: u32,
+    source_sha256: Option<&str>,
+    index: usize,
+    total: usize,
+    name: &str,
+) -> Result<DataEnvelope> {
+    let mut fields = vec![
+        (
+            "source.schema_version".to_string(),
+            Json::Int(schema_version as i64),
+        ),
+        ("source.width".to_string(), Json::Int(width as i64)),
+        ("source.height".to_string(), Json::Int(height as i64)),
+    ];
+    if let Some(hash) = source_sha256 {
+        fields.push(("source.sha256".to_string(), Json::Str(hash.to_string())));
+    }
+    let metadata =
+        MetadataDoc::new(fields).map_err(|err| metadata_contract_error(err, index, total, name))?;
+    let provenance = Provenance::new(
+        "dng-linear-frame",
+        source_sha256.map(str::to_string).into_iter().collect(),
+        Vec::new(),
+    )
+    .map_err(|err| metadata_contract_error(err, index, total, name))?;
+    DataEnvelope::new(
+        FRAME_METADATA,
+        Payload::MemoryFile(file),
+        metadata,
+        provenance,
+    )
+    .map_err(|err| metadata_contract_error(err, index, total, name))
+}
+
+/// Validate the produced PNG as a typed `FRAME_PNG` disk reference.
+fn frame_png_envelope(
+    artifact: &DiskArtifact,
+    width: u32,
+    height: u32,
+    index: usize,
+    total: usize,
+    name: &str,
+) -> Result<DataEnvelope> {
+    let metadata = MetadataDoc::new(vec![
+        ("source.width".to_string(), Json::Int(width as i64)),
+        ("source.height".to_string(), Json::Int(height as i64)),
+        (
+            "color.space".to_string(),
+            Json::Str(PNG_COLOR_SPACE.to_string()),
+        ),
+        (
+            "color.transfer".to_string(),
+            Json::Str(PNG_COLOR_TRANSFER.to_string()),
+        ),
+    ])
+    .map_err(|err| metadata_contract_error(err, index, total, name))?;
+    let provenance = Provenance::new("dng-linear-frame", Vec::new(), Vec::new())
+        .map_err(|err| metadata_contract_error(err, index, total, name))?;
+    DataEnvelope::new(
+        FRAME_PNG,
+        Payload::DiskArtifact(artifact.clone()),
+        metadata,
+        provenance,
+    )
+    .map_err(|err| metadata_contract_error(err, index, total, name))
+}
+
+fn metadata_contract_error(
+    err: transport::TransportError,
+    index: usize,
+    total: usize,
+    name: &str,
+) -> Error {
+    match err {
+        transport::TransportError::MissingMetadata(field)
+        | transport::TransportError::InvalidMetadataValue(field) => {
+            let field = match field.as_str() {
+                "source.sha256" => "source_sha256".to_string(),
+                other => other.strip_prefix("source.").unwrap_or(other).to_string(),
+            };
+            missing_field(index, total, name, &field)
+        }
+        transport::TransportError::SourceHashMismatch(hash) => Error::new(
+            EXIT_FRAME,
+            format!(
+                "frame {index}/{total} ({name}) metadata source_sha256 {hash:?} is not bound to the processed source"
+            ),
+        ),
+        other => Error::new(
+            EXIT_FRAME,
+            format!("frame {index}/{total} ({name}) metadata violates the transport contract: {other}"),
+        ),
+    }
+}
+
+/// Load and validate an analysis sidecar as a typed `ANALYSIS_SIDECAR`
+/// envelope. The sidecar's declared source hash must be bound to the source
+/// hash of the frame that requested it. Callers parse the returned text with
+/// the existing measurement parser.
+pub(crate) fn analysis_sidecar_envelope(
+    artifact: &DiskArtifact,
+    expected_source_hash: Option<&str>,
+) -> std::result::Result<LoadedAnalysisSidecar, SidecarLoadError> {
+    let loaded = load_json_sidecar(artifact)?;
+    let mut fields = Vec::new();
+    let schema_version = loaded
+        .json
+        .get("schema_version")
+        .and_then(Json::as_u64)
+        .ok_or_else(|| {
+            SidecarLoadError::Semantic(transport::TransportError::MissingMetadata(
+                "source.schema_version".into(),
+            ))
+        })?;
+    fields.push((
+        "source.schema_version".to_string(),
+        Json::Int(schema_version as i64),
+    ));
+    let kind = loaded
+        .json
+        .get("kind")
+        .and_then(Json::as_str)
+        .ok_or_else(|| {
+            SidecarLoadError::Semantic(transport::TransportError::MissingMetadata(
+                "source.kind".into(),
+            ))
+        })?;
+    fields.push(("source.kind".to_string(), Json::Str(kind.to_string())));
+    let hash = loaded
+        .json
+        .get("source_sha256")
+        .and_then(Json::as_str)
+        .ok_or_else(|| {
+            SidecarLoadError::Semantic(transport::TransportError::MissingMetadata(
+                "source.sha256".into(),
+            ))
+        })?;
+    fields.push(("source.sha256".to_string(), Json::Str(hash.to_string())));
+    let metadata = MetadataDoc::new(fields).map_err(SidecarLoadError::Semantic)?;
+    let provenance = Provenance::new(
+        "dng-linear-frame",
+        expected_source_hash
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+        Vec::new(),
+    )
+    .map_err(SidecarLoadError::Semantic)?;
+    let envelope = DataEnvelope::new(
+        ANALYSIS_SIDECAR,
+        Payload::MemoryFile(loaded.file),
+        metadata,
+        provenance,
+    )
+    .map_err(SidecarLoadError::Semantic)?;
+    Ok(LoadedAnalysisSidecar {
+        envelope,
+        text: loaded.text,
+        json: loaded.json,
+    })
+}
+
+pub(crate) struct LoadedAnalysisSidecar {
+    envelope: DataEnvelope,
+    text: String,
+    json: Json,
+}
+
+impl LoadedAnalysisSidecar {
+    /// The validated in-memory bytes this envelope handed to the consumer.
+    pub fn bytes(&self) -> &[u8] {
+        match self.envelope.payload() {
+            Payload::MemoryFile(file) => file.bytes(),
+            _ => unreachable!("analysis sidecar envelopes carry a MemoryFile payload"),
+        }
+    }
 }
 
 /// The analysis sidecar is serialized by the accepted producer with 10
@@ -891,5 +1338,225 @@ mod tests {
             canonical_source_pair(link.to_str().expect("utf8"), &real).expect("canonicalize");
         assert_eq!(expected, reported);
         assert_eq!(expected, fs::canonicalize(&real).expect("canonical"));
+    }
+
+    #[cfg(unix)]
+    struct HandoffFixture {
+        root: PathBuf,
+        frames_dir: PathBuf,
+        analysis_dir: PathBuf,
+        analysis_text: String,
+        sequence: FrameSequence,
+    }
+
+    /// Produce one frame with a real metadata/analysis sidecar and a PNG through
+    /// a fake native producer, returning the producer-layout artifacts.
+    #[cfg(unix)]
+    fn produce_handoff_fixture(label: &str) -> HandoffFixture {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp")
+            .join(format!("{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let input_dir = root.join("input");
+        let frames_dir = root.join("frames");
+        let logs_dir = root.join("logs");
+        let analysis_dir = root.join("analysis");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+        let source_path = input_dir.join("IMG_0001.DNG");
+        fs::write(&source_path, b"placeholder").expect("write source frame");
+        let png_path = frames_dir.join("frame_000001.png");
+        let metadata_path = frames_dir.join("frame_000001.json");
+        let analysis_path = analysis_dir.join("frame_000001.analysis.json");
+
+        let metadata = format!(
+            "{{\"schema_version\":1,\"source\":\"{}\",\"source_sha256\":\"fakehash\",\"width\":8,\"height\":6,\
+\"applied_white_balance\":[0.5,1,0.8],\"white_balance_source\":\"as-shot\",\
+\"as_shot_neutral\":[0.5,1,0.8],\"observed_scene_min\":0,\"observed_scene_max\":1,\
+\"exposure_ev\":0,\"capture_time\":null,\"analysis_sidecar\":\"{}\"}}\n",
+            source_path.display(),
+            analysis_path.display()
+        );
+        let analysis = "{\"schema_version\":1,\"kind\":\"rawtl-analysis-sidecar\",\
+\"source_sha256\":\"fakehash\",\"analysis\":{\"exposure_ev\":0.0},\"tiles\":[]}\n";
+        let script = format!(
+            "#!/bin/sh\nprintf 'PNG' > '{}'\nprintf '%s' '{}' > '{}'\nprintf '%s' '{}' > '{}'\n",
+            png_path.display(),
+            metadata.replace('\'', "'\\''"),
+            metadata_path.display(),
+            analysis,
+            analysis_path.display()
+        );
+        let tool = root.join("fake-native.sh");
+        fs::write(&tool, script).expect("write fake producer");
+        let mut permissions = fs::metadata(&tool).expect("stat producer").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tool, permissions).expect("chmod producer");
+
+        let sources = crate::order::enumerate_dng(&input_dir).expect("enumerate sources");
+        assert_eq!(sources.len(), 1);
+        let config = ProduceConfig {
+            frames_dir: &frames_dir,
+            logs_dir: &logs_dir,
+            analysis_dir: Some(&analysis_dir),
+            exposure_ev: None,
+            analysis_roi: None,
+            no_png: false,
+            echo: false,
+            echo_tag: "test ",
+            white_balance: WhiteBalance::FirstFrame,
+            converter: None,
+            converter_timeout: None,
+            frames_relative_dir: "frames",
+            log_relative_dir: "logs",
+        };
+        let sequence = produce(&tool, &sources, &config).expect("produce one frame");
+        HandoffFixture {
+            root,
+            frames_dir,
+            analysis_dir,
+            analysis_text: analysis.to_string(),
+            sequence,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn produce_returns_validated_handoff_envelopes() {
+        use crate::transport::{TransportKind, ANALYSIS_SIDECAR, FRAME_METADATA, FRAME_PNG};
+
+        let fixture = produce_handoff_fixture("frame-handoff");
+        let frame = &fixture.sequence.frames[0];
+
+        assert_eq!(
+            frame.metadata_artifact.path(),
+            fixture.frames_dir.join("frame_000001.json")
+        );
+        assert_eq!(frame.metadata_envelope.semantic_type(), FRAME_METADATA);
+        assert_eq!(
+            frame.metadata_envelope.transport_kind(),
+            TransportKind::MemoryFile
+        );
+        match frame.metadata_envelope.payload() {
+            Payload::MemoryFile(file) => {
+                assert!(std::str::from_utf8(file.bytes())
+                    .expect("metadata bytes")
+                    .contains("\"schema_version\":1"))
+            }
+            other => panic!("unexpected metadata payload {other:?}"),
+        }
+
+        let png_artifact = frame.png_artifact.as_ref().expect("png artifact");
+        assert_eq!(png_artifact.path(), fixture.frames_dir.join("frame_000001.png"));
+        assert_eq!(png_artifact.media_type(), "image/png");
+        let png_envelope = frame.png_envelope.as_ref().expect("png envelope");
+        assert_eq!(png_envelope.semantic_type(), FRAME_PNG);
+        assert_eq!(png_envelope.transport_kind(), TransportKind::DiskArtifact);
+
+        let analysis_artifact = frame.analysis_artifact.as_ref().expect("analysis artifact");
+        assert_eq!(
+            analysis_artifact.path(),
+            fixture.analysis_dir.join("frame_000001.analysis.json")
+        );
+        let loaded = analysis_sidecar_envelope(analysis_artifact, frame.source_sha256.as_deref())
+            .expect("validated analysis envelope");
+        assert_eq!(loaded.envelope.semantic_type(), ANALYSIS_SIDECAR);
+        assert!(std::str::from_utf8(loaded.bytes())
+            .expect("analysis bytes")
+            .contains("\"kind\":\"rawtl-analysis-sidecar\""));
+
+        // The provenance binding rejects a sidecar whose hash does not match.
+        match analysis_sidecar_envelope(analysis_artifact, Some("different-hash")) {
+            Err(SidecarLoadError::Semantic(transport::TransportError::SourceHashMismatch(_))) => {}
+            Err(other) => panic!("unexpected mismatch error: {other:?}"),
+            Ok(_) => panic!("mismatched source hash was accepted"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopted_sequence_repoints_every_typed_reference() {
+        use crate::transport::{TransportKind, FRAME_PNG};
+
+        let fixture = produce_handoff_fixture("frame-adoption");
+        let original_metadata =
+            fs::read(fixture.frames_dir.join("frame_000001.json")).expect("producer metadata");
+        let original_analysis = fs::read(fixture.analysis_dir.join("frame_000001.analysis.json"))
+            .expect("producer analysis sidecar");
+        let before_png = fixture.sequence.frames[0]
+            .png_envelope
+            .clone()
+            .expect("producer png envelope");
+
+        // The adoption flow moves the producer round and its analysis directory
+        // to the final names before the sequence is remapped.
+        let adopted_frames = fixture.root.join("output/frames");
+        let adopted_analysis = fixture.root.join("output/analysis/applied");
+        fs::create_dir_all(adopted_frames.parent().expect("frames parent"))
+            .expect("create output dir");
+        fs::create_dir_all(adopted_analysis.parent().expect("analysis parent"))
+            .expect("create analysis parent");
+        fs::rename(&fixture.frames_dir, &adopted_frames).expect("adopt frames");
+        fs::rename(&fixture.analysis_dir, &adopted_analysis).expect("adopt analysis");
+
+        let adopted = fixture
+            .sequence
+            .adopt_output_locations(&adopted_frames, Some(&adopted_analysis), "logs/applied")
+            .expect("adopt output locations");
+        let frame = &adopted.frames[0];
+
+        let png_path = adopted_frames.join("frame_000001.png");
+        let metadata_path = adopted_frames.join("frame_000001.json");
+        let analysis_path = adopted_analysis.join("frame_000001.analysis.json");
+
+        assert_eq!(frame.png_relative, "frames/frame_000001.png");
+        assert_eq!(frame.metadata_relative, "frames/frame_000001.json");
+        assert_eq!(frame.log_relative, "logs/applied/frame_000001.log");
+
+        let png_artifact = frame.png_artifact.as_ref().expect("adopted png artifact");
+        assert_eq!(png_artifact.path(), png_path);
+        assert!(png_artifact.path().is_file(), "adopted PNG must exist");
+        assert_eq!(png_artifact.media_type(), "image/png");
+
+        let png_envelope = frame.png_envelope.as_ref().expect("adopted png envelope");
+        assert_eq!(png_envelope.semantic_type(), FRAME_PNG);
+        assert_eq!(png_envelope.transport_kind(), TransportKind::DiskArtifact);
+        match png_envelope.payload() {
+            Payload::DiskArtifact(artifact) => {
+                assert_eq!(artifact.path(), png_path);
+                assert!(artifact.path().is_file(), "envelope payload must exist");
+            }
+            other => panic!("unexpected png payload {other:?}"),
+        }
+        assert_eq!(png_envelope.metadata(), before_png.metadata());
+        assert!(png_envelope
+            .provenance()
+            .parent_value_ids()
+            .iter()
+            .any(|id| id == before_png.value_id()));
+        assert_ne!(png_envelope.value_id(), before_png.value_id());
+
+        assert_eq!(frame.metadata_artifact.path(), metadata_path);
+        assert!(metadata_path.is_file(), "adopted metadata must exist");
+        assert_eq!(
+            fs::read(&metadata_path).expect("read metadata"),
+            original_metadata
+        );
+
+        let analysis_artifact = frame.analysis_artifact.as_ref().expect("analysis artifact");
+        assert_eq!(analysis_artifact.path(), analysis_path);
+        assert!(analysis_path.is_file(), "adopted analysis sidecar must exist");
+        assert_eq!(frame.analysis_path.as_deref(), Some(analysis_path.as_path()));
+
+        let loaded = transport::load(analysis_artifact).expect("adopted analysis artifact loads");
+        assert_eq!(loaded.bytes(), original_analysis.as_slice());
+        let envelope = analysis_sidecar_envelope(analysis_artifact, frame.source_sha256.as_deref())
+            .expect("adopted analysis envelope");
+        assert_eq!(
+            std::str::from_utf8(envelope.bytes()).expect("analysis bytes"),
+            fixture.analysis_text
+        );
     }
 }

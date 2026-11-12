@@ -625,10 +625,16 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
             ),
         )
     })?;
+    let mut adopted_analysis_dir: Option<PathBuf> = None;
     if let Some(analysis_dir) = round_analysis_dir(context, best.state.iteration) {
         let final_dir = output.join("analysis/applied");
         let _ = fs::remove_dir_all(&final_dir);
-        let _ = fs::rename(&analysis_dir, &final_dir);
+        // If the rename fails the round directory is still the real location;
+        // the adopted references must point at existing files either way.
+        adopted_analysis_dir = Some(match fs::rename(&analysis_dir, &final_dir) {
+            Ok(()) => final_dir,
+            Err(_) => analysis_dir,
+        });
     }
     let applied_logs = context
         .output
@@ -638,7 +644,11 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         let _ = fs::remove_dir_all(&final_logs);
         let _ = fs::rename(&applied_logs, &final_logs);
     }
-    let final_sequence = best.sequence.clone().remap_output_paths("logs/applied");
+    let final_sequence = best.sequence.clone().adopt_output_locations(
+        &frames_dir,
+        adopted_analysis_dir.as_deref(),
+        "logs/applied",
+    )?;
     println!(
         "accepted render round {} with {} frame(s)",
         best.state.iteration + 1,
@@ -686,7 +696,7 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
             match audit::audit_video(
                 &options.ffmpeg,
                 &options.ffprobe,
-                &stage.temp_linear,
+                &stage.linear_artifact,
                 &stage.linear_probe,
                 final_sequence.frames.len(),
                 &audit_config,
@@ -1606,7 +1616,7 @@ fn remove_round(context: &RunContext<'_>, iteration: usize) {
 // ---------------------------------------------------------------------------
 
 fn parse_measurement(frame: &FrameInfo, pass: &str) -> Result<FrameMeasurement> {
-    let path = frame.analysis_path.as_ref().ok_or_else(|| {
+    let artifact = frame.analysis_artifact.as_ref().ok_or_else(|| {
         Error::new(
             EXIT_FRAME,
             format!(
@@ -1615,16 +1625,44 @@ fn parse_measurement(frame: &FrameInfo, pass: &str) -> Result<FrameMeasurement> 
             ),
         )
     })?;
-    let text = fs::read_to_string(path).map_err(|err| {
+    let path = artifact.path();
+    let loaded = frame::analysis_sidecar_envelope(artifact, frame.source_sha256.as_deref())
+        .map_err(|err| match err {
+            frame::SidecarLoadError::Read(err) => Error::new(
+                EXIT_FRAME,
+                format!(
+                    "cannot read {pass} analysis sidecar {}: {err}",
+                    path.display()
+                ),
+            ),
+            frame::SidecarLoadError::InvalidJson(err) => Error::new(
+                EXIT_FRAME,
+                format!(
+                    "frame {} ({pass} pass) analysis sidecar is invalid ({}): {err}",
+                    frame.index,
+                    path.display()
+                ),
+            ),
+            frame::SidecarLoadError::Semantic(err) => Error::new(
+                EXIT_FRAME,
+                format!(
+                    "frame {} ({pass} pass) analysis sidecar is invalid ({}): {err}",
+                    frame.index,
+                    path.display()
+                ),
+            ),
+        })?;
+    let text = std::str::from_utf8(loaded.bytes()).map_err(|err| {
         Error::new(
             EXIT_FRAME,
             format!(
-                "cannot read {pass} analysis sidecar {}: {err}",
+                "frame {} ({pass} pass) analysis sidecar is invalid ({}): {err}",
+                frame.index,
                 path.display()
             ),
         )
     })?;
-    let sidecar = AnalysisSidecar::parse(&text).map_err(|err| {
+    let sidecar = AnalysisSidecar::parse(text).map_err(|err| {
         Error::new(
             EXIT_FRAME,
             format!(
@@ -1638,22 +1676,47 @@ fn parse_measurement(frame: &FrameInfo, pass: &str) -> Result<FrameMeasurement> 
 }
 
 fn parse_measurement_probe(frame: &FrameInfo, index: usize) -> Result<AnalysisSidecar> {
-    let path = frame.analysis_path.as_ref().ok_or_else(|| {
+    let artifact = frame.analysis_artifact.as_ref().ok_or_else(|| {
         Error::new(
             EXIT_GAIN_PROBE,
             format!("gain probe measurement for frame {index} has no analysis sidecar"),
         )
     })?;
-    let text = fs::read_to_string(path).map_err(|err| {
+    let path = artifact.path();
+    let loaded = frame::analysis_sidecar_envelope(artifact, frame.source_sha256.as_deref())
+        .map_err(|err| match err {
+            frame::SidecarLoadError::Read(err) => Error::new(
+                EXIT_GAIN_PROBE,
+                format!(
+                    "cannot read gain probe analysis sidecar {}: {err}",
+                    path.display()
+                ),
+            ),
+            frame::SidecarLoadError::InvalidJson(err) => Error::new(
+                EXIT_GAIN_PROBE,
+                format!(
+                    "gain probe analysis sidecar for frame {index} is invalid ({}): {err}",
+                    path.display()
+                ),
+            ),
+            frame::SidecarLoadError::Semantic(err) => Error::new(
+                EXIT_GAIN_PROBE,
+                format!(
+                    "gain probe analysis sidecar for frame {index} is invalid ({}): {err}",
+                    path.display()
+                ),
+            ),
+        })?;
+    let text = std::str::from_utf8(loaded.bytes()).map_err(|err| {
         Error::new(
             EXIT_GAIN_PROBE,
             format!(
-                "cannot read gain probe analysis sidecar {}: {err}",
+                "gain probe analysis sidecar for frame {index} is invalid ({}): {err}",
                 path.display()
             ),
         )
     })?;
-    AnalysisSidecar::parse(&text).map_err(|err| {
+    AnalysisSidecar::parse(text).map_err(|err| {
         Error::new(
             EXIT_GAIN_PROBE,
             format!(
