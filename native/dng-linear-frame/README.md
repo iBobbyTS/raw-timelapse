@@ -111,6 +111,52 @@ report and audit flow. The two occupancy series feed distinct decisions:
 camera-domain occupancy gates tile validity/estimation, while delivered-domain
 occupancy drives the report's output-clipping delta.
 
+## Streaming stdout protocol (v1)
+
+Two output modes stream one frame to standard output instead of writing files:
+
+```sh
+native/build/dng-linear-frame --stdout-analysis input.dng \
+  [--white-balance R,G,B] [--converter PATH] [--converter-timeout SECONDS] \
+  [--exposure-ev EV] [--analysis-roi X,Y,W,H]
+
+native/build/dng-linear-frame --stdout-frame input.dng \
+  [--white-balance R,G,B] [--converter PATH] [--converter-timeout SECONDS] \
+  [--exposure-ev EV]
+```
+
+Each call starts with the 8-byte ASCII magic `RAWTLST1` followed by records:
+
+```
+type:u8 | reserved:u8x3 (zero) | length:u64 little-endian | payload[length]
+```
+
+| Type | Payload |
+| --- | --- |
+| `0x01` | Metadata JSON (UTF-8), byte-identical to the positional-mode metadata file, including the trailing newline |
+| `0x02` | Analysis JSON, byte-identical to the `--emit-analysis` sidecar file, including the trailing newline (`--stdout-analysis` only) |
+| `0x03` | Frame descriptor JSON `{"width":W,"height":H,"pixel_format":"rgb48le","pixels_sha256":"<64 hex>"}` |
+| `0x04` | RGB48LE pixels: `width*height*6` bytes, interleaved HWC, little-endian uint16 codes (immediately after its `0x03`) |
+
+`--stdout-analysis` emits `0x01` then `0x02`; `--stdout-frame` emits `0x01`,
+`0x03`, `0x04`. The `0x02` payload reflects the applied `--exposure-ev` with the
+same math and schema as the positional `--emit-analysis` sidecar. The pixel
+payload is the same quantized interleaved buffer the PNG path writes
+(code/16384, same clipping and rounding), and `pixels_sha256` is computed by
+this tool over the exact `0x04` payload with the same authority as
+`source_sha256`. `analysis_sidecar` is always `null` in both stdout modes.
+
+These modes write no PNG, metadata, analysis or pixel artifacts to disk; only
+the vendor-RAW Converter temporary-directory handling is unchanged. The human
+`decoded WxH` line moves to stderr, so stdout carries only the record stream.
+The modes are mutually exclusive with the three positional paths and with each
+other (exit 2), and `--analysis-roi` requires `--stdout-analysis` (or the
+positional `--emit-analysis`); `--no-png` and `--emit-analysis` are rejected in
+stdout modes (exit 2). A closed or failing stdout pipe (EPIPE/partial write)
+exits nonzero (50) without any success claim. Payloads are written
+incrementally in bounded chunks; the frame is never buffered into an extra
+full-size byte copy.
+
 Routing reads classic TIFF directory metadata **before SDK entry**. The
 classification predicate is *recognized DNG*, not *is TIFF*: a classic TIFF
 (magic 42) that declares `DNGVersion` is a DNG and must have exactly one
@@ -163,7 +209,8 @@ the requested gain and before quantization, `exposure_ev`, `gain`,
 Converter output for a vendor/other RAW; legal directories of any fitting size
 are scanned, and `null` means absent or structurally unreadable metadata —
 optional metadata never fails the frame),
-`analysis_sidecar` (requested path or `null`), and the explicit `quantization`
+`analysis_sidecar` (requested positional path; always `null` in the stdout
+modes), and the explicit `quantization`
 policy/counts. It is a numeric sidecar; no claim that 0.18 equals 18% physical
 reflectance is made. PNG bytes are deterministic on the tested toolchain; JSON
 contains run-specific temporary paths. The caller must check exit status before
@@ -184,7 +231,7 @@ renames can leave a PNG without its new sidecar and returns failure.
 | 25 | Converter timeout (process group killed/reaped) |
 | 30 | SDK parse/decode/unsupported channel/residual-black failure |
 | 40 | Missing/invalid color/WB metadata, singular matrix, nonfinite sample |
-| 50 | Other filesystem/output/runtime failure |
+| 50 | Other filesystem/output/runtime failure, including a stdout write failure |
 
 ## Decode and color attribution
 
@@ -236,7 +283,13 @@ equivariance, camera-mask invariance and `+EV` clip growth. The integration
 script additionally checks the analysis sidecar contract on generated DNGs
 (golden values from the independent Decimal matrix, `--no-png`, capture-time
 presence/absence, deterministic sidecar bytes, non-finite EV/ROI rejections,
-nonzero-black camera-domain masking and delivered-domain clipping).
+nonzero-black camera-domain masking and delivered-domain clipping). The
+`stdout-protocol` test covers protocol v1: magic/record framing with zero
+reserved bytes, `0x01`/`0x02` byte equality against positional reference files
+(including `--exposure-ev` and `--analysis-roi`), the `0x03` descriptor and
+`pixels_sha256` over the `0x04` payload, independently recomputed quantization
+bytes, zero on-disk artifacts, mode/option rejection (exit 2) and a closed
+consumer pipe (nonzero exit).
 
 Opt-in real test (large outputs stay in the work directory):
 

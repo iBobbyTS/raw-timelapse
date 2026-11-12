@@ -1,10 +1,12 @@
 #include "frame.h"
 #include <CommonCrypto/CommonDigest.h>
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <fcntl.h>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <spawn.h>
 #include <sstream>
 #include <sys/wait.h>
@@ -59,18 +61,35 @@ std::string sha256(const fs::path &p) {
   std::ifstream in(p, std::ios::binary);
   if (!in)
     throw Error(20, "hash input open failed");
-  CC_SHA256_CTX ctx;
-  CC_SHA256_Init(&ctx);
+  Sha256 hasher;
   char b[65536];
   while (in) {
     in.read(b, sizeof b);
     if (auto n = in.gcount())
-      CC_SHA256_Update(&ctx, b, CC_LONG(n));
+      hasher.update(b, size_t(n));
   }
   if (!in.eof())
     throw Error(20, "hash read failed");
+  return hasher.hex();
+}
+struct Sha256::State {
+  CC_SHA256_CTX context;
+};
+Sha256::Sha256() : state_(new State) { CC_SHA256_Init(&state_->context); }
+Sha256::~Sha256() = default;
+void Sha256::update(const void *data, size_t length) {
+  const auto *bytes = static_cast<const unsigned char *>(data);
+  while (length) {
+    CC_LONG n = static_cast<CC_LONG>(
+        std::min<size_t>(length, std::numeric_limits<CC_LONG>::max()));
+    CC_SHA256_Update(&state_->context, bytes, n);
+    bytes += n;
+    length -= n;
+  }
+}
+std::string Sha256::hex() {
   unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-  CC_SHA256_Final(digest, &ctx);
+  CC_SHA256_Final(digest, &state_->context);
   std::ostringstream out;
   out << std::hex << std::setfill('0');
   for (auto c : digest)

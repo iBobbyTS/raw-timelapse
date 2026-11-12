@@ -1,10 +1,13 @@
 #pragma once
 #include "json.h"
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <vector>
 namespace frame {
 namespace fs = std::filesystem;
@@ -52,4 +55,19 @@ ProcessResult run_process(const std::vector<std::string> &, const fs::path &log,
 std::string sha256(const fs::path &);
 void write_png(const fs::path &, uint32_t, uint32_t,
                const std::vector<uint16_t> &);
+// Incremental SHA-256 over caller-supplied bytes (same authority as sha256()).
+// hex() finalizes the digest; call it once, after every update().
+class Sha256 {
+public:
+  Sha256();
+  ~Sha256();
+  Sha256(const Sha256 &) = delete;
+  Sha256 &operator=(const Sha256 &) = delete;
+  void update(const void *data, size_t length);
+  std::string hex();
+
+private:
+  struct State;
+  std::unique_ptr<State> state_;
+};
 } // namespace frame

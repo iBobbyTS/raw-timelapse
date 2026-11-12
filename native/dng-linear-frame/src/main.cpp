@@ -4,6 +4,8 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <algorithm>
 #include <cmath>
+#include <csignal>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -120,38 +122,409 @@ analysis::Roi parse_roi(const std::string &s) {
   analysis::validate_roi(roi);
   return roi;
 }
+
+// ---- stdout streaming protocol v1 -----------------------------------------
+// Every stdout-mode call starts with the 8-byte ASCII magic and continues with
+// records: type:u8 | reserved:u8x3 (zero) | length:u64 LE | payload[length].
+constexpr char kStdoutMagic[8] = {'R', 'A', 'W', 'T', 'L', 'S', 'T', '1'};
+constexpr unsigned char kRecordMetadata = 0x01;
+constexpr unsigned char kRecordAnalysis = 0x02;
+constexpr unsigned char kRecordFrame = 0x03;
+constexpr unsigned char kRecordPixels = 0x04;
+// Write staging: payloads are never materialized as one full byte copy.
+constexpr size_t kWriteChunk = size_t(1) << 16;
+// 32768 samples per staging block (64 KiB of RGB48LE bytes).
+constexpr size_t kPixelChunk = size_t(1) << 15;
+
+void write_all(const void *data, size_t length) {
+  const auto *bytes = static_cast<const unsigned char *>(data);
+  while (length) {
+    size_t chunk = std::min(length, kWriteChunk);
+    if (std::fwrite(bytes, 1, chunk, stdout) != chunk ||
+        std::ferror(stdout))
+      throw Error(50, "stdout write failed");
+    bytes += chunk;
+    length -= chunk;
+  }
+}
+void write_record_header(unsigned char type, uint64_t length) {
+  unsigned char header[12] = {type, 0, 0, 0};
+  for (int i = 0; i < 8; ++i)
+    header[4 + i] = static_cast<unsigned char>((length >> (8 * i)) & 0xff);
+  write_all(header, sizeof header);
+}
+void write_record_text(unsigned char type, const std::string &payload) {
+  write_record_header(type, uint64_t(payload.size()));
+  write_all(payload.data(), payload.size());
+}
+// The 0x04 payload is little-endian uint16 samples, interleaved HWC RGB.
+template <typename Sink>
+void for_each_rgb48le_chunk(const std::vector<uint16_t> &pixels, Sink &&sink) {
+  std::vector<unsigned char> bytes;
+  for (size_t offset = 0; offset < pixels.size(); offset += kPixelChunk) {
+    size_t count = std::min(kPixelChunk, pixels.size() - offset);
+    bytes.resize(count * 2);
+    for (size_t i = 0; i < count; ++i) {
+      const uint16_t value = pixels[offset + i];
+      bytes[2 * i] = static_cast<unsigned char>(value & 0xff);
+      bytes[2 * i + 1] = static_cast<unsigned char>(value >> 8);
+    }
+    sink(bytes.data(), bytes.size());
+  }
+}
+
+struct Prepared {
+  Decoded decoded;
+  fs::path source;
+  std::string source_hash;
+  Json conversion;
+  std::optional<Routing> routing;
+  Route kind = Route::vendor_raw;
+  std::optional<std::string> capture_time;
+  Vec own{};
+  bool wb_override = false;
+};
+
+// Routing, optional Converter step, decode and capture-time read. The run
+// temporary directory stays owned by the caller so positional publication and
+// stdout streaming keep their existing cleanup ordering.
+Prepared prepare(Temp &temp, const fs::path &input,
+                 const std::optional<Vec> &wb, const std::string &converter,
+                 int timeout) {
+  Prepared out;
+  out.source = input;
+  out.wb_override = wb.has_value();
+  out.routing = inspect(input);
+  // Recognition is DNG-structural: only a recognized DNG is routed by its
+  // main RAW photometric; every other file is a vendor/other RAW candidate for
+  // the converter alone.
+  out.kind = out.routing ? route(out.routing->photometric) : Route::vendor_raw;
+  out.source_hash = sha256(input);
+  fs::path decoded_path = input;
+  out.conversion = Json{{"used", false}};
+  auto convert = [&] {
+    fs::path dir = temp.path / "linear";
+    fs::create_directory(dir);
+    std::vector<std::string> command{converter, "-c",         "-l",
+                                     "-d",      dir.string(), input.string()};
+    auto log = temp.path / "converter.log";
+    auto result = run_process(command, log, timeout);
+    std::string transcript = read_text(log);
+    if (result.timed_out || result.exit_code != 0) {
+      std::cerr << transcript;
+      throw Error(result.timed_out ? 25 : 24,
+                  "Converter failed; exit=" + std::to_string(result.exit_code));
+    }
+    std::vector<fs::path> files;
+    for (auto &e : fs::directory_iterator(dir))
+      if (e.is_regular_file())
+        files.push_back(e.path());
+    if (files.size() != 1)
+      throw Error(23, "Converter must produce exactly one DNG");
+    decoded_path = files.front();
+    auto check = inspect(decoded_path);
+    if (!check || check->photometric != 34892)
+      throw Error(23,
+                  "Converter output main RAW IFD is not LinearRaw (34892)");
+    std::vector<Json> args;
+    for (auto &a : command)
+      args.emplace_back(a);
+    out.conversion = Json{
+        {"used", true},
+        {"executable", converter},
+        {"version", converter_version(converter)},
+        {"command", args},
+        {"exit_code", result.exit_code},
+        {"stdout_stderr", transcript},
+        {"output_name", decoded_path.filename().string()},
+        {"output_sha256", sha256(decoded_path)},
+        {"verified_main_ifd_photometric", int(check->photometric)},
+        {"temporary_directory", temp.path.string()},
+        {"cleanup", "removed before publishing sidecar"},
+        {"upstream_semantics", "Converter performs CFA demosaic; detailed "
+                               "clipping/metadata baking UNKNOWN"}};
+  };
+  // "as-shot" metadata comes from the recognized DNG itself. A vendor/other
+  // input is hashed as the original file, but its neutral and capture time
+  // exist only in the converter's DNG output (probed: ADC preserves both).
+  if (out.kind == Route::vendor_raw) {
+    convert();
+    out.own = read_neutral(decoded_path);
+  } else {
+    out.own = read_neutral(input);
+    if (out.kind == Route::converter)
+      convert();
+  }
+  out.decoded = decode(decoded_path, wb ? wb : std::optional<Vec>(out.own));
+  out.capture_time = read_capture_time(out.kind == Route::vendor_raw
+                                           ? decoded_path
+                                           : input);
+  return out;
+}
+
+struct FrameOutput {
+  uint32_t width = 0, height = 0;
+  std::string metadata;                // without the trailing newline
+  std::optional<std::string> analysis; // without the trailing newline
+  std::vector<uint16_t> pixels;        // empty unless requested
+};
+
+// Gain, quantization, photometry and the metadata/analysis JSON documents.
+// The analysis_sidecar field is the requested positional path or null.
+FrameOutput render(const Prepared &prepared,
+                   const std::optional<fs::path> &analysis_sidecar,
+                   const analysis::Roi &roi, double exposure_ev,
+                   bool want_analysis, bool need_pixels) {
+  const Decoded &d = prepared.decoded;
+  const double gain = std::exp2(exposure_ev);
+  std::vector<uint16_t> pixels;
+  if (need_pixels)
+    pixels.resize(d.camera.size());
+  std::vector<float> gained_scene;
+  if (want_analysis)
+    gained_scene.resize(d.camera.size());
+  double low = INFINITY, high = -INFINITY;
+  size_t negatives = 0, upper = 0;
+  for (size_t i = 0; i < d.camera.size(); i += 3) {
+    Vec camera{d.camera[i], d.camera[i + 1], d.camera[i + 2]};
+    Vec scene = multiply(d.camera_to_ap1, camera);
+    for (int c = 0; c < 3; ++c) {
+      float x = static_cast<float>(scene[c] * gain);
+      if (!std::isfinite(x))
+        throw Error(40, "nonfinite color result");
+      low = std::min(low, double(x));
+      high = std::max(high, double(x));
+      negatives += x < 0;
+      upper += x > 65535.0f / 16384.0f;
+      if (want_analysis)
+        gained_scene[i + c] = x;
+      if (need_pixels)
+        pixels[i + c] = quantize(x);
+    }
+  }
+  std::optional<analysis::Analysis> measured;
+  if (want_analysis)
+    measured = analysis::measure(d, gained_scene, roi, exposure_ev);
+  Json metadata{
+      {"schema_version", 1},
+      {"source", prepared.source.string()},
+      {"source_sha256", prepared.source_hash},
+      {"source_main_ifd_offset",
+       prepared.routing ? Json(int(prepared.routing->ifd)) : Json()},
+      {"source_photometric",
+       prepared.routing ? Json(int(prepared.routing->photometric)) : Json()},
+      {"route", prepared.kind == Route::direct
+                    ? "linearraw-sdk"
+                    : prepared.kind == Route::converter
+                          ? "cfa-converter-linearraw-sdk"
+                          : "vendor-raw-converter-linearraw-sdk"},
+      {"converter", prepared.conversion},
+      {"sdk_version", kDNGSDK_GetInfoVersion},
+      {"sdk_build",
+       "C++20; qDNGUseXMP=1; qDNGXMPFiles=0; FP32 Linearize destination"},
+      {"width", int(d.width)},
+      {"height", int(d.height)},
+      {"channels", 3},
+      {"working_space", "ACEScg AP1/D60 scene-linear FP32"},
+      {"exposure_ev", exposure_ev},
+      {"gain", gain},
+      {"capture_time",
+       prepared.capture_time ? Json(*prepared.capture_time) : Json()},
+      {"analysis_sidecar",
+       analysis_sidecar ? Json(analysis_sidecar->string()) : Json()},
+      {"as_shot_neutral", vec(prepared.own)},
+      {"decoded_as_shot_neutral", vec(d.as_shot)},
+      {"applied_white_balance", vec(d.applied)},
+      {"white_balance_source",
+       prepared.wb_override ? Json("override") : Json("as-shot")},
+      {"color", d.color},
+      {"decode_semantics", d.semantics},
+      {"observed_scene_min", low},
+      {"observed_scene_max", high},
+      {"quantization",
+       Json{{"scale", 16384},
+            {"rounding", "nearest; ties upward"},
+            {"negative_policy", "clip to 0"},
+            {"upper_policy", "above 65535/16384 clips to 65535"},
+            {"negative_samples", double(negatives)},
+            {"above_upper_samples", double(upper)},
+            {"transfer", "linear; no OETF"}}}};
+  FrameOutput out;
+  out.width = d.width;
+  out.height = d.height;
+  out.metadata = metadata.text;
+  if (measured)
+    out.analysis = analysis::sidecar_json(*measured, prepared.source_hash).text;
+  out.pixels = std::move(pixels);
+  return out;
+}
+
+enum class Mode { positional, stdout_analysis, stdout_frame };
 } // namespace
 int main(int argc, char **argv) {
   using namespace frame;
   try {
-    if (argc < 4)
-      throw Error(2, "usage: dng-linear-frame <input.dng> <output.png> "
-                     "<output.json> [--white-balance R,G,B] [--converter PATH] "
-                     "[--converter-timeout SECONDS] [--exposure-ev EV] "
-                     "[--emit-analysis PATH] [--analysis-roi X,Y,W,H] "
-                     "[--no-png]");
-    fs::path input = fs::canonical(argv[1]),
-             png = fs::weakly_canonical(argv[2]),
-             json = fs::weakly_canonical(argv[3]);
-    if (input == png || input == json || png == json ||
-        (fs::exists(png) && fs::equivalent(input, png)) ||
-        (fs::exists(json) && fs::equivalent(input, json)))
-      throw Error(2, "input and output paths must be distinct");
+    Mode mode = Mode::positional;
+    const auto takes_value = [](const std::string &a) {
+      return a == "--white-balance" || a == "--converter" ||
+             a == "--converter-timeout" || a == "--exposure-ev" ||
+             a == "--emit-analysis" || a == "--analysis-roi";
+    };
+    for (int i = 1; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--stdout-analysis" || a == "--stdout-frame") {
+        if (mode != Mode::positional)
+          throw Error(2, "specify exactly one of --stdout-analysis or "
+                         "--stdout-frame");
+        mode = a == "--stdout-analysis" ? Mode::stdout_analysis
+                                        : Mode::stdout_frame;
+      } else if (takes_value(a) && i + 1 < argc) {
+        ++i; // skip the option value so it cannot look like a mode flag
+      }
+    }
+    if (mode == Mode::positional) {
+      if (argc < 4)
+        throw Error(2, "usage: dng-linear-frame <input.dng> <output.png> "
+                       "<output.json> [--white-balance R,G,B] [--converter "
+                       "PATH] [--converter-timeout SECONDS] [--exposure-ev EV] "
+                       "[--emit-analysis PATH] [--analysis-roi X,Y,W,H] "
+                       "[--no-png]; or dng-linear-frame --stdout-analysis "
+                       "<input.dng> | --stdout-frame <input.dng> with the "
+                       "applicable options");
+      fs::path input = fs::canonical(argv[1]),
+               png = fs::weakly_canonical(argv[2]),
+               json = fs::weakly_canonical(argv[3]);
+      if (input == png || input == json || png == json ||
+          (fs::exists(png) && fs::equivalent(input, png)) ||
+          (fs::exists(json) && fs::equivalent(input, json)))
+        throw Error(2, "input and output paths must be distinct");
+      std::optional<Vec> wb;
+      std::string converter = "/Applications/Adobe DNG "
+                              "Converter.app/Contents/MacOS/Adobe DNG Converter";
+      int timeout = 120;
+      double exposure_ev = 0;
+      fs::path analysis_path;
+      analysis::Roi roi;
+      bool no_png = false;
+      bool roi_set = false;
+      for (int i = 4; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--no-png") {
+          no_png = true;
+          continue;
+        }
+        if (i + 1 >= argc)
+          throw Error(2, "option value missing");
+        std::string value = argv[++i];
+        if (a == "--white-balance")
+          wb = parse_wb(value);
+        else if (a == "--converter")
+          converter = value;
+        else if (a == "--exposure-ev")
+          exposure_ev = parse_ev(value);
+        else if (a == "--emit-analysis")
+          analysis_path = fs::weakly_canonical(value);
+        else if (a == "--analysis-roi") {
+          roi = parse_roi(value);
+          roi_set = true;
+        } else if (a == "--converter-timeout") {
+          size_t end = 0;
+          try {
+            timeout = std::stoi(value, &end);
+          } catch (...) {
+            throw Error(2, "invalid timeout");
+          }
+          if (end != value.size() || timeout < 1 || timeout > 3600)
+            throw Error(2, "timeout must be 1..3600 seconds");
+        } else
+          throw Error(2, "unknown option: " + a);
+      }
+      if (roi_set && analysis_path.empty())
+        throw Error(2, "--analysis-roi requires --emit-analysis");
+      if (!analysis_path.empty() &&
+          (analysis_path == input || analysis_path == png ||
+           analysis_path == json ||
+           (fs::exists(analysis_path) &&
+            fs::equivalent(input, analysis_path))))
+        throw Error(2, "analysis sidecar must be distinct from input and "
+                       "outputs");
+      Temp temp;
+      Prepared prepared = prepare(temp, input, wb, converter, timeout);
+      FrameOutput frame =
+          render(prepared,
+                 analysis_path.empty()
+                     ? std::optional<fs::path>()
+                     : std::optional<fs::path>(analysis_path),
+                 roi, exposure_ev, !analysis_path.empty(), !no_png);
+      // Build artifacts in the run directory; cleanup is complete before
+      // publishing.
+      auto staged_png = temp.path / "frame.png";
+      if (!no_png)
+        write_png(staged_png, frame.width, frame.height, frame.pixels);
+      // Output can reside on another volume, so copy to a sibling before
+      // rename.
+      auto out_png = png;
+      out_png += ".tmp-" + std::to_string(getpid());
+      auto out_json = json;
+      out_json += ".tmp-" + std::to_string(getpid());
+      auto out_analysis = analysis_path;
+      if (frame.analysis)
+        out_analysis += ".tmp-" + std::to_string(getpid());
+      try {
+        if (!no_png)
+          fs::copy_file(staged_png, out_png,
+                        fs::copy_options::overwrite_existing);
+        save(out_json, frame.metadata);
+        if (frame.analysis)
+          save(out_analysis, *frame.analysis);
+        temp.clear();
+        if (!no_png)
+          fs::rename(out_png, png);
+        fs::rename(out_json, json);
+        if (frame.analysis)
+          fs::rename(out_analysis, analysis_path);
+      } catch (...) {
+        std::error_code e;
+        fs::remove(out_png, e);
+        fs::remove(out_json, e);
+        if (frame.analysis)
+          fs::remove(out_analysis, e);
+        throw;
+      }
+      std::cout << "decoded " << frame.width << 'x' << frame.height;
+      if (no_png)
+        std::cout << " (PNG suppressed)";
+      else
+        std::cout << " -> " << png;
+      if (frame.analysis)
+        std::cout << " analysis=" << analysis_path;
+      std::cout << '\n';
+      return 0;
+    }
+    // ---- stdout streaming modes -------------------------------------------
+    const bool want_analysis = mode == Mode::stdout_analysis;
+    fs::path input;
+    bool have_input = false;
     std::optional<Vec> wb;
     std::string converter = "/Applications/Adobe DNG "
                             "Converter.app/Contents/MacOS/Adobe DNG Converter";
     int timeout = 120;
     double exposure_ev = 0;
-    fs::path analysis_path;
     analysis::Roi roi;
-    bool no_png = false;
-    bool roi_set = false;
-    for (int i = 4; i < argc; ++i) {
+    for (int i = 1; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--no-png") {
-        no_png = true;
+      if (a == "--stdout-analysis" || a == "--stdout-frame") {
+        if (have_input)
+          throw Error(2, "specify exactly one of --stdout-analysis or "
+                         "--stdout-frame");
+        if (i + 1 >= argc)
+          throw Error(2, "option value missing");
+        input = fs::canonical(argv[++i]);
+        have_input = true;
         continue;
       }
+      if (a == "--no-png" || a == "--emit-analysis")
+        throw Error(2, a + " is not applicable to stdout modes");
       if (i + 1 >= argc)
         throw Error(2, "option value missing");
       std::string value = argv[++i];
@@ -161,11 +534,10 @@ int main(int argc, char **argv) {
         converter = value;
       else if (a == "--exposure-ev")
         exposure_ev = parse_ev(value);
-      else if (a == "--emit-analysis")
-        analysis_path = fs::weakly_canonical(value);
       else if (a == "--analysis-roi") {
+        if (!want_analysis)
+          throw Error(2, "--analysis-roi requires --stdout-analysis");
         roi = parse_roi(value);
-        roi_set = true;
       } else if (a == "--converter-timeout") {
         size_t end = 0;
         try {
@@ -178,196 +550,48 @@ int main(int argc, char **argv) {
       } else
         throw Error(2, "unknown option: " + a);
     }
-    if (roi_set && analysis_path.empty())
-      throw Error(2, "--analysis-roi requires --emit-analysis");
-    if (!analysis_path.empty() &&
-        (analysis_path == input || analysis_path == png ||
-         analysis_path == json ||
-         (fs::exists(analysis_path) && fs::equivalent(input, analysis_path))))
-      throw Error(2, "analysis sidecar must be distinct from input and "
-                     "outputs");
-    auto routing = inspect(input);
-    // Recognition is DNG-structural: only a recognized DNG is routed by its
-    // main RAW photometric; every other file is a vendor/other RAW candidate
-    // for the converter alone.
-    auto kind = routing ? route(routing->photometric) : Route::vendor_raw;
-    std::string source_hash = sha256(input);
+    if (!have_input)
+      throw Error(2, "missing input");
+    // A closed consumer pipe must surface as a write error, not a SIGPIPE
+    // death: no record, artifact or success claim is published.
+    std::signal(SIGPIPE, SIG_IGN);
     Temp temp;
-    fs::path decoded_path = input;
-    Json conversion{{"used", false}};
-    auto convert = [&] {
-      fs::path dir = temp.path / "linear";
-      fs::create_directory(dir);
-      std::vector<std::string> command{converter, "-c",         "-l",
-                                       "-d",      dir.string(), input.string()};
-      auto log = temp.path / "converter.log";
-      auto result = run_process(command, log, timeout);
-      std::string transcript = read_text(log);
-      if (result.timed_out || result.exit_code != 0) {
-        std::cerr << transcript;
-        throw Error(result.timed_out ? 25 : 24,
-                    "Converter failed; exit=" +
-                        std::to_string(result.exit_code));
-      }
-      std::vector<fs::path> files;
-      for (auto &e : fs::directory_iterator(dir))
-        if (e.is_regular_file())
-          files.push_back(e.path());
-      if (files.size() != 1)
-        throw Error(23, "Converter must produce exactly one DNG");
-      decoded_path = files.front();
-      auto check = inspect(decoded_path);
-      if (!check || check->photometric != 34892)
-        throw Error(23,
-                    "Converter output main RAW IFD is not LinearRaw (34892)");
-      std::vector<Json> args;
-      for (auto &a : command)
-        args.emplace_back(a);
-      conversion = Json{
-          {"used", true},
-          {"executable", converter},
-          {"version", converter_version(converter)},
-          {"command", args},
-          {"exit_code", result.exit_code},
-          {"stdout_stderr", transcript},
-          {"output_name", decoded_path.filename().string()},
-          {"output_sha256", sha256(decoded_path)},
-          {"verified_main_ifd_photometric", int(check->photometric)},
-          {"temporary_directory", temp.path.string()},
-          {"cleanup", "removed before publishing sidecar"},
-          {"upstream_semantics", "Converter performs CFA demosaic; detailed "
-                                 "clipping/metadata baking UNKNOWN"}};
-    };
-    // "as-shot" metadata comes from the recognized DNG itself. A vendor/other
-    // input is hashed as the original file, but its neutral and capture time
-    // exist only in the converter's DNG output (probed: ADC preserves both).
-    Vec own;
-    if (kind == Route::vendor_raw) {
-      convert();
-      own = read_neutral(decoded_path);
+    Prepared prepared = prepare(temp, input, wb, converter, timeout);
+    FrameOutput frame =
+        render(prepared, std::optional<fs::path>(), roi, exposure_ev,
+               want_analysis, !want_analysis);
+    temp.clear();
+    write_all(kStdoutMagic, sizeof kStdoutMagic);
+    write_record_text(kRecordMetadata, frame.metadata + "\n");
+    if (want_analysis) {
+      if (!frame.analysis)
+        throw Error(50, "analysis document missing");
+      write_record_text(kRecordAnalysis, *frame.analysis + "\n");
     } else {
-      own = read_neutral(input);
-      if (kind == Route::converter)
-        convert();
+      if (frame.pixels.size() !=
+          size_t(frame.width) * size_t(frame.height) * 3)
+        throw Error(50, "pixel geometry mismatch");
+      Sha256 hasher;
+      for_each_rgb48le_chunk(frame.pixels, [&](const unsigned char *data,
+                                               size_t length) {
+        hasher.update(data, length);
+      });
+      Json descriptor{{"width", int(frame.width)},
+                      {"height", int(frame.height)},
+                      {"pixel_format", "rgb48le"},
+                      {"pixels_sha256", hasher.hex()}};
+      write_record_text(kRecordFrame, descriptor.text);
+      write_record_header(kRecordPixels, uint64_t(frame.pixels.size()) * 2);
+      for_each_rgb48le_chunk(frame.pixels, [](const unsigned char *data,
+                                              size_t length) {
+        write_all(data, length);
+      });
     }
-    Decoded d = decode(decoded_path, wb ? wb : std::optional<Vec>(own));
-    auto capture_time = read_capture_time(
-        kind == Route::vendor_raw ? decoded_path : input);
-    const double gain = std::exp2(exposure_ev);
-    const bool want_analysis = !analysis_path.empty();
-    std::vector<uint16_t> pixels;
-    if (!no_png)
-      pixels.resize(d.camera.size());
-    std::vector<float> gained_scene;
-    if (want_analysis)
-      gained_scene.resize(d.camera.size());
-    double low = INFINITY, high = -INFINITY;
-    size_t negatives = 0, upper = 0;
-    for (size_t i = 0; i < d.camera.size(); i += 3) {
-      Vec camera{d.camera[i], d.camera[i + 1], d.camera[i + 2]};
-      Vec scene = multiply(d.camera_to_ap1, camera);
-      for (int c = 0; c < 3; ++c) {
-        float x = static_cast<float>(scene[c] * gain);
-        if (!std::isfinite(x))
-          throw Error(40, "nonfinite color result");
-        low = std::min(low, double(x));
-        high = std::max(high, double(x));
-        negatives += x < 0;
-        upper += x > 65535.0f / 16384.0f;
-        if (want_analysis)
-          gained_scene[i + c] = x;
-        if (!no_png)
-          pixels[i + c] = quantize(x);
-      }
-    }
-    std::optional<analysis::Analysis> measured;
-    if (want_analysis)
-      measured = analysis::measure(d, gained_scene, roi, exposure_ev);
-    Json metadata{
-        {"schema_version", 1},
-        {"source", input.string()},
-        {"source_sha256", source_hash},
-        {"source_main_ifd_offset",
-         routing ? Json(int(routing->ifd)) : Json()},
-        {"source_photometric",
-         routing ? Json(int(routing->photometric)) : Json()},
-        {"route", kind == Route::direct
-                      ? "linearraw-sdk"
-                      : kind == Route::converter
-                            ? "cfa-converter-linearraw-sdk"
-                            : "vendor-raw-converter-linearraw-sdk"},
-        {"converter", conversion},
-        {"sdk_version", kDNGSDK_GetInfoVersion},
-        {"sdk_build",
-         "C++20; qDNGUseXMP=1; qDNGXMPFiles=0; FP32 Linearize destination"},
-        {"width", int(d.width)},
-        {"height", int(d.height)},
-        {"channels", 3},
-        {"working_space", "ACEScg AP1/D60 scene-linear FP32"},
-        {"exposure_ev", exposure_ev},
-        {"gain", gain},
-        {"capture_time", capture_time ? Json(*capture_time) : Json()},
-        {"analysis_sidecar",
-         want_analysis ? Json(analysis_path.string()) : Json()},
-        {"as_shot_neutral", vec(own)},
-        {"decoded_as_shot_neutral", vec(d.as_shot)},
-        {"applied_white_balance", vec(d.applied)},
-        {"white_balance_source", wb ? "override" : "as-shot"},
-        {"color", d.color},
-        {"decode_semantics", d.semantics},
-        {"observed_scene_min", low},
-        {"observed_scene_max", high},
-        {"quantization",
-         Json{{"scale", 16384},
-              {"rounding", "nearest; ties upward"},
-              {"negative_policy", "clip to 0"},
-              {"upper_policy", "above 65535/16384 clips to 65535"},
-              {"negative_samples", double(negatives)},
-              {"above_upper_samples", double(upper)},
-              {"transfer", "linear; no OETF"}}}};
-    // Build artifacts in the run directory; cleanup is complete before
-    // publishing.
-    auto staged_png = temp.path / "frame.png";
-    if (!no_png)
-      write_png(staged_png, d.width, d.height, pixels);
-    // Output can reside on another volume, so copy to a sibling before rename.
-    auto out_png = png;
-    out_png += ".tmp-" + std::to_string(getpid());
-    auto out_json = json;
-    out_json += ".tmp-" + std::to_string(getpid());
-    auto out_analysis = analysis_path;
-    if (want_analysis)
-      out_analysis += ".tmp-" + std::to_string(getpid());
-    try {
-      if (!no_png)
-        fs::copy_file(staged_png, out_png,
-                      fs::copy_options::overwrite_existing);
-      save(out_json, metadata.text);
-      if (measured)
-        save(out_analysis,
-             analysis::sidecar_json(*measured, source_hash).text);
-      temp.clear();
-      if (!no_png)
-        fs::rename(out_png, png);
-      fs::rename(out_json, json);
-      if (measured)
-        fs::rename(out_analysis, analysis_path);
-    } catch (...) {
-      std::error_code e;
-      fs::remove(out_png, e);
-      fs::remove(out_json, e);
-      if (measured)
-        fs::remove(out_analysis, e);
-      throw;
-    }
-    std::cout << "decoded " << d.width << 'x' << d.height;
-    if (no_png)
-      std::cout << " (PNG suppressed)";
-    else
-      std::cout << " -> " << png;
-    if (measured)
-      std::cout << " analysis=" << analysis_path;
-    std::cout << '\n';
+    if (std::fflush(stdout) != 0 || std::ferror(stdout))
+      throw Error(50, "stdout write failed");
+    std::cerr << "decoded " << frame.width << 'x' << frame.height
+              << " (stdout-" << (want_analysis ? "analysis" : "frame")
+              << ")\n";
     return 0;
   } catch (const Error &e) {
     std::cerr << e.what() << '\n';
