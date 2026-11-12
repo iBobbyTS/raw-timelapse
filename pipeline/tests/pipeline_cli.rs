@@ -289,6 +289,114 @@ fn forged_metadata_source_hash_is_rejected_by_the_typed_boundary() {
 }
 
 #[test]
+fn stdout_frame_missing_source_sha256_is_rejected_after_valid_analysis() {
+    assert_final_source_hash_rejected("omit");
+}
+
+#[test]
+fn stdout_frame_null_source_sha256_is_rejected_after_valid_analysis() {
+    assert_final_source_hash_rejected("null");
+}
+
+#[test]
+fn stdout_frame_non_string_source_sha256_is_rejected_after_valid_analysis() {
+    assert_final_source_hash_rejected("non-string");
+}
+
+#[test]
+fn stdout_frame_empty_source_sha256_is_rejected_after_valid_analysis() {
+    assert_final_source_hash_rejected("empty");
+}
+
+fn assert_final_source_hash_rejected(defect: &str) {
+    use std::io::Write;
+    let root = test_dir(&format!("final-source-hash-{defect}"));
+    let input = root.join("material");
+    let frames = synthetic_sequence(&[0.0, 0.1, -0.1]);
+    let names: Vec<&str> = frames.iter().map(|frame| frame.name.as_str()).collect();
+    make_input(&input, &names);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).unwrap();
+    let tool = fake_native_sequence_sidecar_defect(
+        &fixtures,
+        &frames,
+        FakeSidecarDefects::default(),
+        WIDTH,
+        HEIGHT,
+    );
+    let config = fixtures.join(format!("fake-native-{}.config", std::process::id()));
+    writeln!(
+        fs::OpenOptions::new().append(true).open(config).unwrap(),
+        "frame_source_sha256_defect={defect}"
+    )
+    .unwrap();
+    let output = root.join("run");
+    let result = run_cli(&base_args(&input, &output, &tool));
+
+    // The defect must reach the final consumer after successful measurement
+    // passes; a baseline/sidecar rejection would miss the admitted failure.
+    for pass in ["analysis", "applied-iter0"] {
+        for index in 1..=frames.len() {
+            let log = fs::read_to_string(output.join(format!("logs/{pass}/frame_{index:06}.log")))
+                .unwrap();
+            let metadata = metadata_from_log(&log);
+            assert!(metadata
+                .get("source_sha256")
+                .and_then(Json::as_str)
+                .is_some_and(|hash| !hash.is_empty()));
+            assert!(
+                log.contains("JSON 0x02: ") && log.contains("exit: exit code 0"),
+                "{log}"
+            );
+        }
+    }
+    let final_log = fs::read_to_string(output.join("logs/encode/frame_000001.log")).unwrap();
+    let metadata = metadata_from_log(&final_log);
+    match defect {
+        "omit" => assert!(metadata.get("source_sha256").is_none()),
+        "null" => assert_eq!(metadata.get("source_sha256"), Some(&Json::Null)),
+        "non-string" => assert_eq!(metadata.get("source_sha256"), Some(&Json::Int(7))),
+        "empty" => assert_eq!(
+            metadata.get("source_sha256").and_then(Json::as_str),
+            Some("")
+        ),
+        _ => unreachable!(),
+    }
+    assert_eq!(
+        result.status.code(),
+        Some(30),
+        "{defect}: final video published={}; stderr: {}",
+        output.join("output.mp4").exists(),
+        stderr(&result)
+    );
+    let error = stderr(&result);
+    assert!(
+        error.contains("frame 1/3") && error.contains(&frames[0].name),
+        "{error}"
+    );
+    assert!(
+        error.contains("metadata is missing or invalid field \"source_sha256\""),
+        "{error}"
+    );
+    assert!(!output.join("output.mp4").exists());
+    assert!(output.join(".rawtl-partial").is_dir());
+    assert!(output.join("exposure_report.json").is_file());
+    assert!(
+        final_log.contains("command:") && final_log.contains("exit:"),
+        "{final_log}"
+    );
+    assert!(
+        !output.join("logs/encode/frame_000002.log").exists(),
+        "stop subsequent final-frame dispatch"
+    );
+    let report = read_json(&output.join("exposure_report.json"));
+    assert_eq!(
+        report.get("run_status").and_then(Json::as_str),
+        Some("FAILED")
+    );
+}
+
+#[test]
 fn forged_analysis_sidecar_without_kind_is_rejected() {
     let result = run_sidecar_defect(
         "forged-analysis-kind",

@@ -473,10 +473,14 @@ fn run_frame(
         ));
     }
 
-    let source_sha256 = sidecar
-        .get("source_sha256")
-        .and_then(Json::as_str)
-        .map(str::to_string);
+    let source_sha256 = Some(
+        sidecar
+            .get("source_sha256")
+            .and_then(Json::as_str)
+            .filter(|hash| !hash.is_empty())
+            .ok_or_else(|| missing_field(index, total, &source.name, "source_sha256"))?
+            .to_string(),
+    );
     let metadata_envelope = frame_metadata_envelope(
         file,
         schema_version,
