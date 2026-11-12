@@ -157,6 +157,12 @@ descriptor=json.loads(parsed[1][1])
 assert descriptor['pixels_sha256']==hashlib.sha256(parsed[2][1]).hexdigest()
 expected=codes_for(metadata,[.25,.5,.75],1.0)
 assert parsed[2][1]==struct.pack('<'+'H'*(16*16*3),*(expected*256))
+# Converter timeout propagates unchanged and publishes no partial stream.
+slow=work/'converter-slow'
+slow.write_text('#!/bin/sh\nexec /bin/sleep 5\n')
+slow.chmod(0o755)
+r=stream([exe,'--stdout-frame',cfa,'--converter',slow,'--converter-timeout','1'],25)
+assert r.stdout==b'',r.stdout
 
 # --- Zero on-disk artifacts and mode/option rejection -----------------------
 clean=work/'no-artifacts';clean.mkdir(exist_ok=True)
