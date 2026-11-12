@@ -506,6 +506,27 @@ pub struct ColorProfile {
     pub preview_filename: &'static str,
 }
 
+/// Writable backing for conversion. The pipeline supplies the unique Arc that
+/// becomes its RGB24 NdArray, so conversion does not copy a full-frame buffer.
+pub trait FrameOutput {
+    fn prepare(&mut self, length: usize) -> Result<&mut [u8], String>;
+}
+impl FrameOutput for Vec<u8> {
+    fn prepare(&mut self, length: usize) -> Result<&mut [u8], String> {
+        self.resize(length, 0);
+        Ok(self.as_mut_slice())
+    }
+}
+impl FrameOutput for std::sync::Arc<[u8]> {
+    fn prepare(&mut self, length: usize) -> Result<&mut [u8], String> {
+        if self.len() != length {
+            return Err("RGB24 output geometry mismatch".into());
+        }
+        std::sync::Arc::get_mut(self)
+            .ok_or_else(|| "RGB24 output backing must be uniquely owned".into())
+    }
+}
+
 impl ColorProfile {
     /// Composed AP1/D60 scene-linear -> target linear matrix. The order of the
     /// matrix products matches `preview::ap1_to_linear_srgb_matrix` exactly so
@@ -549,7 +570,7 @@ impl ColorProfile {
         rgb48le: &[u8],
         width: usize,
         height: usize,
-        out: &mut Vec<u8>,
+        out: &mut impl FrameOutput,
     ) -> Result<(), String> {
         let expected = width
             .checked_mul(height)
@@ -566,18 +587,17 @@ impl ColorProfile {
         }
         let matrix = self.composed_matrix();
         let (low, high) = self.transfer.domain();
-        out.clear();
-        out.reserve(width * height * 3);
-        for pixel in rgb48le.chunks_exact(6) {
+        let out = out.prepare(expected / 2)?;
+        for (pixel, dest) in rgb48le.chunks_exact(6).zip(out.chunks_exact_mut(3)) {
             let scene = [
                 u16::from_le_bytes([pixel[0], pixel[1]]) as f64 / preview::SCENE_SCALE,
                 u16::from_le_bytes([pixel[2], pixel[3]]) as f64 / preview::SCENE_SCALE,
                 u16::from_le_bytes([pixel[4], pixel[5]]) as f64 / preview::SCENE_SCALE,
             ];
             let target = preview::mat3_vec(&matrix, scene);
-            for value in target {
+            for (value, dest) in target.into_iter().zip(dest) {
                 let signal = self.transfer.forward(value.clamp(low, high));
-                out.push(quantize_signal(signal));
+                *dest = quantize_signal(signal);
             }
         }
         Ok(())
@@ -874,8 +894,7 @@ const BT2020_NCL_CONTAINER_REASON: &str =
      Only the ideal matrix transform is reversible; actual 8-bit 4:2:0 delivery has \
      quantization, chroma subsampling and lossy compression. This coding matrix does not \
      change vendor primaries or transfer and implies no gamut-containment claim.";
-const LOG_RANGE_REASON: &str =
-    "Rawtl full-range (pc) delivery convention, not a vendor mandate. \
+const LOG_RANGE_REASON: &str = "Rawtl full-range (pc) delivery convention, not a vendor mandate. \
      Nikon's N-Log LUT guide documents both limited and full links \
      (https://nps.nikonimaging.com/technical_info/technical_solutions/z9_tips/3d_lut/); \
      the transfer's code domain alone does not determine the delivery range.";

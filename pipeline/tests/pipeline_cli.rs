@@ -39,177 +39,125 @@ fn base_args<'a>(input: &'a Path, output: &'a Path, tool: &'a Path) -> Vec<&'a s
 }
 
 #[test]
-fn publishes_lossless_linear_video_and_srgb_preview() {
+fn publishes_one_streamed_video_with_manifest_and_no_frame_files() {
     let (root, input, fixtures) = run_success_setup("success");
     let frames = standard_frames(&fixtures);
     let tool = fake_native_tool(&fixtures, &frames, None, false);
     let output = root.join("run");
-
     let result = run_cli(&base_args(&input, &output, &tool));
     assert!(
         result.status.success(),
-        "run failed\nstdout:\n{}\nstderr:\n{}",
+        "{}\n{}",
         stdout(&result),
         stderr(&result)
     );
-
-    // Numeric ordering: IMG_1, IMG_2, IMG_10 (not lexicographic IMG_1, IMG_10, IMG_2).
-    for (index, fixture_name) in [(1, "IMG_1"), (2, "IMG_2"), (3, "IMG_10")] {
-        let produced =
-            fs::read(output.join(format!("frames/frame_{index:06}.png"))).expect("produced frame");
-        let expected =
-            fs::read(fixtures.join(format!("{fixture_name}.png"))).expect("fixture frame");
-        assert_eq!(
-            produced, expected,
-            "frame {index} must be produced from {fixture_name}"
-        );
-    }
-
-    // Sequence-frozen white balance: first frame as-shot, later frames override.
-    let first = fs::read_to_string(output.join("frames/frame_000001.json")).expect("json");
-    assert!(
-        first.contains("\"white_balance_source\":\"as-shot\""),
-        "{first}"
-    );
-    assert!(
-        first.contains("\"applied_white_balance\":[0.5,1,0.8]"),
-        "{first}"
-    );
-    for index in [2, 3] {
-        let text =
-            fs::read_to_string(output.join(format!("frames/frame_{index:06}.json"))).expect("json");
-        assert!(
-            text.contains("\"white_balance_source\":\"override\""),
-            "frame {index}: {text}"
-        );
-        assert!(
-            text.contains("\"applied_white_balance\":[0.5,1,0.8]"),
-            "frame {index}: {text}"
-        );
-        assert!(
-            !text.contains("\"applied_white_balance\":[0.6,1,0.7]"),
-            "frame {index}: {text}"
-        );
-        assert!(
-            text.contains("\"as_shot_neutral\":["),
-            "frame {index}: {text}"
-        );
-    }
-
-    let linear = output.join("linear-acescg-16bit-ffv1.mkv");
-    let preview = output.join("preview-h264-srgb-bt709.mp4");
-    let partial = output.join(".rawtl-partial");
-    assert!(linear.is_file(), "linear video must exist");
-    assert!(preview.is_file(), "preview must exist");
-    assert!(!partial.exists(), "partial directory must be cleaned up");
-
-    let manifest = fs::read_to_string(output.join("manifest.json")).expect("manifest");
-    for expected in [
-        "\"all_applied_equal\": true",
-        "\"value\": \"30/1\"",
-        "legacy/python/src/rawtl/cli.py:91",
-        "\"codec\": \"ffv1\"",
-        "\"pix_fmt\": \"gbrp16le\"",
-        "\"status\": \"validated\"",
-        "\"full_decode\": \"pass\"",
-        "-c:v h264_videotoolbox",
-        "-allow_sw 0",
-    ] {
-        assert!(manifest.contains(expected), "manifest missing {expected:?}");
-    }
-
-    // The default mode is the historical sequence-frozen contract: the full
-    // white-balance block is deterministic, so assert its literal seven fields.
-    let expected_white_balance = Json::obj(vec![
-        (
-            "strategy",
-            Json::Str("sequence-frozen (REQ-008)".to_string()),
-        ),
-        ("reference_frame", Json::Str("IMG_1.DNG".to_string())),
-        ("reference_source", Json::Str("as-shot".to_string())),
-        (
-            "reference",
-            Json::Array(vec![Json::Float(0.5), Json::Int(1), Json::Float(0.8)]),
-        ),
-        (
-            "propagation",
-            Json::Str(
-                "first numerically ordered frame decoded with its as-shot neutral; those \
-                 three camera-neutral values passed as --white-balance to every later frame"
-                    .to_string(),
-            ),
-        ),
-        ("all_applied_equal", Json::Bool(true)),
-        (
-            "per_frame_as_shot_neutral",
-            Json::Str("each frame keeps its own source as_shot_neutral for provenance".to_string()),
-        ),
-    ]);
-    let manifest_json = read_json(&output.join("manifest.json"));
+    let mut names: Vec<_> = fs::read_dir(&output)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
     assert_eq!(
-        manifest_json.get("white_balance"),
-        Some(&expected_white_balance),
-        "the default white_balance block must stay byte-identical"
+        names,
+        vec![
+            "exposure-curve.csv",
+            "exposure_report.json",
+            "frames.csv",
+            "logs",
+            "manifest.json",
+            "output.mp4",
+            "pairs.csv",
+            "temporal_audit.json"
+        ]
     );
-
-    // The frozen summary line and the override argv shape of the baseline pass
-    // are part of the default run's observable contract.
-    let run_stdout = stdout(&result);
-    assert!(
-        run_stdout.contains(
-            "frozen white balance: 0.5,1,0.8 from IMG_1.DNG (applied to every later frame)"
-        ),
-        "{run_stdout}"
-    );
-    assert!(
-        !run_stdout.contains("per-frame white balance"),
-        "the default run must not claim per-frame decoding: {run_stdout}"
-    );
-    let baseline_command = |index: usize| {
-        let text = fs::read_to_string(output.join(format!("logs/analysis/frame_{index:06}.log")))
-            .expect("baseline transcript");
-        text.lines()
-            .find(|line| line.starts_with("command:"))
-            .expect("command line")
-            .to_string()
-    };
-    assert!(
-        !baseline_command(1).contains("--white-balance"),
-        "frame 1 must be decoded with its own as-shot neutral: {}",
-        baseline_command(1)
-    );
-    for index in [2, 3] {
-        assert!(
-            baseline_command(index).contains("--white-balance 0.5,1,0.8"),
-            "frame {index} must receive the frozen triple: {}",
-            baseline_command(index)
+    let manifest = read_json(&output.join("manifest.json"));
+    assert!(manifest.get("linear_video").is_none());
+    assert!(manifest.get("preview").is_none());
+    let video = manifest.get("video").unwrap();
+    assert_eq!(video.get("codec").and_then(Json::as_str), Some("h264"));
+    assert_eq!(video.get("file").and_then(Json::as_str), Some("output.mp4"));
+    assert_eq!(video.get("frames").and_then(Json::as_u64), Some(3));
+    assert!(video.get("bytes").and_then(Json::as_u64).unwrap() > 0);
+    let entries = manifest
+        .get("frames")
+        .and_then(|v| v.get("entries"))
+        .and_then(Json::as_array)
+        .unwrap();
+    for (offset, name) in ["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"].iter().enumerate() {
+        let frame = &entries[offset];
+        assert_eq!(frame.get("source").and_then(Json::as_str), Some(*name));
+        assert_eq!(
+            frame.get("pixels_sha256").and_then(Json::as_str),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
+        assert!(frame
+            .get("source_sha256")
+            .and_then(Json::as_str)
+            .unwrap()
+            .starts_with("fake-"));
+        for removed in [
+            "png",
+            "metadata",
+            "png_sha256",
+            "applied_white_balance",
+            "white_balance_source",
+            "as_shot_neutral",
+        ] {
+            assert!(frame.get(removed).is_none(), "{removed}");
+        }
+        let log = fs::read_to_string(output.join(frame.get("log").and_then(Json::as_str).unwrap()))
+            .unwrap();
+        assert!(log.contains("--stdout-frame"));
+        assert!(log.contains("pixel bytes: 288"));
+        assert!(log.contains("exit: exit code 0"));
+        let metadata = metadata_from_log(&log);
+        assert_eq!(
+            metadata.get("white_balance_source").and_then(Json::as_str),
+            Some(if offset == 0 { "as-shot" } else { "override" })
+        );
+        assert_eq!(
+            white_balance_triple(metadata.get("applied_white_balance").unwrap()),
+            [0.5, 1.0, 0.8]
+        );
+        assert!(log.is_ascii());
+        assert!(!log.contains('\0'));
     }
-
-    let linear_probe = ffprobe(&linear);
-    for expected in [
-        "codec_name=ffv1",
-        "pix_fmt=gbrp16le",
-        "width=8",
-        "height=6",
-        "nb_read_frames=3",
-    ] {
-        assert!(linear_probe.contains(expected), "{linear_probe}");
-    }
-    let preview_probe = ffprobe(&preview);
-    for expected in ["codec_name=h264", "pix_fmt=yuv420p", "nb_read_frames=3"] {
-        assert!(preview_probe.contains(expected), "{preview_probe}");
-    }
-
-    let encode_log = fs::read_to_string(output.join("logs/encode-preview.log")).expect("log");
-    assert!(
-        encode_log.contains("-c:v h264_videotoolbox"),
-        "{encode_log}"
+    let report = read_json(&output.join("exposure_report.json"));
+    assert_eq!(
+        report
+            .get("analysis")
+            .unwrap()
+            .get("transport")
+            .and_then(Json::as_str),
+        Some("MemoryFile; native stdout protocol v1")
     );
-    assert!(encode_log.contains("-allow_sw 0"), "{encode_log}");
+    let text = fs::read_to_string(output.join("exposure_report.json")).unwrap();
+    assert!(!text.contains("baseline_dir") && !text.contains("applied_dir"));
+    let probe = ffprobe(&output.join("output.mp4"));
+    for expected in ["codec_name=h264", "width=8", "height=6", "nb_read_frames=3"] {
+        assert!(probe.contains(expected), "{probe}");
+    }
+    let log = fs::read_to_string(output.join("logs/encode.log")).unwrap();
+    assert!(log.contains("-i pipe:0"));
+    assert!(!log.contains("-nostdin"));
+    assert!(log.contains("-c:v h264_videotoolbox -allow_sw 0"));
+    assert!(log.contains("scale=out_color_matrix=bt709:out_range=tv"));
+    let timings = manifest.get("timings_s").unwrap();
+    for key in [
+        "analysis",
+        "feedback_iteration_0",
+        "encode",
+        "validate_video",
+    ] {
+        assert!(timings.get(key).is_some(), "{key}");
+    }
+}
 
-    let roundtrip = fs::read_to_string(output.join("logs/roundtrip.log")).expect("log");
-    assert!(roundtrip.contains("result: PASS"), "{roundtrip}");
+fn metadata_from_log(text: &str) -> Json {
+    let value = text
+        .lines()
+        .find_map(|line| line.strip_prefix("JSON 0x01: "))
+        .expect("metadata JSON in transcript");
+    rawtl_linear_video::json::parse(value).unwrap()
 }
 
 #[test]
@@ -234,15 +182,11 @@ fn stops_at_the_first_failing_frame_without_video() {
     // The analysis pass runs first and produces no PNG; its measurement sidecar
     // and transcript are retained, and no final frames directory was created.
     assert!(!output.join("frames").exists());
-    assert!(output
-        .join("analysis/baseline/frame_000001.analysis.json")
-        .is_file());
-    assert!(output
-        .join("analysis/baseline/meta/frame_000001.json")
-        .is_file());
-    assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
-    assert!(!output.join("preview-h264-srgb-bt709.mp4").exists());
-    assert!(!output.join(".rawtl-partial").exists());
+
+    assert!(!output.join("output.mp4").exists());
+    assert!(!output.join("output.mp4").exists());
+    assert!(output.join(".rawtl-partial").is_dir());
+    assert!(!output.join("analysis").exists());
     let log =
         fs::read_to_string(output.join("logs/analysis/frame_000002.log")).expect("failure log");
     assert!(log.contains("synthetic frame failure"), "{log}");
@@ -263,17 +207,17 @@ fn encoder_failure_after_bytes_written_publishes_nothing() {
     let mut args = base_args(&input, &output, &tool);
     args.extend_from_slice(&["--ffmpeg", encoder.to_str().expect("utf8")]);
     let result = run_cli(&args);
-    assert_eq!(result.status.code(), Some(40), "{}", stderr(&result));
+    assert_eq!(result.status.code(), Some(60), "{}", stderr(&result));
     let text = stderr(&result);
-    assert!(text.contains("FFV1 encoder failed"), "{text}");
+    assert!(text.contains("streaming encoder failed"), "{text}");
     assert!(
         text.contains("partial/intermediate artifacts retained"),
         "{text}"
     );
 
-    assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
-    assert!(!output.join("preview-h264-srgb-bt709.mp4").exists());
-    let partial = output.join(".rawtl-partial/linear.mkv");
+    assert!(!output.join("output.mp4").exists());
+    assert!(!output.join("output.mp4").exists());
+    let partial = output.join(".rawtl-partial/output.mp4");
     assert!(
         partial.is_file(),
         "partial diagnostic file must be retained"
@@ -313,53 +257,17 @@ fn probe_rejection_publishes_nothing() {
     let mut args = base_args(&input, &output, &tool);
     args.extend_from_slice(&["--ffprobe", ffprobe.to_str().expect("utf8")]);
     let result = run_cli(&args);
-    assert_eq!(result.status.code(), Some(50), "{}", stderr(&result));
+    assert_eq!(result.status.code(), Some(60), "{}", stderr(&result));
     let text = stderr(&result);
-    assert!(text.contains("codec is \"h264\""), "{text}");
-    assert!(text.contains("expected \"ffv1\""), "{text}");
+    assert!(text.contains("codec is \"ffv1\""), "{text}");
+    assert!(text.contains("expected \"h264\""), "{text}");
     assert!(
         text.contains("partial/intermediate artifacts retained"),
         "{text}"
     );
-    assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
-    assert!(!output.join("preview-h264-srgb-bt709.mp4").exists());
-    assert!(output.join(".rawtl-partial/linear.mkv").is_file());
-}
-
-#[test]
-fn lossless_roundtrip_mismatch_is_rejected() {
-    let root = test_dir("roundtrip-mismatch");
-    let input = root.join("material");
-    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
-    let frames = standard_frames(&fixtures);
-    let tool = fake_native_tool(&fixtures, &frames, None, false);
-    let ffmpeg = fake_ffmpeg_zeroed_video_decode(&fixtures, (WIDTH * HEIGHT * 6) as usize, 3);
-    let output = root.join("run");
-
-    let mut args = base_args(&input, &output, &tool);
-    args.extend_from_slice(&["--ffmpeg", ffmpeg.to_str().expect("utf8")]);
-    let result = run_cli(&args);
-    assert_eq!(result.status.code(), Some(50), "{}", stderr(&result));
-    let text = stderr(&result);
-    assert!(
-        text.contains("lossless roundtrip mismatch at frame 1"),
-        "{text}"
-    );
-    assert!(
-        text.contains("partial/intermediate artifacts retained"),
-        "{text}"
-    );
-    assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
-    assert!(!output.join("preview-h264-srgb-bt709.mp4").exists());
-    let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(
-        report.get("run_status").and_then(Json::as_str),
-        Some("FAILED"),
-        "a roundtrip failure must not report a success status"
-    );
-    assert!(report.get("error").and_then(Json::as_str).is_some());
+    assert!(!output.join("output.mp4").exists());
+    assert!(!output.join("output.mp4").exists());
+    assert!(output.join(".rawtl-partial/output.mp4").is_file());
 }
 
 #[test]
@@ -534,7 +442,7 @@ fn detects_a_native_tool_that_ignores_the_frozen_override() {
         text.contains("should use the frozen override white balance"),
         "{text}"
     );
-    assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
+    assert!(!output.join("output.mp4").exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -590,12 +498,12 @@ fn frame_number(report: &Json, index: usize, field: &str) -> Option<f64> {
 }
 
 #[test]
-fn default_pairwise_corrects_injected_flicker_and_audit_passes() {
+fn pairwise_uniform_corrects_injected_flicker_and_audit_passes() {
     let gains: Vec<f64> = (0..30)
         .map(|index| if index % 2 == 0 { -0.3 } else { 0.3 })
         .collect();
     let material = synthetic_material("flicker", synthetic_sequence(&gains));
-    let (result, output) = run_synthetic(&material, "run", &[]);
+    let (result, output) = run_synthetic(&material, "run", &["--brightness", "uniform"]);
     assert!(
         result.status.success(),
         "run failed\nstdout:\n{}\nstderr:\n{}",
@@ -645,16 +553,21 @@ fn default_pairwise_corrects_injected_flicker_and_audit_passes() {
         mean(&bright)
     );
     for index in 0..gains.len() {
-        assert_eq!(frame_status(&report, index), "OK");
+        assert_eq!(frame_status(&report, index), "UNIFORM");
     }
     // The applied sidecars measure the rendered data: adjacent frames no longer
     // show the injected +/-0.3 EV alternation.
     let mut previous: Option<f64> = None;
     for index in 0..gains.len() {
-        let sidecar = read_json(&output.join(format!(
-            "analysis/applied/frame_{:06}.analysis.json",
-            index + 1
-        )));
+        let logs = fs::read_to_string(
+            output.join(format!("logs/applied-iter0/frame_{:06}.log", index + 1)),
+        )
+        .unwrap();
+        let text = logs
+            .lines()
+            .find_map(|l| l.strip_prefix("JSON 0x02: "))
+            .unwrap();
+        let sidecar = rawtl_linear_video::json::parse(text).unwrap();
         let level = sidecar
             .get("tiles")
             .and_then(Json::as_array)
@@ -681,8 +594,8 @@ fn default_pairwise_corrects_injected_flicker_and_audit_passes() {
     );
 
     for name in [
-        "linear-acescg-16bit-ffv1.mkv",
-        "preview-h264-srgb-bt709.mp4",
+        "output.mp4",
+        "output.mp4",
         "temporal_audit.json",
         "pairs.csv",
         "frames.csv",
@@ -784,8 +697,8 @@ fn confirmed_step_is_preserved_and_not_corrected_away() {
             .and_then(Json::as_str),
         Some("SKIPPED")
     );
-    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
-    assert!(output.join("preview-h264-srgb-bt709.mp4").is_file());
+    assert!(output.join("output.mp4").is_file());
+    assert!(output.join("output.mp4").is_file());
 }
 
 #[test]
@@ -830,7 +743,7 @@ fn ev_limits_clamp_to_limited_and_fail_the_target_check() {
             .and_then(|probe| probe.get("passed")),
         Some(&Json::Bool(true))
     );
-    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
+    assert!(output.join("output.mp4").is_file());
     assert!(output.join("exposure-curve.csv").is_file());
 }
 
@@ -913,8 +826,31 @@ fn render_under_execution_publishes_the_best_round_with_a_warning() {
             > 0,
         "the pre-repair bug reported zero updates beside a full history"
     );
-    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
-    assert!(output.join("preview-h264-srgb-bt709.mp4").is_file());
+    // Encoding must use the restored best round, even after later feedback.
+    let manifest = read_json(&output.join("manifest.json"));
+    let entries = manifest
+        .get("frames")
+        .and_then(|v| v.get("entries"))
+        .and_then(Json::as_array)
+        .unwrap();
+    for (index, entry) in entries.iter().enumerate() {
+        let accepted = frame_number(&report, index, "applied_ev").unwrap();
+        assert_eq!(
+            entry.get("applied_ev").and_then(Json::as_f64),
+            Some(accepted)
+        );
+        let log =
+            fs::read_to_string(output.join(format!("logs/encode/frame_{:06}.log", index + 1)))
+                .unwrap();
+        assert_eq!(
+            metadata_from_log(&log)
+                .get("exposure_ev")
+                .and_then(Json::as_f64),
+            Some(accepted)
+        );
+    }
+    assert!(output.join("output.mp4").is_file());
+    assert!(output.join("output.mp4").is_file());
 }
 
 #[test]
@@ -976,8 +912,8 @@ fn wrong_correction_passes_the_probe_but_the_audit_records_fail_and_publishes() 
             .unwrap_or(false),
         "audit FAIL must carry events"
     );
-    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
-    assert!(output.join("preview-h264-srgb-bt709.mp4").is_file());
+    assert!(output.join("output.mp4").is_file());
+    assert!(output.join("output.mp4").is_file());
     let audit = read_json(&output.join("temporal_audit.json"));
     assert_eq!(audit.get("status").and_then(Json::as_str), Some("FAIL"));
     let manifest = read_json(&output.join("manifest.json"));
@@ -1052,8 +988,8 @@ fn unreliable_frames_get_global_reference_fallback_and_publish() {
         .as_str()
         .map(|text| text.starts_with("GLOBAL_REFERENCE_FALLBACK"))
         .unwrap_or(false)));
-    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
-    assert!(output.join("preview-h264-srgb-bt709.mp4").is_file());
+    assert!(output.join("output.mp4").is_file());
+    assert!(output.join("output.mp4").is_file());
 }
 
 #[test]
@@ -1082,20 +1018,23 @@ fn strength_zero_is_the_single_pass_regression_path() {
     let first = run("run-a");
     let second = run("run-b");
 
-    for (index, fixture_name) in [(1, "IMG_1"), (2, "IMG_2"), (3, "IMG_10")] {
-        let produced =
-            fs::read(first.join(format!("frames/frame_{index:06}.png"))).expect("produced frame");
-        let expected =
-            fs::read(fixtures.join(format!("{fixture_name}.png"))).expect("fixture frame");
-        assert_eq!(produced, expected, "strength 0 rewrote frame {index}");
+    let entries = read_json(&first.join("manifest.json"));
+    for entry in entries
+        .get("frames")
+        .and_then(|v| v.get("entries"))
+        .and_then(Json::as_array)
+        .unwrap()
+    {
+        assert_eq!(entry.get("applied_ev").and_then(Json::as_f64), Some(0.0));
+        assert!(entry.get("pixels_sha256").and_then(Json::as_str).is_some());
     }
     assert!(
         !first.join("analysis").exists(),
         "no analysis pass at strength 0"
     );
     assert!(!first.join("temporal_audit.json").exists());
-    assert!(!first.join("pairs.csv").exists());
-    assert!(!first.join("frames.csv").exists());
+    assert!(first.join("pairs.csv").is_file());
+    assert!(first.join("frames.csv").is_file());
 
     let report = read_json(&first.join("exposure_report.json"));
     for index in 0..3 {
@@ -1104,7 +1043,7 @@ fn strength_zero_is_the_single_pass_regression_path() {
     // The disabled (historical) path keeps the frozen argument shape: frame 1
     // decodes with its own as-shot neutral, later frames carry the override.
     let disabled_command = |index: usize| {
-        let text = fs::read_to_string(first.join(format!("logs/frame_{index:06}.log")))
+        let text = fs::read_to_string(first.join(format!("logs/encode/frame_{index:06}.log")))
             .expect("frame transcript");
         text.lines()
             .find(|line| line.starts_with("command:"))
@@ -1138,27 +1077,20 @@ fn strength_zero_is_the_single_pass_regression_path() {
         Some(&Json::Bool(false))
     );
 
-    // Same inputs, arguments and toolchain. Matroska container bytes carry a
-    // random segment identity (the pre-existing encoder byte-determinism
-    // boundary), so byte equality is not claimed; the FFV1 payload and the
-    // encoder command must be identical.
-    let first_md5 = framemd5(&first.join("linear-acescg-16bit-ffv1.mkv"));
-    let second_md5 = framemd5(&second.join("linear-acescg-16bit-ffv1.mkv"));
-    assert_eq!(first_md5, second_md5, "strength 0 FFV1 content changed");
-    let encode_command = |output: &std::path::Path| {
-        let log = fs::read_to_string(output.join("logs/encode-linear.log")).expect("encode log");
-        log.lines()
-            .find(|line| line.starts_with("command:"))
-            .expect("encoder command line")
+    // Both same-candidate runs traverse the pipe with the same encoder options.
+    let command = |output: &Path| {
+        fs::read_to_string(output.join("logs/encode.log"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
             .to_string()
     };
-    let normalized = |command: String| command.replace("run-a", "RUN").replace("run-b", "RUN");
     assert_eq!(
-        normalized(encode_command(&first)),
-        normalized(encode_command(&second))
+        command(&first).replace("run-a", "RUN"),
+        command(&second).replace("run-b", "RUN")
     );
-    let roundtrip = fs::read_to_string(first.join("logs/roundtrip.log")).expect("roundtrip log");
-    assert!(roundtrip.contains("result: PASS"), "{roundtrip}");
+    assert!(!first.join("frames").exists());
 }
 
 #[test]
@@ -1181,7 +1113,7 @@ fn late_encoder_failure_on_disabled_path_reports_failed_status() {
         encoder.to_str().expect("utf8"),
     ]);
     let result = run_cli(&args);
-    assert_eq!(result.status.code(), Some(40), "{}", stderr(&result));
+    assert_eq!(result.status.code(), Some(60), "{}", stderr(&result));
     let report = read_json(&output.join("exposure_report.json"));
     assert_eq!(
         report.get("run_status").and_then(Json::as_str),
@@ -1193,7 +1125,7 @@ fn late_encoder_failure_on_disabled_path_reports_failed_status() {
         Some("FAILED")
     );
     assert!(report.get("error").and_then(Json::as_str).is_some());
-    assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
+    assert!(!output.join("output.mp4").exists());
 }
 
 #[test]
@@ -1243,8 +1175,8 @@ fn fractional_applied_ev_survives_sidecar_precision() {
         exercised,
         "the fixture must contain an EV that does not round-trip at 10 significant digits"
     );
-    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
-    assert!(output.join("frames/frame_000001.png").is_file());
+    assert!(output.join("output.mp4").is_file());
+    assert!(!output.join("frames").exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,7 +1225,7 @@ fn preview_profiles_emit_their_declared_colour_contract() {
     let cases: [(&str, &str, &str, &[&str], bool, &str, &str); 6] = [
         (
             "srgb-preview",
-            "preview-h264-srgb-bt709.mp4",
+            "output.mp4",
             "tv",
             &["yuv420p"],
             false,
@@ -1302,7 +1234,7 @@ fn preview_profiles_emit_their_declared_colour_contract() {
         ),
         (
             "sony-slog3-sgamut3",
-            "preview-h264-slog3-sgamut3.mp4",
+            "output.mp4",
             "pc",
             &["yuv420p", "yuvj420p"],
             true,
@@ -1311,7 +1243,7 @@ fn preview_profiles_emit_their_declared_colour_contract() {
         ),
         (
             "sony-slog3-sgamut3-cine",
-            "preview-h264-slog3-sgamut3cine.mp4",
+            "output.mp4",
             "pc",
             &["yuv420p", "yuvj420p"],
             true,
@@ -1320,7 +1252,7 @@ fn preview_profiles_emit_their_declared_colour_contract() {
         ),
         (
             "canon-log2-cinema-gamut",
-            "preview-h264-clog2-cgamut.mp4",
+            "output.mp4",
             "pc",
             &["yuv420p", "yuvj420p"],
             true,
@@ -1329,7 +1261,7 @@ fn preview_profiles_emit_their_declared_colour_contract() {
         ),
         (
             "nikon-nlog-bt2020",
-            "preview-h264-nlog-bt2020.mp4",
+            "output.mp4",
             "pc",
             &["yuv420p", "yuvj420p"],
             true,
@@ -1338,7 +1270,7 @@ fn preview_profiles_emit_their_declared_colour_contract() {
         ),
         (
             "dji-dlog-dgamut",
-            "preview-h264-dlog-dgamut.mp4",
+            "output.mp4",
             "pc",
             &["yuv420p", "yuvj420p"],
             true,
@@ -1422,7 +1354,7 @@ fn preview_profiles_emit_their_declared_colour_contract() {
         let manifest = fs::read_to_string(output.join("manifest.json")).expect("manifest");
         let json = rawtl_linear_video::json::parse(&manifest).expect("manifest JSON");
         let tags = json
-            .get("preview")
+            .get("video")
             .unwrap()
             .get("emitted_tags")
             .expect("emitted_tags");
@@ -1546,44 +1478,38 @@ fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
     const VENDOR_TOLERANCE: i32 = 3;
     const SRGB_TOLERANCE: i32 = 12;
     let cases: [(&str, &str, &str, &str, [u8; 3]); 6] = [
-        (
-            "srgb-preview",
-            "preview-h264-srgb-bt709.mp4",
-            "bt709",
-            "tv",
-            [0, 255, 0],
-        ),
+        ("srgb-preview", "output.mp4", "bt709", "tv", [0, 255, 0]),
         (
             "sony-slog3-sgamut3",
-            "preview-h264-slog3-sgamut3.mp4",
+            "output.mp4",
             "bt2020",
             "pc",
             [59, 147, 20],
         ),
         (
             "sony-slog3-sgamut3-cine",
-            "preview-h264-slog3-sgamut3cine.mp4",
+            "output.mp4",
             "bt2020",
             "pc",
             [0, 145, 49],
         ),
         (
             "canon-log2-cinema-gamut",
-            "preview-h264-clog2-cgamut.mp4",
+            "output.mp4",
             "bt2020",
             "pc",
             [48, 140, 96],
         ),
         (
             "nikon-nlog-bt2020",
-            "preview-h264-nlog-bt2020.mp4",
+            "output.mp4",
             "bt2020",
             "pc",
             [0, 154, 0],
         ),
         (
             "dji-dlog-dgamut",
-            "preview-h264-dlog-dgamut.mp4",
+            "output.mp4",
             "bt2020",
             "pc",
             [0, 145, 74],
@@ -1702,31 +1628,11 @@ fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
 #[test]
 fn vendor_previews_auto_decode_from_their_own_tags() {
     for (id, filename, expected) in [
-        (
-            "sony-slog3-sgamut3",
-            "preview-h264-slog3-sgamut3.mp4",
-            [59u8, 147, 20],
-        ),
-        (
-            "sony-slog3-sgamut3-cine",
-            "preview-h264-slog3-sgamut3cine.mp4",
-            [0, 145, 49],
-        ),
-        (
-            "canon-log2-cinema-gamut",
-            "preview-h264-clog2-cgamut.mp4",
-            [48, 140, 96],
-        ),
-        (
-            "nikon-nlog-bt2020",
-            "preview-h264-nlog-bt2020.mp4",
-            [0, 154, 0],
-        ),
-        (
-            "dji-dlog-dgamut",
-            "preview-h264-dlog-dgamut.mp4",
-            [0, 145, 74],
-        ),
+        ("sony-slog3-sgamut3", "output.mp4", [59u8, 147, 20]),
+        ("sony-slog3-sgamut3-cine", "output.mp4", [0, 145, 49]),
+        ("canon-log2-cinema-gamut", "output.mp4", [48, 140, 96]),
+        ("nikon-nlog-bt2020", "output.mp4", [0, 154, 0]),
+        ("dji-dlog-dgamut", "output.mp4", [0, 145, 74]),
     ] {
         let (root, input, tool) = profile_material(&format!("auto-tags-{id}"), [0, 16384, 0]);
         let result = run_profile(&root, &input, &tool, id);
@@ -1811,7 +1717,7 @@ fn wrong_ycbcr_matrix_is_rejected_by_the_patch_check() {
         stdout(&result),
         stderr(&result)
     );
-    let preview = root.join("run").join("preview-h264-nlog-bt2020.mp4");
+    let preview = root.join("run").join("output.mp4");
     let expected = [202u8, 0, 0];
     let decoded = decode_first_pixel(&preview, "bt2020", "pc");
     let difference = (0..3)
@@ -1929,13 +1835,13 @@ fn as_shot_sidecars(dir: &Path) -> Vec<[f64; 3]> {
         .unwrap_or_else(|err| panic!("cannot read {}: {err}", dir.display()))
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("log"))
         .collect();
     files.sort();
     assert!(!files.is_empty(), "no sidecars under {}", dir.display());
     let mut triples = Vec::with_capacity(files.len());
     for path in files {
-        let sidecar = read_json(&path);
+        let sidecar = metadata_from_log(&fs::read_to_string(&path).unwrap());
         assert_eq!(
             sidecar.get("white_balance_source").and_then(Json::as_str),
             Some("as-shot"),
@@ -2043,7 +1949,7 @@ fn per_frame_mode_decodes_every_frame_with_its_own_as_shot_neutral() {
 
     // Every frame decodes with its own RAW as-shot neutral; the three neutrals
     // differ, so a producer that froze one triple would fail this assertion.
-    let applied = as_shot_sidecars(&output.join("frames"));
+    let applied = as_shot_sidecars(&output.join("logs/encode"));
     assert_eq!(applied.len(), 3);
     assert_ne!(applied[0], applied[1]);
     assert_ne!(applied[0], applied[2]);
@@ -2064,15 +1970,19 @@ fn per_frame_mode_decodes_every_frame_with_its_own_as_shot_neutral() {
     );
     assert!(!run_stdout.contains("frozen white balance"), "{run_stdout}");
 
-    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
-    assert!(output.join("preview-h264-srgb-bt709.mp4").is_file());
+    assert!(output.join("output.mp4").is_file());
+    assert!(output.join("output.mp4").is_file());
 }
 
 #[test]
 fn per_frame_mode_runs_the_activated_probe_and_renders_without_an_override() {
     let frames = per_frame_flicker_sequence(30);
     let material = synthetic_material("wb-per-frame-deflicker", frames);
-    let (result, output) = run_synthetic(&material, "run", &["--white-balance", "per-frame"]);
+    let (result, output) = run_synthetic(
+        &material,
+        "run",
+        &["--white-balance", "per-frame", "--brightness", "uniform"],
+    );
     assert!(
         result.status.success(),
         "run failed\nstdout:\n{}\nstderr:\n{}",
@@ -2115,11 +2025,11 @@ fn per_frame_mode_runs_the_activated_probe_and_renders_without_an_override() {
         probe_commands.len()
     );
 
-    let baseline = as_shot_sidecars(&output.join("analysis/baseline/meta"));
+    let baseline = as_shot_sidecars(&output.join("logs/analysis"));
     assert_eq!(baseline.len(), 30);
-    let probe_meta = as_shot_sidecars(&output.join("analysis/probe/meta"));
+    let probe_meta = as_shot_sidecars(&output.join("logs/probe"));
     assert!(!probe_meta.is_empty());
-    let rendered = as_shot_sidecars(&output.join("frames"));
+    let rendered = as_shot_sidecars(&output.join("logs/encode"));
     assert_eq!(rendered.len(), 30);
     let mut distinct = std::collections::BTreeSet::new();
     for triple in &rendered {
@@ -2129,7 +2039,7 @@ fn per_frame_mode_runs_the_activated_probe_and_renders_without_an_override() {
         );
     }
     for index in 0..30 {
-        assert_eq!(frame_status(&report, index), "OK");
+        assert_eq!(frame_status(&report, index), "UNIFORM");
     }
 
     assert_per_frame_manifest(&output);
@@ -2138,8 +2048,8 @@ fn per_frame_mode_runs_the_activated_probe_and_renders_without_an_override() {
         !run_stdout.contains("applied to every later frame"),
         "{run_stdout}"
     );
-    assert!(output.join("linear-acescg-16bit-ffv1.mkv").is_file());
-    assert!(output.join("preview-h264-srgb-bt709.mp4").is_file());
+    assert!(output.join("output.mp4").is_file());
+    assert!(output.join("output.mp4").is_file());
 }
 
 #[test]
@@ -2170,8 +2080,8 @@ fn per_frame_mode_rejects_a_producer_that_invents_an_override() {
     );
     assert!(text.contains("frame 1/3"), "{text}");
     assert!(text.contains("override"), "{text}");
-    assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
-    assert!(!output.join("preview-h264-srgb-bt709.mp4").exists());
+    assert!(!output.join("output.mp4").exists());
+    assert!(!output.join("output.mp4").exists());
 }
 
 #[test]
@@ -2197,7 +2107,7 @@ fn rejects_a_producer_that_reports_as_shot_but_applies_another_neutral() {
     );
     assert!(text.contains("as_shot_neutral"), "{text}");
     assert!(text.contains("frame 1/3"), "{text}");
-    assert!(!output.join("linear-acescg-16bit-ffv1.mkv").exists());
+    assert!(!output.join("output.mp4").exists());
 }
 
 #[test]
@@ -2225,5 +2135,191 @@ fn rejects_invalid_white_balance_mode_values() {
             "the usage error must name the flag: {}",
             stderr(&result)
         );
+    }
+}
+
+/// Complete within a fixed bound and verify each instrumented owned process
+/// disappeared before the CLI returned. Output files avoid pipe-fill deadlocks
+/// in the test harness itself.
+fn bounded_owned_run(args: &[&str], root: &Path) -> Output {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let out = root.join("bounded.stdout");
+    let err = root.join("bounded.stderr");
+    let pids = root.join("owned.pids");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rawtl-linear-video"))
+        .args(args)
+        .env("FAKE_NATIVE_PIDS", &pids)
+        .stdout(Stdio::from(fs::File::create(&out).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&err).unwrap()))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (status, in_time) = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break (status, true);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break (child.wait().unwrap(), false);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut owned = fs::read_to_string(&pids).unwrap_or_default();
+    fn log_pids(dir: &Path, owned: &mut String) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    log_pids(&entry.path(), owned);
+                } else if let Ok(log) = fs::read_to_string(entry.path()) {
+                    for line in log.lines() {
+                        if let Some(pid) = line.strip_prefix("pid: ") {
+                            owned.push_str(pid);
+                            owned.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+    }
+    log_pids(&root.join("run/logs"), &mut owned);
+    assert!(
+        !owned.is_empty(),
+        "the fixture must instrument real owned children"
+    );
+    let mut survivors = vec![];
+    for pid in owned.lines() {
+        assert!(pid.parse::<u32>().unwrap() > 1);
+        let exists = Command::new("kill")
+            .args(["-0", pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if exists {
+            survivors.push(pid.to_string());
+            let _ = Command::new("kill").args(["-9", pid]).status();
+        }
+    }
+    assert!(
+        in_time,
+        "pipeline exceeded bounded completion deadline; stdout {} stderr {}",
+        out.display(),
+        err.display()
+    );
+    assert!(
+        survivors.is_empty(),
+        "owned children survived CLI return: {survivors:?}"
+    );
+    Output {
+        status,
+        stdout: fs::read(out).unwrap(),
+        stderr: fs::read(err).unwrap(),
+    }
+}
+
+#[test]
+fn protocol_and_child_failures_reap_live_counterparts_and_never_publish() {
+    for (label, knob, encoder_exit, code, expected) in [
+        ("bad-magic", "bad_magic=1", false, 30, "magic"),
+        (
+            "short-pixels",
+            "short_pixels=1",
+            false,
+            30,
+            "short record payload",
+        ),
+        ("missing-metadata", "omit_metadata=1", false, 30, "width"),
+        (
+            "descriptor-geometry",
+            "descriptor_geometry_mismatch=1",
+            false,
+            30,
+            "descriptor geometry",
+        ),
+        (
+            "mid-run",
+            "frame_fail_on=IMG_2.DNG",
+            false,
+            30,
+            "synthetic mid-run frame failure",
+        ),
+        (
+            "nonzero-after-records",
+            "nonzero_after_records=1",
+            false,
+            30,
+            "exit code 3",
+        ),
+        (
+            "early-encoder",
+            "stall_pixels=1",
+            true,
+            60,
+            "streaming encoder failed",
+        ),
+    ] {
+        let root = test_dir(&format!("bounded-{label}"));
+        let input = root.join("material");
+        make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_3.DNG"]);
+        let fixtures = root.join("fixtures");
+        fs::create_dir_all(&fixtures).unwrap();
+        let frames: Vec<_> = ["IMG_1.DNG", "IMG_2.DNG", "IMG_3.DNG"]
+            .into_iter()
+            .map(|s| FakeFrame::new(s, 0.18f64.log2()))
+            .collect();
+        let native = fake_native_tool(&fixtures, &frames, None, false);
+        let config = fixtures.join(format!("fake-native-{}.config", std::process::id()));
+        use std::io::Write;
+        writeln!(
+            fs::OpenOptions::new().append(true).open(config).unwrap(),
+            "{knob}\nwidth=240\nheight=180"
+        )
+        .unwrap();
+        let encoder = fixtures.join("controlled-encoder");
+        let body = if encoder_exit {
+            "exit 7"
+        } else {
+            "exec /usr/bin/python3 -c 'import sys,time; sys.stdin.buffer.read(129600); time.sleep(60)'"
+        };
+        write_executable(
+            &encoder,
+            &format!("#!/bin/sh\necho $$ >> \"$FAKE_NATIVE_PIDS\"\n{body}\n"),
+        );
+        let output = root.join("run");
+        let mut args = base_args(&input, &output, &native);
+        args.extend(["--strength", "0", "--ffmpeg", encoder.to_str().unwrap()]);
+        let result = bounded_owned_run(&args, &root);
+        assert_eq!(
+            result.status.code(),
+            Some(code),
+            "{label}: {}",
+            stderr(&result)
+        );
+        assert!(
+            stderr(&result).contains(expected),
+            "{label}: {}",
+            stderr(&result)
+        );
+        assert!(output.join(".rawtl-partial").is_dir());
+        assert!(!output.join("output.mp4").exists());
+        assert!(
+            !output.join("logs/encode/frame_000003.log").exists(),
+            "stop dispatch on failure"
+        );
+        let first = fs::read_to_string(output.join("logs/encode/frame_000001.log")).unwrap();
+        assert!(
+            first.contains("exit:"),
+            "native status must be retained: {first}"
+        );
+        if output.join("logs/encode.log").exists() {
+            let log = fs::read_to_string(output.join("logs/encode.log")).unwrap();
+            assert!(log.contains("exit:"), "encoder status must be retained");
+            assert!(
+                log.contains("pid: "),
+                "live counterpart fixture must start both processes"
+            );
+        }
     }
 }

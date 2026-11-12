@@ -4,10 +4,9 @@ Rust driver for the end-to-end linear time-lapse system: enumerate a directory
 of DNG frames (LinearRaw or CFA) or of any other RAW format the Adobe DNG
 Converter can parse, call the accepted `dng-linear-frame` producer,
 apply the selected white balance mode (sequence-frozen first frame by default),
-run the legacy V4 deflicker node (enabled by
-default), encode a lossless 16-bit scene-linear FFV1 video, validate it by full
-decode roundtrip, audit the encoded result independently, render a
-display-referred sRGB or camera-Log review preview, and publish both deliverables atomically.
+run the legacy V4 deflicker node (enabled by default), stream each accepted
+frame through Rust colour conversion into FFmpeg, validate and independently
+audit the H.264 result, and publish a single `output.mp4`.
 
 The crate has no external Rust dependencies, no async runtime and no Python in
 the product path. Child processes are invoked with `std::process::Command`
@@ -16,10 +15,9 @@ using argv vectors (no shell).
 ## Build
 
 ```sh
-cd pipeline
-cargo clean          # avoid stale build artifacts
-cargo build --release
-cargo test
+cargo clean --manifest-path pipeline/Cargo.toml
+cargo build --release --manifest-path pipeline/Cargo.toml
+cargo test --manifest-path pipeline/Cargo.toml
 ```
 
 The binary is `pipeline/target/release/rawtl-linear-video`.
@@ -79,30 +77,25 @@ contain each other in either direction. The input directory is only read.
 
 ```
 <output>/
-  frames/frame_%06d.png   RGB16 scene-linear ACEScg/AP1/D60 (code/16384)
-  frames/frame_%06d.json  native producer sidecar (route, WB provenance, range, ...)
-  analysis/baseline/      per-frame 0 EV analysis sidecars (deflicker input)
-  analysis/applied/       per-frame applied-EV analysis sidecars (accepted round)
-  analysis/probe/         gain-probe measurements (when executed)
-  logs/                   per-pass native, encoder, roundtrip and audit transcripts
-  exposure_report.json    per-frame decisions, statuses, probe/audit summaries
-  exposure-curve.csv      legacy write_curve fields, one row per frame
-  temporal_audit.json     independent encoded-video audit (when executed)
-  pairs.csv, frames.csv   audit pair/frame evidence
-  manifest.json           run provenance, white-balance mode/provenance, fps
-                          provenance, encoder parameters, probe results,
-                          roundtrip/preview checks and the deflicker block
-                          (config, status counts, audit summary)
-  linear-acescg-16bit-ffv1.mkv
-  preview-h264-<transfer>-<gamut>.mp4
-                          (default: preview-h264-srgb-bt709.mp4)
+  output.mp4              H.264 in the selected colour/Log profile
+  manifest.json           sources, pixel digests, applied EV, geometry, profile,
+                          encoder/probe validation and timings
+  logs/                   native JSON summaries/byte counts, encoder/audit logs
+  exposure_report.json    exposure decisions, measurements, statuses and warnings
+  exposure-curve.csv      legacy curve fields, one row per frame
+  pairs.csv, frames.csv   audit measurements and source inventory
+  temporal_audit.json     when temporal audit executes
 ```
 
-Intermediate encoder outputs are written under `<output>/.rawtl-partial/` and
-are removed after successful publication. If validation or encoding fails, the
-directory is retained with that distinguishable name and the error message
-names it; no file is ever created under a final deliverable name before
-validation succeeds.
+Analysis and application-pass measurements stay in memory; there are no
+`frames/` or `analysis/` directories, raw pixel files or linear master video.
+With audit off or deflicker disabled, `pairs.csv` contains only its header and
+`frames.csv` contains the source inventory without measured timestamps.
+
+The encoder writes `<output>/.rawtl-partial/output.mp4`. Publication uses one
+rename to `output.mp4` after validation, refusing an existing destination.
+Successful publication removes the partial directory. Operational failures keep
+it and the logs for diagnostics and never publish the final video name.
 
 ## Input formats and ordering
 
@@ -133,8 +126,7 @@ one resolution; a mismatch is a hard decode-time error with no video produced.
 
 `--white-balance` selects how the scene-linear decode derives its camera
 neutral. The default, `first-frame`, keeps the historical sequence-frozen
-contract and produces byte-identical arguments, manifest and log lines to
-earlier runs; `per-frame` follows each RAW frame's own as-shot neutral.
+white-balance contract; `per-frame` follows each RAW frame's own as-shot neutral.
 
 - `first-frame` (default, REQ-008): the first numerically ordered frame is
   decoded with its own AsShotNeutral (`white_balance_source: "as-shot"`). Its
@@ -159,45 +151,49 @@ or corrects white balance. The chosen mode is recorded in `manifest.json`
 and in the run summary. No per-frame "auto" white balance is performed:
 as-shot *is* the white balance data stored in the RAW.
 
-## Linear video
+## Streaming encoding
 
-`ffmpeg -framerate <fps> -start_number 1 -i frames/frame_%06d.png -frames:v N
--c:v ffv1 -level 3 -g 1 -slicecrc 1 -pix_fmt gbrp16le -map_metadata -1
--f matroska`. No resize, frame-rate filter, colour conversion or metadata is
-inserted. The values remain `code / 16384` scene-linear ACEScg with the
-producer's two-sided clipping policy (negatives to 0, above 65535/16384 to
-65535); the per-frame native sidecar records observed scene min/max and clip
-counts.
+Analysis, gain probes and feedback application passes call
+`--stdout-analysis` (with the requested `--exposure-ev` and ROI). The accepted
+EV vector is restored before the final pass. Each final frame calls
+`--stdout-frame --exposure-ev <accepted>`; frame 1's metadata and descriptor
+establish source geometry and the WB reference before FFmpeg starts.
 
-Validation before publication:
+Native RGB48LE codes (`code / 16384`, scene-linear ACEScg AP1/D60) cross a
+validated RGB48 envelope. Rust converts directly into the RGB24 backing that
+crosses a validated RGB24 envelope and is written to FFmpeg stdin. The consumer
+holds one RGB48 and one RGB24 pixel buffer at a time; it never captures the
+whole pixel stream. Native source/pixel SHA-256 values remain authoritative.
 
-1. `ffprobe -count_frames` must report `ffv1`, `gbrp16le`, the expected
-   dimensions, frame count and frame rate.
-2. Lossless roundtrip: both the sent PNG sequence and the encoded MKV are
-   decoded by ffmpeg to `rgb48le`; the frames are compared byte-for-byte and
-   the first differing frame/byte/channel/value is reported on failure.
+The encoder uses `-f rawvideo -pixel_format rgb24 -video_size WxH -framerate FPS
+-i pipe:0`, the profile's existing `-vf` filter, `h264_videotoolbox -allow_sw 0
+-profile:v high -b:v 0 -q:v 65 -pix_fmt yuv420p`, colour tags and movflags.
+The sRGB filter retains its RGB24 to TV-range conversion verbatim. After N
+frames stdin is closed and the encoder is reaped. Validation checks nonempty
+output, ffprobe codec/geometry/frame count/rate/tags and a full decode. Lossy
+H.264 has no lossless roundtrip claim.
 
 ## 预览输出色彩/Log profile
 
 `--preview-profile <ID>` 选择预览输出，默认 `srgb-preview`。预览是 sRGB 或厂商
-Log 检视信号，不是测量源。编码器仍为 `h264_videotoolbox`、8bit `yuv420p`、
-`-b:v 0 -q:v 65`；FFV1 母版、RAW 显影、去闪、审计均不改变。
+Log 信号；独立审计按所选 profile 反传递后测量。编码器为 `h264_videotoolbox`、8bit `yuv420p`、
+`-b:v 0 -q:v 65`；RAW 显影与去闪数学保持。
 
 | id | 预览文件 | transfer / gamut | range | YCbCr | 标签 primaries / transfer / matrix / full |
 | --- | --- | --- | --- | --- | --- |
-| `srgb-preview` | `preview-h264-srgb-bt709.mp4` | sRGB / Rec.709 | tv | bt709 | 1 / 13 / 1 / 0（既有行为） |
-| `sony-slog3-sgamut3` | `preview-h264-slog3-sgamut3.mp4` | S-Log3 / S-Gamut3 | pc | bt2020nc | 2 / 2 / 9 / 1 |
-| `sony-slog3-sgamut3-cine` | `preview-h264-slog3-sgamut3cine.mp4` | S-Log3 / S-Gamut3.Cine | pc | bt2020nc | 2 / 2 / 9 / 1 |
-| `canon-log2-cinema-gamut` | `preview-h264-clog2-cgamut.mp4` | Canon Log 2 / Cinema Gamut | pc | bt2020nc | 2 / 2 / 9 / 1 |
-| `nikon-nlog-bt2020` | `preview-h264-nlog-bt2020.mp4` | N-Log / BT.2020 | pc | bt2020nc | 9 / 2 / 9 / 1 |
-| `dji-dlog-dgamut` | `preview-h264-dlog-dgamut.mp4` | D-Log / D-Gamut | pc | bt2020nc | 2 / 2 / 9 / 1 |
+| `srgb-preview` | `output.mp4` | sRGB / Rec.709 | tv | bt709 | 1 / 13 / 1 / 0（既有行为） |
+| `sony-slog3-sgamut3` | `output.mp4` | S-Log3 / S-Gamut3 | pc | bt2020nc | 2 / 2 / 9 / 1 |
+| `sony-slog3-sgamut3-cine` | `output.mp4` | S-Log3 / S-Gamut3.Cine | pc | bt2020nc | 2 / 2 / 9 / 1 |
+| `canon-log2-cinema-gamut` | `output.mp4` | Canon Log 2 / Cinema Gamut | pc | bt2020nc | 2 / 2 / 9 / 1 |
+| `nikon-nlog-bt2020` | `output.mp4` | N-Log / BT.2020 | pc | bt2020nc | 9 / 2 / 9 / 1 |
+| `dji-dlog-dgamut` | `output.mp4` | D-Log / D-Gamut | pc | bt2020nc | 2 / 2 / 9 / 1 |
 
 每个 profile 的矩阵、公式、来源和交付约定均记录在 `manifest.json` 的
-`preview.color_contract` 中；`preview.emitted_tags` 逐字段记录 H.264 SPS VUI 与
+`video.color_contract` 中；`video.emitted_tags` 逐字段记录 H.264 SPS VUI 与
 MP4 `colr/nclx` 两层的实际码点。2 表示 unspecified；Nikon 的 9 表示其真实
 BT.2020 primaries，matrix 的 9 表示实际采用的 BT.2020 非恒定亮度编码矩阵。
 
-转换顺序不变：PNG RGB16 的 `code/16384` 为 ACEScg AP1/D60 场景线性值，经
+转换顺序不变：stdout RGB16 的 `code/16384` 为 ACEScg AP1/D60 场景线性值，经
 XYZ(D60) → Bradford CAT → XYZ(D65) → 目标线性 RGB；逐通道裁切到官方反函数
 signal 0/1 的端点，再应用官方 transfer 和 `round(signal*255)`、ties away from
 zero 的 8bit 量化。不做 tone/gamut mapping，不加抖动。8bit Log 可能出现 banding；
@@ -208,7 +204,7 @@ matrix/range，Nikon 另写真实 primaries；没有准确通用码点的厂商 
 primaries 保持 unspecified。`scale=out_color_matrix=bt2020:out_range=pc` 后的
 `setparams` 和编码参数保持这些真实字段一致。本机 FFmpeg 8.0.1/VideoToolbox 能直接
 写入 SPS VUI；封装用 `-movflags +faststart+write_colr`，确保部分字段未知时仍写 nclx。
-sRGB 的滤镜、编码参数和 `+faststart` 保持原样，解码 framemd5 和图像 NAL 回归不变。
+sRGB 的滤镜、色彩编码参数和 `+faststart` 保持原样。
 `pc` 流允许解码器报告 `yuv420p` 或 `yuvj420p`，仍校验 range 和逐字段标签。
 
 厂商 profile 统一 `bt2020nc` 和 full range 是 **rawtl 交付约定，不是厂商强制要求**。
@@ -243,11 +239,10 @@ The macOS hardware H.264 encoder rejects source widths above 4096 (measured:
 proportionally downscaled to 4096 width with lanczos resampling in the RGB
 domain, prepended to the existing colour-matrix conversion; the height is
 `round(source_height * 4096 / source_width)` raised to the nearest even value.
-The FFV1 master is never scaled and keeps full resolution. Sources at or below
-4096 keep the historical filter chain and encode path. The applied geometry,
+Sources at or below 4096 keep the existing geometry and filter chain. The applied geometry,
 algorithm and the exact `-vf` chain are recorded in `manifest.json`
-(`preview.scale`, `preview.encoder_parameters`), and preview validation checks
-the computed preview dimensions, not the master dimensions.
+(`video.scale`, `video.encoder_parameters`). Validation checks the applied
+output dimensions; `frames.width/height` retain source geometry.
 
 The sRGB reference unit tests assert neutral (`0.18 → 118,118,118`), a
 non-neutral reference (`[0.5,0.25,0.125] → [216,129,89]`), the two-sided
@@ -270,7 +265,7 @@ distinct: `saturation_fraction` is the camera-domain gate (EV-invariant) and
 Enabled path:
 
 1. **Analysis pass** — every frame is decoded at 0 EV with
-   `--no-png --emit-analysis`, using the accepted native producer and the
+   `--stdout-analysis`, using the accepted native producer and the
    selected white balance mode (the frozen frame-1 override in `first-frame`;
    each frame's own as-shot neutral, with no override, in `per-frame`). Only
    measurements are kept. The
@@ -283,7 +278,7 @@ Enabled path:
    (`gap_factor 1.5`, at least 3 samples). Filename numeric jumps are report
    metadata only. Missing `capture_time` degrades coverage to `filename_only`
    and adds no audit boundaries.
-3. **Estimation** — the S02 engine (`rawtl_linear_video::deflicker`) runs the
+3. **Estimation** — the Rust engine (`rawtl_linear_video::deflicker`) runs the
    whole-sequence V4 state machine: pairwise graph or legacy estimator, smooth
    trend or uniform target, confirmed steps, EV limits, scene-cut metadata and
    interpolated/lone-frame states.
@@ -312,7 +307,7 @@ Enabled path:
    flag (`GAIN_PROBE_FAILED` warning, probe JSON verbatim), not a publication
    gate; probe-side tool failures remain operational errors (exit 81).
 6. **Application pass** — frames are re-decoded with `--exposure-ev <applied>`
-   and an analysis sidecar, writing the PNG/metadata pair plus applied-EV
+   and `--stdout-analysis`, retaining only in-memory metadata and applied-EV
    measurements. `new_output_clipping_fraction` is the per-tile positive
    increase of `output_clip_fraction` over the 0 EV baseline divided by tile
    count.
@@ -324,20 +319,16 @@ Enabled path:
    `RENDER_TARGETS_NOT_REACHED` warning and `COMPLETED_WITH_REVIEW` — never
    blocked. All-unobservable validation is reported as
    `NOT_VERIFIED_NO_CONSENSUS` / `NOT_INDEPENDENT_LEGACY`, never as a pass.
-8. **Encode / validate / roundtrip / preview** — unchanged from the linear
-   pipeline above.
-9. **Independent audit** — the temporary linear master is decoded by ffmpeg as
-   `rgb48le`, converted with the declared `linear16` inverse transfer
-   (`code / 16384`), area-reduced in linear light, and measured on a 24x18 tile
-   grid with the same paired photometric mathematics as legacy. Audit
-   boundaries are scene cuts union capture-time gaps. The delivered-code
-   saturation proxy is `code >= int(0.965 * 65535)` — a literal port applied to
-   the 16-bit delivered codes, deliberately not the sidecar's linear-scale
-   `16057` series. The verdict is recorded verbatim (`temporal_audit.json`,
-   manifest `audit_status`) and a `FAIL` adds a warning plus
-   `COMPLETED_WITH_REVIEW`; publication is never blocked. `off` records
-   `SKIPPED`. Observation failures are recorded as `UNOBSERVABLE`, never as a
-   pass.
+8. **Streaming encode / validate** — the restored accepted EV vector is used
+   by a final native decode and the streaming encoder described above.
+9. **Independent audit** — the sole MP4 is decoded to `rgb48le`; normalized
+   signals pass through the selected profile's inverse transfer before
+   target-gamut luminance, f64 BOX reduction and the 24x18 tile measurements.
+   Boundaries remain scene cuts union capture-time gaps. The delivered-code
+   saturation proxy remains `code >= int(0.965 * 65535)`, distinct from the
+   analysis sidecar's linear-scale clip series. A FAIL or audit ERROR records
+   warnings and `COMPLETED_WITH_REVIEW`; audit never blocks publication.
+   `off` records SKIPPED.
 10. **Reports and publication** — `exposure_report.json` and
     `exposure-curve.csv` are written atomically before the manifest and
     publication. Any failure after the guarded output directory exists retains
@@ -348,80 +339,82 @@ Enabled path:
     original error. The manifest gains a `deflicker` block with config, status counts,
     probe and audit summaries. Atomic publication is unchanged.
 
-Declared boundaries: the audit's linear16 analysis assumption (the stream has
-no colour tags), legacy float32 area reduction versus this f64 reduction
-(semantically equal, not bit-identical), and encoder byte determinism
-(Matroska metadata is not stable; FFV1 payload identity is proven by the
-lossless roundtrip and framemd5 diagnostics).
+## Audit assumptions and provenance
 
-`--strength 0` is the REQ-011 regression path: a single pass with the exact
-historical native argument shape (no analysis, probe, validation or audit),
-`DISABLED` frame records in the report and a disabled manifest block. It
-reproduces the pre-deflicker PNG/video content byte-for-byte.
+The `VIDEO_ARTIFACT` envelope's `color.profile` is the authoritative identity.
+FFprobe transfer, primaries, matrix and range tags cross-check that identity.
+Expected-unspecified vendor Log tags are legal; an explicit conflicting tag
+produces audit ERROR with no events. A missing or unresolved profile identity
+produces `TEMPORAL_AUDIT_UNOBSERVABLE`, never a guessed curve. Other decoder or
+measurement errors remain ERROR. The caller records either outcome in the
+report and `temporal_audit.json` without blocking publication.
+
+All six selected profiles use `color_profile::Transfer::inverse`, the same
+curve owner as forward conversion. Linearization recovers target-gamut linear
+values within clipping, 8-bit quantization and H.264 losses; it does not undo
+those losses or the AP1-to-target transform. Audit luminance uses the target
+gamut's XYZ Y weights. Smooth target trajectories can cross quantization bins
+and be flagged by the unchanged temporal thresholds. Controlled-decoder tests
+assert known EV changes for every profile, alongside encoded-output tests.
+
+The audit records artifact path, byte length, ffprobe tags and profile identity.
+Encoded artifact SHA-256 is honestly `NOT_COMPUTED_STD_ONLY`; no pixel digest is
+substituted for an artifact digest, and no lossless-content proof is claimed.
+Native `pixels_sha256` identifies each RGB48 payload before conversion.
+
+`--strength 0` uses one streaming frame pass at 0 EV, skips analysis/probe/
+feedback/audit, and records DISABLED statuses. The native positional PNG mode
+remains available independently of this default Rust workflow.
 
 ## Stage handoffs (typed transports)
 
-Every in-process stage boundary hands its data on through the transport
-contract in `pipeline/src/transport/`: a `DiskArtifact`, `MemoryFile` or
-`NdArray` payload inside an immutable `DataEnvelope` with a product semantic
-type and provenance. Subprocess boundaries (native producer, FFmpeg) remain
-path/argv based; only the handoff between pipeline stages is typed.
+The existing transport registry remains unchanged. Subprocesses exchange
+stdout records and stdin pixel bytes; every Rust stage consumes the typed
+payload it validates.
 
-- **Native producer -> pipeline.** The producer still receives the historical
-  argv paths. Its outputs are referenced as `DiskArtifact` (`image/png` for the
-  frame PNG, `application/json; charset=utf-8` for the metadata and analysis
-  sidecars). Sidecar content is read with `transport::load`, wrapped as a
-  `MemoryFile` and validated as `rawtl.frame-metadata@1` /
-  `rawtl.analysis-sidecar@1` before the existing parsers run. The envelope
-  metadata carries `source.schema_version`, `source.width`, `source.height` and
-  (when present) `source.sha256`; the source hash must also appear in the
-  provenance, so a sidecar whose declared hash does not match the frame is
-  rejected. The measurement consumers receive the bytes of that same validated
-  envelope instead of re-reading an untyped file.
-- **Preview RGB48 pipe and lossless roundtrip.** Each `rgb48le` frame read from
-  the decoder pipe is constructed as an `NdArray` (`U16`, `[height, width, 3]`,
-  HWC interleaved, little endian, offset 0) and validated as
-  `rawtl.rgb48-frame@1` against the declared width/height and colour metadata;
-  a buffer whose length does not match the declared geometry is rejected before
-  conversion. The existing `ColorProfile` conversion runs on that validated
-  array, and its packed output is validated as `rawtl.rgb24-frame@1` before it
-  is written. `verify_roundtrip` constructs and validates the frames from both
-  decoders the same way before the byte comparison.
-- **Encoded deliverables -> audit/publish.** The FFV1 master and preview video
-  are handed on as `DiskArtifact` references (`video/x-matroska`, `video/mp4`)
-  validated as `rawtl.video-artifact@1` (`audit.codec`,
-  `source.frame_count`). The audit decodes the referenced file, and publication
-  renames exactly the validated references.
-
-The typed layer only adds rejections: argv, sidecar/manifest byte formats, exit
-codes, log-line semantics and deliverable content are unchanged. When a
-deflicker application round is adopted as the final `frames/` directory (and its
-analysis directory as `analysis/applied`), the sequence re-points every typed
-disk reference and rebuilds the PNG envelope at the adopted absolute paths:
-semantic type, metadata and payload kind stay identical, the producer envelope
-is recorded as a lineage parent, and the recorded relative paths are rewritten
-as before.
+- **Native JSON -> measurement:** protocol v1 begins with `RAWTLST1` and
+  ordered `[type:u8, zero:u8×3, length:u64 LE, payload]` records. Analysis mode
+  requires metadata (0x01) then analysis (0x02). Their bytes become
+  `MemoryFile` envelopes, `rawtl.frame-metadata@1` and
+  `rawtl.analysis-sidecar@1`; source hash/provenance, geometry, WB and EV
+  checks run before the existing measurement parser. No sidecar is persisted.
+- **Native pixels -> encoder:** frame mode requires 0x01, descriptor 0x03,
+  then 0x04 RGB48LE. Types, reserved fields, ordering, geometry-derived length,
+  truncation and trailing bytes are rejected. The descriptor's native pixel
+  digest is recorded. Pixels become a U16 HWC little-endian
+  `rawtl.rgb48-frame@1` NdArray; `ColorProfile::convert_frame` fills a unique
+  backing for the U8 `rawtl.rgb24-frame@1` envelope written to stdin. Neither
+  envelope requires a full-frame copy. Complete records followed by a nonzero
+  native exit still fail before encoder writes.
+- **Encoded video -> audit/publication:** the sole `video/mp4` DiskArtifact
+  becomes `rawtl.video-artifact@1`, with `audit.codec`, `source.frame_count`,
+  `color.profile`, `color.transfer` and `color.space`. Audit and publication
+  resolve this same validated reference. Manifest frame entries contain source
+  identity, source geometry, native pixel digest, applied EV, observed range,
+  quantization, duration and log reference; WB detail lives in run metadata
+  and per-frame JSON logs.
 
 ## Failure semantics and exit codes
 
-Any frame failure stops the run immediately: the failing frame name, exit code,
-a stderr excerpt and the retained frame directory/log are reported; no video is
-produced. A validated video is published by same-directory `rename`; on a
-publication failure the already-renamed linear video is rolled back when
-possible.
+Any operational frame/encoder failure stops further dispatch, closes owned
+pipe endpoints, terminates live counterparts and reaps both owned children
+before returning. Logs retain actual process statuses, JSON summaries and
+pixel byte counts; binary pixel payloads are never logged. Primary frame and
+encoder failures retain families 30 and 60 respectively. A single final rename
+refuses overwrite; `.rawtl-partial` remains on failure.
 
 | Exit | Meaning |
 | --- | --- |
-| 0 | Both deliverables published |
+| 0 | output.mp4 published |
 | 2 | CLI usage error |
 | 10 | Input enumeration/ordering error |
 | 11 | Output/input overlap or invalid output path |
 | 12 | Output directory is not empty |
 | 20 | Required executable (native tool/ffmpeg/ffprobe) unavailable |
 | 30 | Frame production or frame-metadata verification failure |
-| 40 | FFV1 encoder failure |
-| 50 | ffprobe validation or lossless-roundtrip failure |
-| 60 | Preview render/encode/validation failure |
+| 40 | Reserved legacy encode family; unused by default workflow |
+| 50 | Probe/tool output parsing or typed artifact validation failure |
+| 60 | H.264 streaming conversion/encode/validation failure |
 | 70 | Manifest publication or final rename failure |
 | 81 | Gain-probe tool failure (probe verdicts themselves are recorded flags) |
 | 82 | Render-validation internal error (target misses are recorded flags) |
@@ -434,21 +427,19 @@ frozen legacy gate contract (`--on-review error`, `--temporal-quality strict`).
 
 ## Tests
 
-`cargo test` runs unit tests plus integration tests that use the real ffmpeg at
-the default path and a fake native producer (a standalone Rust program compiled
-once by the harness, writing 16-bit PNG fixtures, native metadata and analysis
-sidecars). The producer covers numeric ordering (`IMG_1, IMG_2, IMG_10`),
-frozen-WB propagation and drift detection, fail-fast, encoder failure after
-bytes are written, ffprobe rejection, roundtrip mismatch and directory guards.
-Deflicker scenarios cover injected alternating gain (corrected, audit passes),
-confirmed steps (requested EV preserved; the legacy shared-offset render check
-flags a genuine level step and the run publishes with the warning), EV limits
-(`LIMITED` with requested != applied), render under-execution (best round
-published with `RENDER_TARGETS_NOT_REACHED`), the global-reference fallback
-(unreliable frames get `GLOBAL_REFERENCE` estimates and the run publishes), a
-wrong correction that passes the gain probe while the audit records `FAIL`
-(deliverables still published), and the `--strength 0` regression path
-(fixture-equal PNGs, identical FFV1 content and encoder arguments).
+`cargo test --manifest-path pipeline/Cargo.toml` runs numerical/transport
+unit tests and integrations with real FFmpeg and a standalone fake native
+producer. Coverage includes stdout modes, malformed framing/metadata, short
+pixels, mid-run failure, late nonzero native exit, encoder early exit while the
+native producer is blocked, bounded completion and no surviving owned child.
+Positive tests assert the single-video output layout, numeric ordering, WB,
+manifest/profile tags, pixel digests and logs without binary dumps. Feedback
+under-execution still exercises multiple rounds and the true update count.
+Faithful-gain PASS tests use a uniform target to avoid quantization-bin jumps
+in the old short-sequence smooth-target fixture. Controlled decoded-frame
+tests measure known ±1 EV changes through production audit for every profile,
+including valid unspecified Log tags, explicit conflicts and absent identity.
+
 Real-material runs are opt-in:
 
 ```sh
@@ -460,7 +451,7 @@ pipeline/target/release/rawtl-linear-video \
 
 ## Non-goals
 
-No plugin ABI, events, Stage 1 cache, official Log output, GPU, packaging or
+No plugin ABI, events, Stage 1 cache, lossless master, GPU, packaging or
 Python runtime. The deflicker node uses no Python/SciPy/rawpy. Multi-ROI audit,
 chroma-variation analysis and progress callbacks remain out of scope. The frozen
 legacy Python implementation remains read-only and is not a numerical oracle for

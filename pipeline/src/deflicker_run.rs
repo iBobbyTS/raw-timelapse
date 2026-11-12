@@ -4,10 +4,10 @@
 //! Order of operations (enabled path):
 //! analysis pass @0 EV -> capture-time continuity -> estimation -> review
 //! policy -> gain probe -> application pass(es) with render validation and at
-//! most two feedback updates -> encode/validate/roundtrip/preview -> independent
+//! most two feedback updates -> stream encode/validate -> independent
 //! encoded-video audit -> exposure report + curve -> manifest -> atomic publish.
 //!
-//! `--strength 0` uses the historical single pass (no analysis, probe,
+//! `--strength 0` uses one streaming pass (no analysis, probe,
 //! validation or audit) and records DISABLED frame statuses.
 
 use crate::audit::{self, AuditConfig};
@@ -29,7 +29,7 @@ use rawtl_linear_video::deflicker::{
     estimate_exposure, ExposureConfig, ExposureResult, FrameEstimate,
 };
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 const REPORT_NAME: &str = "exposure_report.json";
@@ -130,6 +130,8 @@ fn run_with_boundary(
         partial_dir: output.join(".rawtl-partial"),
         started,
     };
+    fs::create_dir_all(&context.partial_dir)
+        .map_err(|e| Error::new(EXIT_PUBLISH, e.to_string()))?;
     if options.deflicker.enabled() {
         run_deflicker(&context, state)
     } else {
@@ -138,27 +140,15 @@ fn run_with_boundary(
 }
 
 // ---------------------------------------------------------------------------
-// Disabled path (--strength 0): historical single pass, byte-compatible inputs
+// Disabled path (--strength 0): a single streaming encode pass
 // ---------------------------------------------------------------------------
 
 fn run_disabled(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
     let options = context.options;
-    let config = ProduceConfig {
-        frames_dir: &context.output.join("frames"),
-        logs_dir: &context.output.join("logs"),
-        analysis_dir: None,
-        exposure_ev: None,
-        analysis_roi: None,
-        no_png: false,
-        echo: true,
-        echo_tag: "frame ",
-        white_balance: options.white_balance,
-        converter: options.converter.as_deref(),
-        converter_timeout: options.converter_timeout,
-        frames_relative_dir: "frames",
-        log_relative_dir: "logs",
-    };
-    let sequence = frame::produce(&options.native_tool, context.sources, &config)?;
+    state.filenames = context.sources.iter().map(|s| s.name.clone()).collect();
+    state.capture_times = vec![None; context.sources.len()];
+    state.disabled_exposure(&options.deflicker);
+    let (sequence, stage) = encode_and_validate(context, &vec![0.0; context.sources.len()])?;
     print_sequence_summary(&sequence, options.white_balance);
     state.capture_times = sequence
         .frames
@@ -173,7 +163,6 @@ fn run_disabled(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
     state.disabled_exposure(&options.deflicker);
     state.run_status = "OK".to_string();
 
-    let stage = encode_and_validate(context, &sequence)?;
     write_reports(context.options, context.output, state)?;
     publish_run(
         context,
@@ -192,27 +181,24 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
     let cfg = &options.deflicker;
     let output = context.output;
 
-    // 1. Analysis pass @0 EV: measurements only, no PNG.
-    let baseline_analysis = output.join("analysis/baseline");
-    let baseline_meta = output.join("analysis/baseline/meta");
+    // 1. Analysis pass @0 EV: validated in-memory measurements.
     let baseline_logs = output.join("logs/analysis");
     let analysis_config = ProduceConfig {
-        frames_dir: &baseline_meta,
         logs_dir: &baseline_logs,
-        analysis_dir: Some(&baseline_analysis),
         exposure_ev: Some(0.0),
         analysis_roi: Some(cfg.roi),
-        no_png: true,
         echo: true,
         echo_tag: "analysis ",
         white_balance: options.white_balance,
         converter: options.converter.as_deref(),
         converter_timeout: options.converter_timeout,
-        frames_relative_dir: "analysis/baseline/meta",
         log_relative_dir: "logs/analysis",
     };
     println!("\nanalysis pass (0 EV, tile measurements only)...");
+    let mut pass_timings = std::collections::BTreeMap::new();
+    let phase = Instant::now();
     let baseline = frame::produce(&options.native_tool, context.sources, &analysis_config)?;
+    pass_timings.insert("analysis".to_string(), phase.elapsed());
     print_sequence_summary(&baseline, options.white_balance);
     let n = baseline.frames.len();
 
@@ -317,13 +303,14 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         };
         let summary = {
             let exposure = state.exposure.as_mut().expect("exposure set");
-            fallback::fill_holes(&measurements, exposure, &boundaries, &fallback_config)
-                .map_err(|err| {
+            fallback::fill_holes(&measurements, exposure, &boundaries, &fallback_config).map_err(
+                |err| {
                     Error::new(
                         EXIT_FRAME,
                         format!("global-reference fallback failed: {err}"),
                     )
-                })?
+                },
+            )?
         };
         println!(
             "review policy: global-reference fallback filled {} of {} unestimated \
@@ -356,6 +343,7 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
             .frames
             .iter()
             .any(|frame| frame.applied_ev.is_some());
+    let phase = Instant::now();
     let probe = if probe_required {
         println!("gain probe (+/-0.25 EV on representative frames)...");
         run_gain_probe(context, &baseline, &measurements, cfg)?
@@ -372,6 +360,7 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
             ("reason", Json::Str(reason.to_string())),
         ])
     };
+    pass_timings.insert("gain_probe".into(), phase.elapsed());
     println!(
         "gain probe: {}",
         probe
@@ -422,7 +411,9 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
             "\napplication pass {} (iteration {iteration})...",
             iteration + 1
         );
+        let phase = Instant::now();
         let round = apply_pass(context, state, iteration)?;
+        pass_timings.insert(format!("feedback_iteration_{iteration}"), phase.elapsed());
         let (sequence, rendered) = round;
         let exposure = state.exposure.as_mut().expect("exposure set");
         let mut summary = if must_validate {
@@ -521,18 +512,12 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
                 candidate.outlier_frames.len()
             );
             if better {
-                if let Some(old) = best.take() {
-                    remove_round(context, old.state.iteration);
-                }
                 best_score = score;
                 best = Some(BestRound::new(
-                    round_dir(context, iteration),
                     sequence,
                     snapshot(state, iteration),
                     Some(candidate.clone()),
                 ));
-            } else {
-                remove_round(context, iteration);
             }
             if candidate.passed {
                 break;
@@ -566,15 +551,7 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         } else {
             // Validation is not applicable (short sequence, disabled targets or
             // legacy estimator): accept this round without claiming a pass.
-            if let Some(old) = best.take() {
-                remove_round(context, old.state.iteration);
-            }
-            best = Some(BestRound::new(
-                round_dir(context, iteration),
-                sequence,
-                snapshot(state, iteration),
-                None,
-            ));
+            best = Some(BestRound::new(sequence, snapshot(state, iteration), None));
             break;
         }
     }
@@ -604,61 +581,25 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         }
     }
 
-    // Adopt the accepted round as the final frame directory.
-    let frames_dir = output.join("frames");
-    if frames_dir.exists() {
+    let evs: Vec<f64> = state
+        .exposure
+        .as_ref()
+        .expect("exposure set")
+        .frames
+        .iter()
+        .map(|f| f.applied_ev.unwrap_or(0.0))
+        .collect();
+    let (final_sequence, mut stage) = encode_and_validate(context, &evs)?;
+    if final_sequence.width != best.sequence.width || final_sequence.height != best.sequence.height
+    {
         return Err(Error::new(
-            EXIT_PUBLISH,
-            format!(
-                "refusing to adopt accepted frames: {} already exists",
-                frames_dir.display()
-            ),
+            EXIT_FRAME,
+            "encode geometry differs from accepted analysis",
         ));
     }
-    fs::rename(&best.dir, &frames_dir).map_err(|err| {
-        Error::new(
-            EXIT_PUBLISH,
-            format!(
-                "cannot adopt accepted frames {} -> {}: {err}",
-                best.dir.display(),
-                frames_dir.display()
-            ),
-        )
-    })?;
-    let mut adopted_analysis_dir: Option<PathBuf> = None;
-    if let Some(analysis_dir) = round_analysis_dir(context, best.state.iteration) {
-        let final_dir = output.join("analysis/applied");
-        let _ = fs::remove_dir_all(&final_dir);
-        // If the rename fails the round directory is still the real location;
-        // the adopted references must point at existing files either way.
-        adopted_analysis_dir = Some(match fs::rename(&analysis_dir, &final_dir) {
-            Ok(()) => final_dir,
-            Err(_) => analysis_dir,
-        });
-    }
-    let applied_logs = context
-        .output
-        .join(format!("logs/applied-iter{}", best.state.iteration));
-    if applied_logs.exists() {
-        let final_logs = output.join("logs/applied");
-        let _ = fs::remove_dir_all(&final_logs);
-        let _ = fs::rename(&applied_logs, &final_logs);
-    }
-    let final_sequence = best.sequence.clone().adopt_output_locations(
-        &frames_dir,
-        adopted_analysis_dir.as_deref(),
-        "logs/applied",
-    )?;
-    println!(
-        "accepted render round {} with {} frame(s)",
-        best.state.iteration + 1,
-        final_sequence.frames.len()
-    );
+    stage.timings.extend(pass_timings);
 
-    // 8. Existing encode / probe / roundtrip / preview path.
-    let stage = encode_and_validate(context, &final_sequence)?;
-
-    // 9. Independent audit of the encoded linear master.
+    // 9. Independent audit of the sole encoded deliverable.
     let audit_boundaries: Vec<usize> = {
         let exposure = state.exposure.as_ref().expect("exposure set");
         let mut set: Vec<usize> = exposure
@@ -696,8 +637,8 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
             match audit::audit_video(
                 &options.ffmpeg,
                 &options.ffprobe,
-                &stage.linear_artifact,
-                &stage.linear_probe,
+                &stage.video_artifact,
+                &stage.probe,
                 final_sequence.frames.len(),
                 &audit_config,
                 output,
@@ -723,16 +664,9 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
                     }
                 }
                 Err(err) => {
-                    state
-                        .warnings
-                        .push(format!("TEMPORAL_AUDIT_UNOBSERVABLE: {}", err.message));
-                    state.encoded_temporal_quality = Json::obj(vec![
-                        ("status", Json::Str("UNOBSERVABLE".into())),
-                        ("error", Json::Str(err.message)),
-                        ("detector_model", Json::Str(audit::DETECTOR_MODEL.into())),
-                        ("events", Json::Array(vec![])),
-                        ("segments", Json::Array(vec![])),
-                    ]);
+                    state.encoded_temporal_quality = record_audit_failure(output, &err)?;
+                    state.warnings.push(err.message.clone());
+                    state.run_status = "COMPLETED_WITH_REVIEW".into();
                 }
             }
         }
@@ -755,6 +689,28 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
     publish_run(context, &final_sequence, stage, block)
 }
 
+pub(crate) fn record_audit_failure(output: &Path, err: &Error) -> Result<Json> {
+    let summary = audit_failure_summary(err);
+    write_atomic_json(&output.join("temporal_audit.json"), &summary)
+        .map_err(|e| Error::new(EXIT_PUBLISH, e.to_string()))?;
+    Ok(summary)
+}
+
+pub(crate) fn audit_failure_summary(err: &Error) -> Json {
+    let status = if err.message.starts_with("TEMPORAL_AUDIT_UNOBSERVABLE:") {
+        "UNOBSERVABLE"
+    } else {
+        "ERROR"
+    };
+    Json::obj(vec![
+        ("status", Json::Str(status.into())),
+        ("error", Json::Str(err.message.clone())),
+        ("detector_model", Json::Str(audit::DETECTOR_MODEL.into())),
+        ("events", Json::Array(vec![])),
+        ("segments", Json::Array(vec![])),
+    ])
+}
+
 // ---------------------------------------------------------------------------
 // Passes and probe
 // ---------------------------------------------------------------------------
@@ -765,8 +721,6 @@ fn apply_pass(
     iteration: usize,
 ) -> Result<(FrameSequence, Vec<FrameMeasurement>)> {
     let options = context.options;
-    let dir = round_dir(context, iteration);
-    let analysis_dir = round_analysis_dir(context, iteration).expect("analysis dir");
     let logs_dir = context.output.join(format!("logs/applied-iter{iteration}"));
     let baseline = state
         .baseline
@@ -783,18 +737,14 @@ fn apply_pass(
         })
         .collect();
     let config = ProduceConfig {
-        frames_dir: &dir,
         logs_dir: &logs_dir,
-        analysis_dir: Some(&analysis_dir),
         exposure_ev: None,
         analysis_roi: Some(options.deflicker.roi),
-        no_png: false,
         echo: true,
         echo_tag: "render ",
         white_balance: options.white_balance,
         converter: options.converter.as_deref(),
         converter_timeout: options.converter_timeout,
-        frames_relative_dir: "frames",
         log_relative_dir: "logs/applied",
     };
     let sequence = frame::produce_with_evs(&options.native_tool, context.sources, &evs, &config)?;
@@ -850,8 +800,6 @@ fn run_gain_probe(
     let options = context.options;
     let indices = representative_indices(measurements)
         .map_err(|err| Error::new(EXIT_FRAME, format!("gain probe selection failed: {err}")))?;
-    let analysis_dir = context.output.join("analysis/probe");
-    let meta_dir = analysis_dir.join("meta");
     let logs_dir = context.output.join("logs/probe");
     let mut errors: Vec<f64> = Vec::new();
     let mut reasons: Vec<String> = Vec::new();
@@ -867,18 +815,14 @@ fn run_gain_probe(
         tested.push(index);
         for ev in [-0.25, 0.25] {
             let config = ProduceConfig {
-                frames_dir: &meta_dir,
                 logs_dir: &logs_dir,
-                analysis_dir: Some(&analysis_dir),
                 exposure_ev: Some(ev),
                 analysis_roi: Some(cfg.roi),
-                no_png: true,
                 echo: false,
                 echo_tag: "probe ",
                 white_balance: options.white_balance,
                 converter: options.converter.as_deref(),
                 converter_timeout: options.converter_timeout,
-                frames_relative_dir: "analysis/probe/meta",
                 log_relative_dir: "logs/probe",
             };
             let stem_index = index * 2 + if ev > 0.0 { 2 } else { 1 };
@@ -1015,7 +959,6 @@ struct RunState {
     warnings: Vec<String>,
     run_status: String,
     error: Option<String>,
-    strength: f64,
 }
 
 impl RunState {
@@ -1122,7 +1065,6 @@ impl RunState {
             warnings: vec![],
             run_status: "RUNNING".to_string(),
             error: None,
-            strength: cfg.strength,
         }
     }
 
@@ -1291,17 +1233,10 @@ fn write_reports(options: &crate::cli::Options, output: &Path, state: &mut RunSt
         ));
         entries.push((
             "analysis".to_string(),
-            Json::obj(vec![
-                ("baseline_dir", Json::Str("analysis/baseline".into())),
-                (
-                    "applied_dir",
-                    if state.strength == 0.0 {
-                        Json::Null
-                    } else {
-                        Json::Str("analysis/applied".into())
-                    },
-                ),
-            ]),
+            Json::obj(vec![(
+                "transport",
+                Json::Str("MemoryFile; native stdout protocol v1".into()),
+            )]),
         ));
         entries.push((
             "warnings".to_string(),
@@ -1535,12 +1470,10 @@ type FrameState = (Option<f64>, Option<f64>, Option<f64>, Option<f64>);
 
 #[derive(Clone)]
 struct RoundState {
-    iteration: usize,
     frames: Vec<FrameState>,
 }
 
 struct BestRound {
-    dir: PathBuf,
     sequence: FrameSequence,
     state: RoundState,
     summary: Option<ValidationSummary>,
@@ -1548,13 +1481,11 @@ struct BestRound {
 
 impl BestRound {
     fn new(
-        dir: PathBuf,
         sequence: FrameSequence,
         state: RoundState,
         summary: Option<ValidationSummary>,
     ) -> BestRound {
         BestRound {
-            dir,
             sequence,
             state,
             summary,
@@ -1562,10 +1493,9 @@ impl BestRound {
     }
 }
 
-fn snapshot(state: &RunState, iteration: usize) -> RoundState {
+fn snapshot(state: &RunState, _iteration: usize) -> RoundState {
     let exposure = state.exposure.as_ref().expect("exposure set");
     RoundState {
-        iteration,
         frames: exposure
             .frames
             .iter()
@@ -1591,32 +1521,12 @@ fn restore(state: &mut RunState, snapshot: RoundState) {
     }
 }
 
-fn round_dir(context: &RunContext<'_>, iteration: usize) -> PathBuf {
-    context.partial_dir.join(format!("applied-iter{iteration}"))
-}
-
-fn round_analysis_dir(context: &RunContext<'_>, iteration: usize) -> Option<PathBuf> {
-    Some(
-        context
-            .output
-            .join(format!("analysis/applied-iter{iteration}")),
-    )
-}
-
-fn remove_round(context: &RunContext<'_>, iteration: usize) {
-    let _ = fs::remove_dir_all(round_dir(context, iteration));
-    if let Some(dir) = round_analysis_dir(context, iteration) {
-        let _ = fs::remove_dir_all(dir);
-    }
-    let _ = fs::remove_dir_all(context.output.join(format!("logs/applied-iter{iteration}")));
-}
-
 // ---------------------------------------------------------------------------
 // Measurement and continuity helpers
 // ---------------------------------------------------------------------------
 
 fn parse_measurement(frame: &FrameInfo, pass: &str) -> Result<FrameMeasurement> {
-    let artifact = frame.analysis_artifact.as_ref().ok_or_else(|| {
+    let bytes = frame::analysis_bytes(frame).ok_or_else(|| {
         Error::new(
             EXIT_FRAME,
             format!(
@@ -1625,104 +1535,31 @@ fn parse_measurement(frame: &FrameInfo, pass: &str) -> Result<FrameMeasurement> 
             ),
         )
     })?;
-    let path = artifact.path();
-    let loaded = frame::analysis_sidecar_envelope(artifact, frame.source_sha256.as_deref())
-        .map_err(|err| match err {
-            frame::SidecarLoadError::Read(err) => Error::new(
-                EXIT_FRAME,
-                format!(
-                    "cannot read {pass} analysis sidecar {}: {err}",
-                    path.display()
-                ),
-            ),
-            frame::SidecarLoadError::InvalidJson(err) => Error::new(
-                EXIT_FRAME,
-                format!(
-                    "frame {} ({pass} pass) analysis sidecar is invalid ({}): {err}",
-                    frame.index,
-                    path.display()
-                ),
-            ),
-            frame::SidecarLoadError::Semantic(err) => Error::new(
-                EXIT_FRAME,
-                format!(
-                    "frame {} ({pass} pass) analysis sidecar is invalid ({}): {err}",
-                    frame.index,
-                    path.display()
-                ),
-            ),
-        })?;
-    let text = std::str::from_utf8(loaded.bytes()).map_err(|err| {
+    let text = std::str::from_utf8(bytes).map_err(|e| Error::new(EXIT_FRAME, e.to_string()))?;
+    let sidecar = AnalysisSidecar::parse(text).map_err(|e| {
         Error::new(
             EXIT_FRAME,
             format!(
-                "frame {} ({pass} pass) analysis sidecar is invalid ({}): {err}",
-                frame.index,
-                path.display()
-            ),
-        )
-    })?;
-    let sidecar = AnalysisSidecar::parse(text).map_err(|err| {
-        Error::new(
-            EXIT_FRAME,
-            format!(
-                "frame {} ({pass} pass) analysis sidecar is invalid ({}): {err}",
-                frame.index,
-                path.display()
+                "frame {} ({pass} pass) analysis sidecar is invalid: {e}",
+                frame.index
             ),
         )
     })?;
     Ok(sidecar.measurement)
 }
-
 fn parse_measurement_probe(frame: &FrameInfo, index: usize) -> Result<AnalysisSidecar> {
-    let artifact = frame.analysis_artifact.as_ref().ok_or_else(|| {
+    let bytes = frame::analysis_bytes(frame).ok_or_else(|| {
         Error::new(
             EXIT_GAIN_PROBE,
             format!("gain probe measurement for frame {index} has no analysis sidecar"),
         )
     })?;
-    let path = artifact.path();
-    let loaded = frame::analysis_sidecar_envelope(artifact, frame.source_sha256.as_deref())
-        .map_err(|err| match err {
-            frame::SidecarLoadError::Read(err) => Error::new(
-                EXIT_GAIN_PROBE,
-                format!(
-                    "cannot read gain probe analysis sidecar {}: {err}",
-                    path.display()
-                ),
-            ),
-            frame::SidecarLoadError::InvalidJson(err) => Error::new(
-                EXIT_GAIN_PROBE,
-                format!(
-                    "gain probe analysis sidecar for frame {index} is invalid ({}): {err}",
-                    path.display()
-                ),
-            ),
-            frame::SidecarLoadError::Semantic(err) => Error::new(
-                EXIT_GAIN_PROBE,
-                format!(
-                    "gain probe analysis sidecar for frame {index} is invalid ({}): {err}",
-                    path.display()
-                ),
-            ),
-        })?;
-    let text = std::str::from_utf8(loaded.bytes()).map_err(|err| {
+    let text =
+        std::str::from_utf8(bytes).map_err(|e| Error::new(EXIT_GAIN_PROBE, e.to_string()))?;
+    AnalysisSidecar::parse(text).map_err(|e| {
         Error::new(
             EXIT_GAIN_PROBE,
-            format!(
-                "gain probe analysis sidecar for frame {index} is invalid ({}): {err}",
-                path.display()
-            ),
-        )
-    })?;
-    AnalysisSidecar::parse(text).map_err(|err| {
-        Error::new(
-            EXIT_GAIN_PROBE,
-            format!(
-                "gain probe analysis sidecar for frame {index} is invalid ({}): {err}",
-                path.display()
-            ),
+            format!("gain probe analysis sidecar for frame {index} is invalid: {e}"),
         )
     })
 }

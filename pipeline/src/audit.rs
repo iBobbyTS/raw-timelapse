@@ -1,28 +1,15 @@
-//! Independent temporal audit of the encoded linear master.
-//!
-//! The audit decodes the actual deliverable with FFmpeg at full precision
-//! (RGB48), applies the declared `linear16` analysis transfer, reduces LINEAR
-//! light with an area (BOX) filter, and measures paired photometric common-mode
-//! on matched 24x18 tiles. It reads the encoded file only and never needs the
-//! DNG sources or the estimator's own state.
-//!
-//! Declared assumptions (see pipeline/README.md):
-//! - the master is scene-linear `code / 16384` (no OETF), so the inverse
-//!   transfer is `code / 16384` (the legacy audit's linear16 branch);
-//! - the delivered-domain saturation proxy is `code >= int(0.965 * 65535)`
-//!   (a literal port of the legacy constant, applied to 16-bit codes), which is
-//!   deliberately distinct from the analysis sidecar's linear-scale clip series;
-//! - area reduction is exact fractional-coverage averaging in f64; legacy used
-//!   float32 intermediates, so audit numbers are semantically equal, not
-//!   bit-identical.
+//! Independent audit of the actual encoded deliverable. Profile identity is
+//! authoritative in VIDEO_ARTIFACT metadata; stream tags cross-check it. RGB48
+//! decoder signals are inverse-transferred before BOX reduction and photometry.
 
+use crate::color_profile::{self, ColorProfile};
 use crate::error::{Error, Result, EXIT_AUDIT};
 use crate::json::{self, Json};
 use crate::proc;
 use crate::transport::DataEnvelope;
 use crate::video::{video_artifact_path, ProbeInfo};
 use rawtl_linear_video::deflicker::photometry::{
-    analysis_geometry, audit_features, resolve_transfer, tile_statistics, AuditSegment, TileStats,
+    analysis_geometry, audit_features, tile_statistics, AuditSegment, TileStats,
 };
 use std::fs;
 use std::io::{Read, Write};
@@ -30,7 +17,6 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 pub const DETECTOR_MODEL: &str = "fixed-camera paired photometric common-mode v1";
-pub const AUDIT_TRANSFER: &str = "linear16";
 /// `int(.965 * 65535)` from the legacy audit, applied to delivered codes.
 pub const DELIVERED_SATURATION_CODE: u16 = (0.965 * 65535.0) as u16;
 const NX: usize = 24;
@@ -57,8 +43,7 @@ pub fn audit_video(
     config: &AuditConfig<'_>,
     output_dir: &Path,
 ) -> Result<AuditOutcome> {
-    // The encoded master reached this stage as a typed `VIDEO_ARTIFACT`
-    // handoff. Only a validated disk reference is auditable.
+    let profile = resolve_profile(video, probe)?;
     let video = video_artifact_path(video)
         .ok_or_else(|| audit_error("audit input is not a validated video artifact"))?;
     let width = probe.width as usize;
@@ -67,24 +52,8 @@ pub fn audit_video(
         return Err(audit_error("encoded video reports an empty frame geometry"));
     }
     let (aw, ah) = analysis_geometry(width, height).map_err(|err| audit_error(&err))?;
-    let (transfer, mut warnings) =
-        resolve_transfer(Some(probe.color_transfer.as_str()), Some(AUDIT_TRANSFER))
-            .map_err(|err| audit_error(&err))?;
-    if matches!(
-        probe.color_transfer.as_str(),
-        "" | "unknown" | "unspecified" | "reserved"
-    ) {
-        warnings
-            .push("UNKNOWN_TRANSFER_TAG; declared linear16 analysis assumption used".to_string());
-    }
-    if matches!(
-        probe.color_primaries.as_str(),
-        "" | "unknown" | "unspecified" | "reserved"
-    ) {
-        warnings.push(
-            "UNKNOWN_PRIMARIES_TAG; BT.709 luminance weights assumed for analysis".to_string(),
-        );
-    }
+    let transfer = profile.transfer.name().to_string();
+    let mut warnings: Vec<String> = Vec::new();
     if count != config.frame_labels.len() {
         return Err(audit_error(&format!(
             "encoded frame count {count} != label count {}",
@@ -93,7 +62,9 @@ pub fn audit_video(
     }
 
     let pts = read_pts(ffprobe, video)?;
-    let stats = decode_features(ffmpeg, video, width, height, aw, ah, count, output_dir)?;
+    let stats = decode_features(
+        ffmpeg, video, width, height, aw, ah, count, output_dir, profile,
+    )?;
     if stats.len() != count {
         return Err(audit_error(&format!(
             "decoded frame count {} != expected {count}",
@@ -219,11 +190,12 @@ pub fn audit_video(
             "video_identity",
             Json::obj(vec![
                 ("path", Json::Str(video.display().to_string())),
+                ("profile", Json::Str(profile.id.into())),
                 ("bytes", Json::Int(bytes as i64)),
                 (
                     "sha256",
                     Json::Str(
-                        "NOT_COMPUTED_STD_ONLY (content identity proven by lossless roundtrip)"
+                        "NOT_COMPUTED_STD_ONLY (artifact path, bytes, ffprobe and profile metadata recorded)"
                             .into(),
                     ),
                 ),
@@ -242,7 +214,7 @@ pub fn audit_video(
         (
             "decode_policy",
             Json::Str(
-                "RGB48 -> linear16 inverse transfer -> f64 BOX reduce; no temporal resampling"
+                "RGB48 normalized signals -> selected profile inverse transfer -> target-linear luminance -> f64 BOX reduce; no temporal resampling"
                     .into(),
             ),
         ),
@@ -322,6 +294,7 @@ fn decode_features(
     ah: usize,
     count: usize,
     output_dir: &Path,
+    profile: &ColorProfile,
 ) -> Result<Vec<TileStats>> {
     let args = vec![
         "-hide_banner".to_string(),
@@ -411,7 +384,7 @@ fn decode_features(
             break;
         }
         fill_rgb48(&buffer, &mut rgb);
-        luminance(&rgb, &mut luma);
+        luminance(&rgb, &mut luma, profile);
         saturation_mask(&rgb, &mut saturation);
         reduce(
             &luma,
@@ -442,6 +415,9 @@ fn decode_features(
         }
     }
     drop(stdout);
+    if result.is_err() {
+        let _ = child.kill();
+    }
     let status = child.wait();
     if result.is_ok() {
         match status {
@@ -497,15 +473,87 @@ fn fill_rgb48(bytes: &[u8], rgb: &mut [[u16; 3]]) {
     }
 }
 
-/// Declared linear16 transfer and REC.709 weights, with the transfer applied as
-/// `code / 16384` per component before weighting.
-fn luminance(rgb: &[[u16; 3]], out: &mut [f64]) {
-    const SCALE: f64 = 1.0 / 16384.0;
+fn luminance(rgb: &[[u16; 3]], out: &mut [f64], profile: &ColorProfile) {
+    let weights = profile.gamut.rgb_to_xyz[1];
     for (value, pixel) in out.iter_mut().zip(rgb) {
-        *value = (pixel[0] as f64 * SCALE) * 0.2126
-            + (pixel[1] as f64 * SCALE) * 0.7152
-            + (pixel[2] as f64 * SCALE) * 0.0722;
+        *value = pixel
+            .iter()
+            .zip(weights)
+            .map(|(code, weight)| profile.transfer.inverse(*code as f64 / 65535.0) * weight)
+            .sum();
     }
+}
+
+/// Unknown tags carry no contradictory information. Explicit tags must match
+/// each field of the selected profile, including expected-unspecified Log
+/// policies: a bt709 tag cannot silently relabel a vendor Log stream.
+fn resolve_profile(video: &DataEnvelope, probe: &ProbeInfo) -> Result<&'static ColorProfile> {
+    let id = video.metadata().get("color.profile").and_then(Json::as_str);
+    let profile = id.and_then(color_profile::lookup).ok_or_else(|| {
+        audit_error("TEMPORAL_AUDIT_UNOBSERVABLE: missing or unresolved profile identity")
+    })?;
+    for (field, observed, expected) in [
+        (
+            "color_transfer",
+            probe.color_transfer.as_str(),
+            profile.tag_policy.transfer_token(),
+        ),
+        (
+            "color_primaries",
+            probe.color_primaries.as_str(),
+            profile.tag_policy.primaries_token(),
+        ),
+        (
+            "color_space",
+            probe.color_space.as_str(),
+            profile.tag_policy.matrix_token(),
+        ),
+        (
+            "color_range",
+            probe.color_range.as_str(),
+            profile.range.as_str(),
+        ),
+    ] {
+        if !matches!(observed, "" | "unknown" | "unspecified" | "reserved") && observed != expected
+        {
+            return Err(audit_error(&format!("TEMPORAL_AUDIT_ERROR: profile {} conflicts with {field}={observed} (expected {expected})", profile.id)));
+        }
+    }
+    Ok(profile)
+}
+
+/// Stable run inventory when audit is disabled or unavailable. Empty pairs
+/// mean no measured pairs; the independent audit replaces these on success.
+pub fn write_inventory(output: &Path, labels: &[String]) -> Result<()> {
+    write_csv(
+        &output.join("pairs.csv"),
+        &[
+            "index",
+            "pts_s",
+            "filename",
+            "boundary",
+            "common_ev",
+            "spatial_mad_ev",
+            "valid_tiles",
+            "consensus_tiles",
+            "consensus_fraction",
+            "quadrants",
+            "quality",
+            "local_p90_ev",
+            "candidate_global_jump",
+            "chroma_variation",
+        ],
+        &[],
+    )?;
+    write_csv(
+        &output.join("frames.csv"),
+        &["index", "pts_s", "filename"],
+        &labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| vec![i.to_string(), String::new(), label.clone()])
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn saturation_mask(rgb: &[[u16; 3]], out: &mut [f64]) {
@@ -789,4 +837,205 @@ fn optional_json(value: Option<f64>) -> Json {
 
 fn audit_error(message: &str) -> Error {
     Error::new(EXIT_AUDIT, message.to_string())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::transport::{DataEnvelope, MetadataDoc};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn executable(path: &Path, text: &str) {
+        fs::write(path, text).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fn root(label: &str) -> std::path::PathBuf {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-tmp")
+            .join(format!("audit-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+    fn probe(profile: &ColorProfile, count: usize) -> ProbeInfo {
+        ProbeInfo {
+            codec_name: "h264".into(),
+            pix_fmt: "yuv420p".into(),
+            width: 192,
+            height: 144,
+            frames: count as u64,
+            avg_frame_rate: "30/1".into(),
+            color_space: profile.tag_policy.matrix_token().into(),
+            color_primaries: profile.tag_policy.primaries_token().into(),
+            color_transfer: profile.tag_policy.transfer_token().into(),
+            color_range: profile.range.as_str().into(),
+        }
+    }
+    #[test]
+    fn all_profiles_measure_known_ev_changes_through_the_production_audit() {
+        // This is the real audit_video -> decode_features -> luminance path,
+        // with controlled decoded RGB48 signals from the actual frame converter.
+        for profile in &color_profile::PROFILES {
+            let root = root(profile.id);
+            let video = root.join("output.mp4");
+            fs::write(&video, b"controlled encoded artifact").unwrap();
+            let artifact =
+                crate::video::video_envelope(&video, "video/mp4", "h264", 26, "test", profile)
+                    .unwrap();
+            let mut bytes = Vec::new();
+            for index in 0..26 {
+                let linear = if index % 2 == 0 { 0.18 } else { 0.36 };
+                let code = (linear * 16384.0_f64).round() as u16;
+                let rgb48: Vec<_> = std::iter::repeat_n(code.to_le_bytes(), 192 * 144 * 3)
+                    .flatten()
+                    .collect();
+                let mut converted = Vec::new();
+                profile
+                    .convert_frame(&rgb48, 192, 144, &mut converted)
+                    .unwrap();
+                let decoded: Vec<_> = converted
+                    .iter()
+                    .flat_map(|v| (*v as u16 * 257).to_le_bytes())
+                    .collect();
+                // Quantization-bound comparison in target-linear coordinates.
+                let target = rawtl_linear_video::preview::mat3_vec(
+                    &profile.composed_matrix(),
+                    [code as f64 / 16384.0; 3],
+                );
+                let mut actual = [0.0];
+                luminance(
+                    &[[
+                        u16::from_le_bytes(decoded[0..2].try_into().unwrap()),
+                        u16::from_le_bytes(decoded[2..4].try_into().unwrap()),
+                        u16::from_le_bytes(decoded[4..6].try_into().unwrap()),
+                    ]],
+                    &mut actual,
+                    profile,
+                );
+                let weights = profile.gamut.rgb_to_xyz[1];
+                let expected: f64 = target.iter().zip(weights).map(|(v, w)| v * w).sum();
+                let bound: f64 = converted[..3]
+                    .iter()
+                    .zip(weights)
+                    .map(|(v, w)| {
+                        let signal = *v as f64 / 255.0;
+                        let lo = profile.transfer.inverse(signal - 0.5 / 255.0);
+                        let hi = profile.transfer.inverse(signal + 0.5 / 255.0);
+                        (hi - lo).abs() * w.abs()
+                    })
+                    .sum::<f64>()
+                    + 0.0003; // Published D-Log inverse coefficients have finite precision.
+                assert!(
+                    (actual[0] - expected).abs() <= bound,
+                    "{}: {} vs {} (bound {})",
+                    profile.id,
+                    actual[0],
+                    expected,
+                    bound
+                );
+                bytes.extend_from_slice(&decoded);
+            }
+            fs::write(root.join("decoded.rgb48"), bytes).unwrap();
+            let decoder = root.join("decoder");
+            executable(
+                &decoder,
+                &format!(
+                    "#!/bin/sh\nexec cat '{}'\n",
+                    root.join("decoded.rgb48").display()
+                ),
+            );
+            let prober = root.join("prober");
+            executable(&prober, "#!/bin/sh\nprintf '{\"frames\":[]}'\n");
+            let labels: Vec<_> = (0..26).map(|i| format!("frame-{i}")).collect();
+            let result = audit_video(
+                &decoder,
+                &prober,
+                &artifact,
+                &probe(profile, 26),
+                26,
+                &AuditConfig {
+                    boundaries: &[],
+                    frame_labels: &labels,
+                },
+                &root,
+            )
+            .unwrap();
+            assert_eq!(
+                result.status, "FAIL",
+                "known one-EV changes must be observable: {}",
+                profile.id
+            );
+            let csv = fs::read_to_string(root.join("pairs.csv")).unwrap();
+            for (i, row) in csv.lines().skip(1).enumerate() {
+                let measured: f64 = row.split(',').nth(4).unwrap().parse().unwrap();
+                let expected = if i % 2 == 0 { 1.0 } else { -1.0 };
+                assert!(
+                    (measured - expected).abs() < 0.06,
+                    "{} pair {} measured {} EV",
+                    profile.id,
+                    i,
+                    measured
+                );
+            }
+            let report = fs::read_to_string(root.join("temporal_audit.json")).unwrap();
+            assert!(report.contains("NOT_COMPUTED_STD_ONLY"));
+            assert!(!report.contains("lossless roundtrip"));
+        }
+    }
+
+    #[test]
+    fn identity_conflicts_and_absence_reach_caller_status_without_events() {
+        let root = root("identity-errors");
+        let video = root.join("output.mp4");
+        fs::write(&video, b"artifact").unwrap();
+        for profile in &color_profile::PROFILES {
+            let artifact =
+                crate::video::video_envelope(&video, "video/mp4", "h264", 2, "test", profile)
+                    .unwrap();
+            let mut tags = probe(profile, 2);
+            // Expected-unspecified tags are legal for every vendor Log profile.
+            assert!(resolve_profile(&artifact, &tags).is_ok());
+            tags.color_transfer = "bt709".into();
+            let missing = DataEnvelope::new(
+                artifact.semantic_type(),
+                artifact.payload().clone(),
+                MetadataDoc::new(vec![
+                    ("audit.codec".into(), Json::Str("h264".into())),
+                    ("source.frame_count".into(), Json::Int(2)),
+                ])
+                .unwrap(),
+                artifact.provenance().clone(),
+            )
+            .unwrap();
+            let labels = vec!["a".into(), "b".into()];
+            for (input, expected) in [(&artifact, "ERROR"), (&missing, "UNOBSERVABLE")] {
+                // Neither process exists: resolving identity must precede decode.
+                let err = audit_video(
+                    Path::new("/missing-decoder"),
+                    Path::new("/missing-prober"),
+                    input,
+                    &tags,
+                    2,
+                    &AuditConfig {
+                        boundaries: &[],
+                        frame_labels: &labels,
+                    },
+                    &root,
+                )
+                .err()
+                .unwrap();
+                let summary = crate::deflicker_run::record_audit_failure(&root, &err).unwrap();
+                let persisted =
+                    json::parse(&fs::read_to_string(root.join("temporal_audit.json")).unwrap())
+                        .unwrap();
+                assert_eq!(persisted, summary);
+                assert_eq!(summary.get("status").and_then(Json::as_str), Some(expected));
+                assert!(summary
+                    .get("events")
+                    .and_then(Json::as_array)
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+    }
 }

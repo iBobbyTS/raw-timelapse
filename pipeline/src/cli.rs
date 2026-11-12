@@ -17,7 +17,7 @@ unreliable frames fall back to the global-reference curve; the temporal \
 audit records but never blocks (temporal_quality=report)";
 
 pub const USAGE: &str = "\
-rawtl-linear-video — DNG frame sequence -> scene-linear ACEScg FFV1 video + colour/Log preview
+rawtl-linear-video — DNG frame sequence -> streaming H.264 output.mp4
 (default: V4 deflicker enabled with legacy default parameters)
 
 USAGE:
@@ -55,17 +55,12 @@ OPTIONS:
     --version                  Print version
 
 OUTPUT LAYOUT:
-    <output>/frames/frame_%06d.png|json   per-frame RGB16 scene-linear ACEScg frames + metadata
-    <output>/analysis/                    per-pass analysis sidecars (deflicker enabled)
     <output>/logs/                        per-frame, encoder and audit transcripts
     <output>/exposure_report.json         per-frame exposure decisions and run status
     <output>/exposure-curve.csv           legacy write_curve fields, one row per frame
     <output>/temporal_audit.json          independent encoded-video audit (when enabled)
     <output>/pairs.csv, frames.csv        audit pair/frame evidence
-    <output>/linear-acescg-16bit-ffv1.mkv FFV1 gbrp16le lossless linear video
-    <output>/preview-h264-<transfer>-<gamut>.mp4
-                                          display-referred H.264 review preview
-                                          (default: preview-h264-srgb-bt709.mp4)
+    <output>/output.mp4                  H.264 video in the selected colour/Log profile
     <output>/manifest.json                run provenance and validation record
 ";
 
