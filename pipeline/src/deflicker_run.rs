@@ -190,7 +190,7 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         echo: true,
         echo_tag: "analysis ",
         white_balance: options.white_balance,
-        rev_eng: options.preview_profile.is_rev_eng(),
+        camera_color_method: options.preview_profile.camera_color_method(),
         converter: options.converter.as_deref(),
         converter_timeout: options.converter_timeout,
         log_relative_dir: "logs/analysis",
@@ -745,7 +745,7 @@ fn apply_pass(
         echo: true,
         echo_tag: "render ",
         white_balance: options.white_balance,
-        rev_eng: options.preview_profile.is_rev_eng(),
+        camera_color_method: options.preview_profile.camera_color_method(),
         converter: options.converter.as_deref(),
         converter_timeout: options.converter_timeout,
         log_relative_dir: &log_relative_dir,
@@ -754,7 +754,7 @@ fn apply_pass(
     let mut rendered = Vec::with_capacity(sequence.frames.len());
     for (index, frame) in sequence.frames.iter().enumerate() {
         let applied = parse_measurement(frame, "applied")?;
-        let tiles = applied.output_clip_fraction.len();
+        let tiles = applied.analysis_highlight_fraction.len();
         if tiles == 0 {
             return Err(Error::new(
                 EXIT_FRAME,
@@ -764,19 +764,20 @@ fn apply_pass(
         let base = baseline
             .get(index)
             .ok_or_else(|| Error::new(EXIT_FRAME, "baseline measurement count mismatch"))?;
-        if base.output_clip_fraction.len() != tiles {
+        if base.analysis_highlight_fraction.len() != tiles {
             return Err(Error::new(
                 EXIT_FRAME,
                 format!(
                     "applied analysis tile count {tiles} differs from baseline {} at frame {}",
-                    base.output_clip_fraction.len(),
+                    base.analysis_highlight_fraction.len(),
                     index + 1
                 ),
             ));
         }
         let increase: f64 = (0..tiles)
             .map(|tile| {
-                (applied.output_clip_fraction[tile] - base.output_clip_fraction[tile]).max(0.0)
+                (applied.analysis_highlight_fraction[tile] - base.analysis_highlight_fraction[tile])
+                    .max(0.0)
             })
             .sum::<f64>()
             / tiles as f64;
@@ -787,7 +788,7 @@ fn apply_pass(
             .frames
             .get_mut(index)
         {
-            estimate.new_output_clipping_fraction = Some(increase);
+            estimate.analysis_highlight_increase_fraction = Some(increase);
         }
         rendered.push(applied);
     }
@@ -824,7 +825,7 @@ fn run_gain_probe(
                 echo: false,
                 echo_tag: "probe ",
                 white_balance: options.white_balance,
-                rev_eng: options.preview_profile.is_rev_eng(),
+                camera_color_method: options.preview_profile.camera_color_method(),
                 converter: options.converter.as_deref(),
                 converter_timeout: options.converter_timeout,
                 log_relative_dir: "logs/probe",
@@ -1095,7 +1096,7 @@ impl RunState {
                 residual_mad_ev: None,
                 warnings: vec![],
                 render_target_error_ev: None,
-                new_output_clipping_fraction: None,
+                analysis_highlight_increase_fraction: None,
                 render_ev: Some(0.0),
                 measured_level_ev: None,
                 desired_level_ev: None,
@@ -1143,7 +1144,7 @@ fn write_reports(options: &crate::cli::Options, output: &Path, state: &mut RunSt
         None => {
             // Pre-estimation failure: still leave a report describing the run.
             let root = Json::obj(vec![
-                ("schema_version", Json::Int(1)),
+                ("schema_version", Json::Int(2)),
                 ("run_status", Json::Str(state.run_status.clone())),
                 (
                     "execution_status",
@@ -1230,8 +1231,8 @@ fn write_reports(options: &crate::cli::Options, output: &Path, state: &mut RunSt
         entries.push((
             "clip_semantics".to_string(),
             Json::Str(
-                "new_output_clipping_fraction = sum(max(0, applied.output_clip_fraction - \
-                 baseline.output_clip_fraction)) / tiles; delivered-domain series only"
+                "analysis_highlight_increase_fraction = sum(max(0, applied.analysis_highlight_fraction - \
+                 baseline.analysis_highlight_fraction)) / tiles; analysis-only AP1 threshold occupancy; not final video clipping"
                     .into(),
             ),
         ));
@@ -1330,7 +1331,7 @@ fn curve_csv(frames: &[ReportFrame]) -> String {
         "render_ev",
         "gain",
         "render_target_error_ev",
-        "new_output_clipping_fraction",
+        "analysis_highlight_increase_fraction",
         "measured_level_ev",
         "desired_level_ev",
         "warnings",
@@ -1355,7 +1356,7 @@ fn curve_csv(frames: &[ReportFrame]) -> String {
             csv_number(estimate.render_ev),
             csv_number(estimate.gain()),
             csv_number(estimate.render_target_error_ev),
-            csv_number(estimate.new_output_clipping_fraction),
+            csv_number(estimate.analysis_highlight_increase_fraction),
             csv_number(estimate.measured_level_ev),
             csv_number(estimate.desired_level_ev),
             csv_cell(&estimate.warnings.join(";")),
@@ -1508,7 +1509,7 @@ fn snapshot(state: &RunState, _iteration: usize) -> RoundState {
                     frame.applied_ev,
                     frame.render_ev,
                     frame.render_target_error_ev,
-                    frame.new_output_clipping_fraction,
+                    frame.analysis_highlight_increase_fraction,
                 )
             })
             .collect(),
@@ -1521,7 +1522,7 @@ fn restore(state: &mut RunState, snapshot: RoundState) {
         frame.applied_ev = values.0;
         frame.render_ev = values.1;
         frame.render_target_error_ev = values.2;
-        frame.new_output_clipping_fraction = values.3;
+        frame.analysis_highlight_increase_fraction = values.3;
     }
 }
 
@@ -2013,7 +2014,7 @@ mod tests {
                 residual_mad_ev: None,
                 warnings: vec!["W1".into(), "W2".into()],
                 render_target_error_ev: None,
-                new_output_clipping_fraction: None,
+                analysis_highlight_increase_fraction: None,
                 render_ev: Some(-0.5),
                 measured_level_ev: None,
                 desired_level_ev: None,
@@ -2028,7 +2029,7 @@ mod tests {
             lines.next().expect("header"),
             "index,filename,segment_id,status,valid_tile_count,consensus_fraction,\
              residual_mad_ev,common_residual_ev,cumulative_confirmed_step_ev,requested_ev,\
-             applied_ev,render_ev,gain,render_target_error_ev,new_output_clipping_fraction,\
+             applied_ev,render_ev,gain,render_target_error_ev,analysis_highlight_increase_fraction,\
              measured_level_ev,desired_level_ev,warnings"
         );
         assert_eq!(

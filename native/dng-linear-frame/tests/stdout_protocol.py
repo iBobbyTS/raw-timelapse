@@ -85,7 +85,7 @@ metadata=json.loads(parsed[0][1])
 analysis=json.loads(parsed[1][1])
 assert metadata['analysis_sidecar'] is None
 assert metadata['source']==str(uniform)
-assert analysis['schema_version']==1 and analysis['kind']=='rawtl-analysis-sidecar'
+assert analysis['schema_version']==2 and analysis['kind']=='rawtl-analysis-sidecar'
 assert analysis['source_sha256']==metadata['source_sha256']
 assert b'decoded ' not in r.stdout and b'decoded ' in r.stderr
 
@@ -217,32 +217,33 @@ print('PASS: stdout protocol v1 framing, equivalence, options and failure modes'
 
 # v2 signed FP32 is captured before legacy quantization; both profile methods
 # are checked against an independent matrix product, including EV exactly once.
-for fm in (None,[.7,.1,.1643,.2,.7,.1,.01,.1,.7151]):
-    label='no-fm' if fm is None else 'with-fm'
-    f=make_dng(work,'float-'+label,forward=fm,model='Canon EOS Test',w=64,h=64,pixels=[0,1000,0]*4096)
-    r=stream([exe,'--stdout-frame-f32',f,'--camera-color-method','dng-camera-to-pcs','--exposure-ev','5'])
-    assert r.stdout[:8]==b'RAWTLST2'
-    parsed=records(b'RAWTLST1'+r.stdout[8:])
-    assert [t for t,_ in parsed]==[1,3,4]
-    meta,desc=json.loads(parsed[0][1]),json.loads(parsed[1][1])
-    assert meta['color']['method_requested']=='dng-camera-to-pcs'
-    assert meta['color']['forward_matrix_used']==(fm is not None)
-    assert meta['color']['method_effective']==('dng-camera-to-pcs-forward-matrix' if fm else 'dng-camera-to-pcs-inverse-fallback')
-    assert meta['color']['camera_model']=='Canon EOS Test'
-    assert meta['color']['profile_fingerprint']
-    assert meta['quantization']['negative_policy']=='preserve'
-    assert meta['quantization']['upper_policy']=='preserve'
-    assert (desc['pixel_format'],desc['byte_length'],desc['space'],desc['transfer'])==('rgbf32le',64*64*12,'AP1/D60','linear')
-    assert desc['pixels_sha256']==hashlib.sha256(parsed[2][1]).hexdigest()
-    expected=[row[1]*32 for row in meta['color']['camera_to_acescg']]
-    expected_bytes=struct.pack('<3f',*expected)*4096
-    assert parsed[2][1]==expected_bytes
-    assert max(expected)>4
-    if fm is None: assert min(expected)<0  # a value RGB48 would irreversibly clip
-    # Analysis uses the same selected matrix, keeping its lightweight v1 records.
-    a=stream([exe,'--stdout-analysis',f,'--camera-color-method','dng-camera-to-pcs'])
-    am=json.loads(records(a.stdout)[0][1])
-    assert am['color']==meta['color']
+for method in ('legacy-inverse-cm','dng-camera-to-pcs'):
+    for fm in (None,[.7,.1,.1643,.2,.7,.1,.01,.1,.7151]):
+        label='no-fm' if fm is None else 'with-fm'
+        f=make_dng(work,'float-'+label,forward=fm,model='Canon EOS Test',w=64,h=64,pixels=[0,1000,0]*4096)
+        r=stream([exe,'--stdout-frame-f32',f,'--camera-color-method',method,'--exposure-ev','5'])
+        assert r.stdout[:8]==b'RAWTLST2'
+        parsed=records(b'RAWTLST1'+r.stdout[8:])
+        assert [t for t,_ in parsed]==[1,3,4]
+        meta,desc=json.loads(parsed[0][1]),json.loads(parsed[1][1])
+        assert meta['color']['method_requested']==method
+        assert meta['color']['forward_matrix_used']==(fm is not None and method=='dng-camera-to-pcs')
+        assert meta['color']['method_effective']==(('dng-camera-to-pcs-forward-matrix' if fm else 'dng-camera-to-pcs-inverse-fallback') if method=='dng-camera-to-pcs' else 'legacy-inverse-cm')
+        assert meta['color']['camera_model']=='Canon EOS Test'
+        assert meta['color']['profile_fingerprint']
+        assert meta['quantization']['negative_policy']=='preserve'
+        assert meta['quantization']['upper_policy']=='preserve'
+        assert (desc['pixel_format'],desc['byte_length'],desc['space'],desc['transfer'])==('rgbf32le',64*64*12,'AP1/D60','linear')
+        assert desc['pixels_sha256']==hashlib.sha256(parsed[2][1]).hexdigest()
+        expected=[row[1]*32 for row in meta['color']['camera_to_acescg']]
+        expected_bytes=struct.pack('<3f',*expected)*4096
+        assert parsed[2][1]==expected_bytes
+        assert max(expected)>4
+        if fm is None: assert min(expected)<0  # a value RGB48 would irreversibly clip
+        # Analysis uses the same selected matrix, keeping its lightweight v1 records.
+        a=stream([exe,'--stdout-analysis',f,'--camera-color-method',method])
+        am=json.loads(records(a.stdout)[0][1])
+        assert am['color']==meta['color']
 
 stream([exe,'--stdout-frame-f32',base,'--camera-color-method','bogus'],2)
 print('Signed FP32 / CameraToPCS conformance passed',flush=True)

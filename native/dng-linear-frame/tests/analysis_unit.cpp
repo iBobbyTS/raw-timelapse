@@ -183,7 +183,7 @@ int main() {
     for (int c = 0; c < 3; ++c)
       close(*tile.channel_log_means[size_t(c)], -2.0, 1e-12,
             "channel log mean");
-    close(tile.output_clip_fraction, 0.0, 0, "no delivered clipping");
+    close(tile.analysis_highlight_fraction, 0.0, 0, "no delivered clipping");
   }
   // Channel-mean floor: log2(max(mean, 1e-9)).
   auto blue = uniform(64, 64, Pixel{0.0f, 0.5f, 0.5f});
@@ -191,12 +191,12 @@ int main() {
   close(*blue_result.tiles[0].channel_log_means[0], std::log2(1e-9), 1e-12,
         "channel mean floor");
 
-  // Delivered clip predicate is exactly quantize(code) >= 16057.
-  float exact = float(16056.5 / 16384.0);
-  check(delivered_clip(exact) == (quantize(exact) >= kOutputClipCode),
-        "clip predicate matches quantization");
-  check(delivered_clip(exact), "exact threshold code counts");
-  check(!delivered_clip(std::nextafter(exact, 0.0f)),
+  // Highlight threshold preserves the legacy gate numerically without quantizing pixels.
+  float exact = float(kHighlightThreshold);
+  check(analysis_highlight(8.0f) && !analysis_highlight(-0.01f),
+        "highlight predicate accepts unbounded signed FP32");
+  check(analysis_highlight(exact), "exact threshold code counts");
+  check(!analysis_highlight(std::nextafter(exact, 0.0f)),
         "one float step below threshold does not count");
 
   // EV equivariance plus two-series separation (camera mask vs delivered clip).
@@ -225,8 +225,8 @@ int main() {
   auto nw0 = measure(near_white.d, near_white.scene, {}, 0);
   auto nw_up = measure(near_white_up.d, near_white_up.scene, {}, 0.5);
   for (size_t i = 0; i < nw0.tiles.size(); ++i) {
-    close(nw0.tiles[i].output_clip_fraction, 0.0, 0, "no clip at 0 EV");
-    close(nw_up.tiles[i].output_clip_fraction, 1.0, 0,
+    close(nw0.tiles[i].analysis_highlight_fraction, 0.0, 0, "no clip at 0 EV");
+    close(nw_up.tiles[i].analysis_highlight_fraction, 1.0, 0,
           "+0.5 EV clips near-white tiles");
     close(nw_up.tiles[i].saturation_fraction, 0.0, 0,
           "camera mask unaffected by gain");
@@ -236,15 +236,20 @@ int main() {
       64, 64, [](int, int) { return Pixel{0.9f, 0.9f, 0.9f}; },
       [](int, int) { return Pixel{0.0f, 0.0f, float(16056.5 / 16384.0)}; });
   auto mixed_result = measure(mixed.d, mixed.scene, {}, 0);
-  close(mixed_result.tiles[0].output_clip_fraction, 1.0, 0,
+  close(mixed_result.tiles[0].analysis_highlight_fraction, 1.0, 0,
         "single clipped channel occupies the tile");
 
   auto sidecar = sidecar_json(plain_result, "abc");
   check(sidecar.text.find("\"saturation_mask_quality\":\"camera_domain\"") !=
             std::string::npos,
         "sidecar mask label");
-  check(sidecar.text.find("\"schema_version\":1") != std::string::npos,
+  check(sidecar.text.find("\"schema_version\":2") != std::string::npos,
         "sidecar schema");
+  check(sidecar.text.find("quantum_linear") == std::string::npos &&
+        sidecar.text.find("output_clip") == std::string::npos,
+        "analysis does not claim integer precision or final output clipping");
+  check(sidecar.text.find("analysis_ap1_threshold") != std::string::npos,
+        "analysis-only highlight contract");
   std::cout << "analysis measurement, downsample, gate and EV checks passed\n";
   return 0;
 }

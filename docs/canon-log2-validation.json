@@ -135,5 +135,130 @@
   "final_build_sha256": {
     "pipeline/target/release/rawtl-linear-video": "95dc5855cbd418cef83d61d7315d98d11273b14ef01433badb4f2678d73a4fcd",
     "native/build/dng-linear-frame": "d94f682d6ccde55d4bcaa9c292d0587fd7d7633af44450b6346d315833adf730"
+  },
+  "initial_runs_status": "Historical dual-profile baseline before universal FP32 migration",
+  "fp32_migration": {
+    "baseline_commit": "5d8b152743fa022b08c8b2a1fed7b96202ea3338",
+    "input": "/Users/ibobby/Temp/tl/pair/test/R7_L2219.CR3",
+    "source_sha256": "26c4447b73d85c0f03ba6511bd8c5ea3dcb9b6685a9ef7a526864100847ae868",
+    "runs": [
+      {
+        "profile": "canon-log2-cinema-gamut",
+        "output": "/private/tmp/rawtl-fp32-validation-20261112/white-paper",
+        "seconds": 5.8947861659980845,
+        "manifest_schema": 2,
+        "pipeline_revision": 2,
+        "pixels_sha256": "9bd5688b5faf231c551704bdb81948a0e3731f10ce88ba0343929ce6e3b28f06",
+        "method": "legacy-inverse-cm",
+        "negative_samples_preserved": 70878,
+        "scene_min": -0.011023623868823051,
+        "scene_max": 2.987767457962036,
+        "final_signal_clipping": {
+          "below_domain_samples": 0,
+          "above_domain_samples": 0
+        },
+        "native_bytes": 390545280,
+        "video_sha256": "30793a10d30dc5988468745d712ca5beecd4819aa3e7e788ae831a672089c06c",
+        "video_bytes": 151338,
+        "ffprobe": {
+          "programs": [],
+          "stream_groups": [],
+          "streams": [
+            {
+              "codec_name": "h264",
+              "width": 4096,
+              "height": 2734,
+              "pix_fmt": "yuvj420p",
+              "nb_frames": "1"
+            }
+          ]
+        }
+      },
+      {
+        "profile": "canon-log2-cinema-gamut-rev-eng-crm-dev",
+        "output": "/private/tmp/rawtl-fp32-validation-20261112/rev-eng",
+        "seconds": 3.7970446670078672,
+        "manifest_schema": 2,
+        "pipeline_revision": 2,
+        "pixels_sha256": "114167e19f1dd7a8d446cf69a7b406ee75803e5a42c2d0bc5aba947ecc7e7881",
+        "method": "dng-camera-to-pcs-forward-matrix",
+        "negative_samples_preserved": 445,
+        "scene_min": -1.944551695487462e-05,
+        "scene_max": 2.340156078338623,
+        "final_signal_clipping": {
+          "below_domain_samples": 0,
+          "above_domain_samples": 0
+        },
+        "native_bytes": 390545280,
+        "video_sha256": "863da3dcb1fca9d6aa12986898c9631a83c88d7146542f957e205af48457a1da",
+        "video_bytes": 142489,
+        "ffprobe": {
+          "programs": [],
+          "stream_groups": [],
+          "streams": [
+            {
+              "codec_name": "h264",
+              "width": 4096,
+              "height": 2734,
+              "pix_fmt": "yuvj420p",
+              "nb_frames": "1"
+            }
+          ]
+        }
+      },
+      {
+        "profile": "srgb-preview",
+        "output": "/private/tmp/rawtl-fp32-validation-20261112/srgb",
+        "seconds": 3.7633474160102196,
+        "manifest_schema": 2,
+        "pipeline_revision": 2,
+        "pixels_sha256": "9bd5688b5faf231c551704bdb81948a0e3731f10ce88ba0343929ce6e3b28f06",
+        "method": "legacy-inverse-cm",
+        "negative_samples_preserved": 70878,
+        "scene_min": -0.011023623868823051,
+        "scene_max": 2.987767457962036,
+        "final_signal_clipping": {
+          "below_domain_samples": 294239,
+          "above_domain_samples": 7815
+        },
+        "native_bytes": 390545280,
+        "video_sha256": "a0356ba96417bb5e7e3ba3ecf96a57326b559f90e063e27283d810cbffe3c6bd",
+        "video_bytes": 261163,
+        "ffprobe": {
+          "programs": [],
+          "stream_groups": [],
+          "streams": [
+            {
+              "codec_name": "h264",
+              "width": 4096,
+              "height": 2734,
+              "pix_fmt": "yuv420p",
+              "nb_frames": "1"
+            }
+          ]
+        }
+      }
+    ],
+    "tests": {
+      "rust_library": 143,
+      "rust_binary": 63,
+      "rust_cli": 38,
+      "rust_doc": 3,
+      "rust_total": 247,
+      "native_ctest_groups": 4,
+      "corrupt_contract_cases": 86,
+      "rust_log": "/private/tmp/rawtl-f32-final-tests.log",
+      "native_log": "/private/tmp/rawtl-f32-native-final.log"
+    },
+    "command_template": "pipeline/target/release/rawtl-linear-video --input /private/tmp/rawtl-fp32-validation-20261112/input --output <empty-output> --preview-profile <profile> --strength 0",
+    "limits": [
+      "Single real source frame with strength=0: does not establish temporal quality or colorimetric accuracy",
+      "Hardware H264 remains 8bit 4:2:0; FP32 is the scene-linear intermediate",
+      "Observed timings include converter startup/cache differences and are not comparative benchmarks"
+    ],
+    "binaries": {
+      "native/build/dng-linear-frame": "c0203d1779e7b081e49766bcad89874ef8f9647824cce4f47ea354fa54abd8df",
+      "pipeline/target/release/rawtl-linear-video": "bf8bfd4e2ea4e5485075c12c304904397ec3bf7276a79432f159988ed101b612"
+    }
   }
 }

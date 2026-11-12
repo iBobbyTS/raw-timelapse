@@ -7,7 +7,7 @@ pub struct FrameMeasurement {
     pub valid: Vec<bool>,
     pub centers: Vec<[f64; 2]>,
     pub saturation_fraction: Vec<f64>,
-    pub output_clip_fraction: Vec<f64>,
+    pub analysis_highlight_fraction: Vec<f64>,
     pub width: usize,
     pub height: usize,
     pub grid_nx: usize,
@@ -26,7 +26,7 @@ impl FrameMeasurement {
             || self.valid.len() != k
             || self.centers.len() != k
             || self.saturation_fraction.len() != k
-            || self.output_clip_fraction.len() != k
+            || self.analysis_highlight_fraction.len() != k
             || self.width == 0
             || self.height == 0
             || self
@@ -47,9 +47,12 @@ impl FrameMeasurement {
             if self.centers[i]
                 .iter()
                 .any(|v| !v.is_finite() || !(0. ..=1.).contains(v))
-                || [self.saturation_fraction[i], self.output_clip_fraction[i]]
-                    .iter()
-                    .any(|v| !v.is_finite() || !(0. ..=1.).contains(v))
+                || [
+                    self.saturation_fraction[i],
+                    self.analysis_highlight_fraction[i],
+                ]
+                .iter()
+                .any(|v| !v.is_finite() || !(0. ..=1.).contains(v))
             {
                 return Err("invalid measurement geometry or occupancy".into());
             }
@@ -63,11 +66,11 @@ pub struct AnalysisSidecar {
     pub roi: [f64; 4],
     pub roi_pixel_bounds: [usize; 4],
     pub luma_weights: [f64; 3],
-    pub quantum_linear: f64,
+    pub highlight_threshold_linear: f64,
     pub floor: f64,
     pub exposure_ev: f64,
     pub analysis_domain: String,
-    pub output_clip_quality: String,
+    pub highlight_quality: String,
 }
 fn field<'a>(j: &'a Json, k: &str) -> Result<&'a Json> {
     j.get(k).ok_or_else(|| format!("missing {k}"))
@@ -106,7 +109,7 @@ impl AnalysisSidecar {
         Self::from_json(&json::parse(text)?)
     }
     pub fn from_json(j: &Json) -> Result<Self> {
-        if field(j, "schema_version")?.as_u64() != Some(1)
+        if field(j, "schema_version")?.as_u64() != Some(2)
             || field(j, "kind")?.as_str() != Some("rawtl-analysis-sidecar")
         {
             return Err("unsupported analysis schema".into());
@@ -118,7 +121,7 @@ impl AnalysisSidecar {
             valid: vec![],
             centers: vec![],
             saturation_fraction: vec![],
-            output_clip_fraction: vec![],
+            analysis_highlight_fraction: vec![],
             width: uint(field(a, "downsampled_width")?)?,
             height: uint(field(a, "downsampled_height")?)?,
             grid_nx: uint(field(a, "grid_nx")?)?,
@@ -143,8 +146,8 @@ impl AnalysisSidecar {
             m.centers.push(numbers(field(t, "center")?)?);
             m.saturation_fraction
                 .push(num(field(t, "saturation_fraction")?)?);
-            m.output_clip_fraction
-                .push(num(field(t, "output_clip_fraction")?)?);
+            m.analysis_highlight_fraction
+                .push(num(field(t, "analysis_highlight_fraction")?)?);
             samples.push(
                 arr(field(t, "structure_samples")?)?
                     .iter()
@@ -179,13 +182,13 @@ impl AnalysisSidecar {
             roi: numbers(field(a, "roi")?)?,
             roi_pixel_bounds: bounds,
             luma_weights: numbers(field(a, "luma_weights")?)?,
-            quantum_linear: num(field(a, "quantum_linear")?)?,
+            highlight_threshold_linear: num(field(a, "highlight_threshold_linear")?)?,
             floor: num(field(a, "floor")?)?,
             exposure_ev: num(field(a, "exposure_ev")?)?,
             analysis_domain: string(field(a, "analysis_domain")?)?,
-            output_clip_quality: string(field(a, "output_clip_quality")?)?,
+            highlight_quality: string(field(a, "highlight_quality")?)?,
         };
-        if out.quantum_linear <= 0.
+        if out.highlight_threshold_linear <= 0.
             || out.floor <= 0.
             || out.roi[0] < 0.
             || out.roi[1] < 0.
