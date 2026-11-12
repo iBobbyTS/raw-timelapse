@@ -8,6 +8,7 @@
 
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const MAX_EDGE: u32 = 1024;
@@ -44,6 +45,13 @@ struct Config {
     analysis_omit_kind: bool,
     /// Report an analysis source hash that differs from the frame metadata.
     analysis_sha_mismatch: bool,
+    bad_magic: bool,
+    short_pixels: bool,
+    stall_pixels: bool,
+    omit_metadata: bool,
+    descriptor_geometry_mismatch: bool,
+    nonzero_after_records: bool,
+    frame_fail_on: Option<String>,
     frames: Vec<FrameSpec>,
 }
 
@@ -59,6 +67,7 @@ struct Options {
     emit_analysis: Option<PathBuf>,
     analysis_roi: [f64; 4],
     no_png: bool,
+    stdout_mode: Option<String>,
 }
 
 fn main() {
@@ -82,6 +91,19 @@ fn run() -> Result<(), (i32, String)> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| (3, "input has no file name".to_string()))?
         .to_string();
+    if let Ok(path) = env::var("FAKE_NATIVE_PIDS") {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(f, "{}", std::process::id()).unwrap();
+    }
+    if options.stdout_mode.as_deref() == Some("--stdout-frame")
+        && config.frame_fail_on.as_deref() == Some(&name)
+    {
+        return Err((3, "synthetic mid-run frame failure".into()));
+    }
     if let Some(failing) = &config.fail_on {
         if failing == &name {
             return Err((3, "synthetic frame failure".to_string()));
@@ -108,9 +130,15 @@ fn run() -> Result<(), (i32, String)> {
         format!("fake-{:016x}", fnv1a(read_file(&options.input)?))
     };
     let gain = options.exposure_ev.exp2();
-    let tiles = tile_levels(&config, spec, options.exposure_ev, options.no_png);
+    let tiles = tile_levels(
+        &config,
+        spec,
+        options.exposure_ev,
+        options.stdout_mode.as_deref() == Some("--stdout-analysis")
+            && (options.exposure_ev == 0.0 || options.exposure_ev.abs() == 0.25),
+    );
 
-    if !options.no_png {
+    if !options.no_png && options.stdout_mode.is_none() {
         match (&spec.fixture, options.exposure_ev) {
             (Some(fixture), ev) if ev == 0.0 => {
                 fs::copy(fixture, &options.png)
@@ -144,31 +172,119 @@ fn run() -> Result<(), (i32, String)> {
         own = spec.own_neutral,
         ev = options.exposure_ev,
     );
-    fs::write(&options.json, metadata)
-        .map_err(|err| (5, format!("cannot write metadata: {err}")))?;
-
-    if let Some(path) = &options.emit_analysis {
-        let sidecar = sidecar_json(&config, spec, &tiles, &source_sha, &options, gain);
-        fs::write(path, sidecar)
-            .map_err(|err| (5, format!("cannot write analysis sidecar: {err}")))?;
+    let metadata = if config.omit_metadata {
+        metadata.replace(&format!("\"width\":{},", config.width), "")
+    } else {
+        metadata
+    };
+    if let Some(mode) = &options.stdout_mode {
+        let mut out = std::io::stdout().lock();
+        out.write_all(if config.bad_magic {
+            b"BADMAGIC"
+        } else {
+            b"RAWTLST1"
+        })
+        .unwrap();
+        record(&mut out, 1, metadata.as_bytes())?;
+        if mode == "--stdout-analysis" {
+            record(
+                &mut out,
+                2,
+                sidecar_json(&config, spec, &tiles, &source_sha, &options, gain).as_bytes(),
+            )?;
+        } else {
+            let desc = format!("{{\"width\":{},\"height\":{},\"pixel_format\":\"rgb48le\",\"pixels_sha256\":\"{}\"}}", if config.descriptor_geometry_mismatch {config.width+1} else {config.width}, config.height, "a".repeat(64));
+            record(&mut out, 3, desc.as_bytes())?;
+            if config.stall_pixels {
+                out.flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+            let mut pixels = Vec::new();
+            if let Some(fixture) = &spec.fixture {
+                let decoded =
+                    std::process::Command::new("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg")
+                        .args([
+                            "-v", "error", "-nostdin", "-i", fixture, "-pix_fmt", "rgb48le", "-f",
+                            "rawvideo", "-",
+                        ])
+                        .output()
+                        .unwrap();
+                if !decoded.status.success() {
+                    return Err((5, "fixture decode failed".into()));
+                }
+                for code in decoded.stdout.chunks_exact(2) {
+                    let value = u16::from_le_bytes([code[0], code[1]]) as f64
+                        * (options.exposure_ev * config.gain_scale).exp2();
+                    pixels
+                        .extend_from_slice(&(value.round().clamp(0., 65535.) as u16).to_le_bytes());
+                }
+            } else {
+                for y in 0..config.height {
+                    for x in 0..config.width {
+                        let j = y as usize * config.grid_ny / config.height as usize;
+                        let i = x as usize * config.grid_nx / config.width as usize;
+                        let code = quantize(tiles[j * config.grid_nx + i].0.exp2());
+                        for _ in 0..3 {
+                            pixels.extend_from_slice(&code.to_le_bytes());
+                        }
+                    }
+                }
+            }
+            if config.short_pixels {
+                out.write_all(&[4, 0, 0, 0]).unwrap();
+                out.write_all(&(pixels.len() as u64).to_le_bytes()).unwrap();
+                out.write_all(&pixels[..pixels.len() - 1]).unwrap();
+            } else {
+                record(&mut out, 4, &pixels)?;
+            }
+        }
+        out.flush().map_err(|e| (50, e.to_string()))?;
+        if config.nonzero_after_records {
+            return Err((3, "synthetic failure after complete records".into()));
+        }
+    } else {
+        fs::write(&options.json, metadata).map_err(|e| (5, e.to_string()))?;
+        if let Some(path) = &options.emit_analysis {
+            fs::write(
+                path,
+                sidecar_json(&config, spec, &tiles, &source_sha, &options, gain),
+            )
+            .map_err(|e| (5, e.to_string()))?;
+        }
     }
     Ok(())
 }
 
 fn parse_args() -> Result<Options, (i32, String)> {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.len() < 3 {
-        return Err((2, "expected <input> <png> <json>".to_string()));
-    }
-    let input = PathBuf::from(&args[0]);
-    let png = PathBuf::from(&args[1]);
-    let json = PathBuf::from(&args[2]);
+    let stdout_mode = args
+        .first()
+        .filter(|s| s.as_str() == "--stdout-analysis" || s.as_str() == "--stdout-frame")
+        .cloned();
+    let (input, png, json, start) = if stdout_mode.is_some() {
+        (
+            PathBuf::from(args.get(1).ok_or((2, "missing input".into()))?),
+            PathBuf::new(),
+            PathBuf::new(),
+            2,
+        )
+    } else {
+        if args.len() < 3 {
+            return Err((2, "expected input png json".into()));
+        }
+        (
+            PathBuf::from(&args[0]),
+            PathBuf::from(&args[1]),
+            PathBuf::from(&args[2]),
+            3,
+        )
+    };
     let mut white_balance = None;
     let mut exposure_ev = 0.0;
     let mut emit_analysis = None;
     let mut analysis_roi = [0.0, 0.0, 1.0, 1.0];
     let mut no_png = false;
-    let mut index = 3;
+    let mut index = start;
     while index < args.len() {
         match args[index].as_str() {
             "--white-balance" => {
@@ -219,6 +335,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
         emit_analysis,
         analysis_roi,
         no_png,
+        stdout_mode,
     })
 }
 
@@ -245,6 +362,13 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
         empty_source_sha256: false,
         analysis_omit_kind: false,
         analysis_sha_mismatch: false,
+        bad_magic: false,
+        short_pixels: false,
+        stall_pixels: false,
+        omit_metadata: false,
+        descriptor_geometry_mismatch: false,
+        nonzero_after_records: false,
+        frame_fail_on: None,
         frames: vec![],
     };
     for line in text.lines() {
@@ -284,6 +408,13 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
             return Err((2, format!("invalid config line: {line}")));
         };
         match key {
+            "bad_magic" => config.bad_magic = value == "1",
+            "stall_pixels" => config.stall_pixels = value == "1",
+            "short_pixels" => config.short_pixels = value == "1",
+            "descriptor_geometry_mismatch" => config.descriptor_geometry_mismatch = value == "1",
+            "omit_metadata" => config.omit_metadata = value == "1",
+            "nonzero_after_records" => config.nonzero_after_records = value == "1",
+            "frame_fail_on" => config.frame_fail_on = Some(value.into()),
             "width" => config.width = value.parse().map_err(|_| (2, "bad width".into()))?,
             "height" => config.height = value.parse().map_err(|_| (2, "bad height".into()))?,
             "grid_nx" => config.grid_nx = value.parse().map_err(|_| (2, "bad grid_nx".into()))?,
@@ -550,4 +681,11 @@ fn json_string(text: &str) -> String {
     }
     out.push('"');
     out
+}
+
+fn record(out: &mut impl Write, kind: u8, bytes: &[u8]) -> Result<(), (i32, String)> {
+    out.write_all(&[kind, 0, 0, 0])
+        .and_then(|_| out.write_all(&(bytes.len() as u64).to_le_bytes()))
+        .and_then(|_| out.write_all(bytes))
+        .map_err(|e| (50, e.to_string()))
 }

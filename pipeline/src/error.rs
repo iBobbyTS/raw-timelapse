@@ -9,6 +9,7 @@ pub const EXIT_OUTPUT_GUARD: i32 = 11;
 pub const EXIT_OUTPUT_NOT_EMPTY: i32 = 12;
 pub const EXIT_TOOL: i32 = 20;
 pub const EXIT_FRAME: i32 = 30;
+#[allow(dead_code)] // Reserved legacy family; default H.264 encoding uses 60.
 pub const EXIT_ENCODE: i32 = 40;
 pub const EXIT_VALIDATION: i32 = 50;
 pub const EXIT_PREVIEW: i32 = 60;
@@ -17,9 +18,8 @@ pub const EXIT_PUBLISH: i32 = 70;
 pub const EXIT_GAIN_PROBE: i32 = 81;
 /// Render-validation internal invariants (never a publication gate).
 pub const EXIT_RENDER_VALIDATION: i32 = 82;
-/// Internal to the audit module; every audit error is degraded to an
-/// UNOBSERVABLE warning by the caller, so the audit verdict never gates
-/// publication and this code never becomes the process exit code.
+/// Internal audit failures become ERROR or UNOBSERVABLE report states;
+/// audit verdicts never gate publication or become the process exit code.
 pub const EXIT_AUDIT: i32 = 83;
 
 #[derive(Debug, Clone)]

@@ -1,9 +1,8 @@
-//! Linear video encoding, probe validation, lossless roundtrip and atomic
-//! publication, plus the display-referred/camera-Log preview pipeline.
+//! Streaming RGB frame conversion, H.264 encoding, validation and publication.
 
 use crate::cli::Fps;
 use crate::color_profile::{ColorProfile, TagPolicy};
-use crate::error::{Error, Result, EXIT_ENCODE, EXIT_PREVIEW, EXIT_PUBLISH, EXIT_VALIDATION};
+use crate::error::{Error, Result, EXIT_PREVIEW, EXIT_PUBLISH, EXIT_VALIDATION};
 use crate::json::Json;
 use crate::proc;
 use crate::transport::{
@@ -11,37 +10,27 @@ use crate::transport::{
     NdArray, Payload, Provenance, RGB24_FRAME, RGB48_FRAME, VIDEO_ARTIFACT,
 };
 use std::fs;
-use std::io::{BufWriter, Read, Write};
+use std::io::Write;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-pub const LINEAR_CODEC: &str = "ffv1";
-pub const LINEAR_PIX_FMT: &str = "gbrp16le";
 pub const PREVIEW_CODEC: &str = "h264";
 pub const PREVIEW_PIX_FMT: &str = "yuv420p";
-pub const LINEAR_MEDIA_TYPE: &str = "video/x-matroska";
 pub const PREVIEW_MEDIA_TYPE: &str = "video/mp4";
 
-/// The preview pipe decodes the linear master into scene-linear ACEScg codes.
+/// Native stdout supplies scene-linear ACEScg codes.
 /// RGB24 frames leaving the CPU conversion are described by the profile's
 /// transfer and gamut names.
 const SCENE_LINEAR_SPACE: &str = "ACEScg AP1/D60 scene-linear";
 const SCENE_LINEAR_TRANSFER: &str = "linear";
-const RGB48_PRODUCER: &str = "ffmpeg rgb48le decoder";
 const RGB24_PRODUCER: &str = "rawtl preview colour conversion";
 
-pub const LINEAR_FINAL_NAME: &str = "linear-acescg-16bit-ffv1.mkv";
-
-pub fn preview_final_name(profile: &ColorProfile) -> &'static str {
-    profile.preview_filename
-}
+pub const FINAL_NAME: &str = "output.mp4";
 
 /// macOS VideoToolbox hardware H.264 rejects source widths above 4096
 /// (`cannot create compression session: -12903`), so the display-referred
-/// preview is proportionally downscaled to this width. The FFV1 master is
-/// never scaled.
+/// output is proportionally downscaled to this width.
 pub const PREVIEW_MAX_WIDTH: u32 = 4096;
 
 /// Applied preview geometry for one source frame size.
@@ -174,21 +163,6 @@ fn array_bytes(envelope: &DataEnvelope) -> &[u8] {
     }
 }
 
-fn typed_frame_error(
-    err: transport::TransportError,
-    stream: &str,
-    index: usize,
-    count: usize,
-) -> Error {
-    Error::new(
-        EXIT_VALIDATION,
-        format!(
-            "decoded frame {}/{count} from {stream} is not a valid RGB48 typed frame: {err}",
-            index + 1
-        ),
-    )
-}
-
 /// Build the typed handoff for an encoded deliverable. `audit` consumes the
 /// same envelope, and `publish` renames the referenced file.
 pub fn video_envelope(
@@ -197,9 +171,16 @@ pub fn video_envelope(
     codec: &str,
     frame_count: u64,
     producer: &str,
+    profile: &ColorProfile,
 ) -> transport::Result<DataEnvelope> {
     let artifact = DiskArtifact::new(path, media_type, file_size(path), None)?;
     let metadata = MetadataDoc::new(vec![
+        ("color.profile".into(), Json::Str(profile.id.into())),
+        (
+            "color.transfer".into(),
+            Json::Str(profile.transfer.name().into()),
+        ),
+        ("color.space".into(), Json::Str(profile.gamut.name.into())),
         ("audit.codec".to_string(), Json::Str(codec.to_string())),
         (
             "source.frame_count".to_string(),
@@ -377,61 +358,6 @@ pub fn probe_stream(ffprobe: &Path, file: &Path) -> Result<ProbeInfo> {
     })
 }
 
-pub fn validate_linear(
-    probe: &ProbeInfo,
-    width: u32,
-    height: u32,
-    count: usize,
-    fps: Fps,
-) -> Result<()> {
-    if probe.codec_name != LINEAR_CODEC {
-        return Err(Error::new(
-            EXIT_VALIDATION,
-            format!(
-                "linear video codec is {:?}, expected {:?}",
-                probe.codec_name, LINEAR_CODEC
-            ),
-        ));
-    }
-    if probe.pix_fmt != LINEAR_PIX_FMT {
-        return Err(Error::new(
-            EXIT_VALIDATION,
-            format!(
-                "linear video pixel format is {:?}, expected {:?} (16-bit lossless RGB)",
-                probe.pix_fmt, LINEAR_PIX_FMT
-            ),
-        ));
-    }
-    if probe.width != width || probe.height != height {
-        return Err(Error::new(
-            EXIT_VALIDATION,
-            format!(
-                "linear video is {}x{}, expected {}x{}",
-                probe.width, probe.height, width, height
-            ),
-        ));
-    }
-    if probe.frames != count as u64 {
-        return Err(Error::new(
-            EXIT_VALIDATION,
-            format!(
-                "linear video has {} frames, expected {}",
-                probe.frames, count
-            ),
-        ));
-    }
-    if !rate_matches(&probe.avg_frame_rate, fps) {
-        return Err(Error::new(
-            EXIT_VALIDATION,
-            format!(
-                "linear video frame rate is {:?}, expected {}/{}",
-                probe.avg_frame_rate, fps.num, fps.den
-            ),
-        ));
-    }
-    Ok(())
-}
-
 pub fn validate_preview(
     ffprobe: &Path,
     ffmpeg: &Path,
@@ -510,7 +436,12 @@ pub fn validate_preview(
         ),
         ("color_range", profile.range.as_str(), &probe.color_range),
     ] {
-        let matches = observed == expected || (expected == "unknown" && observed.is_empty());
+        let matches = observed == expected
+            || (expected == "unknown"
+                && matches!(
+                    observed.as_str(),
+                    "" | "unknown" | "unspecified" | "reserved"
+                ));
         if !matches {
             return Err(Error::new(EXIT_PREVIEW, format!(
                 "preview {field} is {observed:?}, expected {expected:?} for {} (per-field colour contract)", profile.id
@@ -544,271 +475,148 @@ pub fn validate_preview(
     Ok(probe)
 }
 
-pub fn encode_linear(
-    ffmpeg: &Path,
-    frames_dir: &Path,
-    count: usize,
-    fps: Fps,
+/// Start with the first frame's validated metadata/descriptor, then retain only
+/// one RGB48 and one RGB24 backing allocation per frame. The encoder owns no
+/// input file; closing stdin is the end-of-sequence signal.
+pub fn encode_stream(
+    context: &crate::RunContext<'_>,
+    evs: &[f64],
     output: &Path,
-    log_path: &Path,
-) -> Result<()> {
-    let pattern = frames_dir.join("frame_%06d.png");
-    let args = vec![
-        "-hide_banner".to_string(),
-        "-nostdin".to_string(),
-        "-v".to_string(),
-        "error".to_string(),
-        "-framerate".to_string(),
-        fps.arg(),
-        "-start_number".to_string(),
-        "1".to_string(),
-        "-i".to_string(),
-        pattern.display().to_string(),
-        "-frames:v".to_string(),
-        count.to_string(),
-        "-c:v".to_string(),
-        LINEAR_CODEC.to_string(),
-        "-level".to_string(),
-        "3".to_string(),
-        "-g".to_string(),
-        "1".to_string(),
-        "-slicecrc".to_string(),
-        "1".to_string(),
-        "-pix_fmt".to_string(),
-        LINEAR_PIX_FMT.to_string(),
-        "-map_metadata".to_string(),
-        "-1".to_string(),
-        "-f".to_string(),
-        "matroska".to_string(),
-        output.display().to_string(),
-    ];
-    let command = proc::display_command(ffmpeg, &args);
-    let captured = proc::run_capture(ffmpeg, &args, EXIT_ENCODE)?;
-    write_log(
-        log_path,
-        &format!(
-            "command: {command}\nexit: {} ({:.3}s)\nstdout:\n{}\nstderr:\n{}\n",
-            proc::exit_description(&captured.status),
-            captured.duration.as_secs_f64(),
-            captured.stdout,
-            captured.stderr
-        ),
-    )?;
-    if !captured.status.success() {
-        return Err(Error::new(
-            EXIT_ENCODE,
-            format!(
-                "FFV1 encoder failed: {}; stderr: {}; transcript {}",
-                proc::exit_description(&captured.status),
-                proc::tail(&captured.stderr, 1200),
-                log_path.display()
-            ),
-        ));
-    }
-    ensure_nonempty(output, EXIT_ENCODE, "encoder produced no video")?;
-    Ok(())
-}
-
-pub fn render_preview(
-    ffmpeg: &Path,
-    frames_dir: &Path,
-    width: u32,
-    height: u32,
-    count: usize,
-    fps: Fps,
-    raw_output: &Path,
-    log_path: &Path,
-    profile: &ColorProfile,
-) -> Result<()> {
-    let pattern = frames_dir.join("frame_%06d.png");
-    let args = vec![
-        "-hide_banner".to_string(),
-        "-nostdin".to_string(),
-        "-v".to_string(),
-        "error".to_string(),
-        "-framerate".to_string(),
-        fps.arg(),
-        "-start_number".to_string(),
-        "1".to_string(),
-        "-i".to_string(),
-        pattern.display().to_string(),
-        "-frames:v".to_string(),
-        count.to_string(),
-        "-pix_fmt".to_string(),
-        "rgb48le".to_string(),
-        "-f".to_string(),
-        "rawvideo".to_string(),
-        "pipe:1".to_string(),
-    ];
-    let command = proc::display_command(ffmpeg, &args);
-    let start = Instant::now();
-    let mut child = spawn_stdout(ffmpeg, &args, EXIT_PREVIEW)?;
-    let mut stdout = child.stdout.take().expect("piped stdout");
-
-    let file = fs::File::create(raw_output).map_err(|err| {
-        Error::new(
-            EXIT_PREVIEW,
-            format!(
-                "cannot create preview raw frame file {}: {err}",
-                raw_output.display()
-            ),
-        )
-    })?;
-    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
-
-    let frame_bytes = (width as usize) * (height as usize) * 6;
-    let mut frame = vec![0u8; frame_bytes];
-    let mut rgb24 = Vec::with_capacity((width as usize) * (height as usize) * 3);
-    let mut result = Ok(());
-
-    for index in 0..count {
-        if let Err(err) = read_exact_frame(&mut stdout, &mut frame, "PNG sequence", index, count) {
-            result = Err(err);
-            break;
-        }
-        let sent = match rgb48_frame_envelope(
-            Arc::from(frame.as_slice()),
-            width,
-            height,
-            RGB48_PRODUCER,
-        ) {
-            Ok(envelope) => envelope,
-            Err(err) => {
-                result = Err(Error::new(
+) -> Result<crate::frame::FrameSequence> {
+    let options = context.options;
+    let logs = context.output.join("logs/encode");
+    let config = crate::frame::ProduceConfig {
+        logs_dir: &logs,
+        exposure_ev: None,
+        analysis_roi: None,
+        echo: true,
+        echo_tag: "encode ",
+        white_balance: options.white_balance,
+        converter: options.converter.as_deref(),
+        converter_timeout: options.converter_timeout,
+        log_relative_dir: "logs/encode",
+    };
+    let active: proc::ActiveNative = Default::default();
+    let mut encoder: Option<StreamingEncoder> = None;
+    let result = crate::frame::stream_frames(
+        &options.native_tool,
+        context.sources,
+        evs,
+        &config,
+        active.clone(),
+        &mut |info, native| {
+            if encoder.is_none() {
+                let args = encoder_args(
+                    info.width,
+                    info.height,
+                    context.sources.len(),
+                    options.fps,
+                    output,
+                    options.preview_profile,
+                );
+                encoder = Some(StreamingEncoder::spawn(
+                    &options.ffmpeg,
+                    &args,
+                    &context.output.join("logs/encode.log"),
+                    active.clone(),
+                )?);
+            }
+            let encoder = encoder.as_mut().unwrap();
+            if encoder.failed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::new(
                     EXIT_PREVIEW,
-                    format!(
-                        "preview conversion failed at frame {} ({}): rgb48 input is not a valid typed frame: {err}",
-                        index + 1,
-                        profile.id
-                    ),
+                    "encoder failed while native frame was active",
                 ));
-                break;
             }
-        };
-        if let Err(err) = profile.convert_frame(
-            array_bytes(&sent),
-            width as usize,
-            height as usize,
-            &mut rgb24,
-        ) {
-            result = Err(Error::new(
-                EXIT_PREVIEW,
-                format!(
-                    "preview conversion failed at frame {} ({}): {err}",
-                    index + 1,
-                    profile.id
-                ),
-            ));
-            break;
-        }
-        let converted = match rgb24_frame_envelope(
-            Arc::from(rgb24.as_slice()),
-            width,
-            height,
-            profile,
-            RGB24_PRODUCER,
-        ) {
-            Ok(envelope) => envelope,
-            Err(err) => {
-                result = Err(Error::new(
-                    EXIT_PREVIEW,
-                    format!(
-                        "preview conversion failed at frame {} ({}): rgb24 output is not a valid typed frame: {err}",
-                        index + 1,
-                        profile.id
-                    ),
-                ));
-                break;
-            }
-        };
-        if let Err(err) = writer.write_all(array_bytes(&converted)) {
-            result = Err(Error::new(
-                EXIT_PREVIEW,
-                format!(
-                    "cannot write preview raw frame {}: {err}",
-                    raw_output.display()
-                ),
-            ));
-            break;
-        }
-    }
-
-    if result.is_ok() {
-        let mut extra = [0u8; 1];
-        match stdout.read(&mut extra) {
-            Ok(0) => {}
-            Ok(_) => {
-                result = Err(Error::new(
-                    EXIT_PREVIEW,
-                    "PNG sequence produced more frames than expected".to_string(),
-                ))
-            }
-            Err(err) => {
-                result = Err(Error::new(
-                    EXIT_PREVIEW,
-                    format!("cannot read PNG sequence decoder output: {err}"),
-                ))
-            }
-        }
-    }
-
-    drop(stdout);
-    let status = child.wait().map_err(|err| {
-        Error::new(
-            EXIT_PREVIEW,
-            format!("cannot wait for PNG sequence decoder: {err}"),
-        )
-    });
-    let _ = writer.flush();
-    let elapsed = start.elapsed();
-    let _ = write_log(
-        log_path,
-        &format!(
-            "command: {command}\nframes: {}x{} x{}\nelapsed: {:.3}s\nexit: {}\nnote: linear RGB16 codes decoded by ffmpeg to rgb48le, then converted to the selected preview profile's RGB24 in Rust\n",
-            width,
-            height,
-            count,
-            elapsed.as_secs_f64(),
-            match &status {
-                Ok(status) => proc::exit_description(status),
-                Err(err) => format!("wait failed: {err}"),
-            }
-        ),
+            let rgb48 = native.pixels(info.width, info.height)?;
+            let sent =
+                rgb48_frame_envelope(rgb48, info.width, info.height, "dng-linear-frame stdout")
+                    .map_err(|e| {
+                        Error::new(
+                            crate::error::EXIT_FRAME,
+                            format!("invalid RGB48 frame: {e}"),
+                        )
+                    })?;
+            // The output backing is initialized and unique until envelope creation.
+            let mut rgb24 = unsafe {
+                Arc::<[u8]>::new_zeroed_slice(info.width as usize * info.height as usize * 3)
+                    .assume_init()
+            };
+            options
+                .preview_profile
+                .convert_frame(
+                    array_bytes(&sent),
+                    info.width as usize,
+                    info.height as usize,
+                    &mut rgb24,
+                )
+                .map_err(|e| Error::new(EXIT_PREVIEW, format!("colour conversion: {e}")))?;
+            let converted = rgb24_frame_envelope(
+                rgb24,
+                info.width,
+                info.height,
+                options.preview_profile,
+                RGB24_PRODUCER,
+            )
+            .map_err(|e| Error::new(EXIT_PREVIEW, format!("invalid RGB24 frame: {e}")))?;
+            encoder
+                .input
+                .as_mut()
+                .unwrap()
+                .write_all(array_bytes(&converted))
+                .map_err(|e| Error::new(EXIT_PREVIEW, format!("encoder stdin failed: {e}")))?;
+            encoder.bytes += array_bytes(&converted).len();
+            Ok(())
+        },
     );
-
-    result?;
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
+    if let Some(encoder) = &mut encoder {
+        let counterpart_failed = encoder.failed.load(std::sync::atomic::Ordering::SeqCst);
+        let status = encoder.finish(result.is_err())?;
+        if counterpart_failed
+            || result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.code == EXIT_PREVIEW)
+        {
             return Err(Error::new(
                 EXIT_PREVIEW,
                 format!(
-                    "PNG sequence decoder failed: {}; transcript {}",
+                    "streaming encoder failed: {}; {}",
                     proc::exit_description(&status),
-                    log_path.display()
+                    result
+                        .as_ref()
+                        .err()
+                        .map(|e| e.message.as_str())
+                        .unwrap_or("see logs/encode.log")
                 ),
-            ))
+            ));
         }
-        Err(err) => return Err(err),
+        if result.is_ok() && !status.success() {
+            return Err(Error::new(
+                EXIT_PREVIEW,
+                format!(
+                    "streaming encoder failed: {}",
+                    proc::exit_description(&status)
+                ),
+            ));
+        }
     }
-    Ok(())
+    let sequence = result?;
+    ensure_nonempty(output, EXIT_PREVIEW, "streaming encoder produced no video")?;
+    Ok(sequence)
 }
 
-pub fn encode_preview(
-    ffmpeg: &Path,
-    raw_input: &Path,
+fn encoder_args(
     width: u32,
     height: u32,
     count: usize,
     fps: Fps,
     output: &Path,
-    log_path: &Path,
     profile: &ColorProfile,
-) -> Result<()> {
+) -> Vec<String> {
     let geometry = preview_geometry(width, height);
     let mut args = vec![
         "-hide_banner".to_string(),
-        "-nostdin".to_string(),
         "-v".to_string(),
         "error".to_string(),
         "-f".to_string(),
@@ -820,7 +628,7 @@ pub fn encode_preview(
         "-framerate".to_string(),
         fps.arg(),
         "-i".to_string(),
-        raw_input.display().to_string(),
+        "pipe:0".to_string(),
         "-frames:v".to_string(),
         count.to_string(),
         "-vf".to_string(),
@@ -873,411 +681,110 @@ pub fn encode_preview(
     }
     args.push(output.display().to_string());
 
-    let command = proc::display_command(ffmpeg, &args);
-    let captured = proc::run_capture(ffmpeg, &args, EXIT_PREVIEW)?;
-    // Keep the unscaled sRGB log byte-identical; scaled runs and non-sRGB
-    // profiles record the applied geometry/profile alongside the source size.
-    let scale_note = if geometry.scaled {
-        format!(
-            "\npreview scale: {}x{} -> {}x{} (lanczos; VideoToolbox max width {})",
-            width, height, geometry.width, geometry.height, PREVIEW_MAX_WIDTH
-        )
-    } else {
-        String::new()
-    };
-    let profile_note = if profile.id == "srgb-preview" {
-        String::new()
-    } else {
-        format!(
-            "\npreview profile: {} (range {}, ycbcr matrix {}, per-field colour tags)",
-            profile.id,
-            profile.range.as_str(),
-            profile.ycbcr_matrix
-        )
-    };
-    write_log(
-        log_path,
-        &format!(
-            "command: {command}\ninput: {}x{} rgb24 x{} @ {}{}{}\nexit: {} ({:.3}s)\nstdout:\n{}\nstderr:\n{}\n",
-            width,
-            height,
-            count,
-            fps.arg(),
-            scale_note,
-            profile_note,
-            proc::exit_description(&captured.status),
-            captured.duration.as_secs_f64(),
-            captured.stdout,
-            captured.stderr
-        ),
-    )?;
-    if !captured.status.success() {
-        let label = if profile.id == "srgb-preview" {
-            "sRGB preview encoder failed".to_string()
-        } else {
-            format!("{} preview encoder failed", profile.id)
-        };
-        return Err(Error::new(
-            EXIT_PREVIEW,
-            format!(
-                "{label}: {}; stderr: {}; transcript {}",
-                proc::exit_description(&captured.status),
-                proc::tail(&captured.stderr, 1200),
-                log_path.display()
-            ),
-        ));
-    }
-    ensure_nonempty(output, EXIT_PREVIEW, "preview encoder produced no video")?;
-    Ok(())
+    args
 }
 
-#[derive(Debug, Clone)]
-pub struct RoundtripReport {
-    pub frames_compared: usize,
-    pub frame_bytes: usize,
-    pub elapsed: Duration,
+struct StreamingEncoder {
+    process: proc::OwnedProcess,
+    input: Option<std::process::ChildStdin>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    watcher: Option<std::thread::JoinHandle<()>>,
+    bytes: usize,
 }
-
-pub fn verify_roundtrip(
-    ffmpeg: &Path,
-    frames_dir: &Path,
-    video: &Path,
-    width: u32,
-    height: u32,
-    count: usize,
-    fps: Fps,
-    log_path: &Path,
-) -> Result<RoundtripReport> {
-    let pattern = frames_dir.join("frame_%06d.png");
-    let png_args = vec![
-        "-hide_banner".to_string(),
-        "-nostdin".to_string(),
-        "-v".to_string(),
-        "error".to_string(),
-        "-framerate".to_string(),
-        fps.arg(),
-        "-start_number".to_string(),
-        "1".to_string(),
-        "-i".to_string(),
-        pattern.display().to_string(),
-        "-frames:v".to_string(),
-        count.to_string(),
-        "-pix_fmt".to_string(),
-        "rgb48le".to_string(),
-        "-f".to_string(),
-        "rawvideo".to_string(),
-        "pipe:1".to_string(),
-    ];
-    let video_args = vec![
-        "-hide_banner".to_string(),
-        "-nostdin".to_string(),
-        "-v".to_string(),
-        "error".to_string(),
-        "-i".to_string(),
-        video.display().to_string(),
-        "-pix_fmt".to_string(),
-        "rgb48le".to_string(),
-        "-f".to_string(),
-        "rawvideo".to_string(),
-        "pipe:1".to_string(),
-    ];
-    let png_command = proc::display_command(ffmpeg, &png_args);
-    let video_command = proc::display_command(ffmpeg, &video_args);
-    let start = Instant::now();
-
-    let mut png_child = spawn_stdout(ffmpeg, &png_args, EXIT_VALIDATION)?;
-    let mut video_child = match spawn_stdout(ffmpeg, &video_args, EXIT_VALIDATION) {
-        Ok(child) => child,
-        Err(err) => {
-            kill_and_wait(&mut png_child);
-            return Err(err);
-        }
-    };
-    let mut png_stdout = png_child.stdout.take().expect("piped stdout");
-    let mut video_stdout = video_child.stdout.take().expect("piped stdout");
-
-    let frame_bytes = (width as usize) * (height as usize) * 6;
-    let mut sent = vec![0u8; frame_bytes];
-    let mut encoded = vec![0u8; frame_bytes];
-    let mut failure: Option<Error> = None;
-
-    for index in 0..count {
-        if let Err(err) = read_exact_frame(&mut png_stdout, &mut sent, "PNG sequence", index, count)
-        {
-            failure = Some(err);
-            break;
-        }
-        if let Err(err) =
-            read_exact_frame(&mut video_stdout, &mut encoded, "FFV1 video", index, count)
-        {
-            failure = Some(err);
-            break;
-        }
-        // Both decoded streams pass through the same typed RGB48 construction
-        // and semantic validation before the byte comparison.
-        let sent_frame =
-            match rgb48_frame_envelope(Arc::from(sent.as_slice()), width, height, RGB48_PRODUCER) {
-                Ok(envelope) => envelope,
-                Err(err) => {
-                    failure = Some(typed_frame_error(err, "PNG sequence", index, count));
+impl StreamingEncoder {
+    fn spawn(
+        program: &Path,
+        args: &[String],
+        log: &Path,
+        active: proc::ActiveNative,
+    ) -> Result<Self> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let process = proc::OwnedProcess::spawn(program, args, log, EXIT_PREVIEW, true)?;
+        let input = process.child.lock().unwrap().stdin.take();
+        let child = process.child.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let (stop_watch, failed_watch) = (stop.clone(), failed.clone());
+        let watcher = std::thread::spawn(move || {
+            while !stop_watch.load(Ordering::SeqCst) {
+                let exited = child.lock().unwrap().try_wait();
+                if let Ok(Some(status)) = exited {
+                    if !status.success() {
+                        failed_watch.store(true, Ordering::SeqCst);
+                        let mut state = active.lock().unwrap();
+                        state.cancelled = true;
+                        if let Some(native) = state.child.as_ref() {
+                            let _ = native.lock().unwrap().kill();
+                        }
+                    }
                     break;
                 }
-            };
-        let encoded_frame = match rgb48_frame_envelope(
-            Arc::from(encoded.as_slice()),
-            width,
-            height,
-            RGB48_PRODUCER,
-        ) {
-            Ok(envelope) => envelope,
-            Err(err) => {
-                failure = Some(typed_frame_error(err, "FFV1 video", index, count));
-                break;
+                std::thread::sleep(Duration::from_millis(5));
             }
-        };
-        let sent_bytes = array_bytes(&sent_frame);
-        let encoded_bytes = array_bytes(&encoded_frame);
-        if sent_bytes != encoded_bytes {
-            failure = Some(describe_mismatch(index, sent_bytes, encoded_bytes));
-            break;
-        }
-    }
-
-    if failure.is_none() {
-        for (stream, reader) in [
-            ("PNG sequence", &mut png_stdout),
-            ("FFV1 video", &mut video_stdout),
-        ] {
-            let mut extra = [0u8; 1];
-            match reader.read(&mut extra) {
-                Ok(0) => {}
-                Ok(_) => {
-                    failure = Some(Error::new(
-                        EXIT_VALIDATION,
-                        format!("{stream} produced more than {count} frames"),
-                    ));
-                    break;
-                }
-                Err(err) => {
-                    failure = Some(Error::new(
-                        EXIT_VALIDATION,
-                        format!("cannot finish reading {stream} decoder output: {err}"),
-                    ));
-                    break;
-                }
-            }
-        }
-    }
-
-    drop(png_stdout);
-    drop(video_stdout);
-    if failure.is_some() {
-        kill_and_wait(&mut png_child);
-        kill_and_wait(&mut video_child);
-    }
-    let png_status = png_child.wait();
-    let video_status = video_child.wait();
-    let elapsed = start.elapsed();
-
-    let mut summary = format!(
-        "command_png: {png_command}\ncommand_video: {video_command}\nframes: {}\nframe_bytes: {frame_bytes}\n",
-        count
-    );
-    summary.push_str(&format!(
-        "png_exit: {}\nvideo_exit: {}\n",
-        match &png_status {
-            Ok(status) => proc::exit_description(status),
-            Err(err) => format!("wait failed: {err}"),
-        },
-        match &video_status {
-            Ok(status) => proc::exit_description(status),
-            Err(err) => format!("wait failed: {err}"),
-        }
-    ));
-    let result_line = match &failure {
-        Some(err) => format!("result: FAIL ({})\n", err.message),
-        None => "result: PASS (byte-identical rgb48le frames)\n".to_string(),
-    };
-    summary.push_str(&result_line);
-    write_log(log_path, &summary)?;
-
-    if let Some(err) = failure {
-        return Err(err);
-    }
-    match png_status {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            return Err(Error::new(
-                EXIT_VALIDATION,
-                format!(
-                    "PNG sequence decoder failed: {}; transcript {}",
-                    proc::exit_description(&status),
-                    log_path.display()
-                ),
-            ))
-        }
-        Err(err) => {
-            return Err(Error::new(
-                EXIT_VALIDATION,
-                format!("cannot wait for PNG sequence decoder: {err}"),
-            ))
-        }
-    }
-    match video_status {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            return Err(Error::new(
-                EXIT_VALIDATION,
-                format!(
-                    "FFV1 decoder failed: {}; transcript {}",
-                    proc::exit_description(&status),
-                    log_path.display()
-                ),
-            ))
-        }
-        Err(err) => {
-            return Err(Error::new(
-                EXIT_VALIDATION,
-                format!("cannot wait for FFV1 decoder: {err}"),
-            ))
-        }
-    }
-    Ok(RoundtripReport {
-        frames_compared: count,
-        frame_bytes,
-        elapsed,
-    })
-}
-
-fn describe_mismatch(index: usize, sent: &[u8], encoded: &[u8]) -> Error {
-    let diff = sent
-        .iter()
-        .zip(encoded.iter())
-        .position(|(left, right)| left != right)
-        .unwrap_or(0);
-    let sample = diff / 2;
-    let channel = sample % 3;
-    let pixel = sample / 3;
-    let sent_value = if diff + 1 < sent.len() {
-        u16::from_le_bytes([sent[diff], sent[diff + 1]])
-    } else {
-        0
-    };
-    let encoded_value = if diff + 1 < encoded.len() {
-        u16::from_le_bytes([encoded[diff], encoded[diff + 1]])
-    } else {
-        0
-    };
-    Error::new(
-        EXIT_VALIDATION,
-        format!(
-            "lossless roundtrip mismatch at frame {} (0-based {index}), byte {}: \
-             sent pixel {} channel {} = {sent_value} but decoded video = {encoded_value}",
-            index + 1,
-            diff,
-            pixel,
-            channel
-        ),
-    )
-}
-
-fn read_exact_frame(
-    reader: &mut impl Read,
-    buffer: &mut [u8],
-    stream: &str,
-    index: usize,
-    count: usize,
-) -> Result<()> {
-    reader.read_exact(buffer).map_err(|err| {
-        Error::new(
-            EXIT_VALIDATION,
-            format!(
-                "cannot read frame {}/{count} from {stream}: {err}",
-                index + 1
-            ),
-        )
-    })
-}
-
-fn spawn_stdout(program: &Path, args: &[String], code: i32) -> Result<Child> {
-    Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|err| {
-            Error::new(
-                code,
-                format!(
-                    "failed to start {} {}: {err}",
-                    program.display(),
-                    args.join(" ")
-                ),
-            )
+        });
+        Ok(Self {
+            process,
+            input,
+            stop,
+            failed,
+            watcher: Some(watcher),
+            bytes: 0,
         })
+    }
+    fn finish(&mut self, abort: bool) -> Result<std::process::ExitStatus> {
+        self.input.take();
+        // Stop the observer before our intentional cancellation, so a native
+        // protocol error keeps its primary family 30 rather than becoming 60.
+        if abort {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if abort {
+            if let Some(w) = self.watcher.take() {
+                let _ = w.join();
+            }
+        }
+        let status = self.process.finish(abort);
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(w) = self.watcher.take() {
+            let _ = w.join();
+        }
+        self.process
+            .note(&format!("pixel bytes (RGB24): {}", self.bytes));
+        status
+    }
 }
-
-fn kill_and_wait(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// Publish both validated deliverables. The temporary names are taken from the
-/// already validated `VIDEO_ARTIFACT` handoffs; the final names are unchanged.
-pub fn publish(
-    temp_linear: &DataEnvelope,
-    final_linear: &Path,
-    temp_preview: &DataEnvelope,
-    final_preview: &Path,
-) -> Result<()> {
-    let temp_linear = video_artifact_path(temp_linear).ok_or_else(|| {
-        Error::new(
-            EXIT_PUBLISH,
-            "linear video handoff is not a validated video artifact",
-        )
-    })?;
-    let temp_preview = video_artifact_path(temp_preview).ok_or_else(|| {
-        Error::new(
-            EXIT_PUBLISH,
-            "preview video handoff is not a validated video artifact",
-        )
-    })?;
-    for final_path in [final_linear, final_preview] {
-        if final_path.exists() {
-            return Err(Error::new(
-                EXIT_PUBLISH,
-                format!(
-                    "refusing to overwrite existing deliverable {}",
-                    final_path.display()
-                ),
-            ));
+impl Drop for StreamingEncoder {
+    fn drop(&mut self) {
+        if self.watcher.is_some() {
+            let _ = self.finish(true);
         }
     }
-    if let Err(err) = fs::rename(temp_linear, final_linear) {
+}
+
+/// Publish the sole validated deliverable with one rename, refusing overwrite.
+pub fn publish(video: &DataEnvelope, destination: &Path) -> Result<()> {
+    let source = video_artifact_path(video)
+        .ok_or_else(|| Error::new(EXIT_PUBLISH, "invalid video artifact handoff"))?;
+    if destination.exists() {
         return Err(Error::new(
             EXIT_PUBLISH,
             format!(
-                "cannot publish {} -> {}: {err}; validated video remains at {}",
-                temp_linear.display(),
-                final_linear.display(),
-                temp_linear.display()
+                "refusing to overwrite existing deliverable {}",
+                destination.display()
             ),
         ));
     }
-    if let Err(err) = fs::rename(temp_preview, final_preview) {
-        let rollback = fs::rename(final_linear, temp_linear);
-        return Err(Error::new(
+    fs::rename(source, destination).map_err(|e| {
+        Error::new(
             EXIT_PUBLISH,
             format!(
-                "cannot publish preview {} -> {}: {err}; linear video rollback: {rollback:?}; \
-                 no final deliverables were added",
-                temp_preview.display(),
-                final_preview.display()
+                "cannot publish {} -> {}: {e}",
+                source.display(),
+                destination.display()
             ),
-        ));
-    }
-    Ok(())
+        )
+    })
 }
 
 fn ensure_nonempty(path: &Path, code: i32, context: &str) -> Result<()> {
@@ -1296,15 +803,6 @@ fn ensure_nonempty(path: &Path, code: i32, context: &str) -> Result<()> {
             format!("{context}: {} is missing: {err}", path.display()),
         )),
     }
-}
-
-fn write_log(path: &Path, text: &str) -> Result<()> {
-    fs::write(path, text).map_err(|err| {
-        Error::new(
-            EXIT_VALIDATION,
-            format!("cannot write transcript {}: {err}", path.display()),
-        )
-    })
 }
 
 fn rate_matches(observed: &str, fps: Fps) -> bool {
@@ -1346,52 +844,6 @@ mod tests {
         assert!(rate_matches("30", Fps { num: 30, den: 1 }));
         assert!(!rate_matches("24/1", Fps { num: 30, den: 1 }));
         assert!(!rate_matches("N/A", Fps { num: 30, den: 1 }));
-    }
-
-    #[test]
-    fn linear_probe_validation_rejects_wrong_pixel_format() {
-        let probe = ProbeInfo {
-            codec_name: "ffv1".to_string(),
-            pix_fmt: "yuv420p".to_string(),
-            width: 8,
-            height: 6,
-            frames: 3,
-            avg_frame_rate: "30/1".to_string(),
-            color_space: "unknown".to_string(),
-            color_primaries: "unknown".to_string(),
-            color_transfer: "unknown".to_string(),
-            color_range: "unknown".to_string(),
-        };
-        let error =
-            validate_linear(&probe, 8, 6, 3, Fps { num: 30, den: 1 }).expect_err("must reject");
-        assert!(error.message.contains("gbrp16le"), "{error}");
-    }
-
-    #[test]
-    fn linear_probe_validation_accepts_matching_stream() {
-        let probe = ProbeInfo {
-            codec_name: "ffv1".to_string(),
-            pix_fmt: "gbrp16le".to_string(),
-            width: 8,
-            height: 6,
-            frames: 3,
-            avg_frame_rate: "30/1".to_string(),
-            color_space: "unknown".to_string(),
-            color_primaries: "unknown".to_string(),
-            color_transfer: "unknown".to_string(),
-            color_range: "unknown".to_string(),
-        };
-        assert!(validate_linear(&probe, 8, 6, 3, Fps { num: 30, den: 1 }).is_ok());
-    }
-
-    #[test]
-    fn mismatch_description_points_at_the_first_difference() {
-        let sent = [1u8, 0, 2, 0, 3, 0];
-        let encoded = [1u8, 0, 2, 0, 9, 0];
-        let error = describe_mismatch(2, &sent, &encoded);
-        assert!(error.message.contains("frame 3"));
-        assert!(error.message.contains("byte 4"));
-        assert!(error.message.contains("3 but decoded video = 9"));
     }
 
     #[test]
@@ -1531,57 +983,38 @@ mod tests {
             other => panic!("unexpected payload {other:?}"),
         }
     }
+}
 
-    #[cfg(unix)]
+#[cfg(all(test, unix))]
+mod publication_tests {
+    use super::*;
     #[test]
-    fn render_preview_converts_through_validated_typed_frames() {
-        use crate::color_profile::lookup;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-tmp")
-            .join(format!("preview-typed-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("create test dir");
-        let raw = dir.join("preview.rgb");
-        let log = dir.join("render.log");
-        let count = 2usize;
-        let frame_bytes = 8 * 6 * 6;
-        let script = dir.join("fake-ffmpeg.sh");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\ni=0\nwhile [ $i -lt {count} ]; do head -c {frame_bytes} /dev/zero; i=$((i+1)); done\nexit 0\n"
-            ),
+    fn single_video_publication_refuses_overwrite_and_retains_validated_source() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-tmp")
+            .join(format!("publish-stream-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("temporary.mp4");
+        let destination = root.join("output.mp4");
+        fs::write(&source, b"validated").unwrap();
+        fs::write(&destination, b"existing").unwrap();
+        let envelope = video_envelope(
+            &source,
+            "video/mp4",
+            "h264",
+            1,
+            "test",
+            crate::color_profile::default_profile(),
         )
-        .expect("write fake decoder");
-        let mut permissions = fs::metadata(&script).expect("stat").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).expect("chmod");
-
-        let profile = lookup("srgb-preview").expect("srgb");
-        render_preview(
-            &script,
-            &dir,
-            8,
-            6,
-            count,
-            Fps { num: 30, den: 1 },
-            &raw,
-            &log,
-            profile,
-        )
-        .expect("render preview");
-
-        let mut expected = Vec::new();
-        profile
-            .convert_frame(&vec![0u8; frame_bytes], 8, 6, &mut expected)
-            .expect("reference conversion");
-        let actual = fs::read(&raw).expect("read raw preview");
-        assert_eq!(actual.len(), expected.len() * count);
-        for frame in actual.chunks_exact(expected.len()) {
-            assert_eq!(frame, expected.as_slice());
-        }
+        .unwrap();
+        let err = publish(&envelope, &destination).unwrap_err();
+        assert_eq!(err.code, EXIT_PUBLISH);
+        assert_eq!(fs::read(&destination).unwrap(), b"existing");
+        assert_eq!(fs::read(&source).unwrap(), b"validated");
+        fs::remove_file(&destination).unwrap();
+        publish(&envelope, &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"validated");
+        assert!(!source.exists());
     }
 }

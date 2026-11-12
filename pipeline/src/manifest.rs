@@ -4,10 +4,7 @@ use crate::cli::{Options, LEGACY_FPS_PROVENANCE};
 use crate::error::{Error, Result, EXIT_PUBLISH};
 use crate::frame::FrameSequence;
 use crate::json::{self, Json};
-use crate::video::{
-    preview_filter, preview_final_name, preview_geometry, ProbeInfo, RoundtripReport,
-    LINEAR_FINAL_NAME,
-};
+use crate::video::{preview_filter, preview_geometry, ProbeInfo, FINAL_NAME};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -17,11 +14,8 @@ pub struct ManifestInput<'a> {
     pub input: &'a Path,
     pub output: &'a Path,
     pub sequence: &'a FrameSequence,
-    pub linear_probe: &'a ProbeInfo,
-    pub roundtrip: &'a RoundtripReport,
-    pub preview_probe: &'a ProbeInfo,
-    pub linear_bytes: u64,
-    pub preview_bytes: u64,
+    pub probe: &'a ProbeInfo,
+    pub bytes: u64,
     pub ffmpeg_version: String,
     pub ffprobe_version: String,
     pub timings: &'a BTreeMap<String, Duration>,
@@ -48,12 +42,16 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                 ),
                 ("width", Json::Int(frame.width as i64)),
                 ("height", Json::Int(frame.height as i64)),
-                ("png", Json::Str(frame.png_relative.clone())),
-                ("metadata", Json::Str(frame.metadata_relative.clone())),
+                (
+                    "pixels_sha256",
+                    frame
+                        .pixels_sha256
+                        .clone()
+                        .map(Json::Str)
+                        .unwrap_or(Json::Null),
+                ),
+                ("applied_ev", Json::Float(frame.exposure_ev)),
                 ("log", Json::Str(frame.log_relative.clone())),
-                ("applied_white_balance", number_triple(frame.applied_wb)),
-                ("white_balance_source", Json::Str(frame.wb_source.clone())),
-                ("as_shot_neutral", number_triple(frame.as_shot_neutral)),
                 ("observed_scene_min", optional_number(frame.observed_min)),
                 ("observed_scene_max", optional_number(frame.observed_max)),
                 (
@@ -260,64 +258,7 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
             ]),
         ),
         (
-            "linear_video",
-            Json::obj(vec![
-                ("file", Json::Str(LINEAR_FINAL_NAME.to_string())),
-                ("bytes", Json::Int(input.linear_bytes as i64)),
-                ("container", Json::Str("matroska".to_string())),
-                ("codec", Json::Str("ffv1".to_string())),
-                ("codec_level", Json::Int(3)),
-                ("golomb", Json::Int(1)),
-                ("slice_crc", Json::Bool(true)),
-                ("pix_fmt", Json::Str("gbrp16le".to_string())),
-                ("frames", Json::Int(sequence.frames.len() as i64)),
-                ("width", Json::Int(sequence.width as i64)),
-                ("height", Json::Int(sequence.height as i64)),
-                ("fps", Json::Str(input.options.fps.arg())),
-                (
-                    "encoder_parameters",
-                    Json::Array(vec![
-                        Json::Str("-c:v ffv1".to_string()),
-                        Json::Str("-level 3".to_string()),
-                        Json::Str("-g 1".to_string()),
-                        Json::Str("-slicecrc 1".to_string()),
-                        Json::Str("-pix_fmt gbrp16le".to_string()),
-                        Json::Str("-map_metadata -1".to_string()),
-                        Json::Str("-f matroska".to_string()),
-                        Json::Str("no resize, no colour conversion, no frame-rate filter".to_string()),
-                    ]),
-                ),
-                ("probe", input.linear_probe.to_json()),
-                (
-                    "roundtrip",
-                    Json::obj(vec![
-                        (
-                            "method",
-                            Json::Str(
-                                "decode sent PNG sequence and encoded MKV to rgb48le and compare \
-                                 every frame byte-for-byte"
-                                    .to_string(),
-                            ),
-                        ),
-                        (
-                            "frames_compared",
-                            Json::Int(input.roundtrip.frames_compared as i64),
-                        ),
-                        (
-                            "frame_bytes",
-                            Json::Int(input.roundtrip.frame_bytes as i64),
-                        ),
-                        (
-                            "elapsed_s",
-                            Json::Float(input.roundtrip.elapsed.as_secs_f64()),
-                        ),
-                        ("status", Json::Str("pass".to_string())),
-                    ]),
-                ),
-            ]),
-        ),
-        (
-            "preview",
+            "video",
             {
                 let profile = input.options.preview_profile;
                 let mut encoder_parameters = vec![
@@ -337,23 +278,26 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                     encoder_parameters.push(Json::Str("-movflags +faststart+write_colr".to_string()));
                 }
                 Json::obj(vec![
-                    ("file", Json::Str(preview_final_name(profile).to_string())),
+                    ("file", Json::Str(FINAL_NAME.to_string())),
                     ("profile", Json::Str(profile.id.to_string())),
                     ("emitted_tags", profile.emitted_tags_json()),
-                    ("bytes", Json::Int(input.preview_bytes as i64)),
+                    ("bytes", Json::Int(input.bytes as i64)),
                     (
                         "purpose",
                         Json::Str(
-                            "review preview (display-referred sRGB or camera Log); \
-                             not a measurement source"
+                            "encoded deliverable (display-referred sRGB or camera Log); temporal audit uses the selected profile inverse transfer"
                                 .to_string(),
                         ),
                     ),
                     ("codec", Json::Str("h264".to_string())),
+                    ("width", Json::Int(input.probe.width as i64)),
+                    ("height", Json::Int(input.probe.height as i64)),
+                    ("frames", Json::Int(input.probe.frames as i64)),
+                    ("duration_s", Json::Float(input.probe.frames as f64 / input.options.fps.as_f64())),
                     ("pix_fmt", Json::Str("yuv420p".to_string())),
                     (
                         "decoder_pix_fmt",
-                        Json::Str(input.preview_probe.pix_fmt.clone()),
+                        Json::Str(input.probe.pix_fmt.clone()),
                     ),
                     (
                         "range",
@@ -393,7 +337,7 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                     ),
                     ("encoder_parameters", Json::Array(encoder_parameters)),
                     ("color_contract", profile.contract_json()),
-                    ("probe", input.preview_probe.to_json()),
+                    ("probe", input.probe.to_json()),
                     ("full_decode", Json::Str("pass".to_string())),
                 ])
             },
@@ -404,18 +348,13 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                 (
                     "method",
                     Json::Str(
-                        "encoder output written under .rawtl-partial; ffprobe and lossless roundtrip validation; atomic rename to final names"
+                        "streamed encoder output under .rawtl-partial; ffprobe and full decode validation; single rename to output.mp4"
                             .to_string(),
                     ),
                 ),
                 (
                     "final_names",
-                    Json::Array(vec![
-                        Json::Str(LINEAR_FINAL_NAME.to_string()),
-                        Json::Str(
-                            preview_final_name(input.options.preview_profile).to_string(),
-                        ),
-                    ]),
+                    Json::Array(vec![Json::Str(FINAL_NAME.to_string())]),
                 ),
             ]),
         ),
