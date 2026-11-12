@@ -183,6 +183,23 @@ stream([exe,'--stdout-frame',base,'--bogus','value'],2)
 # The positional hard rule is unchanged: ROI without an analysis sink.
 run([exe,base,work/'roi-only.png',work/'roi-only.json','--analysis-roi','0,0,1,1'],2)
 
+# --- Positional grammar: path slots are paths, even when spelled like flags --
+# The stdout grammar is flag-first (argv[1]), so a bare relative output filename
+# that happens to equal --stdout-frame/--stdout-analysis must still be accepted
+# by the three-positional invocation.
+for flag in ('--stdout-frame','--stdout-analysis'):
+    out_json='positional-'+flag[2:]+'.json'
+    r=subprocess.run([str(exe),str(base),flag,out_json],cwd=clean,capture_output=True)
+    log({'command':['positional-flag-named-path',str(base),flag,out_json],
+         'exit_code':r.returncode,'stdout':r.stdout.decode(errors='replace'),
+         'stderr':r.stderr.decode(errors='replace')})
+    assert r.returncode==0,(flag,r.returncode,r.stderr)
+    png=clean/flag
+    assert png.read_bytes()[:8]==b'\x89PNG\r\n\x1a\n',flag
+    meta=json.loads((clean/out_json).read_bytes())
+    assert (meta['width'],meta['height'])==(16,16)
+    png.unlink();(clean/out_json).unlink()
+
 # --- Closed consumer pipe: nonzero exit, no success claim -------------------
 read_end,write_end=os.pipe()
 os.close(read_end)
