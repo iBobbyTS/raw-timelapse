@@ -3,7 +3,7 @@
 //! The pipeline always feeds scene-linear ACEScg (AP1 primaries, D60 white) to
 //! this module. Each registered profile fixes, independently of the encoder:
 //!
-//! * one official transfer curve, transcribed with its constants and source;
+//! * one published or independently recovered curve, with constants and source;
 //! * one target colour gamut defined by official primaries plus white point,
 //!   converted through the staged path
 //!   `AP1/D60 -> XYZ(D60) -> Bradford CAT -> XYZ(D65) -> target linear RGB`
@@ -129,7 +129,7 @@ impl ReferenceCode {
     }
 }
 
-/// Official transfer curves used by the registered preview profiles.
+/// Published and independently recovered transfer curves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transfer {
     /// IEC 61966-2-1 sRGB OETF (existing display-referred path).
@@ -138,6 +138,7 @@ pub enum Transfer {
     SonySLog3,
     /// Canon Log 2.
     CanonLog2,
+    CanonLog2RevEng,
     /// Nikon N-Log.
     NikonNLog,
     /// DJI D-Log (original D-Log, not D-Log 2).
@@ -147,6 +148,7 @@ pub enum Transfer {
 impl Transfer {
     pub fn name(self) -> &'static str {
         match self {
+            Transfer::CanonLog2RevEng => "Canon Log 2 (rev-eng crm-dev)",
             Transfer::Srgb => "IEC 61966-2-1 sRGB OETF",
             Transfer::SonySLog3 => "Sony S-Log3",
             Transfer::CanonLog2 => "Canon Log 2",
@@ -157,6 +159,7 @@ impl Transfer {
 
     pub fn formula(self) -> &'static str {
         match self {
+            Transfer::CanonLog2RevEng => "x=reflection/0.9; L=sign(x)*0.122411586*ln(1+87.09937546*abs(x))+0.035388128; y=(L*56064+4096)/65472",
             Transfer::Srgb => "if x <= 0.0031308: y = 12.92*x; else y = 1.055*x^(1/2.4) - 0.055",
             Transfer::SonySLog3 => {
                 "if x >= 0.01125: y = (420 + log10((x+0.01)/(0.18+0.01))*261.5)/1023; \
@@ -179,6 +182,9 @@ impl Transfer {
 
     pub fn document(self) -> &'static str {
         match self {
+            Transfer::CanonLog2RevEng => {
+                "Cinema RAW Development reconstructed continuous Log2 (matrix-only CR3 adaptation)"
+            }
             Transfer::Srgb => "IEC 61966-2-1:1999",
             Transfer::SonySLog3 => "Technical Summary for S-Gamut3.Cine/S-Log3 and S-Gamut3/S-Log3",
             Transfer::CanonLog2 => {
@@ -191,6 +197,7 @@ impl Transfer {
 
     pub fn version(self) -> &'static str {
         match self {
+            Transfer::CanonLog2RevEng => "CRD 2.15.10.1 / CrmSdk 2.11.0.27; rawtl revision 1",
             Transfer::Srgb => "1999",
             Transfer::SonySLog3 => "V1.0 (2013-12, Japanese edition)",
             Transfer::CanonLog2 => "2018-11-01",
@@ -201,6 +208,7 @@ impl Transfer {
 
     pub fn url(self) -> &'static str {
         match self {
+            Transfer::CanonLog2RevEng => "docs/canon-log2-rev-eng.md",
             Transfer::Srgb => "https://webstore.iec.ch/publication/6169",
             Transfer::SonySLog3 => {
                 "https://www.sony.jp/ls-camera/knowledge/pdf/\
@@ -224,6 +232,11 @@ impl Transfer {
     /// Forward transfer: linear target-gamut reflection -> normalized signal.
     pub fn forward(self, value: f64) -> f64 {
         match self {
+            Transfer::CanonLog2RevEng => {
+                let x = value / 0.9;
+                let l = x.signum() * 0.122411586 * (87.09937546 * x.abs()).ln_1p() + 0.035388128;
+                (l * 56064.0 + 4096.0) / 65472.0
+            }
             Transfer::Srgb => preview::srgb_oetf(value),
             Transfer::SonySLog3 => {
                 if value >= 0.01125 {
@@ -261,6 +274,10 @@ impl Transfer {
     /// Inverse transfer: normalized signal -> linear target-gamut reflection.
     pub fn inverse(self, signal: f64) -> f64 {
         match self {
+            Transfer::CanonLog2RevEng => {
+                let l = (signal * 65472.0 - 4096.0) / 56064.0 - 0.035388128;
+                0.9 * l.signum() * (l.abs() / 0.122411586).exp_m1() / 87.09937546
+            }
             Transfer::Srgb => preview::srgb_eotf(signal),
             Transfer::SonySLog3 => {
                 if signal >= 171.2102946929 / 1023.0 {
@@ -303,6 +320,7 @@ impl Transfer {
 
     pub fn references(self) -> &'static [ReferenceCode] {
         match self {
+            Transfer::CanonLog2RevEng => &CANON_REFERENCES,
             Transfer::Srgb => &SRGB_REFERENCES,
             Transfer::SonySLog3 => &SONY_REFERENCES,
             Transfer::CanonLog2 => &CANON_REFERENCES,
@@ -314,6 +332,7 @@ impl Transfer {
     /// How the reference codes were established.
     pub fn reference_basis(self) -> &'static str {
         match self {
+            Transfer::CanonLog2RevEng => "independently reconstructed CRD continuous curve; Canon appendix gray codes cross-check",
             Transfer::Srgb => "existing IEC 61966-2-1 8-bit reference value for 18% grey",
             Transfer::SonySLog3 => {
                 "published 10-bit code values in the Sony technical summary appendix"
@@ -528,6 +547,61 @@ impl FrameOutput for std::sync::Arc<[u8]> {
 }
 
 impl ColorProfile {
+    pub fn is_rev_eng(&self) -> bool {
+        self.transfer == Transfer::CanonLog2RevEng
+    }
+    pub fn display_name(&self) -> &'static str {
+        match self.id {
+            "canon-log2-cinema-gamut" => "clog2(white paper)",
+            "canon-log2-cinema-gamut-rev-eng-crm-dev" => "clog2(rev-eng crm-dev)",
+            _ => self.id,
+        }
+    }
+    /// Signed FP32 AP1 input, with native EV already applied. Reference scale
+    /// is applied once in target gamut, immediately before the Log curve.
+    pub fn convert_f32_frame(
+        &self,
+        bytes: &[u8],
+        width: usize,
+        height: usize,
+        reference_gain: f64,
+        out: &mut impl FrameOutput,
+    ) -> Result<[usize; 2], String> {
+        if !self.is_rev_eng() || !reference_gain.is_finite() || reference_gain <= 0.0 {
+            return Err("invalid FP32 profile/reference gain".into());
+        }
+        let n = width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or("FP32 geometry overflow")?;
+        if n.checked_mul(4) != Some(bytes.len()) {
+            return Err("FP32 length mismatch".into());
+        }
+        let output = out.prepare(n)?;
+        let m = self.composed_matrix();
+        let (low, high) = self.transfer.domain();
+        let mut clipped = [0usize; 2];
+        for (src, dst) in bytes.chunks_exact(12).zip(output.chunks_exact_mut(3)) {
+            let mut ap1 = [0.0; 3];
+            for c in 0..3 {
+                ap1[c] = f32::from_le_bytes(src[c * 4..c * 4 + 4].try_into().unwrap()) as f64;
+                if !ap1[c].is_finite() {
+                    return Err("nonfinite FP32 sample".into());
+                }
+            }
+            let target = preview::mat3_vec(&m, ap1).map(|v| v * reference_gain);
+            if target.iter().any(|v| !v.is_finite()) {
+                return Err("nonfinite target color".into());
+            }
+            for v in target {
+                clipped[0] += usize::from(v < low);
+                clipped[1] += usize::from(v > high);
+            }
+            dst.copy_from_slice(&self.encode_target_linear(target));
+        }
+        Ok(clipped)
+    }
+
     /// Composed AP1/D60 scene-linear -> target linear matrix. The order of the
     /// matrix products matches `preview::ap1_to_linear_srgb_matrix` exactly so
     /// the sRGB profile stays bit-identical to the pre-existing path.
@@ -572,6 +646,10 @@ impl ColorProfile {
         height: usize,
         out: &mut impl FrameOutput,
     ) -> Result<(), String> {
+        if self.is_rev_eng() {
+            return Err("rev-eng Canon Log2 requires signed FP32 input".into());
+        }
+
         let expected = width
             .checked_mul(height)
             .and_then(|pixels| pixels.checked_mul(6))
@@ -654,6 +732,8 @@ impl ColorProfile {
 
         Json::obj(vec![
             ("profile", Json::Str(self.id.to_string())),
+            ("display_name", Json::Str(self.display_name().into())),
+            ("pipeline_revision", Json::Int(1)),
             (
                 "transfer",
                 Json::obj(vec![
@@ -724,11 +804,11 @@ impl ColorProfile {
                     ),
                     (
                         "interpretation",
-                        Json::Str(
-                            "16-bit RGB codes interpreted as code/16384 scene-linear ACEScg \
-                             AP1/D60; no OETF in the source PNG"
-                                .to_string(),
-                        ),
+                        Json::Str(if self.is_rev_eng() {
+                            "signed FP32 AP1/D60; native EV already applied; reference gain applied once in target gamut".to_string()
+                        } else {
+                            "16-bit RGB codes interpreted as code/16384 scene-linear ACEScg AP1/D60; no OETF in the source PNG".to_string()
+                        }),
                     ),
                 ]),
             ),
@@ -899,7 +979,7 @@ const LOG_RANGE_REASON: &str = "Rawtl full-range (pc) delivery convention, not a
      (https://nps.nikonimaging.com/technical_info/technical_solutions/z9_tips/3d_lut/); \
      the transfer's code domain alone does not determine the delivery range.";
 
-pub static PROFILES: [ColorProfile; 6] = [
+pub static PROFILES: [ColorProfile; 7] = [
     ColorProfile {
         id: "srgb-preview",
         transfer: Transfer::Srgb,
@@ -966,6 +1046,17 @@ pub static PROFILES: [ColorProfile; 6] = [
         tag_policy: TagPolicy::VENDOR_LOG,
         preview_filename: "preview-h264-dlog-dgamut.mp4",
     },
+    ColorProfile {
+        id: "canon-log2-cinema-gamut-rev-eng-crm-dev",
+        transfer: Transfer::CanonLog2RevEng,
+        gamut: &CINEMA_GAMUT,
+        range: PreviewRange::Pc,
+        ycbcr_matrix: "bt2020nc",
+        range_reason: LOG_RANGE_REASON,
+        ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
+        tag_policy: TagPolicy::VENDOR_LOG,
+        preview_filename: "preview-h264-clog2-rev-eng-crm-dev.mp4",
+    },
 ];
 
 pub fn default_profile() -> &'static ColorProfile {
@@ -985,8 +1076,59 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_the_frozen_six_profiles_and_srgb_default() {
-        assert_eq!(PROFILES.len(), 6);
+    fn rev_eng_curve_and_signed_f32_boundary_are_independently_reproduced() {
+        let p = lookup("canon-log2-cinema-gamut-rev-eng-crm-dev").unwrap();
+        assert_eq!(p.display_name(), "clog2(rev-eng crm-dev)");
+        assert_eq!(
+            lookup("canon-log2-cinema-gamut").unwrap().display_name(),
+            "clog2(white paper)"
+        );
+        assert_ne!(p.transfer, Transfer::CanonLog2);
+        let contract = p.contract_json();
+        let input = contract
+            .get("input_domain")
+            .unwrap()
+            .get("interpretation")
+            .and_then(Json::as_str)
+            .unwrap();
+        assert!(input.contains("signed FP32") && !input.contains("16384"));
+
+        for (x, code) in [
+            (0., 95.),
+            (0.18, 407.),
+            (0.9, 575.),
+            (7.2, 797.),
+            (14.4, 871.),
+        ] {
+            assert_eq!((p.transfer.forward(x) * 1023.0).round(), code);
+            assert!((p.transfer.inverse(p.transfer.forward(x)) - x).abs() < 1e-11);
+        }
+        for x in [-0.014, -0.005, 0., 0.18, 1., 4., 8., 50.] {
+            assert!((p.transfer.inverse(p.transfer.forward(x)) - x).abs() < 1e-11);
+        }
+        // An AP1-negative color becomes all-positive in Cinema Gamut.
+        let ap1 = [-0.005f32, 0.5, 0.05];
+        let bytes: Vec<_> = ap1.into_iter().flat_map(f32::to_le_bytes).collect();
+        let mut output = vec![];
+        p.convert_f32_frame(&bytes, 1, 1, 1.0, &mut output).unwrap();
+        assert_eq!(output, vec![38, 122, 90]); // independent 10bit [151,491,361] rounded to 8bit
+        let expected = p.encode_linear(ap1.map(|x| x as f64));
+        assert_eq!(output, expected);
+        assert_ne!(output, p.encode_linear([0., 0.5, 0.05]));
+        p.convert_f32_frame(&bytes, 1, 1, 2., &mut output).unwrap();
+        assert_eq!(output, p.encode_linear(ap1.map(|x| 2.0 * x as f64)));
+        let bytes: Vec<_> = [8f32; 3].into_iter().flat_map(f32::to_le_bytes).collect();
+        p.convert_f32_frame(&bytes, 1, 1, 1., &mut output).unwrap();
+        assert_eq!(output, p.encode_linear([8.; 3]));
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let bytes: Vec<_> = [bad; 3].into_iter().flat_map(f32::to_le_bytes).collect();
+            assert!(p.convert_f32_frame(&bytes, 1, 1, 1., &mut output).is_err());
+        }
+    }
+
+    #[test]
+    fn registry_has_seven_profiles_and_srgb_default() {
+        assert_eq!(PROFILES.len(), 7);
         assert_eq!(default_profile().id, "srgb-preview");
         for id in [
             "srgb-preview",

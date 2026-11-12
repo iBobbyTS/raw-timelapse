@@ -40,6 +40,9 @@ OPTIONS:
                                one of: srgb-preview, dji-dlog-dgamut,
                                canon-log2-cinema-gamut, sony-slog3-sgamut3,
                                sony-slog3-sgamut3-cine, nikon-nlog-bt2020
+                               canon-log2-cinema-gamut-rev-eng-crm-dev
+                               Canon names: clog2(white paper), clog2(rev-eng crm-dev)
+    --log-reference-gain <N>   Positive reference scale, new Canon profile only (default: 1, unverified)
     --converter <PATH>         Adobe DNG Converter override passed to the native tool
     --converter-timeout <SEC>  Converter timeout override (1-3600 seconds)
     --strength <0..1>          Correction strength (default: 1.0; 0 disables deflicker)
@@ -282,6 +285,7 @@ pub struct Options {
     pub native_tool: PathBuf,
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
+    pub log_reference_gain: f64,
     pub preview_profile: &'static color_profile::ColorProfile,
     pub converter: Option<String>,
     pub converter_timeout: Option<u64>,
@@ -305,6 +309,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut ffmpeg = PathBuf::from(DEFAULT_FFMPEG);
     let mut ffprobe = PathBuf::from(DEFAULT_FFPROBE);
     let mut preview_profile = color_profile::default_profile();
+    let mut log_reference_gain: Option<f64> = None;
     let mut converter: Option<String> = None;
     let mut converter_timeout: Option<u64> = None;
     let mut deflicker = DeflickerConfig::default();
@@ -369,6 +374,19 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                         ),
                     )
                 })?;
+            }
+            "--log-reference-gain" => {
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                let gain: f64 = value
+                    .parse()
+                    .map_err(|_| Error::new(EXIT_USAGE, "invalid --log-reference-gain"))?;
+                if !gain.is_finite() || gain <= 0.0 {
+                    return Err(Error::new(
+                        EXIT_USAGE,
+                        "--log-reference-gain must be positive and finite",
+                    ));
+                }
+                log_reference_gain = Some(gain);
             }
             "--converter" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
@@ -450,6 +468,12 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let input = input.ok_or_else(|| Error::new(EXIT_USAGE, "--input <DIR> is required"))?;
     let output = output.ok_or_else(|| Error::new(EXIT_USAGE, "--output <DIR> is required"))?;
 
+    if log_reference_gain.is_some() && !preview_profile.is_rev_eng() {
+        return Err(Error::new(
+            EXIT_USAGE,
+            "--log-reference-gain requires canon-log2-cinema-gamut-rev-eng-crm-dev",
+        ));
+    }
     Ok(Parsed::Run(Options {
         input,
         output,
@@ -460,6 +484,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         ffmpeg,
         ffprobe,
         preview_profile,
+        log_reference_gain: log_reference_gain.unwrap_or(1.0),
         converter,
         converter_timeout,
         deflicker,

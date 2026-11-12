@@ -51,6 +51,22 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                         .unwrap_or(Json::Null),
                 ),
                 ("applied_ev", Json::Float(frame.exposure_ev)),
+                (
+                    "final_log_clipping",
+                    frame
+                        .log_clip_counts
+                        .map(|counts| {
+                            Json::obj(vec![
+                                ("below_domain_samples", Json::Int(counts[0] as i64)),
+                                ("above_domain_samples", Json::Int(counts[1] as i64)),
+                            ])
+                        })
+                        .unwrap_or(Json::Null),
+                ),
+                (
+                    "camera_color",
+                    frame.camera_color.clone().unwrap_or(Json::Null),
+                ),
                 ("log", Json::Str(frame.log_relative.clone())),
                 ("observed_scene_min", optional_number(frame.observed_min)),
                 ("observed_scene_max", optional_number(frame.observed_max)),
@@ -239,7 +255,14 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
         ),
         (
             "quantization_policy",
-            Json::obj(vec![
+            if input.options.preview_profile.is_rev_eng() { Json::obj(vec![
+                ("linear_dtype", Json::Str("signed f32 LE AP1/D60".into())),
+                ("linear_clipping", Json::Str("none after camera-to-AP1; upstream limits remain".into())),
+                ("final_denominator", Json::Int(255)),
+                ("reference_gain", Json::Float(input.options.log_reference_gain)),
+                ("reference_status", Json::Str("unverified".into())),
+                ("calibration_id", Json::Null),
+            ]) } else { Json::obj(vec![
                 ("scale", Json::Int(16384)),
                 ("rounding", Json::Str("nearest; ties upward".to_string())),
                 ("negative_policy", Json::Str("clip to 0".to_string())),
@@ -255,7 +278,7 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                             .to_string(),
                     ),
                 ),
-            ]),
+            ]) },
         ),
         (
             "video",

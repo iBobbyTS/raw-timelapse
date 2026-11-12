@@ -68,15 +68,18 @@ Mat mat(const dng_matrix &m) {
     throw Error(40, "only three-channel color matrices supported");
   Mat r{};
   for (int i = 0; i < 3; ++i)
-    for (int j = 0; j < 3; ++j)
+    for (int j = 0; j < 3; ++j) {
+      if (!std::isfinite(m[i][j]))
+        throw Error(40, "nonfinite color matrix");
       r[i][j] = m[i][j];
+    }
   return r;
 }
 Json optional_matrix(const dng_matrix &m) {
   return m.NotEmpty() ? matrix(mat(m)) : Json();
 }
 } // namespace
-Decoded decode(const fs::path &path, const std::optional<Vec> &wb) {
+Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMethod method) {
   auto routing = inspect(path);
   if (!routing || route(routing->photometric) != Route::direct)
     throw Error(23, "CFA cannot enter SDK");
@@ -115,18 +118,24 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb) {
       neutral[i] = d.applied[i] / max;
     auto white = spec.NeutralToXY(neutral);
     spec.SetWhiteXY(white);
-    // DNG Ch.6 no-ForwardMatrix route: inverse of SDK's normalized
-    // AB*CC*CM*MapWhiteMatrix(D50,selectedWhite). Its inverse ALREADY contains
-    // selectedWhite->D50; never apply another CA here. Use PCStoCamera even if
-    // the file also supplies ForwardMatrix (which this route does not consume).
-    d.camera_to_d50 = inverse(mat(spec.PCStoCamera()));
+    // Both SDK paths include the selected neutral and PCS white adaptation.
+    // Legacy deliberately ignores FM; the new matrix-only strategy uses
+    // CameraToPCS, including SDK's no-FM fallback. Do not add another WB/CAT.
+    const bool pcs = method == CameraColorMethod::dng_camera_to_pcs;
+    const bool fm = profile.ForwardMatrix1().NotEmpty() ||
+                    profile.ForwardMatrix2().NotEmpty() ||
+                    profile.ForwardMatrix3().NotEmpty();
+    d.camera_to_d50 = pcs ? mat(spec.CameraToPCS())
+                          : inverse(mat(spec.PCStoCamera()));
+    if (pcs) (void)inverse(d.camera_to_d50); // Reject singular profile transforms.
     d.camera_to_ap1 = multiply(d50_to_ap1(), d.camera_to_d50);
     d.color = Json{
-        {"method", "DNG Ch6 no-ForwardMatrix; inverse(SDK normalized "
-                   "AB*CC*CM*MapWhiteMatrix(D50,selectedWhite))"},
+        {"method", pcs ? "DNG SDK CameraToPCS; matrix only" : "DNG Ch6 no-ForwardMatrix; inverse(SDK normalized AB*CC*CM*MapWhiteMatrix(D50,selectedWhite))"},
         {"selected_white_xy", std::vector<Json>{white.x, white.y}},
         {"profile_index", 0},
         {"profile_name", profile.Name().Get()},
+        {"profile_fingerprint", profile.Fingerprint().ToUtf8HexString().Get()},
+        {"algorithm_revision", 1},
         {"calibration_illuminants",
          std::vector<Json>{int(profile.CalibrationIlluminant1()),
                            int(profile.CalibrationIlluminant2()),
@@ -150,7 +159,19 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb) {
         {"white_balance_normalization",
          "max camera-neutral component=1; SDK PCS-to-camera white "
          "saturation normalization"},
-        {"forward_matrix_used", false}};
+        {"method_requested", pcs ? "dng-camera-to-pcs" : "legacy-inverse-cm"},
+        {"method_effective", pcs ? (fm ? "dng-camera-to-pcs-forward-matrix" : "dng-camera-to-pcs-inverse-fallback") : "legacy-inverse-cm"},
+        {"camera_model", n->ModelName().Get()},
+        {"forward_matrix_present", fm},
+        {"forward_matrix1", optional_matrix(profile.ForwardMatrix1())},
+        {"forward_matrix2", optional_matrix(profile.ForwardMatrix2())},
+        {"forward_matrix3", optional_matrix(profile.ForwardMatrix3())},
+        {"hue_sat_map_present", profile.HasHueSatDeltas()},
+        {"look_table_present", profile.HasLookTable()},
+        {"tone_curve_present", profile.ToneCurve().IsValid()},
+        {"hue_sat_map_applied", false}, {"look_table_applied", false},
+        {"tone_curve_applied", false}, {"baseline_exposure_applied", false},
+        {"forward_matrix_used", pcs && fm}};
     std::vector<Json> black, white_levels;
     for (uint32_t r = 0; r < ifd.fBlackLevelRepeatRows; ++r) {
       std::vector<Json> row;

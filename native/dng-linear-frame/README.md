@@ -113,7 +113,7 @@ occupancy drives the report's output-clipping delta.
 
 ## Streaming stdout protocol (v1)
 
-Two output modes stream one frame to standard output instead of writing files:
+The original two output modes stream one frame to standard output instead of writing files:
 
 ```sh
 native/build/dng-linear-frame --stdout-analysis input.dng \
@@ -125,7 +125,24 @@ native/build/dng-linear-frame --stdout-frame input.dng \
   [--exposure-ev EV]
 ```
 
-Each call starts with the 8-byte ASCII magic `RAWTLST1` followed by records:
+The additional signed-float mode is selected explicitly:
+
+```sh
+native/build/dng-linear-frame --stdout-frame-f32 input.CR3 \
+  --camera-color-method dng-camera-to-pcs [--white-balance R,G,B] [--exposure-ev EV]
+```
+
+It emits `RAWTLST2`, ordered 0x01/0x03/0x04 records, IEEE binary32 LE HWC
+AP1/D60 (12 bytes/pixel), with `space=AP1/D60`, `transfer=linear`,
+`color_contract_version=1`, `byte_length` and actual pixel SHA256 in the
+descriptor. Pixels are written after scene*2^EV and before legacy quantize;
+negative values and values above 4 remain intact. `--camera-color-method`
+also applies to stdout analysis (`RAWTLST1`, no full-frame pixels).
+The default method is `legacy-inverse-cm`; `dng-camera-to-pcs` explicitly
+selects SDK CameraToPCS, with its no-FM fallback and no extra WB/CAT.
+See [Canon dual-profile contract](../../docs/canon-log2-rev-eng.md).
+
+The two original modes remain protocol v1. Each call starts with the 8-byte ASCII magic `RAWTLST1` followed by records:
 
 ```
 type:u8 | reserved:u8x3 (zero) | length:u64 little-endian | payload[length]

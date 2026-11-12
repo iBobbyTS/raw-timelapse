@@ -45,7 +45,9 @@ struct Decoded {
   Mat camera_to_d50{}, camera_to_ap1{};
   Json color, semantics;
 };
-Decoded decode(const fs::path &, const std::optional<Vec> &);
+enum class CameraColorMethod { legacy_inverse_cm, dng_camera_to_pcs };
+Decoded decode(const fs::path &, const std::optional<Vec> &,
+               CameraColorMethod = CameraColorMethod::legacy_inverse_cm);
 struct ProcessResult {
   int exit_code;
   bool timed_out;

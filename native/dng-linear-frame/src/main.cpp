@@ -1,6 +1,7 @@
 #include "dng_flags.h"
 #include "analysis.h"
 #include "frame.h"
+#include <bit>
 #include <CoreFoundation/CoreFoundation.h>
 #include <algorithm>
 #include <cmath>
@@ -190,7 +191,7 @@ struct Prepared {
 // stdout streaming keep their existing cleanup ordering.
 Prepared prepare(Temp &temp, const fs::path &input,
                  const std::optional<Vec> &wb, const std::string &converter,
-                 int timeout) {
+                 int timeout, CameraColorMethod method = CameraColorMethod::legacy_inverse_cm) {
   Prepared out;
   out.source = input;
   out.wb_override = wb.has_value();
@@ -255,7 +256,7 @@ Prepared prepare(Temp &temp, const fs::path &input,
     if (out.kind == Route::converter)
       convert();
   }
-  out.decoded = decode(decoded_path, wb ? wb : std::optional<Vec>(out.own));
+  out.decoded = decode(decoded_path, wb ? wb : std::optional<Vec>(out.own), method);
   out.capture_time = read_capture_time(out.kind == Route::vendor_raw
                                            ? decoded_path
                                            : input);
@@ -267,6 +268,7 @@ struct FrameOutput {
   std::string metadata;                // without the trailing newline
   std::optional<std::string> analysis; // without the trailing newline
   std::vector<uint16_t> pixels;        // empty unless requested
+  std::vector<float> floats;
 };
 
 // Gain, quantization, photometry and the metadata/analysis JSON documents.
@@ -274,14 +276,14 @@ struct FrameOutput {
 FrameOutput render(const Prepared &prepared,
                    const std::optional<fs::path> &analysis_sidecar,
                    const analysis::Roi &roi, double exposure_ev,
-                   bool want_analysis, bool need_pixels) {
+                   bool want_analysis, bool need_pixels, bool f32 = false) {
   const Decoded &d = prepared.decoded;
   const double gain = std::exp2(exposure_ev);
   std::vector<uint16_t> pixels;
-  if (need_pixels)
+  if (need_pixels && !f32)
     pixels.resize(d.camera.size());
   std::vector<float> gained_scene;
-  if (want_analysis)
+  if (want_analysis || f32)
     gained_scene.resize(d.camera.size());
   double low = INFINITY, high = -INFINITY;
   size_t negatives = 0, upper = 0;
@@ -296,9 +298,9 @@ FrameOutput render(const Prepared &prepared,
       high = std::max(high, double(x));
       negatives += x < 0;
       upper += x > 65535.0f / 16384.0f;
-      if (want_analysis)
+      if (want_analysis || f32)
         gained_scene[i + c] = x;
-      if (need_pixels)
+      if (need_pixels && !f32)
         pixels[i + c] = quantize(x);
     }
   }
@@ -307,6 +309,8 @@ FrameOutput render(const Prepared &prepared,
     measured = analysis::measure(d, gained_scene, roi, exposure_ev);
   Json metadata{
       {"schema_version", 1},
+      {"color_contract_version", 1},
+      {"linear_pixel_format", f32 ? "rgbf32le" : "rgb48le"},
       {"source", prepared.source.string()},
       {"source_sha256", prepared.source_hash},
       {"source_main_ifd_offset",
@@ -342,7 +346,11 @@ FrameOutput render(const Prepared &prepared,
       {"observed_scene_min", low},
       {"observed_scene_max", high},
       {"quantization",
-       Json{{"scale", 16384},
+       f32 ? Json{{"dtype", "f32"}, {"pixel_format", "rgbf32le"},
+                  {"negative_policy", "preserve"}, {"upper_policy", "preserve"},
+                  {"negative_samples", double(negatives)},
+                  {"above_legacy_upper_samples", double(upper)},
+                  {"transfer", "linear; no OETF"}} : Json{{"scale", 16384},
             {"rounding", "nearest; ties upward"},
             {"negative_policy", "clip to 0"},
             {"upper_policy", "above 65535/16384 clips to 65535"},
@@ -356,6 +364,7 @@ FrameOutput render(const Prepared &prepared,
   if (measured)
     out.analysis = analysis::sidecar_json(*measured, prepared.source_hash).text;
   out.pixels = std::move(pixels);
+  if (f32) out.floats = std::move(gained_scene);
   return out;
 }
 
@@ -368,7 +377,8 @@ int main(int argc, char **argv) {
     // a mode flag.
     const bool stdout_mode =
         argc >= 2 && (std::string(argv[1]) == "--stdout-analysis" ||
-                      std::string(argv[1]) == "--stdout-frame");
+                      std::string(argv[1]) == "--stdout-frame" ||
+                      std::string(argv[1]) == "--stdout-frame-f32");
     if (!stdout_mode) {
       if (argc < 4)
         throw Error(2, "usage: dng-linear-frame <input.dng> <output.png> "
@@ -376,8 +386,8 @@ int main(int argc, char **argv) {
                        "PATH] [--converter-timeout SECONDS] [--exposure-ev EV] "
                        "[--emit-analysis PATH] [--analysis-roi X,Y,W,H] "
                        "[--no-png]; or dng-linear-frame --stdout-analysis "
-                       "<input.dng> | --stdout-frame <input.dng> with the "
-                       "applicable options");
+                       "<input.dng> | --stdout-frame <input.dng> | --stdout-frame-f32 <input.dng> with the "
+                       "applicable options [--camera-color-method legacy-inverse-cm|dng-camera-to-pcs]");
       fs::path input = fs::canonical(argv[1]),
                png = fs::weakly_canonical(argv[2]),
                json = fs::weakly_canonical(argv[3]);
@@ -491,6 +501,8 @@ int main(int argc, char **argv) {
     // ---- stdout streaming modes -------------------------------------------
     // argv[1] is the mode flag; argv[2] is the input path and options follow.
     const bool want_analysis = std::string(argv[1]) == "--stdout-analysis";
+    const bool f32 = std::string(argv[1]) == "--stdout-frame-f32";
+    CameraColorMethod method = CameraColorMethod::legacy_inverse_cm;
     if (argc < 3)
       throw Error(2, "option value missing");
     const fs::path input = fs::canonical(argv[2]);
@@ -502,7 +514,7 @@ int main(int argc, char **argv) {
     analysis::Roi roi;
     for (int i = 3; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--stdout-analysis" || a == "--stdout-frame")
+      if (a == "--stdout-analysis" || a == "--stdout-frame" || a == "--stdout-frame-f32")
         throw Error(2, "specify exactly one of --stdout-analysis or "
                        "--stdout-frame");
       if (a == "--no-png" || a == "--emit-analysis")
@@ -516,6 +528,11 @@ int main(int argc, char **argv) {
         converter = value;
       else if (a == "--exposure-ev")
         exposure_ev = parse_ev(value);
+      else if (a == "--camera-color-method") {
+        if (value == "dng-camera-to-pcs") method = CameraColorMethod::dng_camera_to_pcs;
+        else if (value == "legacy-inverse-cm") method = CameraColorMethod::legacy_inverse_cm;
+        else throw Error(2, "unknown camera color method");
+      }
       else if (a == "--analysis-roi") {
         if (!want_analysis)
           throw Error(2, "--analysis-roi requires --stdout-analysis");
@@ -536,17 +553,41 @@ int main(int argc, char **argv) {
     // death: no record, artifact or success claim is published.
     std::signal(SIGPIPE, SIG_IGN);
     Temp temp;
-    Prepared prepared = prepare(temp, input, wb, converter, timeout);
+    Prepared prepared = prepare(temp, input, wb, converter, timeout, method);
     FrameOutput frame =
         render(prepared, std::optional<fs::path>(), roi, exposure_ev,
-               want_analysis, !want_analysis);
+               want_analysis, !want_analysis, f32);
     temp.clear();
-    write_all(kStdoutMagic, sizeof kStdoutMagic);
+    write_all(f32 ? "RAWTLST2" : kStdoutMagic, sizeof kStdoutMagic);
     write_record_text(kRecordMetadata, frame.metadata + "\n");
     if (want_analysis) {
       if (!frame.analysis)
         throw Error(50, "analysis document missing");
       write_record_text(kRecordAnalysis, *frame.analysis + "\n");
+    } else if (f32) {
+      if (frame.floats.size() != size_t(frame.width) * frame.height * 3)
+        throw Error(50, "FP32 geometry mismatch");
+      auto chunks = [&](auto sink) {
+        std::vector<unsigned char> bytes;
+        for (size_t start = 0; start < frame.floats.size(); start += kPixelChunk) {
+          size_t count = std::min(kPixelChunk, frame.floats.size() - start);
+          bytes.resize(count * 4);
+          for (size_t i = 0; i < count; ++i) {
+            uint32_t bits = std::bit_cast<uint32_t>(frame.floats[start+i]);
+            for (int b = 0; b < 4; ++b) bytes[i*4+b] = (bits >> (b*8)) & 255;
+          }
+          sink(bytes.data(), bytes.size());
+        }
+      };
+      Sha256 hash;
+      chunks([&](const auto *data, size_t n) { hash.update(data, n); });
+      Json descriptor{{"width", int(frame.width)}, {"height", int(frame.height)},
+        {"pixel_format", "rgbf32le"}, {"byte_length", double(frame.floats.size()*4)},
+        {"color_contract_version", 1}, {"space", "AP1/D60"}, {"transfer", "linear"},
+        {"pixels_sha256", hash.hex()}};
+      write_record_text(kRecordFrame, descriptor.text);
+      write_record_header(kRecordPixels, uint64_t(frame.floats.size())*4);
+      chunks([](const auto *data, size_t n) { write_all(data, n); });
     } else {
       if (frame.pixels.size() !=
           size_t(frame.width) * size_t(frame.height) * 3)

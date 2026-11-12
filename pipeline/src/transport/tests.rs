@@ -49,6 +49,7 @@ fn payload(id: &str) -> Payload {
         FRAME_METADATA | ANALYSIS_SIDECAR => {
             Payload::MemoryFile(MemoryFile::new(b"{}".to_vec().into(), "application/json").unwrap())
         }
+        AP1_F32_FRAME => Payload::NdArray(array(DType::F32, [1, 2, 3])),
         RGB48_FRAME => Payload::NdArray(array(DType::U16, [1, 2, 3])),
         RGB24_FRAME => Payload::NdArray(array(DType::U8, [1, 2, 3])),
         VIDEO_ARTIFACT => Payload::DiskArtifact(
@@ -60,7 +61,7 @@ fn payload(id: &str) -> Payload {
 
 fn semantic_metadata(id: &str) -> MetadataDoc {
     match id {
-        FRAME_PNG | RGB48_FRAME | RGB24_FRAME => frame_metadata(),
+        FRAME_PNG | RGB48_FRAME | RGB24_FRAME | AP1_F32_FRAME => frame_metadata(),
         FRAME_METADATA => metadata(&[
             ("source.schema_version", Json::Int(1)),
             ("source.width", Json::Int(2)),
@@ -444,7 +445,7 @@ fn metadata_rejects_conflicting_duplicates_but_allows_identical_evidence() {
 
 #[test]
 fn every_semantic_type_accepts_a_valid_envelope_and_rejects_transport_mismatch() {
-    assert_eq!(SemanticRegistry::builtins().len(), 6);
+    assert_eq!(SemanticRegistry::builtins().len(), 7);
     for schema in SemanticRegistry::builtins() {
         let envelope = DataEnvelope::new(
             schema.id,

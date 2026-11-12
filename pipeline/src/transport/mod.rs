@@ -576,6 +576,7 @@ impl Payload {
 pub const FRAME_PNG: &str = "rawtl.frame-png@1";
 pub const FRAME_METADATA: &str = "rawtl.frame-metadata@1";
 pub const ANALYSIS_SIDECAR: &str = "rawtl.analysis-sidecar@1";
+pub const AP1_F32_FRAME: &str = "rawtl.ap1-f32-frame@1";
 pub const RGB48_FRAME: &str = "rawtl.rgb48-frame@1";
 pub const RGB24_FRAME: &str = "rawtl.rgb24-frame@1";
 pub const VIDEO_ARTIFACT: &str = "rawtl.video-artifact@1";
@@ -649,6 +650,17 @@ const SEMANTICS: &[SemanticType] = &[
             text("source.kind"),
             text("source.sha256"),
         ],
+    },
+    SemanticType {
+        id: AP1_F32_FRAME,
+        allowed_transports: &[TransportKind::NdArray],
+        array: Some(ArrayConstraints {
+            dtype: DType::F32,
+            channels: 3,
+            layout: ArrayLayout::HwcInterleaved,
+            byte_order: Some(ByteOrder::LittleEndian),
+        }),
+        required_metadata: FRAME_FIELDS,
     },
     SemanticType {
         id: RGB48_FRAME,
