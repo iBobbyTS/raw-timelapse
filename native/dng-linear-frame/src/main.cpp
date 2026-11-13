@@ -289,7 +289,10 @@ FrameOutput render(const Prepared &prepared,
   size_t negatives = 0, upper = 0;
   for (size_t i = 0; i < d.camera.size(); i += 3) {
     Vec camera{d.camera[i], d.camera[i + 1], d.camera[i + 2]};
-    Vec scene = multiply(d.camera_to_ap1, camera);
+    Vec scene = d.calibrated_scene.empty()
+                    ? multiply(d.camera_to_ap1, camera)
+                    : Vec{d.calibrated_scene[i], d.calibrated_scene[i + 1],
+                          d.calibrated_scene[i + 2]};
     for (int c = 0; c < 3; ++c) {
       float x = static_cast<float>(scene[c] * gain);
       if (!std::isfinite(x))

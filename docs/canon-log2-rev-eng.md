@@ -5,7 +5,7 @@
 | 显示名 | `--preview-profile` ID | 相机矩阵 / native 帧交接 |
 | --- | --- | --- |
 | `clog2(white paper)` | `canon-log2-cinema-gamut` | 历史 inverse(PCStoCamera) / RAWTLST2 signed FP32 AP1/D60 |
-| `clog2(rev-eng crm-dev)` | `canon-log2-cinema-gamut-rev-eng-crm-dev` | DNG SDK CameraToPCS / RAWTLST2 signed FP32 AP1/D60 |
+| `clog2(rev-eng crm-dev)` | `canon-log2-cinema-gamut-rev-eng-crm-dev` | DNG SDK CameraToPCS + profile HueSatMap / RAWTLST2 signed FP32 AP1/D60 |
 
 另有独立的 [clog3 (rev-eng crm-dev)](canon-log3-rev-eng.md)，复用相同 CameraToPCS/FP32 路线及 reference gain 合同，使用独立的三段式 Log3 正反曲线。
 
@@ -40,7 +40,8 @@ pipeline/target/release/rawtl-linear-video --input /path/to/canon-cr3 \
 CR3 -> Adobe Converter -c -l -> camera-space LinearRaw DNG
 -> SDK FP32 Linearize / Stage3 camera RGB
 -> 所选相机矩阵（white paper: inverse(PCStoCamera); rev-eng: CameraToPCS）
--> XYZ D50 -> Bradford D50/D60 -> AP1 D60
+-> rev-eng: linear ProPhoto/D50 + profile HueSatMap -> XYZ D50
+-> Bradford D50/D60 -> AP1 D60
 -> ×2^EV（用户/去闪曝光，一次）
 -> RAWTLST2 signed FP32 AP1/D60 -> AP1/D60 到 Cinema Gamut/D65
 -> ×reference_gain（仅rev-eng，一次；其他选项为1）
@@ -48,7 +49,7 @@ CR3 -> Adobe Converter -c -l -> camera-space LinearRaw DNG
 -> H264 8bit 4:2:0，沿用宽度上限4096及比例缩放
 ```
 
-CameraToPCS 优先使用 ForwardMatrix；无 FM 时由 SDK 提供逆矩阵回退。它已经处理相机 neutral / 白点，不再额外乘 WB 或重复适配到 D50。只应用矩阵：HueSatMap、LookTable、ProfileToneCurve、BaselineExposure 均不应用。各帧 metadata/manifest 记录方法、实际矩阵、selected white、profile 指纹、FM/表存在与应用状态。
+CameraToPCS 优先使用 ForwardMatrix；无 FM 时由 SDK 提供逆矩阵回退。它已经处理相机 neutral / 白点，不再额外乘 WB 或重复适配到 D50。逆向路线将 CameraToPCS 与配套 profile HueSatMap 一起应用（在 linear ProPhoto/D50 中，先于用户 EV）；LookTable、ProfileToneCurve、BaselineExposure 不应用。单层线性 HSM 采用保持曝光比例的 HDR 扩展，负 ProPhoto 像素保留有符号矩阵结果。详见 [饱和度修复与实测](canon-profile-calibration.md)。各帧 metadata/manifest 记录方法、实际矩阵、selected white、profile 指纹、FM/表存在与应用状态。
 
 内部 AP1/D60 浮点空间本身不会天然丢色。全部路线跳过旧 `round(AP1*16384)` 的提前负值裁切和约4的上限，直到最终 Log 码域才裁切。ADC 和 SDK 上游的既有范围限制仍然存在。
 
@@ -103,7 +104,7 @@ native/build/dng-linear-frame --stdout-frame-f32 /path/to/input.CR3 \
 
 所有 analysis/probe/application/final pass 使用同一策略。analysis 仍是小 JSON/v1，无完整像素。VIDEO_ARTIFACT 保存独立 profile ID、显示名和 reference gain。真实 output.mp4 审核先用对应反曲线恢复 Cinema Gamut 线性值，再除 reference gain 一次、用其 XYZ 的 Y 行求亮度。标签不能代替独立 profile 身份；身份/标签冲突报告不可观测或错误。时序审核继续 report/off、失败不阻止发布；字节损坏、native/encoder/交付完整性失败不发布。
 
-manifest schema和颜色 pipeline_revision 均为2。`final_signal_clipping` 对全部profile记录最终transfer定义域上下限裁切，native负值/高值仅是观测而非裁切。
+manifest schema仍为2；逆向路线的颜色 pipeline_revision 为3，其他路线为2。`final_signal_clipping` 对全部profile记录最终transfer定义域上下限裁切，native负值/高值仅是观测而非裁切。
 
 analysis JSON schema升至2：移除 `quantum_linear` 和 `output_clip_code_threshold`，改用 `highlight_threshold_linear=0.980010986328125`；这是保留历史行为的分析阈值，不是FP32量化步长。`floor=0.00048828125` 保持为测光算法参数。逐tile字段改为 `analysis_highlight_fraction`，`highlight_quality=analysis_ap1_threshold`；报告和CSV对应改名为 `analysis_highlight_increase_fraction`。报告schema也为2。相机域 `saturation_fraction` 不变。分析阈值占比不等于最终视频裁切，视频损失与传感器饱和也不能由最终Log裁切计数推导。native和Rust必须配套构建；旧schema分析会被拒绝。
 

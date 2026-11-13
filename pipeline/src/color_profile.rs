@@ -187,10 +187,10 @@ impl Transfer {
     pub fn document(self) -> &'static str {
         match self {
             Transfer::CanonLog3RevEng => {
-                "Cinema RAW Development reconstructed continuous Log3 (matrix-only CR3 adaptation)"
+                "Cinema RAW Development reconstructed continuous Log3 (camera-profile calibrated CR3 adaptation)"
             }
             Transfer::CanonLog2RevEng => {
-                "Cinema RAW Development reconstructed continuous Log2 (matrix-only CR3 adaptation)"
+                "Cinema RAW Development reconstructed continuous Log2 (camera-profile calibrated CR3 adaptation)"
             }
             Transfer::Srgb => "IEC 61966-2-1:1999",
             Transfer::SonySLog3 => "Technical Summary for S-Gamut3.Cine/S-Log3 and S-Gamut3/S-Log3",
@@ -815,7 +815,7 @@ impl ColorProfile {
         Json::obj(vec![
             ("profile", Json::Str(self.id.to_string())),
             ("display_name", Json::Str(self.display_name().into())),
-            ("pipeline_revision", Json::Int(2)),
+            ("pipeline_revision", Json::Int(if self.is_rev_eng() { 3 } else { 2 })),
             (
                 "transfer",
                 Json::obj(vec![

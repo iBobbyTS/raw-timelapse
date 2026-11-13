@@ -2567,13 +2567,27 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
             ("rev_defect=hash", "pixels_sha256 mismatch"),
             ("empty_source_sha256=1", "source_sha256"),
             ("rev_defect=nan", "nonfinite FP32"),
+            (
+                "rev_defect=old-calibration",
+                "incomplete camera profile calibration",
+            ),
+            (
+                "rev_defect=skipped-hsm",
+                "incomplete camera profile calibration",
+            ),
             ("rev_defect=infinity", "nonfinite FP32"),
             ("short_pixels=1", "short record payload"),
             ("descriptor_geometry_mismatch=1", "descriptor geometry"),
             ("nonzero_after_records=1", "exit code 3"),
         ] {
             if !profile.is_rev_eng()
-                && ["rev_defect=non-canon", "rev_defect=mixed-model"].contains(&knob)
+                && [
+                    "rev_defect=non-canon",
+                    "rev_defect=mixed-model",
+                    "rev_defect=old-calibration",
+                    "rev_defect=skipped-hsm",
+                ]
+                .contains(&knob)
             {
                 continue;
             }

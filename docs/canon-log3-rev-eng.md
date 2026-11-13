@@ -5,8 +5,8 @@
 | 显示名 | CLI ID | 相机颜色方法 |
 | --- | --- | --- |
 | `clog2(white paper)` | `canon-log2-cinema-gamut` | legacy inverse(PCStoCamera) |
-| `clog2(rev-eng crm-dev)` | `canon-log2-cinema-gamut-rev-eng-crm-dev` | DNG SDK CameraToPCS |
-| `clog3 (rev-eng crm-dev)` | `canon-log3-cinema-gamut-rev-eng-crm-dev` | DNG SDK CameraToPCS |
+| `clog2(rev-eng crm-dev)` | `canon-log2-cinema-gamut-rev-eng-crm-dev` | DNG SDK CameraToPCS + profile HueSatMap |
+| `clog3 (rev-eng crm-dev)` | `canon-log3-cinema-gamut-rev-eng-crm-dev` | DNG SDK CameraToPCS + profile HueSatMap |
 
 默认仍为 `srgb-preview`。既有两个 Log2 ID、矩阵和曲线不变。新 Log3 和逆向 Log2
 共享 Canon CR3 / 同相机型号限制、ForwardMatrix 优先策略、signed FP32 交接和曝光合同。
@@ -43,7 +43,8 @@ pipeline/target/release/rawtl-linear-video \
 CR3 -> Adobe Converter -c -l -> camera-space LinearRaw DNG
 -> DNG SDK FP32 Linearize / Stage3 camera RGB
 -> CameraToPCS（ForwardMatrix 优先；无 FM 时用 SDK 回退）
--> XYZ/D50 -> Bradford D50/D60 -> AP1/D60
+-> linear ProPhoto/D50 -> 配套 profile HueSatMap -> XYZ/D50
+-> Bradford D50/D60 -> AP1/D60
 -> ×2^EV（native 用户/去闪曝光，只应用一次）
 -> RAWTLST2 signed FP32 AP1/D60 -> Cinema Gamut/D65
 -> ×reference_gain（一次）-> 连续 Canon Log3
@@ -51,8 +52,7 @@ CR3 -> Adobe Converter -c -l -> camera-space LinearRaw DNG
 -> H.264 VideoToolbox 8bit 4:2:0，宽度上限4096，output.mp4
 ```
 
-CameraToPCS 已处理相机 neutral/白点，不重复 WB 或 D50 适配；不应用 HueSatMap、
-LookTable、ProfileToneCurve、BaselineExposure。FP32 保留 AP1 负值和高于旧约4上限的值。
+CameraToPCS 已处理相机 neutral/白点，不重复 WB 或 D50 适配。配套 HueSatMap 在 linear ProPhoto/D50 中应用，先于用户 EV；不应用 LookTable、ProfileToneCurve、BaselineExposure。HDR 与负值策略及实测见 [profile 校正说明](canon-profile-calibration.md)。FP32 保留 AP1 负值和高于旧约4上限的值。
 native 元数据、descriptor、像素 hash、finite、几何、颜色策略和源 hash 均校验。
 所有 analysis/probe/application/final pass 使用相同相机矩阵。
 
@@ -69,7 +69,7 @@ AP1 `[-.005,.5,.05]` 的最终 Log3 RGB8 为 `[36,114,74]`；提前裁 AP1 红�
 `[38,114,74]`，因此即使目标色域值全为正，也应保留相机矩阵输出的有符号值。
 
 RAWTLST2/analysis schema2、2.4GB帧上限及格式细节见 [通用 Canon FP32 合同](canon-log2-rev-eng.md)。
-此次不修改 native 协议或 DNG SDK；现有 native 可直接配套新的 Rust 选项。
+协议格式和 DNG SDK 不变。补全 profile 校正后必须重建匹配的 native/Rust：Rust 要求相机算法 revision2，拒绝跳过现有 HueSatMap 的旧 native。
 
 ## 恢复的正反曲线
 
@@ -128,7 +128,7 @@ r = 0.9*x
 
 ## 输出、去闪与审计
 
-manifest schema2 / color pipeline_revision2；记录独立 profile ID、显示名、曲线、来源、
+manifest schema2 / color pipeline_revision3；记录独立 profile ID、显示名、曲线、来源、
 定义域、reference gain 和每帧 `final_signal_clipping`。编码采用 pc/full、BT.2020 NCL
 YCbCr 系数；MP4 nclx 与 H.264 SPS VUI 为 primaries2 / transfer2 / matrix9 / full1。
 这些标签保留 vendor gamut/transfer 未指定，不把 Cinema Gamut 声称为 BT.2020。
@@ -160,7 +160,7 @@ ctest --test-dir native/build --output-on-failure
 `userDef+0x238` 为 Log2 中间表，`+0x248` 才是 Log3 输出表。已保存6960×3672
 RGB16LE及TIFF，回读 SHA256 `8e078465ef4605565d4e8d840d5b0185b2e4a5dffa6994d62a1b9ca612102e16`。
 
-实拍 CR3、构建和完整回归结果见 [验证记录](canon-log3-validation.json)。
+最初 matrix-only revision2 的实拍与回归记录保留在 [历史验证记录](canon-log3-validation.json)；当前 revision3 的 profile 校正与实测见 [校正记录](canon-profile-calibration.md)。
 单帧实拍验证关闭去闪；28帧受控序列另覆盖两种 WB、reference gain=2、所有趟次和
 真实视频审计。色卡ΔE、官方 Canon CR3 显影匹配和灰卡标定尚未进行；精确恢复传输函数
 不等于整个 CR3 官方显影管线逐像素一致。

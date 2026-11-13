@@ -513,6 +513,21 @@ fn run_frame(
             return Err(failure("missing/invalid camera matrix/profile fingerprint"));
         }
 
+        if config.camera_color_method.requires_canon_cr3()
+            && (color.get("algorithm_revision").and_then(Json::as_u64) != Some(2)
+                || !matches!(
+                    (
+                        color.get("hue_sat_map_present"),
+                        color.get("hue_sat_map_applied")
+                    ),
+                    (Some(Json::Bool(true)), Some(Json::Bool(true)))
+                        | (Some(Json::Bool(false)), Some(Json::Bool(false)))
+                ))
+        {
+            return Err(failure(
+                "incomplete camera profile calibration; rebuild matched native/Rust tools",
+            ));
+        }
         if sidecar.get("color_contract_version").and_then(Json::as_u64) != Some(1)
             || color.get("method_requested").and_then(Json::as_str)
                 != Some(config.camera_color_method.native_token())
