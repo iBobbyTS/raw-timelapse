@@ -1,21 +1,21 @@
-//! rawtl-linear-video: DNG frame sequence -> one configured video file.
+//! rawtl-linear-video: RAW/DNG frame sequence -> one video file and one log.
 //!
-//! The deflicker node (legacy V4 semantics) is enabled by default; every pass,
-//! failure path, report and publication rule lives in the modules below.
+//! The graph runtime owns preparation, measurement/solve, rendering, encoding
+//! and event-driven cleanup. This module owns the product surface: the single
+//! `--output` video file, its sibling run log, the run-specific scratch
+//! directory, publication and the failure contract.
 
-mod audit;
 mod cli;
-mod deflicker_run;
+mod continuity;
 mod digest;
 mod error;
-mod fallback;
 mod frame;
 mod graph_run;
 mod guard;
-mod manifest;
 mod order;
 mod proc;
 mod resample;
+mod run_log;
 mod video;
 
 // The binary and the library compile the same source files. Re-exporting the
@@ -28,11 +28,12 @@ pub use rawtl_linear_video::json;
 pub use rawtl_linear_video::transport;
 
 use cli::{Options, Parsed};
-use error::{Result, EXIT_TOOL};
+use error::Result;
 use order::SourceFrame;
+use run_log::{quote, RunLog};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use transport::DataEnvelope;
 
@@ -60,110 +61,254 @@ fn main() {
 
 pub struct RunContext<'a> {
     pub options: &'a Options,
-    pub input: &'a Path,
-    pub output: &'a Path,
+    /// Run-specific scratch root: converted cache and child transcripts.
+    pub scratch: &'a Path,
     pub sources: &'a [SourceFrame],
-    pub partial_dir: PathBuf,
     pub started: Instant,
+}
+
+pub struct EncodedStage {
+    pub probe: video::ProbeInfo,
+    pub bytes: u64,
+    pub timings: BTreeMap<String, Duration>,
+    pub video_artifact: DataEnvelope,
+    pub resize: Option<video::ResizeRecord>,
 }
 
 fn run(options: &Options) -> Result<()> {
     let started = Instant::now();
     let input = guard::canonical_input(&options.input)?;
-    let output = guard::canonical_output(&options.output)?;
-    guard::ensure_disjoint(&input, &output)?;
-    let output = guard::prepare_output(&output)?;
-    guard::ensure_output_empty(&output)?;
+    let mut video = guard::canonical_artifact(&options.video)?;
+    let mut log_path = guard::canonical_artifact(&options.log)?;
+    guard::ensure_outside_input(&input, &[&video, &log_path])?;
+    // Configuration failures must not create a directory, log, scratch or
+    // output.
+    graph_run::resolve_configuration(options)?;
+    guard::prepare_parent(&video)?;
+    video = guard::canonical_artifact(&video)?;
+    log_path = guard::canonical_artifact(&log_path)?;
+    guard::ensure_absent(&[&video, &log_path])?;
 
-    // The guarded, writable output directory is established. From here on every
-    // failure (including required-executable and source-enumeration failures)
-    // must retain a report; guard rejections above stay report-free.
-    let partial_dir = output.join(".rawtl-partial");
-    let outcome = deflicker_run::run(options, &input, &output, started);
-    if outcome.is_err() && partial_dir.exists() {
-        eprintln!(
-            "note: partial/intermediate artifacts retained at {}; no final deliverable name was published",
-            partial_dir.display()
-        );
-    }
-    outcome
-}
-
-pub struct EncodedStage {
-    pub retain_partial: bool,
-    pub probe: video::ProbeInfo,
-    pub bytes: u64,
-    pub timings: BTreeMap<String, Duration>,
-    pub video_artifact: DataEnvelope,
-    pub encoder: encoder::ResolvedConfig,
-    pub resize: Option<video::ResizeRecord>,
-}
-
-/// Build and write the manifest, then publish the validated configured video.
-pub fn publish_run(
-    context: &RunContext<'_>,
-    sequence: &frame::FrameSequence,
-    mut stage: EncodedStage,
-    deflicker: json::Json,
-) -> Result<()> {
-    let options = context.options;
-    let output = context.output;
-    stage
-        .timings
-        .insert("total".to_string(), context.started.elapsed());
-
-    let manifest_json = manifest::build(&manifest::ManifestInput {
-        options,
-        input: context.input,
-        output,
-        sequence,
-        probe: &stage.probe,
-        bytes: stage.bytes,
-        ffmpeg_version: tool_version(&options.ffmpeg).unwrap_or_else(|| "UNKNOWN".to_string()),
-        ffprobe_version: tool_version(&options.ffprobe).unwrap_or_else(|| "UNKNOWN".to_string()),
-        timings: &stage.timings,
-        deflicker,
-        encoder: &stage.encoder,
-        resize: stage.resize,
-    });
-    manifest::write(&output.join("manifest.json"), &manifest_json)?;
-
-    proc::check_stop()?;
-    let final_video = output.join(stage.encoder.output_name());
-    video::publish(&stage.video_artifact, &final_video)?;
-
-    if stage.retain_partial {
-        println!(
-            "retained graph cache: {}",
-            context.partial_dir.join("cache").display()
-        );
-    } else {
-        match fs::remove_dir_all(&context.partial_dir) {
-            Ok(()) => {}
-            Err(err) => eprintln!(
-                "warning: could not remove partial directory {}: {err}",
-                context.partial_dir.display()
-            ),
+    let mut log = RunLog::create(&log_path, env!("CARGO_PKG_VERSION"))?;
+    let scratch = match guard::create_scratch(&video) {
+        Ok(scratch) => scratch,
+        Err(err) => {
+            let _ = log.line(&format!(
+                "kind=run.error code={} message={}",
+                err.code,
+                quote(&err.message)
+            ));
+            return Err(err);
         }
+    };
+    let outcome = execute(options, &input, &video, &scratch, started, &mut log);
+    if let Err(err) = outcome {
+        let retained = scratch_has_content(&scratch);
+        if retained {
+            let _ = log.line(&format!(
+                "kind=run.error code={} message={} scratch={} retained=true",
+                err.code,
+                quote(&err.message),
+                quote(&scratch.display().to_string())
+            ));
+            eprintln!(
+                "note: partial/intermediate artifacts retained at {} (converted cache, \
+                 transcripts and any partial output); no video was published",
+                scratch.display()
+            );
+        } else {
+            let _ = log.line(&format!(
+                "kind=run.error code={} message={} retained=false",
+                err.code,
+                quote(&err.message)
+            ));
+            let _ = fs::remove_dir_all(&scratch);
+        }
+        return Err(err);
     }
-    println!(
-        "\nrun complete in {:.2}s",
-        context.started.elapsed().as_secs_f64()
-    );
-    println!("video:        {}", final_video.display());
-    println!("manifest:     {}", output.join("manifest.json").display());
     Ok(())
 }
 
-fn tool_version(program: &Path) -> Option<String> {
-    let captured = proc::run_capture(program, &["-version".to_string()], EXIT_TOOL).ok()?;
-    if !captured.status.success() {
-        return None;
+fn execute(
+    options: &Options,
+    input: &Path,
+    video: &Path,
+    scratch: &Path,
+    started: Instant,
+    log: &mut RunLog,
+) -> Result<()> {
+    log.line(&format!(
+        "kind=run.start input={} video={} log={} scratch={}",
+        quote(&input.display().to_string()),
+        quote(&video.display().to_string()),
+        quote(&log.path().display().to_string()),
+        quote(&scratch.display().to_string())
+    ))?;
+    println!("rawtl-linear-video {}", env!("CARGO_PKG_VERSION"));
+    println!("input:   {}", input.display());
+    println!("video:   {}", video.display());
+    println!("log:     {}", log.path().display());
+    println!("scratch: {}", scratch.display());
+    println!(
+        "fps:     {} ({})",
+        options.fps.arg(),
+        if options.fps_explicit {
+            "CLI override"
+        } else {
+            cli::LEGACY_FPS_PROVENANCE
+        }
+    );
+    let deflicker = &options.deflicker;
+    if deflicker.enabled() {
+        println!(
+            "deflicker: enabled (strength {}, period {}, brightness {}, estimator {}, \
+             ev_limits {})",
+            deflicker.strength,
+            deflicker.period,
+            deflicker.brightness.as_str(),
+            deflicker.estimator.as_str(),
+            deflicker.ev_limits_text(),
+        );
+    } else {
+        println!("deflicker: disabled (--strength 0: single pass, EV 0)");
     }
-    captured
-        .stdout
-        .lines()
-        .next()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
+    log.line(&format!(
+        "kind=settings fps={} white_balance={} strength={} period={} brightness={} \
+         estimator={} ev_limits={} roi={} exclude_rois={} steps={} reference_gain={}",
+        options.fps.arg(),
+        options.white_balance.as_str(),
+        deflicker.strength,
+        deflicker.period,
+        deflicker.brightness.as_str(),
+        deflicker.estimator.as_str(),
+        deflicker.ev_limits_text(),
+        deflicker
+            .roi
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        deflicker.exclude_rois.len(),
+        deflicker.steps.len(),
+        options.log_reference_gain
+    ))?;
+
+    proc::require_executable(&options.native_tool, "--dng-linear-frame")?;
+    proc::require_executable(&options.ffmpeg, "--ffmpeg")?;
+    proc::require_executable(&options.ffprobe, "--ffprobe")?;
+
+    let sources = order::enumerate_dng(input)?;
+    log.line(&format!(
+        "kind=inventory frames={} first={} last={}",
+        sources.len(),
+        quote(&sources.first().map_or_else(String::new, |s| s.name.clone())),
+        quote(&sources.last().map_or_else(String::new, |s| s.name.clone()))
+    ))?;
+    println!("found {} frame(s) in numeric order:", sources.len());
+    for (index, source) in sources.iter().enumerate() {
+        println!("  {:>3}. {}", index + 1, source.name);
+    }
+
+    let context = RunContext {
+        options,
+        scratch,
+        sources: &sources,
+        started,
+    };
+    let result = graph_run::run(&context, log)?;
+    print_sequence_summary(&result.sequence, options.white_balance);
+
+    let stage = &result.stage;
+    log.line(&format!(
+        "kind=video path={} bytes={} codec={} profile={} width={} height={} frames={} \
+         pix_fmt={} range={} resize={}",
+        quote(&video.display().to_string()),
+        stage.bytes,
+        stage.probe.codec_name,
+        stage.probe.profile,
+        stage.probe.width,
+        stage.probe.height,
+        stage.probe.frames,
+        stage.probe.pix_fmt,
+        stage.probe.color_range,
+        match stage.resize {
+            Some(record) => format!("{}x{}", record.width, record.height),
+            None => "none".to_string(),
+        }
+    ))?;
+    log.line(&format!(
+        "kind=timing preflight={:.3} graph={:.3} validate={:.3}",
+        stage
+            .timings
+            .get("preflight")
+            .map_or(0.0, |value| value.as_secs_f64()),
+        stage
+            .timings
+            .get("graph")
+            .map_or(0.0, |value| value.as_secs_f64()),
+        stage
+            .timings
+            .get("validate_video")
+            .map_or(0.0, |value| value.as_secs_f64())
+    ))?;
+
+    proc::check_stop()?;
+    let publish_started = Instant::now();
+    video::publish(&stage.video_artifact, video)?;
+    let published = publish_started.elapsed();
+    let total = started.elapsed();
+
+    log.line_best_effort(&format!(
+        "kind=publish path={} duration={:.3}",
+        quote(&video.display().to_string()),
+        published.as_secs_f64()
+    ));
+    log.line_best_effort(&format!(
+        "kind=timing.publish duration={:.3} total={:.3}",
+        published.as_secs_f64(),
+        total.as_secs_f64()
+    ));
+    if let Err(err) = fs::remove_dir_all(scratch) {
+        eprintln!(
+            "warning: could not remove run scratch {}: {err}",
+            scratch.display()
+        );
+        log.line_best_effort(&format!(
+            "kind=warning message={}",
+            quote(&format!("could not remove run scratch: {err}"))
+        ));
+    }
+    log.line_best_effort("kind=run.complete");
+    println!("\nrun complete in {:.2}s", total.as_secs_f64());
+    println!("video: {}", video.display());
+    println!("log:   {}", log.path().display());
+    Ok(())
+}
+
+fn scratch_has_content(scratch: &Path) -> bool {
+    fs::read_dir(scratch)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+fn print_sequence_summary(sequence: &frame::FrameSequence, white_balance: cli::WhiteBalance) {
+    if white_balance.freezes_reference() {
+        println!(
+            "frozen white balance: {} from {} (applied to every later frame)",
+            frame::format_wb(sequence.reference_wb),
+            sequence.reference_frame
+        );
+    } else {
+        println!(
+            "per-frame white balance: every frame decoded with its own as-shot neutral \
+             (no --white-balance override)"
+        );
+    }
+    println!(
+        "frames complete: {} frames of {}x{} in {:.2}s",
+        sequence.frames.len(),
+        sequence.width,
+        sequence.height,
+        sequence.total_duration.as_secs_f64()
+    );
 }

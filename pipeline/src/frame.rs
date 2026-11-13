@@ -1,6 +1,5 @@
 //! Streaming native protocol v1/v2 consumption. JSON crosses validated MemoryFile
 //! envelopes; pixels are read one frame at a time and never written to disk.
-use crate::cli::WhiteBalance;
 use crate::error::{Error, Result, EXIT_FRAME};
 use crate::json::{self, Json};
 use crate::order::SourceFrame;
@@ -24,7 +23,6 @@ pub struct FrameInfo {
     pub index: usize,
     pub source_name: String,
     pub camera_color: Option<Json>,
-    pub signal_clip_counts: Option<[usize; 2]>,
     pub source_sha256: Option<String>,
     pub pixels_sha256: Option<String>,
     pub width: u32,
@@ -32,14 +30,8 @@ pub struct FrameInfo {
     pub applied_wb: [f64; 3],
     pub wb_source: String,
     pub as_shot_neutral: [f64; 3],
-    pub observed_min: Option<f64>,
-    pub observed_max: Option<f64>,
-    pub quantization: Option<Json>,
-    pub capture_time: Option<String>,
     pub exposure_ev: f64,
-    pub log_relative: String,
     pub duration: Duration,
-    pub metadata_envelope: DataEnvelope,
     pub analysis_envelope: Option<DataEnvelope>,
 }
 #[derive(Debug, Clone)]
@@ -51,6 +43,9 @@ pub struct FrameSequence {
     pub reference_frame: String,
     pub total_duration: Duration,
 }
+/// Test-only caller of the retired source-path producer. The product graph
+/// consumes `PreparedFrame` through `prepare`/`analyze_prepared`/`develop` only.
+#[cfg(test)]
 pub struct ProduceConfig<'a> {
     pub camera_color_method: crate::color_profile::CameraColorMethod,
     pub logs_dir: &'a Path,
@@ -58,10 +53,9 @@ pub struct ProduceConfig<'a> {
     pub analysis_roi: Option<[f64; 4]>,
     pub echo: bool,
     pub echo_tag: &'a str,
-    pub white_balance: WhiteBalance,
+    pub white_balance: crate::cli::WhiteBalance,
     pub converter: Option<&'a str>,
     pub converter_timeout: Option<u64>,
-    pub log_relative_dir: &'a str,
 }
 
 /// Versioned prepared-context header. The context is a strict line document
@@ -550,24 +544,23 @@ impl Drop for NativeStream {
     }
 }
 
-struct NativeRun<'a> {
+struct NativeRun {
     method: crate::color_profile::CameraColorMethod,
-    log_path: Option<&'a Path>,
-    logs_dir: &'a Path,
-    log_relative_dir: &'a str,
-    converter: Option<&'a str>,
-    converter_timeout: Option<u64>,
+    log: PathBuf,
     analysis_roi: Option<[f64; 4]>,
+    #[cfg(test)]
+    converter: Option<String>,
+    #[cfg(test)]
+    converter_timeout: Option<u64>,
 }
 
-impl<'a> NativeRun<'a> {
-    fn from_produce(config: &'a ProduceConfig<'a>) -> Self {
+impl NativeRun {
+    #[cfg(test)]
+    fn from_produce(config: &ProduceConfig<'_>) -> Self {
         Self {
             method: config.camera_color_method,
-            log_path: None,
-            logs_dir: config.logs_dir,
-            log_relative_dir: config.log_relative_dir,
-            converter: config.converter,
+            log: config.logs_dir.join("frame_000001.log"),
+            converter: config.converter.map(str::to_string),
             converter_timeout: config.converter_timeout,
             analysis_roi: config.analysis_roi,
         }
@@ -576,50 +569,40 @@ impl<'a> NativeRun<'a> {
 
 /// Either an original source file or a validated prepared context. Both reach
 /// the same native consumer protocol; only the second may not carry Converter
-/// options because the conversion already happened during --prepare.
+/// options because the conversion already happened during --prepare. The
+/// source variant exists only for the retired-producer tests.
 #[derive(Clone, Copy)]
 enum FrameInput<'a> {
+    #[cfg(test)]
     Source(&'a SourceFrame),
-    #[allow(dead_code)]
     Prepared(&'a PreparedFrame),
 }
 
 impl FrameInput<'_> {
     fn name(&self) -> &str {
         match self {
+            #[cfg(test)]
             Self::Source(source) => &source.name,
             Self::Prepared(prepared) => &prepared.source_name,
         }
     }
     fn path(&self) -> &Path {
         match self {
+            #[cfg(test)]
             Self::Source(source) => &source.path,
             Self::Prepared(prepared) => &prepared.source,
         }
     }
     fn prepared(&self) -> Option<&PreparedFrame> {
         match self {
+            #[cfg(test)]
             Self::Source(_) => None,
             Self::Prepared(prepared) => Some(prepared),
         }
     }
 }
 
-pub fn produce(
-    tool: &Path,
-    sources: &[SourceFrame],
-    config: &ProduceConfig<'_>,
-) -> Result<FrameSequence> {
-    produce_inner(
-        tool,
-        sources,
-        None,
-        config,
-        false,
-        Default::default(),
-        &mut |_, _| Ok(()),
-    )
-}
+#[cfg(test)]
 pub fn produce_with_evs(
     tool: &Path,
     sources: &[SourceFrame],
@@ -636,6 +619,7 @@ pub fn produce_with_evs(
         &mut |_, _| Ok(()),
     )
 }
+#[cfg(test)]
 pub fn stream_frames(
     tool: &Path,
     sources: &[SourceFrame],
@@ -646,6 +630,7 @@ pub fn stream_frames(
 ) -> Result<FrameSequence> {
     produce_inner(tool, sources, Some(evs), config, true, active, consume)
 }
+#[cfg(test)]
 fn produce_inner(
     tool: &Path,
     sources: &[SourceFrame],
@@ -756,31 +741,8 @@ fn produce_inner(
         total_duration: started.elapsed(),
     })
 }
-pub fn produce_single(
-    tool: &Path,
-    source: &SourceFrame,
-    override_wb: Option<[f64; 3]>,
-    index: usize,
-    config: &ProduceConfig<'_>,
-) -> Result<FrameInfo> {
-    let run = NativeRun::from_produce(config);
-    run_frame(
-        tool,
-        FrameInput::Source(source),
-        index,
-        1,
-        override_wb,
-        config.exposure_ev,
-        &run,
-        false,
-        Default::default(),
-        &mut |_, _| Ok(()),
-    )
-}
-
 /// Settings for `dng-linear-frame --prepare`. The caller owns the scratch
-/// directory (it must already exist), the context path and its log.
-#[allow(dead_code)] // consumed by the graph scheduling integration
+/// directory (it must already exist), the context path and its transcript.
 pub struct PrepareSettings<'a> {
     pub scratch_dir: &'a Path,
     pub context_path: &'a Path,
@@ -791,17 +753,13 @@ pub struct PrepareSettings<'a> {
 
 /// Prepared-frame consumer settings. No Converter options exist here on
 /// purpose: a prepared context already records its conversion provenance.
-#[allow(dead_code)] // consumed by the graph scheduling integration
-pub struct PreparedSettings<'a> {
+pub struct PreparedSettings {
     pub camera_color_method: crate::color_profile::CameraColorMethod,
-    pub logs_dir: &'a Path,
-    pub log_relative_dir: &'a str,
 }
 
 /// Run the native prepare operation once for one source and load the resulting
 /// context. The returned frame carries the original identity; the prepared DNG
 /// stays in the caller's scratch until the caller deletes it.
-#[allow(dead_code)] // consumed by the graph scheduling integration
 pub fn prepare(
     tool: &Path,
     source: &SourceFrame,
@@ -854,7 +812,6 @@ pub fn prepare(
     Ok(prepared)
 }
 
-#[allow(dead_code)] // consumed by the graph scheduling integration
 fn write_prepare_log(
     log: &Path,
     tool: &Path,
@@ -876,35 +833,35 @@ fn write_prepare_log(
         .map_err(|e| Error::new(EXIT_FRAME, format!("cannot write {}: {e}", log.display())))
 }
 
-#[allow(dead_code)] // consumed by the graph scheduling integration
-fn prepared_native_run<'a>(
-    settings: &'a PreparedSettings<'a>,
+fn prepared_native_run(
+    settings: &PreparedSettings,
     analysis_roi: Option<[f64; 4]>,
-) -> NativeRun<'a> {
+    log: &Path,
+) -> NativeRun {
     NativeRun {
         method: settings.camera_color_method,
-        log_path: None,
-        logs_dir: settings.logs_dir,
-        log_relative_dir: settings.log_relative_dir,
-        converter: None,
-        converter_timeout: None,
+        log: log.to_path_buf(),
         analysis_roi,
+        #[cfg(test)]
+        converter: None,
+        #[cfg(test)]
+        converter_timeout: None,
     }
 }
 
 /// Analysis pass over a prepared context. Invokes no Converter and never
 /// deletes the prepared DNG.
-#[allow(dead_code)] // consumed by the graph scheduling integration
+#[cfg(test)]
 pub fn analyze_prepared(
     tool: &Path,
     prepared: &PreparedFrame,
     override_wb: Option<[f64; 3]>,
     exposure_ev: Option<f64>,
     analysis_roi: Option<[f64; 4]>,
-    settings: &PreparedSettings<'_>,
+    settings: &PreparedSettings,
+    log: &Path,
 ) -> Result<FrameInfo> {
-    let run = prepared_native_run(settings, analysis_roi);
-    let log = settings.logs_dir.join("frame_000001.log");
+    let run = prepared_native_run(settings, analysis_roi, log);
     run_frame(
         tool,
         FrameInput::Prepared(prepared),
@@ -920,7 +877,6 @@ pub fn analyze_prepared(
     .map_err(|error| prepared_consumer_error(error, &log))
 }
 
-#[allow(dead_code)] // consumed by the graph scheduling integration
 fn prepared_consumer_error(error: Error, log: &Path) -> Error {
     let detail = fs::read_to_string(log).unwrap_or_default();
     Error::new(
@@ -936,17 +892,17 @@ fn prepared_consumer_error(error: Error, log: &Path) -> Error {
 
 /// FP32 develop pass over a prepared context. The caller reads pixels through
 /// the callback while the native process is still alive.
-#[allow(dead_code)] // consumed by the graph scheduling integration
+#[cfg(test)]
 pub fn develop_prepared(
     tool: &Path,
     prepared: &PreparedFrame,
     override_wb: Option<[f64; 3]>,
     exposure_ev: Option<f64>,
-    settings: &PreparedSettings<'_>,
+    settings: &PreparedSettings,
+    log: &Path,
     consume: &mut impl FnMut(&FrameInfo, &mut NativeStream) -> Result<()>,
 ) -> Result<FrameInfo> {
-    let run = prepared_native_run(settings, None);
-    let log = settings.logs_dir.join("frame_000001.log");
+    let run = prepared_native_run(settings, None, log);
     run_frame(
         tool,
         FrameInput::Prepared(prepared),
@@ -968,13 +924,12 @@ pub fn analyze_prepared_at(
     prepared: &PreparedFrame,
     wb: Option<[f64; 3]>,
     roi: [f64; 4],
-    settings: &PreparedSettings<'_>,
+    settings: &PreparedSettings,
     id: usize,
     total: usize,
     log: &Path,
 ) -> Result<FrameInfo> {
-    let mut run = prepared_native_run(settings, Some(roi));
-    run.log_path = Some(log);
+    let run = prepared_native_run(settings, Some(roi), log);
     run_frame(
         tool,
         FrameInput::Prepared(prepared),
@@ -994,15 +949,14 @@ pub fn develop_prepared_at(
     prepared: &PreparedFrame,
     wb: Option<[f64; 3]>,
     ev: f64,
-    settings: &PreparedSettings<'_>,
+    settings: &PreparedSettings,
     id: usize,
     total: usize,
     log: &Path,
     active: ActiveNative,
     consume: &mut impl FnMut(&FrameInfo, &mut NativeStream) -> Result<()>,
 ) -> Result<FrameInfo> {
-    let mut run = prepared_native_run(settings, None);
-    run.log_path = Some(log);
+    let run = prepared_native_run(settings, None, log);
     run_frame(
         tool,
         FrameInput::Prepared(prepared),
@@ -1025,7 +979,7 @@ fn run_frame(
     total: usize,
     override_wb: Option<[f64; 3]>,
     exposure_ev: Option<f64>,
-    run: &NativeRun<'_>,
+    run: &NativeRun,
     pixels: bool,
     active: ActiveNative,
     consume: &mut impl FnMut(&FrameInfo, &mut NativeStream) -> Result<()>,
@@ -1047,6 +1001,7 @@ fn run_frame(
         return Err(failure("rev-eng Canon Log requires Canon CR3 photos"));
     }
     match input {
+        #[cfg(test)]
         FrameInput::Source(source) => args.push(source.path.display().to_string()),
         FrameInput::Prepared(prepared) => {
             // The context already records the conversion; never pass a
@@ -1055,7 +1010,8 @@ fn run_frame(
             args.push(prepared.context.display().to_string());
         }
     }
-    if let FrameInput::Prepared(prepared) = input {
+    if let Some(prepared) = input.prepared() {
+        #[cfg(test)]
         if run.converter.is_some() || run.converter_timeout.is_some() {
             return Err(failure(
                 "a prepared context already carries its Converter provenance",
@@ -1075,9 +1031,10 @@ fn run_frame(
     if let Some(ev) = exposure_ev {
         args.extend(["--exposure-ev".into(), format_ev(ev)]);
     }
+    #[cfg(test)]
     if let FrameInput::Source(_) = input {
-        if let Some(path) = run.converter {
-            args.extend(["--converter".into(), path.into()]);
+        if let Some(path) = &run.converter {
+            args.extend(["--converter".into(), path.clone()]);
         }
         if let Some(seconds) = run.converter_timeout {
             args.extend(["--converter-timeout".into(), seconds.to_string()]);
@@ -1094,12 +1051,7 @@ fn run_frame(
             ]);
         }
     }
-    let mut stream = NativeStream::open(
-        tool,
-        &args,
-        run.log_path.unwrap_or(&run.logs_dir.join(format!("frame_{index:06}.log"))),
-        active,
-    )?;
+    let mut stream = NativeStream::open(tool, &args, &run.log, active)?;
     let bytes = stream.json(1)?;
     let sidecar = parse_json(&bytes)?;
     {
@@ -1216,7 +1168,7 @@ fn run_frame(
             .ok_or_else(|| missing_field(index, total, input.name(), "source_sha256"))?
             .to_string(),
     );
-    let metadata_envelope = frame_metadata_envelope(
+    let _metadata_envelope = frame_metadata_envelope(
         file,
         schema_version,
         frame_width,
@@ -1302,9 +1254,6 @@ fn run_frame(
         ));
     }
 
-    let observed_min = sidecar.get("observed_scene_min").and_then(Json::as_f64);
-    let observed_max = sidecar.get("observed_scene_max").and_then(Json::as_f64);
-    let quantization = sidecar.get("quantization").cloned();
 
     let reported_ev = sidecar
         .get("exposure_ev")
@@ -1405,7 +1354,6 @@ fn run_frame(
         index,
         source_name: input.name().to_string(),
         camera_color: sidecar.get("color").cloned(),
-        signal_clip_counts: None,
         source_sha256,
         pixels_sha256: None,
         width: frame_width,
@@ -1413,14 +1361,8 @@ fn run_frame(
         applied_wb,
         wb_source,
         as_shot_neutral,
-        observed_min,
-        observed_max,
-        quantization,
-        capture_time,
         exposure_ev: reported_ev,
-        log_relative: format!("{}/frame_{index:06}.log", run.log_relative_dir),
         duration: Duration::ZERO,
-        metadata_envelope,
         analysis_envelope: None,
     };
     if pixels {
@@ -1924,11 +1866,9 @@ mod prepared_tests {
     const FRAME_1: &str = "frame=IMG_1.DNG|0.5,1,0.8|0.0|0.0|-|-|flat";
     const FRAME_2: &str = "frame=IMG_2.CR3|0.6,1,0.7|0.2|0.3|2026:11:13 04:05:06|-|flat";
 
-    fn prepared_settings<'a>(logs: &'a std::path::Path) -> PreparedSettings<'a> {
+    fn prepared_settings() -> PreparedSettings {
         PreparedSettings {
             camera_color_method: crate::color_profile::CameraColorMethod::LegacyInverseCm,
-            logs_dir: logs,
-            log_relative_dir: "logs",
         }
     }
 
@@ -1973,9 +1913,9 @@ mod prepared_tests {
         assert_eq!(prepared.as_shot_neutral, [0.5, 1.0, 0.8]);
 
         let logs = dir.join("logs");
-        let settings = prepared_settings(&logs);
+        let settings = prepared_settings();
         let analysis =
-            analyze_prepared(&tool, &prepared, None, Some(0.0), None, &settings).expect("analyze");
+            analyze_prepared(&tool, &prepared, None, Some(0.0), None, &settings, &logs.join("frame_000001.log")).expect("analyze");
         assert_eq!(analysis.index, 1);
         assert_eq!(analysis.source_name, "IMG_1.DNG");
         assert_eq!(analysis.applied_wb, prepared.as_shot_neutral);
@@ -1989,7 +1929,7 @@ mod prepared_tests {
             .starts_with(b"{\"schema_version\":2"));
 
         let mut pixel_bytes = 0usize;
-        let developed = develop_prepared(&tool, &prepared, None, Some(0.25), &settings, &mut |info, native| {
+        let developed = develop_prepared(&tool, &prepared, None, Some(0.25), &settings, &logs.join("frame_000001.log"), &mut |info, native| {
             let pixels = native.pixels(info.width, info.height)?;
             pixel_bytes = pixels.len();
             assert!(pixels
@@ -2009,6 +1949,7 @@ mod prepared_tests {
             None,
             Some([0.0, 0.0, 0.5, 0.5]),
             &settings,
+            &logs.join("frame_000002.log"),
         )
         .expect("override analyze");
         assert_eq!(overridden.wb_source, WB_SOURCE_OVERRIDE);
@@ -2046,10 +1987,8 @@ mod prepared_tests {
         let logs = dir.join("canon-logs");
         let settings = PreparedSettings {
             camera_color_method: crate::color_profile::CameraColorMethod::DngCameraToPcs,
-            logs_dir: &logs,
-            log_relative_dir: "logs",
         };
-        let info = analyze_prepared(&tool, &prepared, None, Some(0.0), None, &settings)
+        let info = analyze_prepared(&tool, &prepared, None, Some(0.0), None, &settings, &logs.join("frame_000001.log"))
             .expect("canon analyze");
         assert_eq!(
             info.camera_color
@@ -2058,7 +1997,7 @@ mod prepared_tests {
                 .and_then(Json::as_str),
             Some("Canon EOS R7")
         );
-        develop_prepared(&tool, &prepared, Some([0.6, 1.0, 0.7]), Some(0.0), &settings, &mut |info, native| {
+        develop_prepared(&tool, &prepared, Some([0.6, 1.0, 0.7]), Some(0.0), &settings, &logs.join("frame_000001.log"), &mut |info, native| {
             native.pixels(info.width, info.height)?;
             Ok(())
         })
@@ -2070,7 +2009,7 @@ mod prepared_tests {
         let dng_source = source_frame(&dir, "IMG_1.DNG");
         let dng_tool = fake_tool(&dir, &[FRAME_1], "");
         let dng_prepared = prepare_one(&dir, &dng_tool, &dng_source, "dng");
-        let error = analyze_prepared(&tool, &dng_prepared, None, None, None, &settings)
+        let error = analyze_prepared(&tool, &dng_prepared, None, None, None, &settings, &logs.join("frame_000001.log"))
             .expect_err("Canon method requires CR3");
         assert!(
             error.message.contains("requires Canon CR3"),
@@ -2085,8 +2024,7 @@ mod prepared_tests {
         let source = source_frame(&dir, "IMG_2.CR3");
         let base = fake_tool(&dir, &[FRAME_2], "");
         let prepared = prepare_one(&dir, &base, &source, "base");
-        let logs = dir.join("logs");
-        let settings = prepared_settings(&logs);
+        let settings = prepared_settings();
         for (defect, needle) in [
             ("route", "route"),
             ("dng", "DNG identity"),
@@ -2100,7 +2038,7 @@ mod prepared_tests {
                 &[FRAME_2],
                 &format!("prepared_metadata_defect={defect}"),
             );
-            let error = analyze_prepared(&tool, &prepared, None, None, None, &settings)
+            let error = analyze_prepared(&tool, &prepared, None, None, None, &settings, &dir.join("defect.log"))
                 .expect_err(defect);
             assert!(
                 error.message.contains(needle),
@@ -2287,8 +2225,6 @@ mod prepared_tests {
         let legacy_logs = work.join("legacy-logs");
         let settings = PreparedSettings {
             camera_color_method: crate::color_profile::CameraColorMethod::DngCameraToPcs,
-            logs_dir: &prepared_logs,
-            log_relative_dir: "logs",
         };
         let sources: Vec<SourceFrame> = materials
             .iter()
@@ -2330,7 +2266,7 @@ mod prepared_tests {
 
         // Analysis: the first frame uses its as-shot neutral, later frames the
         // frozen first-frame reference (the product's default).
-        let first = analyze_prepared(&tool, &prepared_frames[0], None, Some(0.0), None, &settings)
+        let first = analyze_prepared(&tool, &prepared_frames[0], None, Some(0.0), None, &settings, &prepared_logs.join("frame_000001.log"))
             .expect("prepare analysis");
         let first_wb = first.applied_wb;
         let legacy_config = ProduceConfig {
@@ -2343,13 +2279,12 @@ mod prepared_tests {
             white_balance: WhiteBalance::FirstFrame,
             converter: Some(legacy_converter.to_str().unwrap()),
             converter_timeout: Some(120),
-            log_relative_dir: "logs",
         };
         let baseline = produce_with_evs(&tool, &sources, &[0.0, 0.0][..sources.len()], &legacy_config)
             .expect("legacy analysis");
         for (index, (prepared, legacy)) in prepared_frames.iter().zip(&baseline.frames).enumerate() {
             let wb = if index == 0 { None } else { Some(first_wb) };
-            let info = analyze_prepared(&tool, prepared, wb, Some(0.0), None, &settings)
+            let info = analyze_prepared(&tool, prepared, wb, Some(0.0), None, &settings, &prepared_logs.join(format!("frame_{index:06}.log")))
                 .expect("prepared analysis");
             assert_eq!(info.applied_wb, legacy.applied_wb, "frame {index} WB");
             assert_eq!(info.as_shot_neutral, legacy.as_shot_neutral);
@@ -2378,7 +2313,7 @@ mod prepared_tests {
             for (index, prepared) in prepared_frames.iter().enumerate() {
                 let wb = if index == 0 { None } else { Some(first_wb) };
                 let mut digest = String::new();
-                let info = develop_prepared(&tool, prepared, wb, Some(ev), &settings, &mut |info, native| {
+                let info = develop_prepared(&tool, prepared, wb, Some(ev), &settings, &prepared_logs.join(format!("frame_{index:06}.log")), &mut |info, native| {
                     let pixels = native.pixels(info.width, info.height)?;
                     digest = crate::digest::sha256(&pixels);
                     Ok(())
@@ -2414,7 +2349,7 @@ mod prepared_tests {
         )
         .expect("prepare deletion frame");
         fs::remove_file(&deletion.dng).expect("caller deletes prepared DNG");
-        let error = analyze_prepared(&tool, &deletion, None, None, None, &settings)
+        let error = analyze_prepared(&tool, &deletion, None, None, None, &settings, &prepared_logs.join("frame_000001.log"))
             .expect_err("deleted cache must fail");
         assert!(error.message.contains("prepared"), "{}", error.message);
         assert_eq!(counter_lines(&prepared_counter), sources.len() + 1);

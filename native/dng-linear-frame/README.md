@@ -105,11 +105,16 @@ The same input and options produce byte-identical sidecar JSON (fixed
 `source_sha256`, analysis geometry, `exposure_ev`, the fixed analysis constants,
 and the row-major tile list.
 
-Pipeline consumption: all analysis/probe/application passes use stdout
-analysis; all final frames use stdout FP32 regardless of profile. Camera-domain
-occupancy gates estimation; analysis highlight occupancy produces the report's
-`analysis_highlight_increase_fraction`. Final signal-domain clipping is counted
-separately after the target gamut conversion, in Rust.
+Pipeline consumption: the product graph calls `--prepare` once per source, then
+uses stdout analysis for the single measurement pass and stdout FP32 for the
+single develop pass regardless of profile. Camera-domain occupancy gates
+estimation; analysis highlight occupancy stays internal to the estimator. There
+is no probe, feedback or independent encoded-video audit pass in the product
+path. The native metadata/analysis records are machine-read by Rust and are not
+dumped into the product log. The product surface (one video file, one sibling
+run log, run-specific scratch) is documented in
+[`pipeline/README.md`](../../pipeline/README.md) and
+[`docs/node-graph-workflow.md`](../../docs/node-graph-workflow.md).
 
 ## Streaming stdout protocol (v1)
 

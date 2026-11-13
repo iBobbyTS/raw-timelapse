@@ -1,8 +1,17 @@
+//! Product CLI acceptance: one video file, one sibling run log, a run-specific
+//! scratch directory, and the failure/degraded/retry contracts.
+//!
+//! Every test that needs real encoding calls the FFmpeg 8 binary directly.
+//! Synthetic frames cross the fake native producer; one guarded journey uses
+//! the staged Canon R7 CR3 material with the real native producer.
+
 mod common;
 
 use common::*;
+use rawtl_linear_video::json::Json;
 use std::fs;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 fn stderr(output: &Output) -> String {
@@ -13,22 +22,12 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn run_success_setup(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-    require_ffmpeg();
-    let root = test_dir(name);
-    let input = root.join("material");
-    make_input(&input, &["IMG_10.DNG", "IMG_1.DNG", "IMG_2.DNG"]);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
-    (root, input, fixtures)
-}
-
-fn base_args<'a>(input: &'a Path, output: &'a Path, tool: &'a Path) -> Vec<&'a str> {
+fn base_args<'a>(input: &'a Path, video: &'a Path, tool: &'a Path) -> Vec<&'a str> {
     vec![
         "--input",
         input.to_str().expect("utf8"),
         "--output",
-        output.to_str().expect("utf8"),
+        video.to_str().expect("utf8"),
         "--dng-linear-frame",
         tool.to_str().expect("utf8"),
         "--ffmpeg",
@@ -38,95 +37,62 @@ fn base_args<'a>(input: &'a Path, output: &'a Path, tool: &'a Path) -> Vec<&'a s
     ]
 }
 
+fn run_directory(root: &Path, name: &str) -> PathBuf {
+    root.join(name)
+}
+
+/// The historical three-frame fixture with vendor RAW names, so the prepared
+/// cache is run-generated and therefore deletable.
+fn cr3_standard_frames(fixtures: &Path) -> Vec<FakeFrame> {
+    standard_frames(fixtures)
+        .into_iter()
+        .map(|mut frame| {
+            frame.name = frame.name.replace(".DNG", ".CR3");
+            frame
+        })
+        .collect()
+}
+
+fn append_config(fixtures: &Path, line: &str) {
+    let config = fixtures.join(format!("fake-native-{}.config", std::process::id()));
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&config).expect("config"),
+        "{line}"
+    )
+    .expect("append config");
+}
+
+// ---------------------------------------------------------------------------
+// Core surface
+// ---------------------------------------------------------------------------
+
 #[test]
-fn publishes_one_streamed_video_with_manifest_and_no_frame_files() {
-    let (root, input, fixtures) = run_success_setup("success");
-    let frames = standard_frames(&fixtures);
+fn publishes_one_video_and_one_run_log_with_a_clean_scratch() {
+    require_ffmpeg();
+    let root = test_dir("surface");
+    let input = root.join("material");
+    make_input(&input, &["IMG_10.CR3", "IMG_1.CR3", "IMG_2.CR3"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = cr3_standard_frames(&fixtures);
     let tool = fake_native_tool(&fixtures, &frames, None, false);
-    let output = root.join("run");
-    let result = run_cli(&base_args(&input, &output, &tool));
+    let directory = run_directory(&root, "run");
+    fs::create_dir_all(&directory).expect("create run dir");
+    fs::write(directory.join("notes.txt"), b"user file").expect("pre-existing file");
+
+    let video = video_in(&directory);
+    let result = run_cli(&base_args(&input, &video, &tool));
     assert!(
         result.status.success(),
         "{}\n{}",
         stdout(&result),
         stderr(&result)
     );
-    let mut names: Vec<_> = fs::read_dir(&output)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
-    names.sort();
-    assert_eq!(
-        names,
-        vec![
-            "exposure-curve.csv",
-            "exposure_report.json",
-            "frames.csv",
-            "logs",
-            "manifest.json",
-            "output.mov",
-            "pairs.csv",
-        ]
-    );
-    let manifest = read_json(&output.join("manifest.json"));
-    assert!(manifest.get("linear_video").is_none());
-    assert!(manifest.get("preview").is_none());
-    let video = manifest.get("video").unwrap();
-    assert_eq!(video.get("codec").and_then(Json::as_str), Some("prores"));
-    assert_eq!(video.get("file").and_then(Json::as_str), Some("output.mov"));
-    assert_eq!(video.get("frames").and_then(Json::as_u64), Some(3));
-    assert!(video.get("bytes").and_then(Json::as_u64).unwrap() > 0);
-    let entries = manifest
-        .get("frames")
-        .and_then(|v| v.get("entries"))
-        .and_then(Json::as_array)
-        .unwrap();
-    for (offset, name) in ["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"].iter().enumerate() {
-        let frame = &entries[offset];
-        assert_eq!(frame.get("source").and_then(Json::as_str), Some(*name));
-        for key in ["pixels_sha256", "source_sha256"] {
-            let hash = frame.get(key).and_then(Json::as_str).unwrap();
-            assert!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()));
-        }
-        for removed in [
-            "png",
-            "metadata",
-            "png_sha256",
-            "applied_white_balance",
-            "white_balance_source",
-            "as_shot_neutral",
-        ] {
-            assert!(frame.get(removed).is_none(), "{removed}");
-        }
-        let log = fs::read_to_string(output.join(frame.get("log").and_then(Json::as_str).unwrap()))
-            .unwrap();
-        assert!(log.contains("--stdout-frame-f32"));
-        assert!(log.contains("pixel bytes: 576"));
-        assert!(log.contains("exit: exit code 0"));
-        let metadata = metadata_from_log(&log);
-        assert_eq!(
-            metadata.get("white_balance_source").and_then(Json::as_str),
-            Some(if offset == 0 { "as-shot" } else { "override" })
-        );
-        assert_eq!(
-            white_balance_triple(metadata.get("applied_white_balance").unwrap()),
-            [0.5, 1.0, 0.8]
-        );
-        assert!(log.is_ascii());
-        assert!(!log.contains('\0'));
-    }
-    let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(
-        report
-            .get("analysis")
-            .unwrap()
-            .get("transport")
-            .and_then(Json::as_str),
-        Some("MemoryFile; native stdout protocol v1")
-    );
-    let text = fs::read_to_string(output.join("exposure_report.json")).unwrap();
-    assert!(!text.contains("baseline_dir") && !text.contains("applied_dir"));
-    let probe = ffprobe(&output.join("output.mov"));
+    assert_only_video_and_log(&directory, VIDEO_NAME, &["notes.txt"]);
+    let log = read_log(&directory);
+
+    // The video is the configured ProRes 4444 at the source geometry.
+    let probe = ffprobe(&video_in(&directory));
     for expected in [
         "codec_name=prores",
         "profile=4444",
@@ -134,27 +100,263 @@ fn publishes_one_streamed_video_with_manifest_and_no_frame_files() {
         "width=8",
         "height=6",
         "nb_read_frames=3",
+        "avg_frame_rate=30/1",
     ] {
         assert!(probe.contains(expected), "{probe}");
     }
-    let log = fs::read_to_string(output.join("logs/encode.log")).unwrap();
-    assert!(log.contains("-i pipe:0"));
-    assert!(!log.contains("-nostdin"));
-    assert!(log.contains("-c:v prores_ks -pix_fmt yuv444p10le"));
-    assert!(log.contains("setparams=color_primaries=bt709"));
-    let timings = manifest.get("timings_s").unwrap();
-    for key in ["graph", "validate_video"] {
-        assert!(timings.get(key).is_some(), "{key}");
+
+    // The log records the run contract in one place.
+    for expected in [
+        "kind=run.start",
+        "kind=settings fps=30/1",
+        "kind=graph source=\"built-in\"",
+        "kind=encoder encoder=prores_ks",
+        "kind=colour profile=srgb-preview",
+        "kind=prepare frame=1",
+        "kind=measure frame=1",
+        "kind=develop frame=1",
+        "kind=delete frame=1",
+        "kind=timing preflight=",
+        "kind=publish",
+        "kind=run.complete",
+    ] {
+        assert!(log.contains(expected), "missing {expected} in:\n{log}");
+    }
+    // Node order: develop completes, the cache is deleted, then the frame is
+    // pushed to the encoder.
+    let develop_at = log.find("kind=develop frame=1").expect("develop");
+    let delete_at = log.find("kind=delete frame=1").expect("delete");
+    let encode_at = log
+        .find("kind=node node=encode frame=1")
+        .expect("encode node");
+    assert!(develop_at < delete_at && delete_at < encode_at, "{log}");
+    // Every declared node reports a completion event.
+    for node in [
+        "source",
+        "convert-cache",
+        "measure-solve",
+        "apply-ev",
+        "color",
+        "encode",
+        "delete-cache",
+    ] {
+        assert!(
+            log.contains(&format!("kind=node node={node} ")),
+            "missing node {node}"
+        );
+    }
+    // Converter runs once per source; only one full-resolution develop each.
+    assert_eq!(log_kind(&log, "prepare").len(), 3);
+    assert_eq!(log_kind(&log, "measure").len(), 3);
+    assert_eq!(log_kind(&log, "develop").len(), 3);
+    assert_eq!(log_kind(&log, "delete").len(), 3);
+
+    // The scratch directory is run-specific and gone after success.
+    let scratch = scratch_from_log(&log);
+    assert!(!scratch.exists(), "scratch {} survived", scratch.display());
+    assert!(
+        !fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".rawtl-")),
+        "no scratch directory may remain"
+    );
+
+    // Nothing else from the retired report workflow exists.
+    for retired in [
+        "manifest.json",
+        "exposure_report.json",
+        "exposure-curve.csv",
+        "pairs.csv",
+        "frames.csv",
+        "temporal_audit.json",
+        "logs",
+    ] {
+        assert!(!directory.join(retired).exists(), "{retired} must not exist");
     }
 }
 
-fn metadata_from_log(text: &str) -> Json {
-    let value = text
-        .lines()
-        .find_map(|line| line.strip_prefix("JSON 0x01: "))
-        .expect("metadata JSON in transcript");
-    rawtl_linear_video::json::parse(value).unwrap()
+#[test]
+fn refuses_to_overwrite_an_existing_video_or_log() {
+    require_ffmpeg();
+    let root = test_dir("retry");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_tool(&fixtures, &frames, None, false);
+    let directory = run_directory(&root, "run");
+    let video = video_in(&directory);
+
+    let first = run_cli(&base_args(&input, &video, &tool));
+    assert!(first.status.success(), "{}", stderr(&first));
+    let log_before = read_log(&directory);
+    let video_bytes = fs::read(&video).expect("video");
+
+    // A retry with the same name never overwrites the published video or log.
+    let second = run_cli(&base_args(&input, &video, &tool));
+    assert_eq!(second.status.code(), Some(12), "{}", stderr(&second));
+    assert!(stderr(&second).contains("refusing to overwrite"), "{}", stderr(&second));
+    assert_eq!(fs::read(&video).expect("video"), video_bytes);
+    assert_eq!(read_log(&directory), log_before);
+
+    // Removing only the video is still not an overwrite invitation.
+    fs::remove_file(&video).expect("remove video");
+    let third = run_cli(&base_args(&input, &video, &tool));
+    assert_eq!(third.status.code(), Some(12), "{}", stderr(&third));
+    assert!(stderr(&third).contains("timelapse.log"), "{}", stderr(&third));
+
+    // A stale scratch from an earlier run is never picked up: a fresh name uses
+    // a new, empty scratch directory and leaves the old one untouched.
+    let stale = directory.join(".rawtl-stale-run");
+    fs::create_dir_all(stale.join("cache/frame_000001")).expect("stale scratch");
+    fs::write(
+        stale.join("cache/frame_000001/prepared.context"),
+        b"stale cache",
+    )
+    .expect("stale cache");
+    let fresh_directory = run_directory(&root, "fresh");
+    let fresh = fresh_directory.join(VIDEO_NAME);
+    let fourth = run_cli(&base_args(&input, &fresh, &tool));
+    assert!(fourth.status.success(), "{}", stderr(&fourth));
+    let fresh_log = read_log(&fresh_directory);
+    let fresh_scratch = scratch_from_log(&fresh_log);
+    assert_ne!(fresh_scratch, stale);
+    assert_ne!(fresh_scratch, scratch_from_log(&log_before));
+    assert_eq!(
+        fs::read(stale.join("cache/frame_000001/prepared.context")).unwrap(),
+        b"stale cache",
+        "an earlier scratch is never reused or cleaned by a new run"
+    );
 }
+
+#[test]
+fn old_run_directory_output_is_rejected_with_a_migration_message() {
+    let root = test_dir("migration");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG"]);
+    let directory = root.join("run");
+    fs::create_dir_all(&directory).expect("create old output dir");
+    let tool = root.join("unused-native-tool");
+
+    let result = run_cli(&[
+        "--input",
+        input.to_str().unwrap(),
+        "--output",
+        directory.to_str().unwrap(),
+        "--dng-linear-frame",
+        tool.to_str().unwrap(),
+    ]);
+    assert_eq!(result.status.code(), Some(2), "{}", stderr(&result));
+    let text = stderr(&result);
+    assert!(text.contains("names a directory"), "{text}");
+    assert!(text.contains("timelapse.mov"), "{text}");
+    assert!(
+        fs::read_dir(&directory).unwrap().next().is_none(),
+        "a rejected output must stay empty"
+    );
+}
+
+#[test]
+fn removed_quality_workflow_flags_are_rejected_explicitly() {
+    require_ffmpeg();
+    let root = test_dir("quality-flags");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG"]);
+    let tool = root.join("unused-native-tool");
+    let video = root.join("run").join(VIDEO_NAME);
+    for (flag, marker) in [
+        ("--temporal-quality", "temporal-quality"),
+        ("--temporal-quality=off", "temporal-quality"),
+        ("--on-review=error", "on-review"),
+        ("--save-frames", "save-frames"),
+        ("--overwrite", "overwrite"),
+    ] {
+        let mut args = base_args(&input, &video, &tool);
+        args.push(flag);
+        let result = run_cli(&args);
+        assert_eq!(result.status.code(), Some(2), "{flag}: {}", stderr(&result));
+        assert!(
+            stderr(&result).contains(marker),
+            "{flag}: {}",
+            stderr(&result)
+        );
+        assert!(!video.exists(), "{flag} must not create a video");
+        assert!(!root.join("run").exists(), "{flag} must not create the directory");
+    }
+}
+
+#[test]
+fn container_extension_must_match_the_configured_container() {
+    require_ffmpeg();
+    let root = test_dir("container-extension");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_tool(&fixtures, &frames, None, false);
+
+    let mp4 = root.join("run").join(VIDEO_MP4_NAME);
+    let result = run_cli(&base_args(&input, &mp4, &tool));
+    assert_eq!(result.status.code(), Some(2), "{}", stderr(&result));
+    let text = stderr(&result);
+    assert!(text.contains(".mp4") && text.contains("mov"), "{text}");
+    assert!(!root.join("run").exists(), "no artifact for a config error");
+
+    // Naming the matching container makes the same file acceptable.
+    let mkv = root.join("run").join(VIDEO_MKV_NAME);
+    let mut args = base_args(&input, &mkv, &tool);
+    args.extend(["--encoder", "ffv1", "--strength", "0"]);
+    let result = run_cli(&args);
+    assert!(result.status.success(), "{}", stderr(&result));
+    assert!(ffprobe_color(&mkv).contains("codec_name=ffv1"));
+}
+
+#[test]
+fn no_quality_verdict_or_audit_content_reaches_the_product() {
+    require_ffmpeg();
+    let root = test_dir("no-quality");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_tool(&fixtures, &frames, None, false);
+    let directory = run_directory(&root, "run");
+    let video = video_in(&directory);
+    let result = run_cli(&base_args(&input, &video, &tool));
+    assert!(result.status.success(), "{}", stderr(&result));
+
+    let log = read_log(&directory);
+    for product_text in [&log, &stdout(&result), &stderr(&result)] {
+        for banned in [
+            "REVIEW_REQUIRED",
+            "COMPLETED_WITH_REVIEW",
+            "GLOBAL_REFERENCE",
+            "plan_quality",
+            "temporal_quality",
+            "PASS",
+            "FAIL",
+            "质量评分",
+        ] {
+            assert!(
+                !product_text.contains(banned),
+                "product output must not contain {banned}:\n{product_text}"
+            );
+        }
+    }
+    // No per-frame metadata document, matrix or pixel payload.
+    for line in log.lines() {
+        assert!(line.len() <= 1400, "unbounded log line: {line}");
+        assert!(!line.contains("[[") && !line.contains("\"matrix\""), "{line}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Failure and stop behaviour
+// ---------------------------------------------------------------------------
 
 #[test]
 fn stops_at_the_first_failing_frame_without_video() {
@@ -162,79 +364,70 @@ fn stops_at_the_first_failing_frame_without_video() {
     let input = root.join("material");
     make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
     let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
     let frames = standard_frames(&fixtures);
     let tool = fake_native_tool(&fixtures, &frames, Some("IMG_2.DNG"), false);
-    let output = root.join("run");
+    let directory = run_directory(&root, "run");
 
-    let result = run_cli(&base_args(&input, &output, &tool));
+    let video = video_in(&directory);
+    let result = run_cli(&base_args(&input, &video, &tool));
     assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
     let text = stderr(&result);
     assert!(text.contains("frame 2/3"), "{text}");
     assert!(text.contains("IMG_2.DNG"), "{text}");
     assert!(text.contains("synthetic frame failure"), "{text}");
-    assert!(!output.join("output.mov").exists());
+    assert!(text.contains("retained"), "{text}");
+    assert!(!video_in(&directory).exists());
 
-    // The analysis pass runs first and produces no PNG; its measurement sidecar
-    // and transcript are retained, and no final frames directory was created.
-    assert!(!output.join("frames").exists());
-
-    assert!(!output.join("output.mov").exists());
-    assert!(!output.join("output.mov").exists());
-    assert!(output.join(".rawtl-partial").is_dir());
-    assert!(!output.join("analysis").exists());
-    let log =
-        fs::read_to_string(output.join("logs/analysis/frame_000002.log")).expect("failure log");
+    let log = read_log(&directory);
+    assert!(log.contains("kind=run.error code=30"), "{log}");
     assert!(log.contains("synthetic frame failure"), "{log}");
+    assert!(log.contains("retained=true"), "{log}");
+    let scratch = scratch_from_log(&log);
+    assert!(scratch.is_dir(), "failure keeps the scratch for diagnosis");
+    assert!(scratch.join("cache").is_dir());
+    let transcripts = scratch.join("transcripts/prepare");
+    assert!(
+        fs::read_dir(&transcripts).unwrap().next().is_some(),
+        "converter transcripts are retained in scratch"
+    );
+    // No later frame was developed.
+    assert!(!log.contains("kind=develop frame=3"), "{log}");
 }
 
 #[test]
-fn encoder_failure_after_bytes_written_publishes_nothing() {
+fn encoder_failure_publishes_nothing_and_records_bounded_stderr() {
     let root = test_dir("encoder-failure");
     let input = root.join("material");
     make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
     let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
     let frames = standard_frames(&fixtures);
     let tool = fake_native_tool(&fixtures, &frames, None, false);
     let encoder = fake_failing_encoder(&fixtures);
-    let output = root.join("run");
+    let directory = run_directory(&root, "run");
 
-    let mut args = base_args(&input, &output, &tool);
-    args.extend_from_slice(&["--ffmpeg", encoder.to_str().expect("utf8")]);
+    let video = video_in(&directory);
+    let mut args = base_args(&input, &video, &tool);
+    args.extend(["--ffmpeg", encoder.to_str().expect("utf8")]);
     let result = run_cli(&args);
     assert_eq!(result.status.code(), Some(60), "{}", stderr(&result));
-    let text = stderr(&result);
-    assert!(text.contains("streaming encoder failed"), "{text}");
     assert!(
-        text.contains("partial/intermediate artifacts retained"),
-        "{text}"
+        stderr(&result).contains("partial/intermediate artifacts retained"),
+        "{}",
+        stderr(&result)
     );
-
-    assert!(!output.join("output.mov").exists());
-    assert!(!output.join("output.mov").exists());
-    let partial = output.join(".rawtl-partial/output.mov");
+    assert!(!video_in(&directory).exists());
+    let log = read_log(&directory);
+    assert!(log.contains("kind=run.error code=60"), "{log}");
     assert!(
-        partial.is_file(),
-        "partial diagnostic file must be retained"
+        log.contains("synthetic encoder failure after write"),
+        "the encoder stderr tail enters the single log:\n{log}"
     );
-    // A late encode failure must never leave a success status beside the error.
-    let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(
-        report.get("run_status").and_then(Json::as_str),
-        Some("FAILED")
-    );
-    assert_eq!(
-        report.get("execution_status").and_then(Json::as_str),
-        Some("FAILED")
-    );
+    let scratch = scratch_from_log(&log);
     assert!(
-        report.get("error").and_then(Json::as_str).is_some(),
-        "encode failure report must carry the error"
-    );
-    assert_eq!(
-        fs::read(&partial).expect("read partial"),
-        b"partial video bytes"
+        scratch.join(VIDEO_NAME).is_file(),
+        "the partial output stays in scratch"
     );
 }
 
@@ -244,1647 +437,50 @@ fn probe_rejection_publishes_nothing() {
     let input = root.join("material");
     make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
     let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
     let frames = standard_frames(&fixtures);
     let tool = fake_native_tool(&fixtures, &frames, None, false);
     let ffprobe = fake_ffprobe_wrong_codec(&fixtures);
-    let output = root.join("run");
+    let directory = run_directory(&root, "run");
 
-    let mut args = base_args(&input, &output, &tool);
-    args.extend_from_slice(&["--ffprobe", ffprobe.to_str().expect("utf8")]);
+    let video = video_in(&directory);
+    let mut args = base_args(&input, &video, &tool);
+    args.extend(["--ffprobe", ffprobe.to_str().expect("utf8")]);
     let result = run_cli(&args);
     assert_eq!(result.status.code(), Some(60), "{}", stderr(&result));
     let text = stderr(&result);
     assert!(text.contains("codec is \"ffv1\""), "{text}");
     assert!(text.contains("expected \"prores\""), "{text}");
-    assert!(
-        text.contains("partial/intermediate artifacts retained"),
-        "{text}"
-    );
-    assert!(!output.join("output.mov").exists());
-    assert!(!output.join("output.mov").exists());
-    assert!(output.join(".rawtl-partial/output.mov").is_file());
+    assert!(!video_in(&directory).exists());
+    let log = read_log(&directory);
+    assert!(log.contains("kind=run.error code=60"), "{log}");
 }
 
 #[test]
-fn forged_metadata_source_hash_is_rejected_by_the_typed_boundary() {
-    let result = run_sidecar_defect(
-        "forged-metadata-hash",
-        FakeSidecarDefects {
-            empty_source_sha256: true,
-            ..FakeSidecarDefects::default()
-        },
-    );
-    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
-    let text = stderr(&result);
-    assert!(text.contains("frame 1/2"), "{text}");
-    assert!(
-        text.contains("metadata is missing or invalid field \"source_sha256\""),
-        "{text}"
-    );
-}
-
-#[test]
-fn stdout_frame_missing_source_sha256_is_rejected_after_valid_analysis() {
-    assert_final_source_hash_rejected("omit");
-}
-
-#[test]
-fn stdout_frame_null_source_sha256_is_rejected_after_valid_analysis() {
-    assert_final_source_hash_rejected("null");
-}
-
-#[test]
-fn stdout_frame_non_string_source_sha256_is_rejected_after_valid_analysis() {
-    assert_final_source_hash_rejected("non-string");
-}
-
-#[test]
-fn stdout_frame_empty_source_sha256_is_rejected_after_valid_analysis() {
-    assert_final_source_hash_rejected("empty");
-}
-
-fn assert_final_source_hash_rejected(defect: &str) {
-    use std::io::Write;
-    let root = test_dir(&format!("final-source-hash-{defect}"));
-    let input = root.join("material");
-    let frames = synthetic_sequence(&[0.0, 0.1, -0.1]);
-    let names: Vec<&str> = frames.iter().map(|frame| frame.name.as_str()).collect();
-    make_input(&input, &names);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).unwrap();
-    let tool = fake_native_sequence_sidecar_defect(
-        &fixtures,
-        &frames,
-        FakeSidecarDefects::default(),
-        WIDTH,
-        HEIGHT,
-    );
-    let config = fixtures.join(format!("fake-native-{}.config", std::process::id()));
-    writeln!(
-        fs::OpenOptions::new().append(true).open(config).unwrap(),
-        "frame_source_sha256_defect={defect}"
-    )
-    .unwrap();
-    let output = root.join("run");
-    let result = run_cli(&base_args(&input, &output, &tool));
-
-    // The defect must reach the final consumer after successful measurement
-    // passes; a baseline/sidecar rejection would miss the admitted failure.
-    for pass in ["analysis"] {
-        for index in 1..=frames.len() {
-            let log = fs::read_to_string(output.join(format!("logs/{pass}/frame_{index:06}.log")))
-                .unwrap();
-            let metadata = metadata_from_log(&log);
-            assert!(metadata
-                .get("source_sha256")
-                .and_then(Json::as_str)
-                .is_some_and(|hash| !hash.is_empty()));
-            assert!(
-                log.contains("JSON 0x02: ") && log.contains("exit: exit code 0"),
-                "{log}"
-            );
-        }
-    }
-    let final_log = fs::read_to_string(output.join("logs/render/frame_000001.log")).unwrap();
-    let metadata = metadata_from_log(&final_log);
-    match defect {
-        "omit" => assert!(metadata.get("source_sha256").is_none()),
-        "null" => assert_eq!(metadata.get("source_sha256"), Some(&Json::Null)),
-        "non-string" => assert_eq!(metadata.get("source_sha256"), Some(&Json::Int(7))),
-        "empty" => assert_eq!(
-            metadata.get("source_sha256").and_then(Json::as_str),
-            Some("")
-        ),
-        _ => unreachable!(),
-    }
-    assert_eq!(
-        result.status.code(),
-        Some(30),
-        "{defect}: final video published={}; stderr: {}",
-        output.join("output.mov").exists(),
-        stderr(&result)
-    );
-    let error = stderr(&result);
-    assert!(
-        error.contains("frame 1/3") && error.contains(&frames[0].name),
-        "{error}"
-    );
-    assert!(
-        error.contains("metadata is missing or invalid field \"source_sha256\""),
-        "{error}"
-    );
-    assert!(!output.join("output.mov").exists());
-    assert!(output.join(".rawtl-partial").is_dir());
-    assert!(output.join("exposure_report.json").is_file());
-    assert!(
-        final_log.contains("command:") && final_log.contains("exit:"),
-        "{final_log}"
-    );
-    assert!(
-        !output.join("logs/render/frame_000002.log").exists(),
-        "stop subsequent final-frame dispatch"
-    );
-    let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(
-        report.get("run_status").and_then(Json::as_str),
-        Some("FAILED")
-    );
-}
-
-#[test]
-fn forged_analysis_sidecar_without_kind_is_rejected() {
-    let result = run_sidecar_defect(
-        "forged-analysis-kind",
-        FakeSidecarDefects {
-            analysis_omit_kind: true,
-            ..FakeSidecarDefects::default()
-        },
-    );
-    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
-    let text = stderr(&result);
-    assert!(text.contains("frame 1/2"), "{text}");
-    assert!(
-        text.contains("analysis sidecar has an unsupported schema"),
-        "{text}"
-    );
-}
-
-#[test]
-fn forged_analysis_sidecar_hash_mismatch_is_rejected() {
-    let result = run_sidecar_defect(
-        "forged-analysis-hash",
-        FakeSidecarDefects {
-            analysis_sha_mismatch: true,
-            ..FakeSidecarDefects::default()
-        },
-    );
-    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
-    let text = stderr(&result);
-    assert!(text.contains("frame 1/2"), "{text}");
-    assert!(
-        text.contains("analysis sidecar source_sha256 does not match the frame metadata"),
-        "{text}"
-    );
-}
-
-fn run_sidecar_defect(name: &str, defects: FakeSidecarDefects) -> Output {
-    let root = test_dir(name);
-    let input = root.join("material");
-    let frames = synthetic_sequence(&[0.0, 0.1]);
-    let names: Vec<&str> = frames.iter().map(|frame| frame.name.as_str()).collect();
-    make_input(&input, &names);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
-    let tool = fake_native_sequence_sidecar_defect(&fixtures, &frames, defects, WIDTH, HEIGHT);
-    let output = root.join("run");
-    run_cli(&base_args(&input, &output, &tool))
-}
-
-#[test]
-fn rejects_overlapping_input_and_output_directories() {
+fn rejects_output_inside_the_material_directory_without_writes() {
     let root = test_dir("overlap");
-    let tool = root.join("unused-native-tool");
-
-    fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
-        let mut tree = std::collections::BTreeMap::new();
-        for entry in fs::read_dir(root).expect("read directory") {
-            let path = entry.expect("directory entry").path();
-            if path.is_dir() {
-                tree.insert(path.clone(), None);
-                tree.extend(snapshot(&path));
-            } else {
-                tree.insert(path.clone(), Some(fs::read(path).expect("read file")));
-            }
-        }
-        tree
-    }
-
-    let assert_rejected_without_writes = |input: &Path, output: &Path| {
-        let before = snapshot(&root);
-        let result = run_cli(&base_args(input, output, &tool));
-        assert_eq!(result.status.code(), Some(11), "{}", stderr(&result));
-        assert!(
-            stderr(&result).contains("input/material directory"),
-            "{}",
-            stderr(&result)
-        );
-        assert_eq!(
-            snapshot(&root),
-            before,
-            "rejection must leave no new directories or changed files"
-        );
-    };
-
-    // output == input
-    let same = root.join("same");
-    make_input(&same, &["IMG_1.DNG"]);
-    assert_rejected_without_writes(&same, &same);
-
-    // output inside input
     let material = root.join("material");
     make_input(&material, &["IMG_1.DNG"]);
-    let nested = material.join("out");
-    assert_rejected_without_writes(&material, &nested);
-    assert!(!nested.exists(), "rejected output must not be created");
-    assert_rejected_without_writes(&material, &nested.join("deeper/run"));
-    assert!(
-        !nested.exists(),
-        "missing parents must not be created either"
-    );
-
-    // Resolve an existing symlinked parent before checking a missing output leaf.
-    let alias = root.join("material-alias");
-    std::os::unix::fs::symlink(&material, &alias).expect("create material alias");
-    assert_rejected_without_writes(&material, &alias.join("out"));
-    assert!(
-        !nested.exists(),
-        "symlink aliases must not bypass the guard"
-    );
-
-    // input inside output
-    let outer = root.join("outer");
-    let inner = outer.join("material");
-    make_input(&inner, &["IMG_1.DNG"]);
-    assert_rejected_without_writes(&inner, &outer);
-}
-
-#[test]
-fn rejects_non_empty_output_directory() {
-    require_ffmpeg();
-    let root = test_dir("nonempty");
-    let input = root.join("material");
-    make_input(&input, &["IMG_1.DNG"]);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
-    let frames = standard_frames(&fixtures);
-    let tool = fake_native_tool(&fixtures, &frames, None, false);
-    let output = root.join("run");
-    fs::create_dir_all(&output).expect("create output");
-    fs::write(output.join("existing.txt"), b"keep me").expect("write existing");
-
-    let result = run_cli(&base_args(&input, &output, &tool));
-    assert_eq!(result.status.code(), Some(12), "{}", stderr(&result));
-    assert!(output.join("existing.txt").is_file());
-}
-
-#[test]
-fn detects_a_native_tool_that_ignores_the_frozen_override() {
-    let root = test_dir("wb-drift");
-    let input = root.join("material");
-    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
-    let frames = standard_frames(&fixtures);
-    let tool = fake_native_tool(&fixtures, &frames, None, true);
-    let output = root.join("run");
-
-    let result = run_cli(&base_args(&input, &output, &tool));
-    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
-    let text = stderr(&result);
-    assert!(
-        text.contains("should use the frozen override white balance"),
-        "{text}"
-    );
-    assert!(!output.join("output.mov").exists());
-}
-
-// ---------------------------------------------------------------------------
-// Deflicker node integration (AC1) and REQ-011 regression path (AC3-style)
-// ---------------------------------------------------------------------------
-
-use rawtl_linear_video::json::Json;
-
-const SYNTH_WIDTH: u32 = 240;
-const SYNTH_HEIGHT: u32 = 180;
-
-struct SyntheticMaterial {
-    root: std::path::PathBuf,
-    input: std::path::PathBuf,
-    tool: std::path::PathBuf,
-}
-
-fn synthetic_material(name: &str, frames: Vec<FakeFrame>) -> SyntheticMaterial {
-    require_ffmpeg();
-    let root = test_dir(name);
-    let input = root.join("material");
-    let names: Vec<&str> = frames.iter().map(|frame| frame.name.as_str()).collect();
-    make_input(&input, &names);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
-    let tool = fake_native_sequence(&fixtures, &frames, None, false, SYNTH_WIDTH, SYNTH_HEIGHT);
-    SyntheticMaterial { root, input, tool }
-}
-
-fn run_synthetic(
-    material: &SyntheticMaterial,
-    output_name: &str,
-    extra: &[&str],
-) -> (Output, std::path::PathBuf) {
-    let output = material.root.join(output_name);
-    let mut args = base_args(&material.input, &output, &material.tool);
-    args.extend_from_slice(extra);
-    (run_cli(&args), output)
-}
-
-fn frame_status(report: &Json, index: usize) -> String {
-    frame_record(report, index)
-        .get("status")
-        .and_then(Json::as_str)
-        .unwrap_or("MISSING")
-        .to_string()
-}
-
-fn frame_number(report: &Json, index: usize, field: &str) -> Option<f64> {
-    frame_record(report, index)
-        .get(field)
-        .and_then(Json::as_f64)
-}
-
-#[test]
-fn pairwise_uniform_corrects_flicker_with_one_measurement_and_render() {
-    let gains: Vec<f64> = (0..30)
-        .map(|i| if i % 2 == 0 { -0.3 } else { 0.3 })
-        .collect();
-    let material = synthetic_material("flicker", synthetic_sequence(&gains));
-    let (result, output) = run_synthetic(&material, "run", &["--brightness", "uniform"]);
-    assert!(result.status.success(), "{}", stderr(&result));
-    let report = read_json(&output.join("exposure_report.json"));
-    let mut corrected = Vec::new();
-    for (id, gain) in gains.iter().enumerate() {
-        let ev = frame_number(&report, id, "applied_ev").unwrap();
-        corrected.push(gain + ev);
-        let log = fs::read_to_string(output.join(format!("logs/render/frame_{:06}.log", id + 1)))
-            .unwrap();
-        let metadata = metadata_from_log(&log);
-        assert!((metadata.get("exposure_ev").and_then(Json::as_f64).unwrap() - ev).abs() < 1e-8);
-    }
-    assert!(corrected.windows(2).all(|w| (w[1] - w[0]).abs() < 0.1));
-    assert!(!output.join("temporal_audit.json").exists());
-    assert!(!output.join("logs/probe").exists());
-    assert!(!output.join("logs/applied-iter0").exists());
-    assert_eq!(frame_commands(&output.join("logs/analysis")).len(), 30);
-    assert_eq!(frame_commands(&output.join("logs/render")).len(), 30);
-    assert!(report.get("plan_quality").is_none());
-}
-
-#[test]
-fn confirmed_step_is_preserved_and_not_corrected_away() {
-    let base = 0.18f64.log2();
-    let mut frames = synthetic_sequence(&vec![0.0; 20]);
-    for (index, frame) in frames.iter_mut().enumerate() {
-        if index >= 10 {
-            frame.log_level = base + 0.5;
-        }
-    }
-    let material = synthetic_material("confirmed-step", frames);
-    let (result, output) = run_synthetic(
-        &material,
-        "run",
-        &["--step", "10:0.5", "--temporal-quality", "off"],
-    );
-    // Confirmed steps now belong to the desired physical signal as well as
-    // the estimator. Correct execution preserves the step without inventing
-    // a render-target error or feedback correction.
-    assert!(
-        result.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        stdout(&result),
-        stderr(&result)
-    );
-    let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(report.get("run_status").and_then(Json::as_str), Some("OK"));
-    let warnings = report
-        .get("warnings")
-        .and_then(Json::as_array)
-        .expect("warnings");
-    assert!(
-        !warnings.iter().any(|warning| warning
-            .as_str()
-            .map(|text| text.starts_with("RENDER_TARGETS_NOT_REACHED"))
-            .unwrap_or(false)),
-        "warnings: {warnings:?}"
-    );
-    for index in 0..10 {
-        assert_eq!(
-            frame_number(&report, index, "cumulative_confirmed_step_ev"),
-            Some(0.0),
-            "frame {index} must precede the declared step"
-        );
-    }
-    for index in 10..20 {
-        assert_eq!(
-            frame_number(&report, index, "cumulative_confirmed_step_ev"),
-            Some(0.5),
-            "frame {index} must carry the declared step"
-        );
-    }
-    let mean = |range: std::ops::Range<usize>| {
-        let values: Vec<f64> = range
-            .map(|index| frame_number(&report, index, "requested_ev").expect("requested_ev"))
-            .collect();
-        values.iter().sum::<f64>() / values.len() as f64
-    };
-    assert!(
-        (mean(10..20) - mean(0..10)).abs() < 0.1,
-        "the estimator must not cancel the confirmed step: before={} after={}",
-        mean(0..10),
-        mean(10..20)
-    );
-    assert!(!output.join("temporal_audit.json").exists());
-    assert!(output.join("output.mov").is_file());
-    assert!(output.join("output.mov").is_file());
-}
-
-#[test]
-fn ev_limits_are_carried_into_the_frozen_graph_plan() {
-    let gains: Vec<f64> = (0..12)
-        .map(|index| if index % 2 == 0 { 1.0 } else { -1.0 })
-        .collect();
-    let material = synthetic_material("ev-limits", synthetic_sequence(&gains));
-    let (result, output) = run_synthetic(
-        &material,
-        "run",
-        &["--ev-limits", "-0.25,0.25", "--temporal-quality", "off"],
-    );
-    assert!(
-        result.status.success(),
-        "run failed\nstdout:\n{}\nstderr:\n{}",
-        stdout(&result),
-        stderr(&result)
-    );
-    let report = read_json(&output.join("exposure_report.json"));
-    // Limited frames cannot be counted as covered merely because the few
-    // unconstrained frames meet their own targets.
-    assert_eq!(report.get("run_status").and_then(Json::as_str), Some("OK"));
-    let mut limited = 0;
-    for index in 0..gains.len() {
-        if frame_status(&report, index) == "LIMITED" {
-            limited += 1;
-            let requested = frame_number(&report, index, "requested_ev").expect("requested");
-            let applied = frame_number(&report, index, "applied_ev").expect("applied");
-            assert!(
-                requested != applied,
-                "frame {index}: LIMITED must preserve requested != applied"
-            );
-            assert!(
-                (-0.25..=0.25).contains(&applied),
-                "frame {index}: applied {applied} escaped the declared limits"
-            );
-        }
-    }
-    assert!(limited > 0, "expected LIMITED frames, report: {report:?}");
-    assert!(!output.join("logs/probe").exists());
-    assert!(!output.join("logs/applied-iter0").exists());
-    assert!(output.join("output.mov").is_file());
-    assert!(output.join("exposure-curve.csv").is_file());
-}
-
-#[test]
-fn product_graph_does_not_add_full_frame_feedback_rounds() {
-    let material = synthetic_material(
-        "one-render",
-        synthetic_sequence(&[0.3, -0.3, 0.3, -0.3, 0.3, -0.3]),
-    );
-    use std::io::Write;
-    let config = material
-        .root
-        .join("fixtures")
-        .join(format!("fake-native-{}.config", std::process::id()));
-    writeln!(
-        fs::OpenOptions::new().append(true).open(config).unwrap(),
-        "gain_scale=0.5"
-    )
-    .unwrap();
-    let (result, output) = run_synthetic(&material, "run", &[]);
-    assert!(result.status.success(), "{}", stderr(&result));
-    assert_eq!(frame_commands(&output.join("logs/analysis")).len(), 6);
-    assert_eq!(frame_commands(&output.join("logs/render")).len(), 6);
-    assert!(!output.join("logs/probe").exists());
-    assert!(!output.join("temporal_audit.json").exists());
-}
-
-#[test]
-fn product_graph_leaves_temporal_audit_to_development_tools() {
-    let material = synthetic_material("no-audit", synthetic_sequence(&[0.2, -0.2, 0.2, -0.2]));
-    let (result, output) = run_synthetic(&material, "run", &[]);
-    assert!(result.status.success(), "{}", stderr(&result));
-    assert!(!output.join("temporal_audit.json").exists());
-    assert!(!output.join("logs/probe").exists());
-    let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(report.get("gain_probe"), Some(&Json::Null));
-    assert_eq!(
-        report
-            .get("feedback_history")
-            .and_then(Json::as_array)
-            .unwrap()
-            .len(),
-        0
-    );
-}
-
-#[test]
-fn best_effort_plan_still_renders_a_complete_inventory() {
-    let mut frames = synthetic_sequence(&[0.2, -0.2, 0.2, -0.2]);
-    frames[1].pattern = "sparse".into();
-    let material = synthetic_material("best-effort-graph", frames);
-    let (result, output) = run_synthetic(&material, "run", &[]);
-    assert!(result.status.success(), "{}", stderr(&result));
-    let report = read_json(&output.join("exposure_report.json"));
-    for id in 0..4 {
-        assert!(frame_number(&report, id, "applied_ev").unwrap().is_finite());
-    }
-    assert_eq!(frame_commands(&output.join("logs/render")).len(), 4);
-}
-
-#[test]
-fn strength_zero_is_the_single_pass_regression_path() {
-    let root = test_dir("strength-zero");
-    let input = root.join("material");
-    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
-    let frames = standard_frames(&fixtures);
-    let tool = fake_native_tool(&fixtures, &frames, None, false);
-
-    let run = |output_name: &str| {
-        let output = root.join(output_name);
-        let mut args = base_args(&input, &output, &tool);
-        args.extend_from_slice(&["--strength", "0"]);
-        let result = run_cli(&args);
-        assert!(
-            result.status.success(),
-            "run failed\nstdout:\n{}\nstderr:\n{}",
-            stdout(&result),
-            stderr(&result)
-        );
-        output
-    };
-    let first = run("run-a");
-    let second = run("run-b");
-
-    let entries = read_json(&first.join("manifest.json"));
-    for entry in entries
-        .get("frames")
-        .and_then(|v| v.get("entries"))
-        .and_then(Json::as_array)
+    let tool = root.join("unused-native-tool");
+    let before: Vec<PathBuf> = fs::read_dir(&material)
         .unwrap()
-    {
-        assert_eq!(entry.get("applied_ev").and_then(Json::as_f64), Some(0.0));
-        assert!(entry.get("pixels_sha256").and_then(Json::as_str).is_some());
-    }
-    assert!(
-        !first.join("analysis").exists(),
-        "no analysis pass at strength 0"
-    );
-    assert!(!first.join("temporal_audit.json").exists());
-    assert!(first.join("pairs.csv").is_file());
-    assert!(first.join("frames.csv").is_file());
-
-    let report = read_json(&first.join("exposure_report.json"));
-    for index in 0..3 {
-        assert_eq!(frame_status(&report, index), "DISABLED");
-    }
-    // The disabled (historical) path keeps the frozen argument shape: frame 1
-    // decodes with its own as-shot neutral, later frames carry the override.
-    let disabled_command = |index: usize| {
-        let text = fs::read_to_string(first.join(format!("logs/render/frame_{index:06}.log")))
-            .expect("frame transcript");
-        text.lines()
-            .find(|line| line.starts_with("command:"))
-            .expect("command line")
-            .to_string()
-    };
-    assert!(
-        !disabled_command(1).contains("--white-balance"),
-        "{}",
-        disabled_command(1)
-    );
-    for index in [2, 3] {
-        assert!(
-            disabled_command(index).contains("--white-balance 0.5,1,0.8"),
-            "{}",
-            disabled_command(index)
-        );
-    }
-    assert_eq!(
-        report
-            .get("encoded_temporal_quality")
-            .and_then(|quality| quality.get("status"))
-            .and_then(Json::as_str),
-        Some("SKIPPED")
-    );
-    let manifest = read_json(&first.join("manifest.json"));
-    assert_eq!(
-        manifest
-            .get("deflicker")
-            .and_then(|block| block.get("enabled")),
-        Some(&Json::Bool(false))
-    );
-
-    // Both same-candidate runs traverse the pipe with the same encoder options.
-    let command = |output: &Path| {
-        fs::read_to_string(output.join("logs/encode.log"))
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap()
-            .to_string()
-    };
-    assert_eq!(
-        command(&first).replace("run-a", "RUN"),
-        command(&second).replace("run-b", "RUN")
-    );
-    assert!(!first.join("frames").exists());
-}
-
-#[test]
-fn late_encoder_failure_on_disabled_path_reports_failed_status() {
-    let root = test_dir("disabled-encode-failure");
-    let input = root.join("material");
-    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
-    let frames = standard_frames(&fixtures);
-    let tool = fake_native_tool(&fixtures, &frames, None, false);
-    let encoder = fake_failing_encoder(&fixtures);
-    let output = root.join("run");
-
-    let mut args = base_args(&input, &output, &tool);
-    args.extend_from_slice(&[
-        "--strength",
-        "0",
-        "--ffmpeg",
-        encoder.to_str().expect("utf8"),
-    ]);
-    let result = run_cli(&args);
-    assert_eq!(result.status.code(), Some(60), "{}", stderr(&result));
-    let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(
-        report.get("run_status").and_then(Json::as_str),
-        Some("FAILED"),
-        "the disabled path must replace its early OK with the failure class"
-    );
-    assert_eq!(
-        report.get("execution_status").and_then(Json::as_str),
-        Some("FAILED")
-    );
-    assert!(report.get("error").and_then(Json::as_str).is_some());
-    assert!(!output.join("output.mov").exists());
-}
-
-#[test]
-fn fractional_applied_ev_survives_sidecar_precision() {
-    // The producer serializes the analysis sidecar with 10 significant digits,
-    // so a fractional correction never round-trips through f64 exactly. The
-    // legacy/uniform estimator on a linear gain ramp produces such EVs.
-    let gains: Vec<f64> = (0..12).map(|index| 0.1 * index as f64).collect();
-    let material = synthetic_material("fractional-ev", synthetic_sequence(&gains));
-    let (result, output) = run_synthetic(
-        &material,
-        "run",
-        &[
-            "--estimator",
-            "legacy",
-            "--brightness",
-            "uniform",
-            "--strength",
-            "0.7",
-            "--temporal-quality",
-            "off",
-        ],
-    );
-    assert!(
-        result.status.success(),
-        "fractional-EV run failed\nstdout:\n{}\nstderr:\n{}",
-        stdout(&result),
-        stderr(&result)
-    );
-    let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(report.get("run_status").and_then(Json::as_str), Some("OK"));
-    let mut exercised = false;
-    for index in 0..gains.len() {
-        let applied = frame_number(&report, index, "applied_ev")
-            .unwrap_or_else(|| panic!("frame {index} has no applied_ev"));
-        let requested = frame_number(&report, index, "requested_ev").expect("requested_ev");
-        assert_eq!(applied, requested);
-        if format!("{applied:.9e}")
-            .parse::<f64>()
-            .expect("formatted EV")
-            != applied
-        {
-            exercised = true;
-        }
-    }
-    assert!(
-        exercised,
-        "the fixture must contain an EV that does not round-trip at 10 significant digits"
-    );
-    assert!(output.join("output.mov").is_file());
-    assert!(!output.join("frames").exists());
-}
-
-// ---------------------------------------------------------------------------
-// Preview output colour/Log profiles
-// ---------------------------------------------------------------------------
-
-/// Build a 64x48 three-frame sequence whose frames are a uniform RGB16 ACEScg
-/// code triple. The fake producer copies the fixtures at EV 0.
-fn profile_material(
-    name: &str,
-    rgb: [u16; 3],
-) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-    profile_material_for_extension(name, rgb, "DNG")
-}
-
-fn profile_material_for_extension(
-    name: &str,
-    rgb: [u16; 3],
-    extension: &str,
-) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-    require_ffmpeg();
-    let root = test_dir(name);
-    let input = root.join("material");
-    let names: Vec<String> = (0..3)
-        .map(|index| format!("frame_{index:04}.{extension}"))
-        .collect();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    make_input(&input, &refs);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
-    let mut frames = Vec::new();
-    for index in 0..3 {
-        let path = fixtures.join(format!("patch_{index}.png"));
-        write_rgb48_png(&path, 64, 48, &vec![rgb; 64 * 48]);
-        let mut frame = FakeFrame::new(&format!("frame_{index:04}.{extension}"), 0.0);
-        frame.fixture = Some(path);
-        frame.capture_time = Some(format!("2026:11:08 20:00:{:02}", index + 1));
-        frames.push(frame);
-    }
-    let tool = fake_native_sequence(&fixtures, &frames, None, false, 64, 48);
-    (root, input, tool)
-}
-
-fn run_profile(root: &Path, input: &Path, tool: &Path, id: &str) -> Output {
-    let output = root.join("run");
-    let mut args = base_args(input, &output, tool);
-    args.push("--preview-profile");
-    args.push(id);
-    run_cli(&args)
-}
-
-#[test]
-fn preview_profiles_emit_their_declared_colour_contract() {
-    // The default deliverable is ProRes 4444 in MOV. Primaries and transfer are
-    // profile-accurate, the coding matrix is declared, and the delivered signal
-    // is limited range: MOV `colr` is `nclc`, which has no range field, and
-    // ProRes decoders assume video range. A full-range profile convention is
-    // therefore delivered as limited at the encoder node.
-    let cases: [(&str, &str, bool, &str, &str); 6] = [
-        ("srgb-preview", "bt709", false, "bt709", "iec.ch"),
-        ("sony-slog3-sgamut3", "bt2020nc", true, "unknown", "sony.jp"),
-        (
-            "sony-slog3-sgamut3-cine",
-            "bt2020nc",
-            true,
-            "unknown",
-            "sony.jp",
-        ),
-        (
-            "canon-log2-cinema-gamut",
-            "bt2020nc",
-            true,
-            "unknown",
-            "canon.com",
-        ),
-        ("nikon-nlog-bt2020", "bt2020nc", true, "bt2020", "nikon"),
-        ("dji-dlog-dgamut", "bt2020nc", true, "unknown", "djicdn"),
-    ];
-
-    for (id, matrix, vendor, primaries, source_marker) in cases {
-        let (root, input, fixtures) = run_success_setup(&format!("profile-contract-{id}"));
-        let frames = standard_frames(&fixtures);
-        let tool = fake_native_tool(&fixtures, &frames, None, false);
-        let result = run_profile(&root, &input, &tool, id);
-        assert!(
-            result.status.success(),
-            "{id} run failed\nstdout:\n{}\nstderr:\n{}",
-            stdout(&result),
-            stderr(&result)
-        );
-        let output = root.join("run");
-        let manifest = read_json(&output.join("manifest.json"));
-        assert_eq!(
-            manifest
-                .get("quantization_policy")
-                .unwrap()
-                .get("linear_dtype")
-                .and_then(Json::as_str),
-            Some("signed f32 LE AP1/D60")
-        );
-        assert_eq!(
-            manifest
-                .get("quantization_policy")
-                .unwrap()
-                .get("final_denominator")
-                .and_then(Json::as_u64),
-            Some(1023)
-        );
-        for (path, command) in frame_commands(&output.join("logs")) {
-            assert!(
-                command.contains("--camera-color-method legacy-inverse-cm"),
-                "{command}"
-            );
-            if path.to_string_lossy().contains("/render/") {
-                assert!(command.contains("--stdout-frame-f32"), "{command}");
-            } else {
-                assert!(command.contains("--stdout-analysis"), "{command}");
-            }
-        }
-        let preview = output.join("output.mov");
-        assert!(preview.is_file(), "{id}: missing output.mov");
-
-        let probe = ffprobe_color(&preview);
-        for expected in [
-            "codec_name=prores",
-            "profile=4444",
-            "pix_fmt=yuv444p12le",
-            "width=8",
-            "height=6",
-            "nb_read_frames=3",
-            "color_range=unknown",
-        ] {
-            assert!(probe.contains(expected), "{id}: {probe}");
-        }
-        let transfer = if vendor { "unknown" } else { "iec61966-2-1" };
-        for tag in [
-            format!("color_space={matrix}"),
-            format!("color_primaries={primaries}"),
-            format!("color_transfer={transfer}"),
-        ] {
-            assert!(probe.contains(&tag), "{id}: {probe}");
-        }
-        println!("tags {id}: ffprobe\n{probe}");
-
-        let (expected_primaries, expected_transfer, expected_matrix) = if vendor {
-            (if id == "nikon-nlog-bt2020" { 9 } else { 2 }, 2, 9)
-        } else {
-            (1, 13, 1)
-        };
-        let tags = manifest
-            .get("video")
-            .unwrap()
-            .get("emitted_tags")
-            .expect("emitted_tags");
-        for (field, value) in [
-            ("colour_primaries", expected_primaries),
-            ("transfer_characteristics", expected_transfer),
-            ("matrix_coefficients", expected_matrix),
-            ("video_full_range_flag", 0),
-        ] {
-            assert_eq!(
-                tags.get(field).and_then(|v| v.as_u64()),
-                Some(value as u64),
-                "{id} {field}"
-            );
-        }
-        let manifest_text = fs::read_to_string(output.join("manifest.json")).expect("manifest");
-        for expected in [
-            "\"file\": \"output.mov\"".to_string(),
-            format!("\"profile\": \"{id}\""),
-            "\"dither\": false".to_string(),
-            "\"range\": \"tv\"".to_string(),
-            format!("\"ycbcr_matrix\": \"{matrix}\""),
-            "\"full_decode\": \"pass\"".to_string(),
-            "\"encoder\": \"prores_ks\"".to_string(),
-            "\"container\": \"mov\"".to_string(),
-        ] {
-            assert!(
-                manifest_text.contains(&expected),
-                "{id}: manifest missing {expected:?}"
-            );
-        }
-        assert!(
-            manifest_text.contains(source_marker),
-            "{id}: manifest must cite the vendor source ({source_marker})"
-        );
-        assert!(
-            manifest_text.contains("\"reference_codes\""),
-            "{id}: manifest must record official reference codes"
-        );
-    }
-}
-
-/// Independent transcription of the BT.709 and BT.2020-2 (10/2015) Table 4
-/// NCL equations: Y'=Kr*R'+(1-Kr-Kb)*G'+Kb*B', Cb=(B'-Y')/2(1-Kb),
-/// Cr=(R'-Y')/2(1-Kr). The production quantizer must produce the same 10-bit
-/// codes for the same target signal; the expectations below are written with
-/// the published constants, not with the registry's coefficients.
-#[test]
-fn production_ycbcr_quantization_matches_the_standard_derivation() {
-    use rawtl_linear_video::color_profile::{lookup, quantize_chroma, quantize_luma};
-    let cases = [
-        ("srgb-preview", 0.2126, 0.7152, 0.0722, 1.8556, 1.5748),
-        ("canon-log3-cinema-gamut-rev-eng-crm-dev", 0.2627, 0.6780, 0.0593, 1.8814, 1.4746),
-        ("nikon-nlog-bt2020", 0.2627, 0.6780, 0.0593, 1.8814, 1.4746),
-    ];
-    for (id, kr, kg, kb, div_cb, div_cr) in cases {
-        let profile = lookup(id).expect(id);
-        for signal in [
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [0.18, 0.18, 0.18],
-            [0.4, 0.18, 0.09],
-            [-0.05, 0.6, 1.2],
-        ] {
-            let y = kr * signal[0] + kg * signal[1] + kb * signal[2];
-            let expected = [
-                quantize_luma(y, profile.range),
-                quantize_chroma((signal[2] - y) / div_cb, profile.range),
-                quantize_chroma((signal[0] - y) / div_cr, profile.range),
-            ];
-            assert_eq!(
-                profile.encode_signal_yuv10(signal, profile.range).unwrap(),
-                expected,
-                "{id} {signal:?}"
-            );
-        }
-        // Limited range uses 64..940 for luma and centres chroma at 512; full
-        // range uses 0..1023. The tag written with the output follows this
-        // choice, and ProRes delivery forces limited.
-        let limited = [64u16, 512, 512];
-        assert_eq!(
-            [
-                quantize_luma(0.0, rawtl_linear_video::color_profile::PreviewRange::Tv),
-                quantize_chroma(0.0, rawtl_linear_video::color_profile::PreviewRange::Tv),
-                quantize_chroma(0.0, rawtl_linear_video::color_profile::PreviewRange::Tv),
-            ],
-            limited
-        );
-        assert_eq!(
-            quantize_luma(1.0, rawtl_linear_video::color_profile::PreviewRange::Tv),
-            940
-        );
-        assert_eq!(
-            quantize_luma(1.0, rawtl_linear_video::color_profile::PreviewRange::Pc),
-            1023
-        );
-    }
-}
-
-/// The known patch goes through the real render -> encode -> decode path. The
-/// expected triples are independently derived (reference_derive.py); they are
-/// separated by >=25 codes so the observation rejects a wrong or bypassed
-/// profile, and the two Sony gamuts differ by 59 codes in red.
-#[test]
-fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
-    // Uniform 64x48 patches have <=3 codes of correct-path error. The nearest
-    // wrong-matrix result is Canon at 5 codes (wrong range: 8), so a vendor
-    // bound of 3 leaves a two-code rejection margin without relying on tags.
-    // Keep the historical sRGB bound; its live path is outside this repair.
-    const VENDOR_TOLERANCE: i32 = 3;
-    const SRGB_TOLERANCE: i32 = 12;
-    let cases: [(&str, &str, &str, &str, [u8; 3]); 6] = [
-        ("srgb-preview", "output.mov", "bt709", "tv", [0, 255, 0]),
-        (
-            "sony-slog3-sgamut3",
-            "output.mov",
-            "bt2020",
-            "tv",
-            [59, 147, 20],
-        ),
-        (
-            "sony-slog3-sgamut3-cine",
-            "output.mov",
-            "bt2020",
-            "tv",
-            [0, 145, 49],
-        ),
-        (
-            "canon-log2-cinema-gamut",
-            "output.mov",
-            "bt2020",
-            "tv",
-            [48, 140, 96],
-        ),
-        (
-            "nikon-nlog-bt2020",
-            "output.mov",
-            "bt2020",
-            "tv",
-            [0, 154, 0],
-        ),
-        (
-            "dji-dlog-dgamut",
-            "output.mov",
-            "bt2020",
-            "tv",
-            [0, 145, 74],
-        ),
-    ];
-
-    let mut observed = Vec::new();
-    for (id, filename, matrix, range, expected) in cases {
-        // AP1/D60 pure green: 0.0, 1.0, 0.0 in PNG RGB16 codes.
-        let (root, input, tool) = profile_material(&format!("profile-patch-{id}"), [0, 16384, 0]);
-        let result = run_profile(&root, &input, &tool, id);
-        assert!(
-            result.status.success(),
-            "{id} run failed\nstdout:\n{}\nstderr:\n{}",
-            stdout(&result),
-            stderr(&result)
-        );
-        let preview = root.join("run").join(filename);
-        let decoded = decode_first_pixel(&preview, matrix, range);
-        let difference = (0..3)
-            .map(|channel| (decoded[channel] as i32 - expected[channel] as i32).abs())
-            .max()
-            .unwrap_or(0);
-        let tolerance = if id == "srgb-preview" {
-            SRGB_TOLERANCE
-        } else {
-            VENDOR_TOLERANCE
-        };
-        let accepts = |pixel: [u8; 3]| {
-            (0..3)
-                .map(|channel| (pixel[channel] as i32 - expected[channel] as i32).abs())
-                .max()
-                .unwrap_or(0)
-                <= tolerance
-        };
-        assert!(accepts(decoded),
-            "{id}: decoded {decoded:?} vs independent reference {expected:?} (tolerance {tolerance})");
-        println!(
-            "sensitivity {id}: correct {decoded:?}, error {difference}, bound {tolerance}: PASS"
-        );
-
-        if id != "srgb-preview" {
-            // Counterfactuals decode the same encoded signal under the wrong
-            // matrix and the wrong range. Metadata cannot make a wrong inverse
-            // pass; the encoded 4:4:4 samples are unchanged.
-            for (name, wrong_matrix, wrong_range) in [
-                ("wrong-matrix", "bt709", range),
-                ("wrong-range", matrix, "pc"),
-            ] {
-                let wrong = decode_first_pixel(&preview, wrong_matrix, wrong_range);
-                let wrong_difference = (0..3)
-                    .map(|channel| (wrong[channel] as i32 - expected[channel] as i32).abs())
-                    .max()
-                    .unwrap_or(0);
-                assert!(!accepts(wrong),
-                    "{id} {name} must fail the same patch bound {tolerance}: {wrong:?} vs {expected:?}");
-                println!("sensitivity {id}: {name} {wrong:?}, error {wrong_difference}, bound {tolerance}: REJECTED");
-            }
-        }
-        observed.push((id, expected));
-    }
-
-    // A wrong profile cannot pass: the independent references are far apart.
-    for left in 0..observed.len() {
-        for right in left + 1..observed.len() {
-            let (left_id, left_code) = observed[left];
-            let (right_id, right_code) = observed[right];
-            let distance = (0..3)
-                .map(|channel| (left_code[channel] as i32 - right_code[channel] as i32).abs())
-                .max()
-                .unwrap_or(0);
-            assert!(
-                distance > SRGB_TOLERANCE,
-                "{left_id} and {right_id} references are not distinguishable: {left_code:?} vs {right_code:?}"
-            );
-        }
-    }
-
-    // The two Sony gamuts are separated by 59 codes in red.
-    let sony = observed
-        .iter()
-        .find(|(id, _)| *id == "sony-slog3-sgamut3")
-        .expect("sony")
-        .1;
-    let cine = observed
-        .iter()
-        .find(|(id, _)| *id == "sony-slog3-sgamut3-cine")
-        .expect("cine")
-        .1;
-    assert!((sony[0] as i32 - cine[0] as i32).abs() >= 25);
-}
-
-/// No decoder colour/range overrides: tags must select the same conversion as
-/// the forced-correct path. ProRes in MOV carries matrix/primaries/transfer in
-/// `colr nclc` but no range field, so the decoder's video-range default is the
-/// contract; a full-range read is visibly wrong.
-#[test]
-fn vendor_previews_auto_decode_from_their_own_tags() {
-    for (id, expected) in [
-        ("sony-slog3-sgamut3", [59u8, 147, 20]),
-        ("sony-slog3-sgamut3-cine", [0, 145, 49]),
-        ("canon-log2-cinema-gamut", [48, 140, 96]),
-        (REV3_PROFILE, [39, 135, 77]),
-        ("nikon-nlog-bt2020", [0, 154, 0]),
-        ("dji-dlog-dgamut", [0, 145, 74]),
-    ] {
-        let (root, input, tool) = profile_material_for_extension(
-            &format!("auto-tags-{id}"),
-            [0, 16384, 0],
-            if id == REV3_PROFILE { "CR3" } else { "DNG" },
-        );
-        let result = run_profile(&root, &input, &tool, id);
-        assert!(result.status.success(), "{id}: {}", stderr(&result));
-        let preview = root.join("run").join("output.mov");
-        let auto = decode_first_pixel_auto(&preview);
-        let correct = decode_first_pixel(&preview, "bt2020", "tv");
-        let wrong_matrix = decode_first_pixel(&preview, "bt709", "tv");
-        let wrong_range = decode_first_pixel(&preview, "bt2020", "pc");
-        let distance = |a: [u8; 3], b: [u8; 3]| {
-            (0..3)
-                .map(|c| (a[c] as i32 - b[c] as i32).abs())
-                .max()
-                .unwrap()
-        };
-        assert!(
-            distance(auto, expected) <= 3,
-            "{id} auto {auto:?} vs reference {expected:?}"
-        );
-        assert!(
-            distance(auto, correct) <= 1,
-            "{id} auto {auto:?} vs forced {correct:?}"
-        );
-        assert!(
-            distance(auto, wrong_matrix) >= 4,
-            "{id} auto {auto:?} vs wrong matrix {wrong_matrix:?}"
-        );
-        assert!(
-            distance(auto, wrong_range) > 3,
-            "{id} auto {auto:?} vs wrong range {wrong_range:?}"
-        );
-        assert!(
-            distance(wrong_range, expected) > 3,
-            "{id}: wrong range passes reference"
-        );
-        println!("auto {id}: reference={expected:?} auto={auto:?} forced={correct:?} wrong-matrix={wrong_matrix:?} wrong-range={wrong_range:?}");
-    }
-}
-
-/// Decoding with the wrong YCbCr matrix must visibly disagree with the declared
-/// reference, so the end-to-end check is not satisfied by a decoder default.
-#[test]
-fn wrong_ycbcr_matrix_is_rejected_by_the_patch_check() {
-    // N-Log compresses highlights least in this range, so AP1/D60 red 3.5 maps
-    // to a maximally chromatic coded triple [202,0,0]; the BT.709 inverse
-    // differs by 11 codes from the declared BT.2020 matrix, while ProRes error
-    // on the uniform patch stays well below that.
-    const CORRECT_TOLERANCE: i32 = 8;
-    let (root, input, tool) = profile_material("profile-wrong-matrix", [57344, 0, 0]);
-    let result = run_profile(&root, &input, &tool, "nikon-nlog-bt2020");
-    assert!(
-        result.status.success(),
-        "run failed\nstdout:\n{}\nstderr:\n{}",
-        stdout(&result),
-        stderr(&result)
-    );
-    let preview = root.join("run").join("output.mov");
-    let expected = [202u8, 0, 0];
-    let decoded = decode_first_pixel(&preview, "bt2020", "tv");
-    let difference = (0..3)
-        .map(|channel| (decoded[channel] as i32 - expected[channel] as i32).abs())
-        .max()
-        .unwrap_or(0);
-    assert!(
-        difference <= CORRECT_TOLERANCE,
-        "declared matrix: {decoded:?} vs {expected:?}"
-    );
-
-    let wrong = decode_first_pixel(&preview, "bt709", "tv");
-    let wrong_difference = (0..3)
-        .map(|channel| (wrong[channel] as i32 - expected[channel] as i32).abs())
-        .max()
-        .unwrap_or(0);
-    assert!(
-        wrong_difference > CORRECT_TOLERANCE,
-        "decoding with the wrong matrix must be rejected: {wrong:?} vs {expected:?}"
-    );
-}
-
-#[test]
-fn rejects_unknown_or_empty_preview_profile_with_exit_usage() {
-    let (root, input, fixtures) = run_success_setup("profile-unknown");
-    let frames = standard_frames(&fixtures);
-    let tool = fake_native_tool(&fixtures, &frames, None, false);
-    let output = root.join("run");
-    for value in ["no-such-profile", ""] {
-        let mut args = base_args(&input, &output, &tool);
-        args.push("--preview-profile");
-        args.push(value);
-        let result = run_cli(&args);
-        assert_eq!(
-            result.status.code(),
-            Some(2),
-            "value {value:?} must be EXIT_USAGE\nstdout:\n{}\nstderr:\n{}",
-            stdout(&result),
-            stderr(&result)
-        );
-        assert!(
-            stderr(&result).contains("--preview-profile"),
-            "{}",
-            stderr(&result)
-        );
-        assert!(!output.exists(), "usage rejection must not create output");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// White balance modes
-// ---------------------------------------------------------------------------
-
-fn white_balance_triple(value: &Json) -> [f64; 3] {
-    let values = value.as_array().expect("white balance array");
-    assert_eq!(values.len(), 3, "white balance must have three channels");
-    [
-        values[0].as_f64().expect("channel 0"),
-        values[1].as_f64().expect("channel 1"),
-        values[2].as_f64().expect("channel 2"),
-    ]
-}
-
-/// `command:` lines of every per-frame native transcript under `logs_dir`.
-fn frame_commands(logs_dir: &Path) -> Vec<(std::path::PathBuf, String)> {
-    fn walk(dir: &Path, out: &mut Vec<(std::path::PathBuf, String)>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.starts_with("frame_") && name.ends_with(".log"))
-                .unwrap_or(false)
-            {
-                let text = fs::read_to_string(&path).expect("read frame transcript");
-                let command = text
-                    .lines()
-                    .find(|line| line.starts_with("command:"))
-                    .unwrap_or_else(|| panic!("no command line in {}", path.display()));
-                if !command.contains("--prepare ") {
-                    out.push((path, command.to_string()));
-                }
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(logs_dir, &mut out);
-    out
-}
-
-fn assert_commands_without_white_balance(logs_dir: &Path) -> usize {
-    let commands = frame_commands(logs_dir);
-    assert!(
-        !commands.is_empty(),
-        "expected native frame transcripts under {}",
-        logs_dir.display()
-    );
-    for (path, command) in &commands {
-        assert!(
-            !command.contains("--white-balance"),
-            "{} passed an override: {command}",
-            path.display()
-        );
-    }
-    commands.len()
-}
-
-/// Every sidecar under `dir` must report `as-shot` and apply exactly its own
-/// `as_shot_neutral`; returns the applied triples in filename order.
-fn as_shot_sidecars(dir: &Path) -> Vec<[f64; 3]> {
-    let mut files: Vec<std::path::PathBuf> = fs::read_dir(dir)
-        .unwrap_or_else(|err| panic!("cannot read {}: {err}", dir.display()))
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("log"))
         .collect();
-    files.sort();
-    assert!(!files.is_empty(), "no sidecars under {}", dir.display());
-    let mut triples = Vec::with_capacity(files.len());
-    for path in files {
-        let sidecar = metadata_from_log(&fs::read_to_string(&path).unwrap());
-        assert_eq!(
-            sidecar.get("white_balance_source").and_then(Json::as_str),
-            Some("as-shot"),
-            "{} must report as-shot",
-            path.display()
-        );
-        let applied = white_balance_triple(
-            sidecar
-                .get("applied_white_balance")
-                .unwrap_or_else(|| panic!("{} has no applied_white_balance", path.display())),
-        );
-        let own = white_balance_triple(
-            sidecar
-                .get("as_shot_neutral")
-                .unwrap_or_else(|| panic!("{} has no as_shot_neutral", path.display())),
-        );
-        assert_eq!(
-            applied,
-            own,
-            "{} must apply its own as-shot neutral",
-            path.display()
-        );
-        triples.push(applied);
-    }
-    triples
-}
 
-fn assert_per_frame_manifest(output: &Path) {
-    let manifest = read_json(&output.join("manifest.json"));
-    let block = manifest
-        .get("white_balance")
-        .expect("manifest white_balance block");
-    assert_eq!(
-        block.get("strategy").and_then(Json::as_str),
-        Some("per-frame")
-    );
-    assert_eq!(block.get("reference_frame"), Some(&Json::Null));
-    assert_eq!(block.get("reference_source"), Some(&Json::Null));
-    assert_eq!(block.get("reference"), Some(&Json::Null));
-    let propagation = block
-        .get("propagation")
-        .and_then(Json::as_str)
-        .expect("propagation");
+    let result = run_cli(&base_args(&material, &material.join(VIDEO_NAME), &tool));
+    assert_eq!(result.status.code(), Some(11), "{}", stderr(&result));
     assert!(
-        propagation.contains("own as-shot neutral") && propagation.contains("no --white-balance"),
-        "per-frame propagation must describe the per-frame contract: {propagation}"
-    );
-    let provenance = block
-        .get("per_frame_as_shot_neutral")
-        .and_then(Json::as_str)
-        .expect("per_frame_as_shot_neutral");
-    assert!(
-        provenance.contains("applied_white_balance"),
-        "per-frame provenance must state the applied/own equality: {provenance}"
-    );
-    let text = fs::read_to_string(output.join("manifest.json")).expect("manifest text");
-    assert!(
-        !text.contains("all_applied_equal\": true"),
-        "a per-frame run must not claim one frozen triple: {text}"
-    );
-    assert!(
-        !text.contains("applied to every later frame"),
-        "a per-frame manifest must not claim frozen propagation: {text}"
-    );
-}
-
-/// Flicker fixture with a distinct as-shot neutral per frame.
-fn per_frame_flicker_sequence(count: usize) -> Vec<FakeFrame> {
-    (0..count)
-        .map(|index| {
-            let gain = if index % 2 == 0 { -0.3 } else { 0.3 };
-            let red = 0.40 + 0.005 * index as f64;
-            let blue = 0.60 + 0.004 * index as f64;
-            FakeFrame::new(&format!("frame_{:04}.DNG", index), 0.18f64.log2() + gain)
-                .neutral(&format!("{red:.3},1,{blue:.3}"))
-                .capture(&format!(
-                    "2026:11:08 20:{:02}:{:02}",
-                    index / 60,
-                    index % 60
-                ))
-        })
-        .collect()
-}
-
-#[test]
-fn per_frame_mode_decodes_every_frame_with_its_own_as_shot_neutral() {
-    let root = test_dir("wb-per-frame");
-    let input = root.join("material");
-    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
-    let frames = standard_frames(&fixtures);
-    let tool = fake_native_tool(&fixtures, &frames, None, false);
-    let output = root.join("run");
-
-    let mut args = base_args(&input, &output, &tool);
-    args.extend_from_slice(&["--white-balance", "per-frame", "--strength", "0"]);
-    let result = run_cli(&args);
-    assert!(
-        result.status.success(),
-        "run failed\nstdout:\n{}\nstderr:\n{}",
-        stdout(&result),
+        stderr(&result).contains("inside the input/material directory"),
+        "{}",
         stderr(&result)
     );
-
-    // Every frame decodes with its own RAW as-shot neutral; the three neutrals
-    // differ, so a producer that froze one triple would fail this assertion.
-    let applied = as_shot_sidecars(&output.join("logs/render"));
-    assert_eq!(applied.len(), 3);
-    assert_ne!(applied[0], applied[1]);
-    assert_ne!(applied[0], applied[2]);
-    assert_ne!(applied[1], applied[2]);
-
-    assert_commands_without_white_balance(&output.join("logs"));
-    assert_per_frame_manifest(&output);
-
-    let run_stdout = stdout(&result);
-    assert!(
-        run_stdout
-            .contains("per-frame white balance: every frame decoded with its own as-shot neutral"),
-        "{run_stdout}"
-    );
-    assert!(
-        !run_stdout.contains("applied to every later frame"),
-        "the per-frame summary must not claim frozen propagation: {run_stdout}"
-    );
-    assert!(!run_stdout.contains("frozen white balance"), "{run_stdout}");
-
-    assert!(output.join("output.mov").is_file());
-    assert!(output.join("output.mov").is_file());
-}
-
-#[test]
-fn per_frame_mode_measures_and_renders_without_an_override() {
-    let material = synthetic_material("wb-per-frame-deflicker", per_frame_flicker_sequence(30));
-    let (result, output) = run_synthetic(
-        &material,
-        "run",
-        &["--white-balance", "per-frame", "--brightness", "uniform"],
-    );
-    assert!(result.status.success(), "{}", stderr(&result));
-    assert_commands_without_white_balance(&output.join("logs"));
-    let baseline = as_shot_sidecars(&output.join("logs/analysis"));
-    let rendered = as_shot_sidecars(&output.join("logs/render"));
-    assert_eq!(baseline.len(), 30);
-    assert_eq!(baseline, rendered);
-    assert!(!output.join("logs/probe").exists());
-    assert_per_frame_manifest(&output);
-}
-
-#[test]
-fn per_frame_mode_rejects_a_producer_that_invents_an_override() {
-    let root = test_dir("wb-per-frame-override-lie");
-    let input = root.join("material");
-    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
-    let frames = standard_frames(&fixtures);
-    let tool = fake_native_sequence_wb_lie(
-        &fixtures,
-        &frames,
-        FakeWbLie::OverrideWhenUnset,
-        WIDTH,
-        HEIGHT,
-    );
-    let output = root.join("run");
-
-    let mut args = base_args(&input, &output, &tool);
-    args.extend_from_slice(&["--white-balance", "per-frame", "--strength", "0"]);
-    let result = run_cli(&args);
-    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
-    let text = stderr(&result);
-    assert!(
-        text.contains("should use its as-shot white balance"),
-        "the error must name the required as-shot contract: {text}"
-    );
-    assert!(text.contains("frame 1/3"), "{text}");
-    assert!(text.contains("override"), "{text}");
-    assert!(!output.join("output.mov").exists());
-    assert!(!output.join("output.mov").exists());
-}
-
-#[test]
-fn rejects_a_producer_that_reports_as_shot_but_applies_another_neutral() {
-    let root = test_dir("wb-as-shot-lie");
-    let input = root.join("material");
-    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("create fixtures");
-    let frames = standard_frames(&fixtures);
-    let tool =
-        fake_native_sequence_wb_lie(&fixtures, &frames, FakeWbLie::AsShotMismatch, WIDTH, HEIGHT);
-    let output = root.join("run");
-
-    let mut args = base_args(&input, &output, &tool);
-    args.extend_from_slice(&["--white-balance", "per-frame", "--strength", "0"]);
-    let result = run_cli(&args);
-    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
-    let text = stderr(&result);
-    assert!(
-        text.contains("reports as-shot white balance but applied"),
-        "the error must reject the applied/own mismatch: {text}"
-    );
-    assert!(text.contains("as_shot_neutral"), "{text}");
-    assert!(text.contains("frame 1/3"), "{text}");
-    assert!(!output.join("output.mov").exists());
-}
-
-#[test]
-fn rejects_invalid_white_balance_mode_values() {
-    let root = test_dir("wb-invalid-mode");
-    let input = root.join("material");
-    let output = root.join("run");
-    let tool = root.join("unused-native-tool");
-    for extra in [
-        vec!["--white-balance", "bogus"],
-        vec!["--white-balance", ""],
-        vec!["--white-balance="],
-    ] {
-        let mut args = base_args(&input, &output, &tool);
-        args.extend(extra.iter());
-        let result = run_cli(&args);
-        assert_eq!(
-            result.status.code(),
-            Some(2),
-            "must reject {extra:?}: {}",
-            stderr(&result)
-        );
-        assert!(
-            stderr(&result).contains("--white-balance"),
-            "the usage error must name the flag: {}",
-            stderr(&result)
-        );
-    }
-}
-
-/// Complete within a fixed bound and verify each instrumented owned process
-/// disappeared before the CLI returned. Output files avoid pipe-fill deadlocks
-/// in the test harness itself.
-fn bounded_owned_run(args: &[&str], root: &Path) -> Output {
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-    let out = root.join("bounded.stdout");
-    let err = root.join("bounded.stderr");
-    let pids = root.join("owned.pids");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rawtl-linear-video"))
-        .args(args)
-        .env("FAKE_NATIVE_PIDS", &pids)
-        .stdout(Stdio::from(fs::File::create(&out).unwrap()))
-        .stderr(Stdio::from(fs::File::create(&err).unwrap()))
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let (status, in_time) = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break (status, true);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            break (child.wait().unwrap(), false);
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let mut owned = fs::read_to_string(&pids).unwrap_or_default();
-    fn log_pids(dir: &Path, owned: &mut String) {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    log_pids(&entry.path(), owned);
-                } else if let Ok(log) = fs::read_to_string(entry.path()) {
-                    for line in log.lines() {
-                        if let Some(pid) = line.strip_prefix("pid: ") {
-                            owned.push_str(pid);
-                            owned.push('\n');
-                        }
-                    }
-                }
-            }
-        }
-    }
-    log_pids(&root.join("run/logs"), &mut owned);
-    assert!(
-        !owned.is_empty(),
-        "the fixture must instrument real owned children"
-    );
-    let mut survivors = vec![];
-    for pid in owned.lines() {
-        assert!(pid.parse::<u32>().unwrap() > 1);
-        let exists = Command::new("kill")
-            .args(["-0", pid])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success();
-        if exists {
-            survivors.push(pid.to_string());
-            let _ = Command::new("kill").args(["-9", pid]).status();
-        }
-    }
-    assert!(
-        in_time,
-        "pipeline exceeded bounded completion deadline; stdout {} stderr {}",
-        out.display(),
-        err.display()
-    );
-    assert!(
-        survivors.is_empty(),
-        "owned children survived CLI return: {survivors:?}"
-    );
-    Output {
-        status,
-        stdout: fs::read(out).unwrap(),
-        stderr: fs::read(err).unwrap(),
-    }
+    let after: Vec<PathBuf> = fs::read_dir(&material)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(before, after, "a rejected output writes nothing");
 }
 
 #[test]
@@ -1931,13 +527,9 @@ fn protocol_and_child_failures_reap_live_counterparts_and_never_publish() {
             .map(|s| FakeFrame::new(s, 0.18f64.log2()))
             .collect();
         let native = fake_native_tool(&fixtures, &frames, None, false);
-        let config = fixtures.join(format!("fake-native-{}.config", std::process::id()));
-        use std::io::Write;
-        writeln!(
-            fs::OpenOptions::new().append(true).open(config).unwrap(),
-            "{knob}\nwidth=240\nheight=180"
-        )
-        .unwrap();
+        append_config(&fixtures, knob);
+        append_config(&fixtures, "width=240");
+        append_config(&fixtures, "height=180");
         let encoder = fixtures.join("controlled-encoder");
         let body = if encoder_exit {
             "exit 7"
@@ -1945,15 +537,16 @@ fn protocol_and_child_failures_reap_live_counterparts_and_never_publish() {
             "exec /usr/bin/python3 -c 'import sys,time; sys.stdin.buffer.read(259200); time.sleep(60)'"
         };
         // The capability preflight is a synthetic lavfi frame; only the real
-        // streaming invocation should stall or fail.
+        // streaming invocation stalls or fails.
         write_executable(
             &encoder,
             &format!(
                 "#!/bin/sh\necho $$ >> \"$FAKE_NATIVE_PIDS\"\ncase \" $* \" in *\" lavfi \"*|*\" -h \"*) exit 0;; esac\n{body}\n"
             ),
         );
-        let output = root.join("run");
-        let mut args = base_args(&input, &output, &native);
+        let directory = run_directory(&root, "run");
+        let video = video_in(&directory);
+        let mut args = base_args(&input, &video, &native);
         args.extend(["--strength", "0", "--ffmpeg", encoder.to_str().unwrap()]);
         let result = bounded_owned_run(&args, &root);
         assert_eq!(
@@ -1967,36 +560,1042 @@ fn protocol_and_child_failures_reap_live_counterparts_and_never_publish() {
             "{label}: {}",
             stderr(&result)
         );
-        assert!(output.join(".rawtl-partial").is_dir());
-        assert!(!output.join("output.mov").exists());
+        assert!(!video_in(&directory).exists());
+
+        let log = read_log(&directory);
+        let scratch = scratch_from_log(&log);
+        assert!(scratch.is_dir(), "{label}: scratch retained");
+        let mut pids = fs::read_to_string(root.join("owned.pids")).unwrap_or_default();
+        fn collect_transcripts(dir: &Path, out: &mut String) {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        collect_transcripts(&entry.path(), out);
+                    } else if let Ok(text) = fs::read_to_string(entry.path()) {
+                        for line in text.lines() {
+                            if let Some(pid) = line.strip_prefix("pid: ") {
+                                out.push_str(pid);
+                                out.push('\n');
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        collect_transcripts(&scratch, &mut pids);
         assert!(
-            !output.join("logs/render/frame_000003.log").exists(),
-            "stop dispatch on failure"
+            !pids.trim().is_empty(),
+            "{label}: the fixture must instrument owned children"
         );
-        let first = fs::read_to_string(output.join("logs/render/frame_000001.log")).unwrap();
+        let mut survivors = vec![];
+        for pid in pids.lines().filter(|pid| !pid.trim().is_empty()) {
+            assert!(pid.parse::<u32>().unwrap() > 1);
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if alive {
+                survivors.push(pid.to_string());
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", pid])
+                    .status();
+            }
+        }
         assert!(
-            first.contains("exit:"),
-            "native status must be retained: {first}"
+            survivors.is_empty(),
+            "{label}: owned children survived CLI return: {survivors:?}"
         );
-        if output.join("logs/encode.log").exists() {
-            let log = fs::read_to_string(output.join("logs/encode.log")).unwrap();
-            assert!(log.contains("exit:"), "encoder status must be retained");
-            assert!(
-                log.contains("pid: "),
-                "live counterpart fixture must start both processes"
+    }
+}
+
+fn bounded_owned_run(args: &[&str], root: &Path) -> Output {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let out = root.join("bounded.stdout");
+    let err = root.join("bounded.stderr");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rawtl-linear-video"))
+        .args(args)
+        .env("FAKE_NATIVE_PIDS", root.join("owned.pids"))
+        .stdout(Stdio::from(fs::File::create(&out).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&err).unwrap()))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (status, in_time) = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break (status, true);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break (child.wait().unwrap(), false);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        in_time,
+        "pipeline exceeded bounded completion deadline; stdout {} stderr {}",
+        out.display(),
+        err.display()
+    );
+    Output {
+        status,
+        stdout: fs::read(out).unwrap(),
+        stderr: fs::read(err).unwrap(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deflicker plan behaviour through the product surface
+// ---------------------------------------------------------------------------
+
+const SYNTH_WIDTH: u32 = 240;
+const SYNTH_HEIGHT: u32 = 180;
+
+struct SyntheticMaterial {
+    root: PathBuf,
+    input: PathBuf,
+    fixtures: PathBuf,
+    tool: PathBuf,
+}
+
+fn synthetic_material(name: &str, frames: Vec<FakeFrame>) -> SyntheticMaterial {
+    require_ffmpeg();
+    let root = test_dir(name);
+    let input = root.join("material");
+    let names: Vec<&str> = frames.iter().map(|frame| frame.name.as_str()).collect();
+    make_input(&input, &names);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let tool = fake_native_sequence(&fixtures, &frames, None, false, SYNTH_WIDTH, SYNTH_HEIGHT);
+    SyntheticMaterial {
+        root,
+        input,
+        fixtures,
+        tool,
+    }
+}
+
+fn run_synthetic(
+    material: &SyntheticMaterial,
+    output_name: &str,
+    extra: &[&str],
+) -> (Output, PathBuf) {
+    let directory = material.root.join(output_name);
+    let video = directory.join(VIDEO_NAME);
+    let mut args = base_args(&material.input, &video, &material.tool);
+    args.extend(extra);
+    (run_cli(&args), directory)
+}
+
+#[test]
+fn pairwise_uniform_corrects_flicker_with_one_measure_and_render() {
+    let gains: Vec<f64> = (0..30)
+        .map(|index| if index % 2 == 0 { -0.3 } else { 0.3 })
+        .collect();
+    let material = synthetic_material("flicker", synthetic_sequence(&gains));
+    let (result, directory) = run_synthetic(&material, "run", &["--brightness", "uniform"]);
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        stdout(&result),
+        stderr(&result)
+    );
+    let log = read_log(&directory);
+    let evs = develop_evs(&log);
+    assert_eq!(evs.len(), 30);
+    let corrected: Vec<f64> = gains.iter().zip(&evs).map(|(g, ev)| g + ev).collect();
+    assert!(
+        corrected.windows(2).all(|w| (w[1] - w[0]).abs() < 0.1),
+        "{corrected:?}"
+    );
+    assert_eq!(log_kind(&log, "measure").len(), 30);
+    assert_eq!(log_kind(&log, "develop").len(), 30);
+    assert_only_video_and_log(&directory, VIDEO_NAME, &[]);
+    assert!(!scratch_from_log(&log).exists());
+}
+
+#[test]
+fn confirmed_step_is_preserved_and_not_corrected_away() {
+    let base = 0.18f64.log2();
+    let mut frames = synthetic_sequence(&vec![0.0; 20]);
+    for (index, frame) in frames.iter_mut().enumerate() {
+        if index >= 10 {
+            frame.log_level = base + 0.5;
+        }
+    }
+    let material = synthetic_material("confirmed-step", frames);
+    let (result, directory) = run_synthetic(&material, "run", &["--step", "10:0.5"]);
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        stdout(&result),
+        stderr(&result)
+    );
+    let log = read_log(&directory);
+    let evs = develop_evs(&log);
+    assert_eq!(evs.len(), 20);
+    let mean = |range: std::ops::Range<usize>| {
+        let values = &evs[range];
+        values.iter().sum::<f64>() / values.len() as f64
+    };
+    assert!(
+        (mean(10..20) - mean(0..10)).abs() < 0.1,
+        "the estimator must not cancel the confirmed step: before={} after={}",
+        mean(0..10),
+        mean(10..20)
+    );
+    assert!(video_in(&directory).is_file());
+}
+
+#[test]
+fn ev_limits_clamp_every_applied_ev() {
+    let gains: Vec<f64> = (0..12)
+        .map(|index| if index % 2 == 0 { 1.0 } else { -1.0 })
+        .collect();
+    let material = synthetic_material("ev-limits", synthetic_sequence(&gains));
+    let (result, directory) = run_synthetic(&material, "run", &["--ev-limits", "-0.25,0.25"]);
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        stdout(&result),
+        stderr(&result)
+    );
+    let log = read_log(&directory);
+    let evs = develop_evs(&log);
+    assert_eq!(evs.len(), 12);
+    assert!(
+        evs.iter().all(|ev| (-0.25..=0.25).contains(ev)),
+        "{evs:?}"
+    );
+    assert!(evs.iter().any(|ev| *ev == 0.25 || *ev == -0.25), "{evs:?}");
+    assert_only_video_and_log(&directory, VIDEO_NAME, &[]);
+}
+
+#[test]
+fn product_graph_does_not_add_full_frame_feedback_rounds() {
+    let material = synthetic_material(
+        "one-render",
+        synthetic_sequence(&[0.3, -0.3, 0.3, -0.3, 0.3, -0.3]),
+    );
+    append_config(&material.fixtures, "gain_scale=0.5");
+    let (result, directory) = run_synthetic(&material, "run", &[]);
+    assert!(result.status.success(), "{}", stderr(&result));
+    let log = read_log(&directory);
+    assert_eq!(log_kind(&log, "measure").len(), 6);
+    assert_eq!(log_kind(&log, "develop").len(), 6);
+    assert_eq!(log_kind(&log, "prepare").len(), 6);
+}
+
+#[test]
+fn degraded_photometry_and_single_frame_still_publish_finite_ev() {
+    // A one-frame sequence has no pairs at all.
+    let single = synthetic_material("single-frame", synthetic_sequence(&[0.2]));
+    let (result, directory) = run_synthetic(&single, "run", &[]);
+    assert!(result.status.success(), "{}", stderr(&result));
+    let log = read_log(&directory);
+    let evs = develop_evs(&log);
+    assert_eq!(evs.len(), 1);
+    assert!(evs[0].is_finite(), "{evs:?}");
+    assert!(video_in(&directory).is_file());
+
+    // Most tiles invalid: the estimator falls back to a finite plan.
+    let mut frames = synthetic_sequence(&[0.2, -0.2, 0.2, -0.2]);
+    frames[1].pattern = "sparse";
+    let sparse = synthetic_material("best-effort-graph", frames);
+    let (result, directory) = run_synthetic(&sparse, "run", &[]);
+    assert!(result.status.success(), "{}", stderr(&result));
+    let log = read_log(&directory);
+    let evs = develop_evs(&log);
+    assert_eq!(evs.len(), 4);
+    assert!(evs.iter().all(|ev| ev.is_finite()), "{evs:?}");
+    assert_eq!(log_kind(&log, "develop").len(), 4);
+}
+
+#[test]
+fn fractional_ev_values_survive_the_sidecar_round_trip() {
+    // The producer serializes the analysis sidecar with 10 significant digits,
+    // so a fractional correction never round-trips through f64 exactly.
+    let gains: Vec<f64> = (0..12).map(|index| 0.1 * index as f64).collect();
+    let material = synthetic_material("fractional-ev", synthetic_sequence(&gains));
+    let (result, directory) = run_synthetic(
+        &material,
+        "run",
+        &["--estimator", "legacy", "--brightness", "uniform", "--strength", "0.7"],
+    );
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        stdout(&result),
+        stderr(&result)
+    );
+    let log = read_log(&directory);
+    let evs = develop_evs(&log);
+    assert_eq!(evs.len(), 12);
+    assert!(evs.iter().all(|ev| ev.is_finite()), "{evs:?}");
+    assert!(video_in(&directory).is_file());
+}
+
+#[test]
+fn strength_zero_is_the_single_pass_regression_path() {
+    let root = test_dir("strength-zero");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_tool(&fixtures, &frames, None, false);
+
+    let run = |name: &str| {
+        let directory = run_directory(&root, name);
+        let video = video_in(&directory);
+        let mut args = base_args(&input, &video, &tool);
+        args.extend(["--strength", "0"]);
+        let result = run_cli(&args);
+        assert!(
+            result.status.success(),
+            "run failed\nstdout:\n{}\nstderr:\n{}",
+            stdout(&result),
+            stderr(&result)
+        );
+        directory
+    };
+    let first = run("run-a");
+    let second = run("run-b");
+
+    let log = read_log(&first);
+    assert!(log_kind(&log, "measure").is_empty(), "no analysis at strength 0");
+    let evs = develop_evs(&log);
+    assert_eq!(evs, vec![0.0, 0.0, 0.0]);
+    // Frame 1 decodes with its own as-shot neutral; later frames carry the
+    // frozen override (same three-valued field, different source).
+    let wb: Vec<(String, String)> = log_kind(&log, "develop")
+        .iter()
+        .map(|line| {
+            (
+                log_field(line, "wb").unwrap().to_string(),
+                log_field(line, "wb_source").unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(wb[0].1, "as-shot");
+    assert_eq!(wb[1].1, "override");
+    assert_eq!(wb[2].1, "override");
+    assert_eq!(wb[0].0, wb[1].0);
+    assert_eq!(wb[0].0, wb[2].0);
+
+    // Both same-candidate runs traverse the pipe with the same encoder argv.
+    let command = |directory: &Path| {
+        let log = read_log(directory);
+        let args = log_field(log_kind(&log, "encoder.command")[0], "args").unwrap();
+        args.split(" -f mov ").next().unwrap().to_string()
+    };
+    assert_eq!(command(&first), command(&second));
+    assert_only_video_and_log(&first, VIDEO_NAME, &[]);
+}
+
+#[test]
+fn late_encoder_failure_on_disabled_path_reports_the_error() {
+    let root = test_dir("disabled-encode-failure");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_tool(&fixtures, &frames, None, false);
+    let encoder = fake_failing_encoder(&fixtures);
+    let directory = run_directory(&root, "run");
+
+    let video = video_in(&directory);
+    let mut args = base_args(&input, &video, &tool);
+    args.extend([
+        "--strength",
+        "0",
+        "--ffmpeg",
+        encoder.to_str().expect("utf8"),
+    ]);
+    let result = run_cli(&args);
+    assert_eq!(result.status.code(), Some(60), "{}", stderr(&result));
+    assert!(!video_in(&directory).exists());
+    let log = read_log(&directory);
+    assert!(log.contains("kind=run.error code=60"), "{log}");
+    assert!(log.contains("synthetic encoder failure"), "{log}");
+}
+
+// ---------------------------------------------------------------------------
+// White balance modes
+// ---------------------------------------------------------------------------
+
+fn white_balance_triple(text: &str) -> [f64; 3] {
+    let values: Vec<f64> = text
+        .split(',')
+        .map(|value| value.parse().expect("wb channel"))
+        .collect();
+    assert_eq!(values.len(), 3, "{text}");
+    [values[0], values[1], values[2]]
+}
+
+fn develop_wb(log: &str) -> Vec<([f64; 3], [f64; 3], String)> {
+    log_kind(log, "develop")
+        .iter()
+        .map(|line| {
+            (
+                white_balance_triple(log_field(line, "wb").unwrap()),
+                white_balance_triple(log_field(line, "as_shot").unwrap()),
+                log_field(line, "wb_source").unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn per_frame_flicker_sequence(count: usize) -> Vec<FakeFrame> {
+    (0..count)
+        .map(|index| {
+            let gain = if index % 2 == 0 { -0.3 } else { 0.3 };
+            let red = 0.40 + 0.005 * index as f64;
+            let blue = 0.60 + 0.004 * index as f64;
+            FakeFrame::new(&format!("frame_{:04}.DNG", index), 0.18f64.log2() + gain)
+                .neutral(&format!("{red:.3},1,{blue:.3}"))
+                .capture(&format!(
+                    "2026:11:08 20:{:02}:{:02}",
+                    index / 60,
+                    index % 60
+                ))
+        })
+        .collect()
+}
+
+#[test]
+fn per_frame_mode_decodes_every_frame_with_its_own_as_shot_neutral() {
+    let root = test_dir("wb-per-frame");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_tool(&fixtures, &frames, None, false);
+    let directory = run_directory(&root, "run");
+
+    let video = video_in(&directory);
+    let mut args = base_args(&input, &video, &tool);
+    args.extend(["--white-balance", "per-frame", "--strength", "0"]);
+    let result = run_cli(&args);
+    assert!(
+        result.status.success(),
+        "run failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&result),
+        stderr(&result)
+    );
+    let log = read_log(&directory);
+    let applied = develop_wb(&log);
+    assert_eq!(applied.len(), 3);
+    for (wb, as_shot, source) in &applied {
+        assert_eq!(source, "as-shot");
+        assert_eq!(wb, as_shot, "each frame applies its own neutral");
+    }
+    assert_ne!(applied[0].0, applied[1].0);
+    assert_ne!(applied[1].0, applied[2].0);
+    assert!(
+        stdout(&result)
+            .contains("per-frame white balance: every frame decoded with its own as-shot neutral"),
+        "{}",
+        stdout(&result)
+    );
+    assert!(!stdout(&result).contains("applied to every later frame"));
+    assert!(video_in(&directory).is_file());
+}
+
+#[test]
+fn per_frame_deflicker_measures_and_renders_without_an_override() {
+    let material = synthetic_material("wb-per-frame-deflicker", per_frame_flicker_sequence(30));
+    let (result, directory) = run_synthetic(
+        &material,
+        "run",
+        &["--white-balance", "per-frame", "--brightness", "uniform"],
+    );
+    assert!(result.status.success(), "{}", stderr(&result));
+    let log = read_log(&directory);
+    let measured: Vec<(String, String)> = log_kind(&log, "measure")
+        .iter()
+        .map(|line| {
+            (
+                log_field(line, "frame").unwrap().to_string(),
+                log_field(line, "source").unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(measured.len(), 30);
+    let rendered = develop_wb(&log);
+    assert_eq!(rendered.len(), 30);
+    assert!(rendered.iter().all(|(wb, own, source)| {
+        source == "as-shot" && wb == own
+    }));
+    assert!(video_in(&directory).is_file());
+}
+
+#[test]
+fn per_frame_mode_rejects_a_producer_that_invents_an_override() {
+    let root = test_dir("wb-per-frame-override-lie");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_sequence_wb_lie(
+        &fixtures,
+        &frames,
+        FakeWbLie::OverrideWhenUnset,
+        WIDTH,
+        HEIGHT,
+    );
+    let directory = run_directory(&root, "run");
+    let video = video_in(&directory);
+    let mut args = base_args(&input, &video, &tool);
+    args.extend(["--white-balance", "per-frame", "--strength", "0"]);
+    let result = run_cli(&args);
+    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
+    let text = stderr(&result);
+    assert!(text.contains("should use its as-shot white balance"), "{text}");
+    assert!(text.contains("frame 1/3"), "{text}");
+    assert!(!video_in(&directory).exists());
+}
+
+#[test]
+fn rejects_a_producer_that_reports_as_shot_but_applies_another_neutral() {
+    let root = test_dir("wb-as-shot-lie");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool =
+        fake_native_sequence_wb_lie(&fixtures, &frames, FakeWbLie::AsShotMismatch, WIDTH, HEIGHT);
+    let directory = run_directory(&root, "run");
+    let video = video_in(&directory);
+    let mut args = base_args(&input, &video, &tool);
+    args.extend(["--white-balance", "per-frame", "--strength", "0"]);
+    let result = run_cli(&args);
+    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
+    let text = stderr(&result);
+    assert!(text.contains("reports as-shot white balance but applied"), "{text}");
+    assert!(text.contains("as_shot_neutral"), "{text}");
+    assert!(!video_in(&directory).exists());
+}
+
+#[test]
+fn rejects_invalid_white_balance_mode_values() {
+    let root = test_dir("wb-invalid-mode");
+    let input = root.join("material");
+    let tool = root.join("unused-native-tool");
+    let video = root.join("run").join(VIDEO_NAME);
+    for extra in [
+        vec!["--white-balance", "bogus"],
+        vec!["--white-balance", ""],
+        vec!["--white-balance="],
+    ] {
+        let mut args = base_args(&input, &video, &tool);
+        args.extend(extra.iter());
+        let result = run_cli(&args);
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "must reject {extra:?}: {}",
+            stderr(&result)
+        );
+        assert!(stderr(&result).contains("--white-balance"), "{}", stderr(&result));
+        assert!(!root.join("run").exists());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Typed handoff defects
+// ---------------------------------------------------------------------------
+
+fn metadata_from_transcript(text: &str) -> Json {
+    let value = text
+        .lines()
+        .find_map(|line| line.strip_prefix("JSON 0x01: "))
+        .expect("metadata JSON in transcript");
+    rawtl_linear_video::json::parse(value).unwrap()
+}
+
+fn assert_final_source_hash_rejected(defect: &str) {
+    let root = test_dir(&format!("final-source-hash-{defect}"));
+    let input = root.join("material");
+    let frames = synthetic_sequence(&[0.0, 0.1, -0.1]);
+    let names: Vec<&str> = frames.iter().map(|frame| frame.name.as_str()).collect();
+    make_input(&input, &names);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).unwrap();
+    let tool = fake_native_sequence_sidecar_defect(
+        &fixtures,
+        &frames,
+        FakeSidecarDefects::default(),
+        WIDTH,
+        HEIGHT,
+    );
+    append_config(&fixtures, &format!("frame_source_sha256_defect={defect}"));
+    let directory = run_directory(&root, "run");
+    let video = video_in(&directory);
+    let result = run_cli(&base_args(&input, &video, &tool));
+
+    assert_eq!(
+        result.status.code(),
+        Some(30),
+        "{defect}: video published={}; stderr: {}",
+        video_in(&directory).exists(),
+        stderr(&result)
+    );
+    let error = stderr(&result);
+    assert!(
+        error.contains("frame 1/3") && error.contains(&frames[0].name),
+        "{error}"
+    );
+    assert!(
+        error.contains("metadata is missing or invalid field \"source_sha256\""),
+        "{error}"
+    );
+    assert!(!video_in(&directory).exists());
+    let log = read_log(&directory);
+    assert!(log.contains("kind=run.error code=30"), "{log}");
+    let scratch = scratch_from_log(&log);
+    let transcript = fs::read_to_string(scratch.join("transcripts/develop/frame_000001.log"))
+        .expect("final-frame transcript");
+    metadata_from_transcript(&transcript);
+    assert!(!log.contains("kind=develop frame=3"), "{log}");
+}
+
+#[test]
+fn stdout_frame_missing_source_sha256_is_rejected_after_valid_analysis() {
+    assert_final_source_hash_rejected("omit");
+}
+
+#[test]
+fn stdout_frame_null_source_sha256_is_rejected_after_valid_analysis() {
+    assert_final_source_hash_rejected("null");
+}
+
+#[test]
+fn stdout_frame_non_string_source_sha256_is_rejected_after_valid_analysis() {
+    assert_final_source_hash_rejected("non-string");
+}
+
+#[test]
+fn stdout_frame_empty_source_sha256_is_rejected_after_valid_analysis() {
+    assert_final_source_hash_rejected("empty");
+}
+
+fn run_sidecar_defect(name: &str, defects: FakeSidecarDefects) -> (Output, PathBuf) {
+    let root = test_dir(name);
+    let input = root.join("material");
+    let frames = synthetic_sequence(&[0.0, 0.1]);
+    let names: Vec<&str> = frames.iter().map(|frame| frame.name.as_str()).collect();
+    make_input(&input, &names);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let tool = fake_native_sequence_sidecar_defect(&fixtures, &frames, defects, WIDTH, HEIGHT);
+    let directory = run_directory(&root, "run");
+    let video = video_in(&directory);
+    (run_cli(&base_args(&input, &video, &tool)), directory)
+}
+
+#[test]
+fn forged_metadata_source_hash_is_rejected_by_the_typed_boundary() {
+    let (result, _) = run_sidecar_defect(
+        "forged-metadata-hash",
+        FakeSidecarDefects {
+            empty_source_sha256: true,
+            ..FakeSidecarDefects::default()
+        },
+    );
+    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
+    let text = stderr(&result);
+    assert!(text.contains("frame 1/2"), "{text}");
+    assert!(
+        text.contains("metadata is missing or invalid field \"source_sha256\""),
+        "{text}"
+    );
+}
+
+#[test]
+fn forged_analysis_sidecar_without_kind_is_rejected() {
+    let (result, _) = run_sidecar_defect(
+        "forged-analysis-kind",
+        FakeSidecarDefects {
+            analysis_omit_kind: true,
+            ..FakeSidecarDefects::default()
+        },
+    );
+    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
+    let text = stderr(&result);
+    assert!(text.contains("frame 1/2"), "{text}");
+    assert!(text.contains("analysis sidecar has an unsupported schema"), "{text}");
+}
+
+#[test]
+fn forged_analysis_sidecar_hash_mismatch_is_rejected() {
+    let (result, _) = run_sidecar_defect(
+        "forged-analysis-hash",
+        FakeSidecarDefects {
+            analysis_sha_mismatch: true,
+            ..FakeSidecarDefects::default()
+        },
+    );
+    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
+    let text = stderr(&result);
+    assert!(text.contains("frame 1/2"), "{text}");
+    assert!(
+        text.contains("analysis sidecar source_sha256 does not match the frame metadata"),
+        "{text}"
+    );
+}
+
+#[test]
+fn detects_a_native_tool_that_ignores_the_frozen_override() {
+    let root = test_dir("wb-drift");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_tool(&fixtures, &frames, None, true);
+    let directory = run_directory(&root, "run");
+    let video = video_in(&directory);
+    let result = run_cli(&base_args(&input, &video, &tool));
+    assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
+    assert!(
+        stderr(&result).contains("should use the frozen override white balance"),
+        "{}",
+        stderr(&result)
+    );
+    assert!(!video_in(&directory).exists());
+}
+
+// ---------------------------------------------------------------------------
+// Colour/Log profiles through the encoded stream
+// ---------------------------------------------------------------------------
+
+fn profile_material_for_extension(
+    name: &str,
+    rgb: [u16; 3],
+    extension: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    require_ffmpeg();
+    let root = test_dir(name);
+    let input = root.join("material");
+    let names: Vec<String> = (0..3)
+        .map(|index| format!("frame_{index:04}.{extension}"))
+        .collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    make_input(&input, &refs);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let mut frames = Vec::new();
+    for index in 0..3 {
+        let path = fixtures.join(format!("patch_{index}.png"));
+        write_rgb48_png(&path, 64, 48, &vec![rgb; 64 * 48]);
+        let mut frame = FakeFrame::new(&format!("frame_{index:04}.{extension}"), 0.0);
+        frame.fixture = Some(path);
+        frame.capture_time = Some(format!("2026:11:08 20:00:{:02}", index + 1));
+        frames.push(frame);
+    }
+    let tool = fake_native_sequence(&fixtures, &frames, None, false, 64, 48);
+    (root, input, tool)
+}
+
+fn run_profile(root: &Path, input: &Path, tool: &Path, id: &str) -> (Output, PathBuf) {
+    let directory = run_directory(root, "run");
+    let video = video_in(&directory);
+    let mut args = base_args(input, &video, tool);
+    args.push("--preview-profile");
+    args.push(id);
+    (run_cli(&args), directory)
+}
+
+#[test]
+fn preview_profiles_emit_their_declared_colour_contract() {
+    let cases: [(&str, &str, bool, &str, &str); 6] = [
+        ("srgb-preview", "bt709", false, "bt709", "iec.ch"),
+        ("sony-slog3-sgamut3", "bt2020nc", true, "unknown", "sony.jp"),
+        ("sony-slog3-sgamut3-cine", "bt2020nc", true, "unknown", "sony.jp"),
+        ("canon-log2-cinema-gamut", "bt2020nc", true, "unknown", "canon.com"),
+        ("nikon-nlog-bt2020", "bt2020nc", true, "bt2020", "nikon"),
+        ("dji-dlog-dgamut", "bt2020nc", true, "unknown", "djicdn"),
+    ];
+
+    for (id, matrix, vendor, primaries, _source) in cases {
+        let (root, input, tool) = profile_material_for_extension(
+            &format!("profile-contract-{id}"),
+            [0, 16384, 0],
+            if id.contains("rev-eng") { "CR3" } else { "DNG" },
+        );
+        let (result, directory) = run_profile(&root, &input, &tool, id);
+        assert!(
+            result.status.success(),
+            "{id} run failed\nstdout:\n{}\nstderr:\n{}",
+            stdout(&result),
+            stderr(&result)
+        );
+        let log = read_log(&directory);
+        let colour = log_kind(&log, "colour");
+        assert_eq!(colour.len(), 1, "{log}");
+        assert!(colour[0].contains(&format!("profile={id}")), "{log}");
+        assert!(colour[0].contains(&format!("matrix={matrix}")), "{log}");
+        assert!(colour[0].contains("camera_color=legacy-inverse-cm"), "{log}");
+        let encoder_command = log_kind(&log, "encoder.command");
+        assert_eq!(encoder_command.len(), 1, "{log}");
+        assert!(
+            log_field(encoder_command[0], "args")
+                .unwrap()
+                .contains("-pix_fmt yuv444p10le"),
+            "{log}"
+        );
+
+        let video = video_in(&directory);
+        assert!(video.is_file(), "{id}: missing video");
+        let probe = ffprobe_color(&video);
+        for expected in [
+            "codec_name=prores",
+            "profile=4444",
+            "pix_fmt=yuv444p12le",
+            "width=64",
+            "height=48",
+            "nb_read_frames=3",
+        ] {
+            assert!(probe.contains(expected), "{id}: {probe}");
+        }
+        let encoder_line = log_kind(&log, "encoder");
+        assert!(
+            encoder_line[0].contains("range=tv") && encoder_line[0].contains("pix_fmt=yuv444p10le"),
+            "{id}: {log}"
+        );
+        let transfer = if vendor { "unknown" } else { "iec61966-2-1" };
+        for tag in [
+            format!("color_space={matrix}"),
+            format!("color_primaries={primaries}"),
+            format!("color_transfer={transfer}"),
+        ] {
+            assert!(probe.contains(&tag), "{id}: {probe}");
+        }
+    }
+}
+
+#[test]
+fn production_ycbcr_quantization_matches_the_standard_derivation() {
+    use rawtl_linear_video::color_profile::{lookup, quantize_chroma, quantize_luma};
+    let cases = [
+        ("srgb-preview", 0.2126, 0.7152, 0.0722, 1.8556, 1.5748),
+        (
+            "canon-log3-cinema-gamut-rev-eng-crm-dev",
+            0.2627,
+            0.6780,
+            0.0593,
+            1.8814,
+            1.4746,
+        ),
+        ("nikon-nlog-bt2020", 0.2627, 0.6780, 0.0593, 1.8814, 1.4746),
+    ];
+    for (id, kr, kg, kb, div_cb, div_cr) in cases {
+        let profile = lookup(id).expect(id);
+        for signal in [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.18, 0.18, 0.18],
+            [0.4, 0.18, 0.09],
+            [-0.05, 0.6, 1.2],
+        ] {
+            let y = kr * signal[0] + kg * signal[1] + kb * signal[2];
+            let expected = [
+                quantize_luma(y, profile.range),
+                quantize_chroma((signal[2] - y) / div_cb, profile.range),
+                quantize_chroma((signal[0] - y) / div_cr, profile.range),
+            ];
+            assert_eq!(
+                profile.encode_signal_yuv10(signal, profile.range).unwrap(),
+                expected,
+                "{id} {signal:?}"
             );
         }
     }
+}
+
+#[test]
+fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
+    const VENDOR_TOLERANCE: i32 = 3;
+    const SRGB_TOLERANCE: i32 = 12;
+    let cases: [(&str, &str, &str, [u8; 3]); 6] = [
+        ("srgb-preview", "bt709", "tv", [0, 255, 0]),
+        ("sony-slog3-sgamut3", "bt2020", "tv", [59, 147, 20]),
+        ("sony-slog3-sgamut3-cine", "bt2020", "tv", [0, 145, 49]),
+        ("canon-log2-cinema-gamut", "bt2020", "tv", [48, 140, 96]),
+        ("nikon-nlog-bt2020", "bt2020", "tv", [0, 154, 0]),
+        ("dji-dlog-dgamut", "bt2020", "tv", [0, 145, 74]),
+    ];
+
+    let mut observed = Vec::new();
+    for (id, matrix, range, expected) in cases {
+        let (root, input, tool) =
+            profile_material_for_extension(&format!("profile-patch-{id}"), [0, 16384, 0], "DNG");
+        let (result, directory) = run_profile(&root, &input, &tool, id);
+        assert!(
+            result.status.success(),
+            "{id} run failed\nstdout:\n{}\nstderr:\n{}",
+            stdout(&result),
+            stderr(&result)
+        );
+        let video = video_in(&directory);
+        let decoded = decode_first_pixel(&video, matrix, range);
+        let tolerance = if id == "srgb-preview" {
+            SRGB_TOLERANCE
+        } else {
+            VENDOR_TOLERANCE
+        };
+        let accepts = |pixel: [u8; 3]| {
+            (0..3)
+                .map(|channel| (pixel[channel] as i32 - expected[channel] as i32).abs())
+                .max()
+                .unwrap_or(0)
+                <= tolerance
+        };
+        assert!(
+            accepts(decoded),
+            "{id}: decoded {decoded:?} vs independent reference {expected:?}"
+        );
+        if id != "srgb-preview" {
+            for (name, wrong_matrix, wrong_range) in [
+                ("wrong-matrix", "bt709", range),
+                ("wrong-range", matrix, "pc"),
+            ] {
+                let wrong = decode_first_pixel(&video, wrong_matrix, wrong_range);
+                assert!(
+                    !accepts(wrong),
+                    "{id} {name} must fail the same patch bound {tolerance}: {wrong:?}"
+                );
+            }
+        }
+        observed.push((id, expected));
+    }
+    for left in 0..observed.len() {
+        for right in left + 1..observed.len() {
+            let (left_id, left_code) = observed[left];
+            let (right_id, right_code) = observed[right];
+            let distance = (0..3)
+                .map(|channel| (left_code[channel] as i32 - right_code[channel] as i32).abs())
+                .max()
+                .unwrap_or(0);
+            assert!(
+                distance > SRGB_TOLERANCE,
+                "{left_id} and {right_id} references are not distinguishable"
+            );
+        }
+    }
+}
+
+#[test]
+fn wrong_ycbcr_matrix_is_rejected_by_the_patch_check() {
+    const CORRECT_TOLERANCE: i32 = 8;
+    let (root, input, tool) = profile_material_for_extension(
+        "profile-wrong-matrix",
+        [57344, 0, 0],
+        "DNG",
+    );
+    let (result, directory) = run_profile(&root, &input, &tool, "nikon-nlog-bt2020");
+    assert!(
+        result.status.success(),
+        "run failed\nstdout:\n{}\nstderr:\n{}",
+        stdout(&result),
+        stderr(&result)
+    );
+    let video = video_in(&directory);
+    let expected = [202u8, 0, 0];
+    let decoded = decode_first_pixel(&video, "bt2020", "tv");
+    let difference = (0..3)
+        .map(|channel| (decoded[channel] as i32 - expected[channel] as i32).abs())
+        .max()
+        .unwrap_or(0);
+    assert!(difference <= CORRECT_TOLERANCE, "declared matrix: {decoded:?}");
+    let wrong = decode_first_pixel(&video, "bt709", "tv");
+    let wrong_difference = (0..3)
+        .map(|channel| (wrong[channel] as i32 - expected[channel] as i32).abs())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        wrong_difference > CORRECT_TOLERANCE,
+        "decoding with the wrong matrix must be rejected: {wrong:?}"
+    );
 }
 
 const REV_PROFILE: &str = "canon-log2-cinema-gamut-rev-eng-crm-dev";
 const REV3_PROFILE: &str = "canon-log3-cinema-gamut-rev-eng-crm-dev";
 
 #[test]
+fn vendor_previews_auto_decode_from_their_own_tags() {
+    for (id, expected) in [
+        ("sony-slog3-sgamut3", [59u8, 147, 20]),
+        ("sony-slog3-sgamut3-cine", [0, 145, 49]),
+        ("canon-log2-cinema-gamut", [48, 140, 96]),
+        (REV3_PROFILE, [39, 135, 77]),
+        ("nikon-nlog-bt2020", [0, 154, 0]),
+        ("dji-dlog-dgamut", [0, 145, 74]),
+    ] {
+        let (root, input, tool) = profile_material_for_extension(
+            &format!("auto-tags-{id}"),
+            [0, 16384, 0],
+            if id == REV3_PROFILE { "CR3" } else { "DNG" },
+        );
+        let (result, directory) = run_profile(&root, &input, &tool, id);
+        assert!(result.status.success(), "{id}: {}", stderr(&result));
+        let video = video_in(&directory);
+        let auto = decode_first_pixel_auto(&video);
+        let correct = decode_first_pixel(&video, "bt2020", "tv");
+        let wrong_matrix = decode_first_pixel(&video, "bt709", "tv");
+        let wrong_range = decode_first_pixel(&video, "bt2020", "pc");
+        let distance = |a: [u8; 3], b: [u8; 3]| {
+            (0..3)
+                .map(|c| (a[c] as i32 - b[c] as i32).abs())
+                .max()
+                .unwrap()
+        };
+        assert!(distance(auto, expected) <= 3, "{id} auto {auto:?}");
+        assert!(distance(auto, correct) <= 1, "{id} auto vs forced");
+        assert!(distance(auto, wrong_matrix) >= 4, "{id} wrong matrix");
+        assert!(distance(auto, wrong_range) > 3, "{id} wrong range");
+        assert!(distance(wrong_range, expected) > 3, "{id}: wrong range passes");
+    }
+}
+
+#[test]
+fn rejects_unknown_or_empty_preview_profile_with_exit_usage() {
+    let root = test_dir("profile-unknown");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG"]);
+    let tool = root.join("unused-native-tool");
+    let video = root.join("run").join(VIDEO_NAME);
+    for value in ["no-such-profile", ""] {
+        let mut args = base_args(&input, &video, &tool);
+        args.push("--preview-profile");
+        args.push(value);
+        let result = run_cli(&args);
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "value {value:?} must be EXIT_USAGE\nstdout:\n{}\nstderr:\n{}",
+            stdout(&result),
+            stderr(&result)
+        );
+        assert!(stderr(&result).contains("--preview-profile"), "{}", stderr(&result));
+        assert!(!root.join("run").exists(), "usage rejection must not create output");
+    }
+}
+
+#[test]
 fn rev_eng_profile_streams_f32_through_graph_measure_and_render() {
     for id in [REV_PROFILE, REV3_PROFILE] {
         for wb in ["first-frame", "per-frame"] {
-            let frames = (0..28)
+            let frames: Vec<FakeFrame> = (0..28)
                 .map(|i| {
                     let mut f = FakeFrame::new(
                         &format!("IMG_{i:04}.CR3"),
@@ -2007,7 +1606,7 @@ fn rev_eng_profile_streams_f32_through_graph_measure_and_render() {
                 })
                 .collect();
             let material = synthetic_material(&format!("rev-eng-{id}-{wb}"), frames);
-            let (result, output) = run_synthetic(
+            let (result, directory) = run_synthetic(
                 &material,
                 "run",
                 &[
@@ -2025,9 +1624,24 @@ fn rev_eng_profile_streams_f32_through_graph_measure_and_render() {
                 stdout(&result),
                 stderr(&result)
             );
-            assert!(output.join("output.mov").exists());
-            assert!(!output.join("frames").exists());
-            let video = output.join("output.mov");
+            let video = video_in(&directory);
+            assert!(video.exists());
+            let log = read_log(&directory);
+            let colour = log_kind(&log, "colour");
+            assert_eq!(colour.len(), 1);
+            for expected in [
+                format!("profile={id}"),
+                "camera_color=dng-camera-to-pcs".to_string(),
+                "reference_gain=2".to_string(),
+            ] {
+                assert!(colour[0].contains(&expected), "{log}");
+            }
+            let developments = log_kind(&log, "develop");
+            assert_eq!(developments.len(), 28);
+            for line in &developments {
+                assert_eq!(log_field(line, "pixels"), Some("518400"), "{line}");
+            }
+            assert_eq!(log_kind(&log, "measure").len(), 28);
             let probe = ffprobe_color(&video);
             for tag in [
                 "codec_name=prores",
@@ -2038,56 +1652,6 @@ fn rev_eng_profile_streams_f32_through_graph_measure_and_render() {
                 "color_range=unknown",
             ] {
                 assert!(probe.contains(tag), "{probe}");
-            }
-            let manifest = read_json(&output.join("manifest.json"));
-            let emitted = manifest
-                .get("video")
-                .unwrap()
-                .get("emitted_tags")
-                .unwrap();
-            assert_eq!(
-                emitted.get("video_full_range_flag").and_then(Json::as_u64),
-                Some(0)
-            );
-            let contract = manifest
-                .get("video")
-                .unwrap()
-                .get("color_contract")
-                .unwrap();
-            assert_eq!(contract.get("profile").and_then(Json::as_str), Some(id));
-            assert_eq!(
-                contract.get("display_name").and_then(Json::as_str),
-                Some(if id == REV_PROFILE {
-                    "clog2(rev-eng crm-dev)"
-                } else {
-                    "clog3 (rev-eng crm-dev)"
-                })
-            );
-            let q = manifest.get("quantization_policy").unwrap();
-            assert_eq!(q.get("reference_gain").and_then(Json::as_f64), Some(2.));
-            assert!(!output.join("temporal_audit.json").exists());
-            // Analysis, gain probe, application feedback, final encoding all carry
-            // and validate the same camera strategy. No RGB48 fallback is allowed.
-            for (path, command) in frame_commands(&output.join("logs")) {
-                assert!(
-                    command.contains("--camera-color-method dng-camera-to-pcs"),
-                    "{command}"
-                );
-                let log = fs::read_to_string(&path).unwrap();
-                if path.to_string_lossy().contains("/render/") {
-                    assert!(command.contains("--stdout-frame-f32"), "{command}");
-                    assert!(log.contains("pixel bytes: 518400"));
-                } else {
-                    assert!(command.contains("--stdout-analysis"), "{command}");
-                }
-                let m = metadata_from_log(&log);
-                assert_eq!(
-                    m.get("color")
-                        .unwrap()
-                        .get("method_requested")
-                        .and_then(Json::as_str),
-                    Some("dng-camera-to-pcs")
-                );
             }
         }
     }
@@ -2119,14 +1683,8 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
                 "rev_defect=skipped-fixed",
                 "incomplete camera profile calibration",
             ),
-            (
-                "rev_defect=auto-tone",
-                "incomplete camera profile calibration",
-            ),
-            (
-                "rev_defect=double-scale",
-                "incomplete camera profile calibration",
-            ),
+            ("rev_defect=auto-tone", "incomplete camera profile calibration"),
+            ("rev_defect=double-scale", "incomplete camera profile calibration"),
             ("rev_defect=infinity", "nonfinite FP32"),
             ("short_pixels=1", "short record payload"),
             ("descriptor_geometry_mismatch=1", "descriptor geometry"),
@@ -2156,32 +1714,19 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
                 FakeFrame::new("IMG_2.CR3", 0.18f64.log2()),
             ];
             let tool = fake_native_sequence(&fixtures, &frames, None, false, 240, 180);
-            use std::io::Write;
-            let config = fixtures.join(format!("fake-native-{}.config", std::process::id()));
-            writeln!(
-                fs::OpenOptions::new().append(true).open(config).unwrap(),
-                "{knob}"
-            )
-            .unwrap();
-            let output = root.join("run");
-            let mut args = base_args(&input, &output, &tool);
+            append_config(&fixtures, knob);
+            let directory = run_directory(&root, "run");
+            let video = video_in(&directory);
+            let mut args = base_args(&input, &video, &tool);
             args.extend(["--strength", "0", "--preview-profile", profile.id]);
             let result = run_cli(&args);
-            assert_eq!(
-                result.status.code(),
-                Some(30),
-                "{knob}: {}",
-                stderr(&result)
-            );
-            assert!(
-                stderr(&result).contains(expected),
-                "{knob}: {}",
-                stderr(&result)
-            );
-            assert!(!output.join("output.mov").exists());
+            assert_eq!(result.status.code(), Some(30), "{knob}: {}", stderr(&result));
+            assert!(stderr(&result).contains(expected), "{knob}: {}", stderr(&result));
+            assert!(!video_in(&directory).exists());
         }
     }
 }
+
 #[test]
 fn log_reference_gain_is_finite_positive_and_exclusive_to_new_profile() {
     for id in [REV_PROFILE, REV3_PROFILE] {
@@ -2190,7 +1735,7 @@ fn log_reference_gain_is_finite_positive_and_exclusive_to_new_profile() {
                 "--input",
                 "/tmp",
                 "--output",
-                "/tmp/unused",
+                "/tmp/unused.mov",
                 "--preview-profile",
                 id,
                 "--log-reference-gain",
@@ -2203,7 +1748,7 @@ fn log_reference_gain_is_finite_positive_and_exclusive_to_new_profile() {
                 "--input",
                 "/tmp",
                 "--output",
-                "/tmp/unused",
+                "/tmp/unused.mov",
                 "--preview-profile",
                 profile,
                 "--log-reference-gain",
@@ -2211,14 +1756,114 @@ fn log_reference_gain_is_finite_positive_and_exclusive_to_new_profile() {
             ]);
             assert_eq!(result.status.code(), Some(2), "{}", stderr(&result));
         }
-        let (root, input, fixtures) = run_success_setup(&format!("rev-reject-dng-{id}"));
+        let root = test_dir(&format!("rev-reject-dng-{id}"));
+        let input = root.join("material");
+        make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+        let fixtures = root.join("fixtures");
+        fs::create_dir_all(&fixtures).expect("fixtures");
         let tool = fake_native_tool(&fixtures, &standard_frames(&fixtures), None, false);
-        let output = root.join("run");
-        let mut args = base_args(&input, &output, &tool);
+        let directory = run_directory(&root, "run");
+        let video = video_in(&directory);
+        let mut args = base_args(&input, &video, &tool);
         args.extend(["--strength", "0", "--preview-profile", id]);
         let result = run_cli(&args);
         assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
         assert!(stderr(&result).contains("requires Canon CR3"));
-        assert!(!output.join("output.mov").exists());
+        assert!(!video_in(&directory).exists());
+    }
+}
+
+#[test]
+fn rational_fps_is_honoured_by_the_encoder_and_the_log() {
+    let root = test_dir("fps-rational");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_tool(&fixtures, &frames, None, false);
+    let directory = run_directory(&root, "run");
+    let video = video_in(&directory);
+    let mut args = base_args(&input, &video, &tool);
+    args.extend(["--strength", "0", "--fps", "30000/1001"]);
+    let result = run_cli(&args);
+    assert!(result.status.success(), "{}", stderr(&result));
+    let log = read_log(&directory);
+    assert!(log.contains("kind=settings fps=30000/1001"), "{log}");
+    let probe = ffprobe(&video_in(&directory));
+    assert!(
+        probe.contains("avg_frame_rate=30000/1001"),
+        "{probe}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Real material journey (staged, read-only; skipped when absent)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn real_cr3_small_sequence_delivers_one_video_and_one_log() {
+    let material = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join(".agent-work/tmp/node-graph-product/material/cr3-boundary");
+    let native = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("native/build/dng-linear-frame");
+    let converter = "/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter";
+    if !material.is_dir() || !native.is_file() || !Path::new(converter).is_file() {
+        eprintln!(
+            "skipping the real CR3 journey: material={} native={} converter={}",
+            material.display(),
+            native.display(),
+            converter
+        );
+        return;
+    }
+    require_ffmpeg();
+    let root = test_dir("real-cr3");
+    let input = root.join("material");
+    fs::create_dir_all(&input).unwrap();
+    let mut staged: Vec<PathBuf> = fs::read_dir(&material)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cr3"))
+        })
+        .collect();
+    staged.sort();
+    for source in staged.iter().take(3) {
+        let name = source.file_name().unwrap();
+        fs::copy(source, input.join(name)).expect("stage CR3");
+    }
+    let directory = run_directory(&root, "run");
+    let video = video_in(&directory);
+    let result = run_cli(&base_args(&input, &video, &native));
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        stdout(&result),
+        stderr(&result)
+    );
+    assert_only_video_and_log(&directory, VIDEO_NAME, &[]);
+    let log = read_log(&directory);
+    assert_eq!(log_kind(&log, "prepare").len(), 3);
+    assert_eq!(log_kind(&log, "develop").len(), 3);
+    assert_eq!(log_kind(&log, "delete").len(), 3);
+    let probe = ffprobe(&video_in(&directory));
+    for expected in ["codec_name=prores", "profile=4444", "nb_read_frames=3"] {
+        assert!(probe.contains(expected), "{probe}");
+    }
+    assert!(!scratch_from_log(&log).exists());
+    for source in staged.iter().take(3) {
+        assert_eq!(
+            fs::read(material.join(source.file_name().unwrap())).unwrap(),
+            fs::read(input.join(source.file_name().unwrap())).unwrap(),
+            "the source material is read-only"
+        );
     }
 }

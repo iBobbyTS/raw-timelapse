@@ -57,8 +57,8 @@ for mode in ['interrupt','terminate','operation-error','operation-error-with-enc
         sys.stdin.buffer.read()
         signal.pause()
     ''')
-    output=root/'run'
-    args=[str(cli),'--input',str(incoming),'--output',str(output),'--strength','0','--dng-linear-frame',str(wrapper if error_mode else native),'--converter',str(converter),'--ffmpeg',str(encoder)]
+    output=root/'run';video=output/'timelapse.mov'
+    args=[str(cli),'--input',str(incoming),'--output',str(video),'--strength','0','--dng-linear-frame',str(wrapper if error_mode else native),'--converter',str(converter),'--ffmpeg',str(encoder)]
     proc=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     owned={};ready=[]
     try:
@@ -77,12 +77,14 @@ for mode in ['interrupt','terminate','operation-error','operation-error-with-enc
         (root/'stdout.txt').write_bytes(stdout);(root/'stderr.txt').write_bytes(stderr)
         assert proc.returncode!=0,(args,stdout,stderr)
         assert all(absent(pid) for pid in owned.values()),owned
-        assert not (output/'output.mov').exists()
-        trace=(output/'logs/graph.log').read_text()
+        assert not video.exists()
+        trace=(output/'timelapse.log').read_text()
+        # Frame IDs are 1-based in the product log; a late frame must not reach
+        # the develop node.
         if late:
-            assert 'node=apply-ev frame=Some(1)' not in trace,trace
-            assert 'node=apply-ev frame=Some(0)' in trace,trace
-        else: assert 'node=apply-ev' not in trace,trace
+            assert 'node=apply-ev frame=2 ' not in trace,trace
+            assert 'node=apply-ev frame=1 ' in trace,trace
+        else: assert 'kind=node node=apply-ev' not in trace,trace
         record={'mode':mode,'command':args,'exit':proc.returncode,'ready':ready,'owned_absent_at_return':owned}
         (root/'result.json').write_text(json.dumps(record,indent=2));print(json.dumps(record),flush=True)
     finally:

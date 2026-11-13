@@ -1,7 +1,7 @@
 //! Minimal JSON value, parser and pretty writer.
 //!
 //! The pipeline consumes the numeric sidecar produced by `dng-linear-frame`
-//! and writes its own run manifest. No external crates are used.
+//! for the run log and the typed stage handoffs. No external crates are used.
 
 use std::fmt::Write as _;
 

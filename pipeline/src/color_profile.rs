@@ -17,7 +17,7 @@
 //!
 //! The constants below are transcriptions, not values recalled from memory.
 //! Citations are attached to every transfer and gamut and are also written into
-//! the run manifest. The existing IEC 61966-2-1 sRGB path is preserved exactly:
+//! the delivered colour contract. The existing IEC 61966-2-1 sRGB path is preserved exactly:
 //! the `srgb-preview` profile composes the same matrices in the same order as
 //! [`crate::preview::ap1_to_linear_srgb_matrix`].
 
@@ -954,7 +954,7 @@ impl ColorProfile {
         )
     }
 
-    /// The complete per-profile colour contract written into `manifest.json`.
+    /// The complete per-profile colour contract consumed by the encoder/colour node.
     pub fn contract_json(&self) -> Json {
         let (low, high) = self.transfer.domain();
         let mut matrices = vec![
@@ -976,7 +976,7 @@ impl ColorProfile {
             ),
         ];
         if self.id == "srgb-preview" {
-            // Keep the pre-existing sRGB contract keys available to manifest
+            // Keep the pre-existing sRGB contract keys available to the encoder
             // readers while the generic per-profile keys above are added.
             matrices.push((
                 "xyz_d65_to_linear_srgb",

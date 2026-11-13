@@ -262,6 +262,11 @@ impl Graph {
         self.nodes.iter().find_map(|node| node.encoder.as_ref())
     }
 
+    /// Declared node IDs in graph order (the run log records them once).
+    pub fn node_ids(&self) -> Vec<&str> {
+        self.nodes.iter().map(|node| node.id.as_str()).collect()
+    }
+
     /// The single explicit resize geometry, when the graph declares one.
     pub fn resize_geometry(&self) -> Option<(u32, u32)> {
         self.nodes.iter().find_map(|node| match node.kind {

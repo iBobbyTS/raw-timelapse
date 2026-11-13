@@ -5,7 +5,6 @@ pub mod graph;
 pub mod measurement;
 pub mod pairwise;
 pub mod photometry;
-pub mod report;
 mod stats;
 pub mod trends;
 pub mod validation;

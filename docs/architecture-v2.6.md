@@ -8,6 +8,13 @@
 > **继承 v2.4 的全部功能与边界**：八种传输载体、插件 Schema、单图/序列双系统、严格 Adobe Converter/DNG SDK 路由、ACEScg FP32、V4 去闪语义、官方 Log 预设、可替换 CPU/Metal/CUDA。  
 > **本版审计修订**：保留 v2.5 的全部能力，补齐 EventScope、RootRun 与子图调用的事件隔离、明确 ExposureApply、Stage1Bundle/FrameMeasurement Schema、Artifact 生命周期、未来消费者保留、事务事件 Outbox、渲染完成后的缓存释放与恢复语义。默认仍是 **Sequence RenderCompleted → Converter 逻辑节点请求释放临时 DNG → Rust ArtifactManager 安全清理**。
 
+> **历史标识（2026-11-13 起）**：本文档仍是 2026-11-07 的目标架构记录，但**不再是
+> 产品范围的唯一依据**。当前产品只实现一个节点图、一个视频文件与一个运行日志，
+> 不含插件 ABI、持久事件库、跨 run 恢复或全生命周期管理；当前工作流见
+> [`docs/node-graph-workflow.md`](node-graph-workflow.md)，用户合同以
+> `.agent-work/REQUIREMENTS.md`（U01–U10 / R01–R09）为准。本文档保留为历史身份，
+> 不据此扩展实现范围。
+
 ## 使用优先级和文档边界
 
 本文件是**完整、规范性架构文档**，不是仅有 Rust 差异的补丁。实施冲突按本文件 > `docs/exposure-contract.md` 的较新 V4 条款 > 旧 v2.5 示例处理；**不能**将早期 V2 的场景分段语义重新带回现有算法。Stage 1 双模式的规范性要求见 §1.2 与 §7.1；事件执行及 Converter 清理的规范要求见 §4.4、§7.3–§7.6；任何早期示意图与双模式或事件规范冲突，以上述规范性章节为准。代码实现时，实测行为优先于对第三方 SDK 的猜测；不明确的语义要拒绝、标记 `UNVERIFIED` 或通过受控试验解决。
