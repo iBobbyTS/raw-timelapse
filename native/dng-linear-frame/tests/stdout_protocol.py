@@ -268,7 +268,7 @@ def transform(m,v):return [sum(float(x)*float(y) for x,y in zip(row,v)) for row 
 for camera in ([121,400,289],[605,1000,482]):
     f=make_dng(work,'hsm-nonidentity-'+str(camera[0]),w=64,h=64,pixels=camera*4096,forward=fwd,hue_sat=hsm)
     meta,pixel=calibrated_stream(f)
-    c=meta['color'];assert c['hue_sat_map_applied'] and c['algorithm_revision']==2
+    c=meta['color'];assert c['hue_sat_map_applied'] and c['algorithm_revision']==3
     assert not c['look_table_applied'] and not c['tone_curve_applied'] and not c['baseline_exposure_applied']
     assert c['profile_correction']['dimensions']==[2,2,1]
     # Independent HSV saturation multiplication: preserve max (V), move each

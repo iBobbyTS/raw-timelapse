@@ -621,6 +621,9 @@ impl ColorProfile {
             CameraColorMethod::LegacyInverseCm
         }
     }
+    pub fn scene_to_reflection_scale(&self) -> f64 {
+        if self.is_rev_eng() { 0.9 } else { 1.0 }
+    }
     pub fn is_rev_eng(&self) -> bool {
         matches!(
             self.transfer,
@@ -670,7 +673,7 @@ impl ColorProfile {
                     return Err("nonfinite FP32 sample".into());
                 }
             }
-            let target = preview::mat3_vec(&m, ap1).map(|v| v * reference_gain);
+            let target = preview::mat3_vec(&m, ap1).map(|v| v * reference_gain * self.scene_to_reflection_scale());
             if target.iter().any(|v| !v.is_finite()) {
                 return Err("nonfinite target color".into());
             }
@@ -703,7 +706,8 @@ impl ColorProfile {
 
     /// Convert one scene-linear ACEScg AP1/D60 triple to 8-bit target signal.
     pub fn encode_linear(&self, ap1: [f64; 3]) -> [u8; 3] {
-        let target = preview::mat3_vec(&self.composed_matrix(), ap1);
+        let target = preview::mat3_vec(&self.composed_matrix(), ap1)
+            .map(|v| v * self.scene_to_reflection_scale());
         self.encode_target_linear(target)
     }
 
@@ -815,7 +819,8 @@ impl ColorProfile {
         Json::obj(vec![
             ("profile", Json::Str(self.id.to_string())),
             ("display_name", Json::Str(self.display_name().into())),
-            ("pipeline_revision", Json::Int(if self.is_rev_eng() { 3 } else { 2 })),
+            ("native_scene_to_reflection_scale", Json::Float(self.scene_to_reflection_scale())),
+            ("pipeline_revision", Json::Int(if self.is_rev_eng() { 4 } else { 2 })),
             (
                 "transfer",
                 Json::obj(vec![
@@ -1200,7 +1205,7 @@ mod tests {
         let bytes: Vec<_> = ap1.into_iter().flat_map(f32::to_le_bytes).collect();
         let mut output = vec![];
         p.convert_f32_frame(&bytes, 1, 1, 1.0, &mut output).unwrap();
-        assert_eq!(output, vec![38, 122, 90]); // independent 10bit [151,491,361] rounded to 8bit
+        assert_eq!(output, vec![37, 120, 87]); // independent scene -> reflection (.9) -> CRD Log2
         let expected = p.encode_linear(ap1.map(|x| x as f64));
         assert_eq!(output, expected);
         assert_ne!(output, p.encode_linear([0., 0.5, 0.05]));
@@ -1238,7 +1243,7 @@ mod tests {
                 p.id
             );
             if p.transfer == Transfer::CanonLog2 || p.transfer == Transfer::CanonLog2RevEng {
-                assert_eq!(out, [38, 122, 90], "independent Canon negative-AP1 vector");
+                assert_eq!(out, if p.is_rev_eng() { [37, 120, 87] } else { [38, 122, 90] }, "independent Canon negative-AP1 vector");
             }
             let bytes: Vec<_> = [8f32; 3].into_iter().flat_map(f32::to_le_bytes).collect();
             p.convert_f32_frame(&bytes, 1, 1, 1., &mut out).unwrap();

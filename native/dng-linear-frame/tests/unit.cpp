@@ -8,6 +8,16 @@ void check(bool v) {
     throw std::runtime_error("assertion failed");
 }
 int main() {
+  check(std::abs(canon_normal_white_gain(16383,2047,13135,65535,8188) * .9 -
+                 1.62 * 57347.0 / 44352.0) < 1e-12);
+  check(std::abs(canon_normal_white_gain(16383,511,12535,65535,2048) * .9 -
+                 1.62 * 63487.0 / 48096.0) < 1e-12);
+  for (auto bad : {0.0, 511.0, 8191.0, 20000.0}) {
+    bool rejected=false; try { canon_normal_white_gain(16383,511,bad,65535,2048); }
+    catch (const Error &) { rejected=true; } check(rejected);
+  }
+  bool mismatch=false; try { canon_normal_white_gain(16383,511,12535,65535,4096); }
+  catch (const Error &) { mismatch=true; } check(mismatch);
   check(quantize(0) == 0);
   check(quantize(-.25f) == 0);
   check(quantize(1) == 16384);

@@ -260,8 +260,8 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                 ("linear_clipping", Json::Str("none after camera-to-AP1; upstream limits remain".into())),
                 ("final_denominator", Json::Int(255)),
                 ("reference_gain", Json::Float(input.options.log_reference_gain)),
-                ("reference_status", Json::Str(if input.options.preview_profile.is_rev_eng() { "unverified" } else { "not-applicable" }.into())),
-                ("calibration_id", Json::Null),
+                ("reference_status", Json::Str(if input.options.preview_profile.is_rev_eng() { "fixed-canon-normal-white; user gain is additional" } else { "not-applicable" }.into())),
+                ("calibration_id", if input.options.preview_profile.is_rev_eng() { Json::Str("canon-normal-white-fixed-v1".into()) } else { Json::Null }),
             ])
         ),
         (

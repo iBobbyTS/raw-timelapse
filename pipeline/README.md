@@ -86,12 +86,12 @@ contain each other in either direction. The input directory is only read.
   [algorithm, reproduction and evidence](../docs/canon-log3-rev-eng.md).
 
 The two rev-eng Canon options accept `--log-reference-gain N` (positive finite; default 1,
-recorded unverified). This flag is rejected for the other profiles. It applies
+additional to the fixed Canon NormalWhite calibration). This flag is rejected for the other profiles. It applies
 once after the Cinema Gamut transform; native user/deflicker EV is already
 applied. Every analysis/probe/application/encode pass uses the same camera calibration.
 The rev-eng routes apply the interpolated profile HueSatMap in linear ProPhoto
 before EV, without LookTable/tone/baseline exposure. Rebuild matched native/Rust
-tools; camera algorithm revision2 is required. See [calibration evidence](../docs/canon-profile-calibration.md). The actual video audit divides the reference gain once after inverse
+tools; camera algorithm revision3 is required. See [calibration evidence](../docs/canon-profile-calibration.md). The actual video audit divides the reference gain and scene-to-reflection .9 once after inverse
 transfer. All Canon options still deliver the existing 8-bit H.264 `output.mp4`.
 
 See [complete algorithm, protocol and evidence](../docs/canon-log2-rev-eng.md)
@@ -488,3 +488,5 @@ Python runtime. The deflicker node uses no Python/SciPy/rawpy. Multi-ROI audit,
 chroma-variation analysis and progress callbacks remain out of scope. The frozen
 legacy Python implementation remains read-only and is not a numerical oracle for
 this ACEScg chain.
+
+Fixed Canon calibration and new LibRaw metadata dependency: [contract and reproduction](../docs/canon-fixed-calibration.md).

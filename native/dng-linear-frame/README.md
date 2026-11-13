@@ -327,3 +327,7 @@ last-frame frozen WB while retaining its own differing AsShotNeutral. Per-run
 stdout/stderr and real exit codes are saved under the supplied work directory's
 `logs/`. All-39 Converter routing evidence and exact environment/known gaps are
 in `docs/migration-log.md`.
+
+## Canon fixed calibration (revision3)
+
+The rev-eng CR3 route now requires LibRaw headers/library (`brew install libraw`) for original-file metadata only. Pixel decode remains ADC + DNG SDK. NormalWhite endpoint scaling and fixed scene gain1.8 apply before user EV; Rust converts scene to reflection once with.9. No auto tone or BaselineExposure. Rebuild both tools. See [contract, guards and reproduction](../../docs/canon-fixed-calibration.md).

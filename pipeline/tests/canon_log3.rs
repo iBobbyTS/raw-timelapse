@@ -82,7 +82,7 @@ fn joins_domain_signed_pixels_and_reference_scale_match_independent_math() {
         p.convert_f32_frame(&bytes, 1, 1, 1.0, &mut out).unwrap(),
         [0, 0]
     );
-    assert_eq!(out, [36, 114, 74]); // independently evaluated AP1 -> Cinema Gamut -> Log3
+    assert_eq!(out, [35, 111, 72]); // independently evaluated AP1 scene -> Cinema Gamut -> reflection (.9) -> Log3
     assert_ne!(out, p.encode_linear([0.0, 0.5, 0.05]));
     p.convert_f32_frame(&bytes, 1, 1, 2.0, &mut out).unwrap();
     assert_eq!(out, p.encode_linear(input.map(|v| v as f64 * 2.0)));

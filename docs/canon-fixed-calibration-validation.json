@@ -1,0 +1,228 @@
+{
+  "base_commit": "51a7807",
+  "branch": "main",
+  "calibration_id": "canon-normal-white-fixed-v1",
+  "native_algorithm_revision": 3,
+  "pipeline_revision": 4,
+  "tests": {
+    "native": "4 CTest groups pass",
+    "rust": "143 lib + 64 main + 3 Canon Log3 oracle + 38 CLI + 3 doctests pass in grouped runs; tag test expectation updated for .9 scene conversion and rerun independently",
+    "logs": [
+      "/tmp/rawtl-cal-native-tests.log",
+      "/tmp/rawtl-cal-full-tests.log",
+      "/tmp/rawtl-cal-tag-test.log",
+      "/tmp/rawtl-cal-doc-tests.log"
+    ]
+  },
+  "pipeline_manifest": "/private/tmp/rawtl-fixed-canon-check/manifest.json",
+  "review_output": "/Users/ibobby/Temp/tl/pair/test-clog3-fixed-calibration/output.mov",
+  "review_sha256": "69490cba61098060561c4e1e31a444392c173e64d2a936c5afd7fe491f13a4a5",
+  "wb": "per-frame as-shot",
+  "deflicker": false,
+  "auto_tone_normalization": false,
+  "baseline_exposure_applied": false,
+  "frames": [
+    {
+      "source": "R7_L2219.CR3",
+      "source_sha256": "26c4447b73d85c0f03ba6511bd8c5ea3dcb9b6685a9ef7a526864100847ae868",
+      "pixels_sha256": "7b3578b1bad6391092aa4211fce75785d3a126b6a45e6ca68f4870012d70addc",
+      "as_shot_neutral": [
+        0.793184,
+        1,
+        0.407157
+      ],
+      "calibration": {
+        "applied": true,
+        "method": "canon-normal-white-fixed-v1",
+        "source": "original CR3; LibRaw metadata only, no LibRaw pixel decode",
+        "metadata_reader_version": "0.21.4-Release",
+        "adc_maximum": 16383,
+        "black": 2047,
+        "normal_white": 13135,
+        "dng_white": 65535,
+        "dng_black": 8188,
+        "storage_scale": 4,
+        "normal_white_gain": 1.2929969336219336,
+        "fixed_scene_gain": 1.8,
+        "native_scene_gain": 2.3273944805194806,
+        "scene_to_reflection": 0.9,
+        "auto_tone_normalization": false,
+        "baseline_exposure_applied": false
+      },
+      "native_vs_previous_times_gain_max_absolute_difference": 5.245208740234375e-06,
+      "vs_resolve_autooff": {
+        "pixels": 353657,
+        "exposure": {
+          "ours_minus_reference_ev_p50": -0.03793091985113232,
+          "gain_to_align_median_Y": 1.0266403862187443,
+          "residual_ev_after_alignment": {
+            "p50": 0.031948039035999375,
+            "p95": 0.08145141447284832,
+            "rms": 0.0492006361514623
+          },
+          "mean_Y_ratio": 0.9739253043568259
+        },
+        "distribution": {
+          "ours_Y_p10_p50_p90": [
+            0.06215675750096878,
+            0.1734872925104289,
+            0.6628367092409488
+          ],
+          "reference_Y_p10_p50_p90": [
+            0.06280216835632073,
+            0.1836044096426985,
+            0.6738353728297746
+          ],
+          "aligned_ours_Y_p10_p50_p90": [
+            0.06381263752689942,
+            0.178109060986951,
+            0.6804949351750893
+          ],
+          "ours_p90_p10_stops": 3.4146703536443272,
+          "reference_p90_p10_stops": 3.423509887688998
+        },
+        "lightness": {
+          "raw_signed_delta_Lstar_p50": -0.6798869350261185,
+          "raw_abs_delta_Lstar": {
+            "p50": 0.7266342084671749,
+            "p95": 1.650617471039857,
+            "rms": 0.9983855340467295
+          },
+          "reference_Y_normalization_for_aligned_Lab": 0.9803686107010565,
+          "aligned_abs_delta_Lstar": {
+            "p50": 0.5138530747067023,
+            "p95": 1.1728508242206575,
+            "rms": 0.6851539593770576
+          }
+        },
+        "chroma": {
+          "delta_uv_prime": {
+            "p50": 0.006912103823598436,
+            "p95": 0.015723433538379815,
+            "rms": 0.009520226549752073
+          },
+          "aligned_Cstar_ratio_p50": 1.0410522164095066,
+          "aligned_abs_delta_Cstar": {
+            "p50": 0.9006003485255505,
+            "p95": 2.7426336504186786,
+            "rms": 1.48547087786246
+          },
+          "aligned_abs_hue_degrees": {
+            "p50": 8.947594308102197,
+            "p95": 14.719113097012993,
+            "rms": 9.785534435032815
+          },
+          "aligned_deltaE76": {
+            "p50": 3.0525375964121757,
+            "p95": 6.420765247549227,
+            "rms": 4.008071552620694
+          },
+          "normalized_rgb_chroma_ratio_p50": 1.0905035431590444,
+          "normalized_rgb_chroma_rmse": 0.035834178369957795,
+          "chromatic_pixels": 329271
+        }
+      }
+    },
+    {
+      "source": "R7_L2220.CR3",
+      "source_sha256": "98aa5f224a65c676066b36e1ed58b36d6e2182ee64f41a917778b54a71cb481c",
+      "pixels_sha256": "88c4924b1d03fbc5e50b0633e0a6a52b43a95e1f4712dc3b3cd00c9e3b7f8665",
+      "as_shot_neutral": [
+        0.61244,
+        1,
+        0.583144
+      ],
+      "calibration": {
+        "applied": true,
+        "method": "canon-normal-white-fixed-v1",
+        "source": "original CR3; LibRaw metadata only, no LibRaw pixel decode",
+        "metadata_reader_version": "0.21.4-Release",
+        "adc_maximum": 16383,
+        "black": 511,
+        "normal_white": 12535,
+        "dng_white": 65535,
+        "dng_black": 2048,
+        "storage_scale": 4,
+        "normal_white_gain": 1.3200058216899535,
+        "fixed_scene_gain": 1.8,
+        "native_scene_gain": 2.3760104790419163,
+        "scene_to_reflection": 0.9,
+        "auto_tone_normalization": false,
+        "baseline_exposure_applied": false
+      },
+      "native_vs_previous_times_gain_max_absolute_difference": 5.960464477539062e-07,
+      "vs_resolve_autooff": {
+        "pixels": 402754,
+        "exposure": {
+          "ours_minus_reference_ev_p50": -0.00033028886530106835,
+          "gain_to_align_median_Y": 1.00022896500424,
+          "residual_ev_after_alignment": {
+            "p50": 0.01804573937530094,
+            "p95": 0.05613087598683309,
+            "rms": 0.03550192933949577
+          },
+          "mean_Y_ratio": 1.00194947955159
+        },
+        "distribution": {
+          "ours_Y_p10_p50_p90": [
+            0.030643158443811214,
+            0.08587783873474789,
+            0.4021382373413771
+          ],
+          "reference_Y_p10_p50_p90": [
+            0.03026232058711214,
+            0.08755689081284723,
+            0.3992809547673622
+          ],
+          "aligned_ours_Y_p10_p50_p90": [
+            0.030650174654714226,
+            0.0858975017544579,
+            0.40223031292459505
+          ],
+          "ours_p90_p10_stops": 3.714054610280872,
+          "reference_p90_p10_stops": 3.721809732537943
+        },
+        "lightness": {
+          "raw_signed_delta_Lstar_p50": -0.0035076507582978422,
+          "raw_abs_delta_Lstar": {
+            "p50": 0.2571720392201371,
+            "p95": 0.6799807036333667,
+            "rms": 0.3980349149628781
+          },
+          "reference_Y_normalization_for_aligned_Lab": 2.055806211583618,
+          "aligned_abs_delta_Lstar": {
+            "p50": 0.33037991216344764,
+            "p95": 0.8619780106722639,
+            "rms": 0.5062083217594195
+          }
+        },
+        "chroma": {
+          "delta_uv_prime": {
+            "p50": 0.0025439922186143334,
+            "p95": 0.008144861659376322,
+            "rms": 0.007211278936979325
+          },
+          "aligned_Cstar_ratio_p50": 1.0192273452998306,
+          "aligned_abs_delta_Cstar": {
+            "p50": 0.6856444583068786,
+            "p95": 3.432668075436085,
+            "rms": 2.3833128635164815
+          },
+          "aligned_abs_hue_degrees": {
+            "p50": 3.3445332851329397,
+            "p95": 6.459066392354498,
+            "rms": 4.002809056329548
+          },
+          "aligned_deltaE76": {
+            "p50": 1.0759955573332578,
+            "p95": 4.033254286188602,
+            "rms": 2.5322385130296063
+          },
+          "normalized_rgb_chroma_ratio_p50": 1.0385009532190976,
+          "normalized_rgb_chroma_rmse": 0.027545796120142494,
+          "chromatic_pixels": 245493
+        }
+      }
+    }
+  ]
+}

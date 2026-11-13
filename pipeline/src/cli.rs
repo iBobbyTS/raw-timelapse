@@ -44,7 +44,7 @@ OPTIONS:
                                canon-log3-cinema-gamut-rev-eng-crm-dev
                                Canon names: clog2(white paper), clog2(rev-eng crm-dev),
                                clog3 (rev-eng crm-dev)
-    --log-reference-gain <N>   Positive reference scale, rev-eng Canon profiles only (default: 1, unverified)
+    --log-reference-gain <N>   Positive reference scale, rev-eng Canon profiles only (default: 1, extra gain after fixed Canon calibration)
     --converter <PATH>         Adobe DNG Converter override passed to the native tool
     --converter-timeout <SEC>  Converter timeout override (1-3600 seconds)
     --strength <0..1>          Correction strength (default: 1.0; 0 disables deflicker)

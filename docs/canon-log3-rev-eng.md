@@ -1,5 +1,8 @@
 # clog3 (rev-eng crm-dev)
 
+当前为固定标定 revision4（native revision3）：原CR3 NormalWhite → 固定scene倍率1.8 → 反射率×0.9。详见[固定标定合同](canon-fixed-calibration.md)。旧验证记录保留历史含义。
+
+
 实现日期：2026-11-12。在已有统一 signed FP32 架构中增加独立 Canon CR3 Log 选项。
 
 | 显示名 | CLI ID | 相机颜色方法 |
@@ -33,8 +36,8 @@ pipeline/target/release/rawtl-linear-video \
 选择逐张拍摄白平衡。`--strength 0` 可关闭去闪、隔离颜色流程。其他参数保持既有含义。
 最终文件 `output.mp4`；manifest、曝光报告、去闪/视频审计日志按现有布局输出。
 
-`--log-reference-gain` 对两个 rev-eng Canon 预设可用；正有限数，默认1，当前记录为
-`unverified`，`calibration_id=null`。该标量应用一次，不代表已完成灰卡标定。
+`--log-reference-gain` 对两个 rev-eng Canon 预设可用；正有限数，默认1，记录为固定标定后的额外倍率，
+`calibration_id=canon-normal-white-fixed-v1`。该标量应用一次，不代表已完成灰卡标定。
 不要把 DNG 白电平归一化自动理解为实际18%灰卡输出0.18。
 
 ## 颜色和精度合同
@@ -128,13 +131,13 @@ r = 0.9*x
 
 ## 输出、去闪与审计
 
-manifest schema2 / color pipeline_revision3；记录独立 profile ID、显示名、曲线、来源、
+manifest schema2 / color pipeline_revision4；记录独立 profile ID、显示名、曲线、来源、
 定义域、reference gain 和每帧 `final_signal_clipping`。编码采用 pc/full、BT.2020 NCL
 YCbCr 系数；MP4 nclx 与 H.264 SPS VUI 为 primaries2 / transfer2 / matrix9 / full1。
 这些标签保留 vendor gamut/transfer 未指定，不把 Cinema Gamut 声称为 BT.2020。
 
 视频审计从 VIDEO_ARTIFACT 的 profile 身份选择 Log3 反函数，恢复 Cinema Gamut 线性值，
-除 reference gain 一次后求亮度。去闪测量仍使用 FP32 AP1 的既有算法和分析阈值，
+除 reference gain 和0.9各一次后求亮度。去闪测量仍使用 FP32 AP1 的既有算法和分析阈值，
 `analysis_highlight_fraction` 不等于最终 Log3 裁切。时序质量审核仍为 report/off。
 
 最终交付保持 RGB8 / 有损 H.264 4:2:0，非高位深调色母版。普通播放器不会自动正确显示
