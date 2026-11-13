@@ -170,6 +170,7 @@ fn run() -> Result<(), (i32, String)> {
             }
         }
     };
+    let source_sha = if config.empty_source_sha256 {String::new()}else{source_sha};
     let gain = options.exposure_ev.exp2();
     let tiles = tile_levels(
         &config,

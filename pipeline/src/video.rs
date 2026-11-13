@@ -763,7 +763,7 @@ impl StreamingEncoder {
                         let mut state = active.lock().unwrap();
                         state.cancelled = true;
                         if let Some(native) = state.child.as_ref() {
-                            let _ = native.lock().unwrap().kill();
+                            proc::terminate(native);
                         }
                     }
                     break;
@@ -1064,5 +1064,72 @@ mod publication_tests {
         publish(&envelope, &destination).unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"validated");
         assert!(!source.exists());
+    }
+}
+
+/// Temporary graph endpoint. It accepts owned prepared-frame pixels and never
+/// re-enters source decoding. The encoder section replaces this RGB24 adapter.
+pub struct GraphEncoder {
+    encoder: Option<StreamingEncoder>,
+    pub active: proc::ActiveNative,
+}
+impl GraphEncoder {
+    pub fn new() -> Self {
+        Self {
+            encoder: None,
+            active: Default::default(),
+        }
+    }
+    pub fn push(
+        &mut self,
+        context: &crate::RunContext<'_>,
+        info: &crate::frame::FrameInfo,
+        pixels: Arc<[u8]>,
+    ) -> Result<()> {
+        proc::check_stop()?;
+        let options = context.options;
+        if self.encoder.is_none() {
+            let args = encoder_args(
+                info.width,
+                info.height,
+                context.sources.len(),
+                options.fps,
+                &context.partial_dir.join("output.mp4"),
+                options.preview_profile,
+            );
+            self.encoder = Some(StreamingEncoder::spawn(
+                &options.ffmpeg,
+                &args,
+                &context.output.join("logs/encode.log"),
+                self.active.clone(),
+            )?);
+        }
+        let encoder = self.encoder.as_mut().unwrap();
+        encoder
+            .input
+            .as_mut()
+            .unwrap()
+            .write_all(&pixels)
+            .map_err(|e| Error::new(EXIT_PREVIEW, format!("encoder stdin failed: {e}")))?;
+        encoder.bytes += pixels.len();
+        Ok(())
+    }
+    pub fn end(&mut self) -> Result<()> {
+        let encoder = self
+            .encoder
+            .as_mut()
+            .ok_or_else(|| Error::new(EXIT_PREVIEW, "empty encoder input"))?;
+        let status = encoder.finish(false)?;
+        proc::check_stop()?;
+        if !status.success() {
+            return Err(Error::new(
+                EXIT_PREVIEW,
+                format!(
+                    "streaming encoder failed: {}",
+                    proc::exit_description(&status)
+                ),
+            ));
+        }
+        Ok(())
     }
 }

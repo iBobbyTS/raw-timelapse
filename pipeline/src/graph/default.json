@@ -1,0 +1,11 @@
+{
+  "nodes": [
+    {"id":"source", "kind":"source"},
+    {"id":"convert-cache", "kind":"prepare", "inputs":{"source":"source"}},
+    {"id":"measure-solve", "kind":"solve", "inputs":{"frames":"convert-cache"}},
+    {"id":"apply-ev", "kind":"develop", "inputs":{"frames":"convert-cache", "plan":"measure-solve"}},
+    {"id":"color", "kind":"color", "inputs":{"image":"apply-ev"}},
+    {"id":"encode", "kind":"encode", "inputs":{"image":"color"}},
+    {"id":"delete-cache", "kind":"delete", "inputs":{"frames":"convert-cache"}, "waits":[{"node":"apply-ev", "scope":"frame"}]}
+  ]
+}

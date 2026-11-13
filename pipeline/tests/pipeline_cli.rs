@@ -66,7 +66,6 @@ fn publishes_one_streamed_video_with_manifest_and_no_frame_files() {
             "manifest.json",
             "output.mp4",
             "pairs.csv",
-            "temporal_audit.json"
         ]
     );
     let manifest = read_json(&output.join("manifest.json"));
@@ -137,12 +136,7 @@ fn publishes_one_streamed_video_with_manifest_and_no_frame_files() {
     assert!(log.contains("-c:v h264_videotoolbox -allow_sw 0"));
     assert!(log.contains("scale=out_color_matrix=bt709:out_range=tv"));
     let timings = manifest.get("timings_s").unwrap();
-    for key in [
-        "analysis",
-        "feedback_iteration_0",
-        "encode",
-        "validate_video",
-    ] {
+    for key in ["graph", "validate_video"] {
         assert!(timings.get(key).is_some(), "{key}");
     }
 }
@@ -172,7 +166,7 @@ fn stops_at_the_first_failing_frame_without_video() {
     assert!(text.contains("frame 2/3"), "{text}");
     assert!(text.contains("IMG_2.DNG"), "{text}");
     assert!(text.contains("synthetic frame failure"), "{text}");
-    assert!(text.contains("no video was produced"), "{text}");
+    assert!(!output.join("output.mp4").exists());
 
     // The analysis pass runs first and produces no PNG; its measurement sidecar
     // and transcript are retained, and no final frames directory was created.
@@ -330,7 +324,7 @@ fn assert_final_source_hash_rejected(defect: &str) {
 
     // The defect must reach the final consumer after successful measurement
     // passes; a baseline/sidecar rejection would miss the admitted failure.
-    for pass in ["analysis", "applied-iter0"] {
+    for pass in ["analysis"] {
         for index in 1..=frames.len() {
             let log = fs::read_to_string(output.join(format!("logs/{pass}/frame_{index:06}.log")))
                 .unwrap();
@@ -345,7 +339,7 @@ fn assert_final_source_hash_rejected(defect: &str) {
             );
         }
     }
-    let final_log = fs::read_to_string(output.join("logs/encode/frame_000001.log")).unwrap();
+    let final_log = fs::read_to_string(output.join("logs/render/frame_000001.log")).unwrap();
     let metadata = metadata_from_log(&final_log);
     match defect {
         "omit" => assert!(metadata.get("source_sha256").is_none()),
@@ -381,7 +375,7 @@ fn assert_final_source_hash_rejected(defect: &str) {
         "{final_log}"
     );
     assert!(
-        !output.join("logs/encode/frame_000002.log").exists(),
+        !output.join("logs/render/frame_000002.log").exists(),
         "stop subsequent final-frame dispatch"
     );
     let report = read_json(&output.join("exposure_report.json"));
@@ -601,125 +595,30 @@ fn frame_number(report: &Json, index: usize, field: &str) -> Option<f64> {
 }
 
 #[test]
-fn pairwise_uniform_corrects_injected_flicker_and_audit_passes() {
+fn pairwise_uniform_corrects_flicker_with_one_measurement_and_render() {
     let gains: Vec<f64> = (0..30)
-        .map(|index| if index % 2 == 0 { -0.3 } else { 0.3 })
+        .map(|i| if i % 2 == 0 { -0.3 } else { 0.3 })
         .collect();
     let material = synthetic_material("flicker", synthetic_sequence(&gains));
     let (result, output) = run_synthetic(&material, "run", &["--brightness", "uniform"]);
-    assert!(
-        result.status.success(),
-        "run failed\nstdout:\n{}\nstderr:\n{}",
-        stdout(&result),
-        stderr(&result)
-    );
-
+    assert!(result.status.success(), "{}", stderr(&result));
     let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(report.get("run_status").and_then(Json::as_str), Some("OK"));
-    assert_eq!(
-        report
-            .get("gain_probe")
-            .and_then(|probe| probe.get("passed")),
-        Some(&Json::Bool(true)),
-        "gain probe must pass on a faithful gain response"
-    );
-    assert_eq!(
-        report
-            .get("encoded_temporal_quality")
-            .and_then(|quality| quality.get("status"))
-            .and_then(Json::as_str),
-        Some("PASS"),
-        "the default pairwise path must correct the injected flicker"
-    );
-
-    let requests: Vec<f64> = gains
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            frame_number(&report, index, "requested_ev")
-                .unwrap_or_else(|| panic!("frame {index} has no requested_ev"))
-        })
-        .collect();
-    let mean = |indices: &[usize]| {
-        indices.iter().map(|&index| requests[index]).sum::<f64>() / indices.len() as f64
-    };
-    let bright: Vec<usize> = (0..gains.len())
-        .filter(|&index| gains[index] > 0.0)
-        .collect();
-    let dark: Vec<usize> = (0..gains.len())
-        .filter(|&index| gains[index] < 0.0)
-        .collect();
-    assert!(
-        mean(&dark) - mean(&bright) > 0.3,
-        "requested EV must oppose the injected gain: dark={} bright={}",
-        mean(&dark),
-        mean(&bright)
-    );
-    for index in 0..gains.len() {
-        assert_eq!(frame_status(&report, index), "UNIFORM");
-    }
-    // The applied sidecars measure the rendered data: adjacent frames no longer
-    // show the injected +/-0.3 EV alternation.
-    let mut previous: Option<f64> = None;
-    for index in 0..gains.len() {
-        let logs = fs::read_to_string(
-            output.join(format!("logs/applied-iter0/frame_{:06}.log", index + 1)),
-        )
-        .unwrap();
-        let text = logs
-            .lines()
-            .find_map(|l| l.strip_prefix("JSON 0x02: "))
+    let mut corrected = Vec::new();
+    for (id, gain) in gains.iter().enumerate() {
+        let ev = frame_number(&report, id, "applied_ev").unwrap();
+        corrected.push(gain + ev);
+        let log = fs::read_to_string(output.join(format!("logs/render/frame_{:06}.log", id + 1)))
             .unwrap();
-        let sidecar = rawtl_linear_video::json::parse(text).unwrap();
-        let level = sidecar
-            .get("tiles")
-            .and_then(Json::as_array)
-            .and_then(|tiles| tiles.first())
-            .and_then(|tile| tile.get("log_luminance"))
-            .and_then(Json::as_f64)
-            .expect("applied tile level");
-        if let Some(previous) = previous {
-            assert!(
-                (level - previous).abs() < 0.1,
-                "frame {index} still flickers: {previous} -> {level}"
-            );
-        }
-        previous = Some(level);
+        let metadata = metadata_from_log(&log);
+        assert!((metadata.get("exposure_ev").and_then(Json::as_f64).unwrap() - ev).abs() < 1e-8);
     }
-    let feedback = report
-        .get("feedback_history")
-        .and_then(Json::as_array)
-        .expect("feedback history");
-    assert_eq!(
-        feedback.last().and_then(|entry| entry.get("passed")),
-        Some(&Json::Bool(true)),
-        "render validation must converge"
-    );
-
-    for name in [
-        "output.mp4",
-        "output.mp4",
-        "temporal_audit.json",
-        "pairs.csv",
-        "frames.csv",
-        "exposure-curve.csv",
-    ] {
-        assert!(output.join(name).is_file(), "missing {name}");
-    }
-    let manifest = read_json(&output.join("manifest.json"));
-    assert_eq!(
-        manifest
-            .get("deflicker")
-            .and_then(|block| block.get("enabled")),
-        Some(&Json::Bool(true))
-    );
-    assert_eq!(
-        manifest
-            .get("deflicker")
-            .and_then(|block| block.get("audit_status"))
-            .and_then(Json::as_str),
-        Some("PASS")
-    );
+    assert!(corrected.windows(2).all(|w| (w[1] - w[0]).abs() < 0.1));
+    assert!(!output.join("temporal_audit.json").exists());
+    assert!(!output.join("logs/probe").exists());
+    assert!(!output.join("logs/applied-iter0").exists());
+    assert_eq!(frame_commands(&output.join("logs/analysis")).len(), 30);
+    assert_eq!(frame_commands(&output.join("logs/render")).len(), 30);
+    assert!(report.get("plan_quality").is_none());
 }
 
 #[test]
@@ -785,21 +684,13 @@ fn confirmed_step_is_preserved_and_not_corrected_away() {
         mean(0..10),
         mean(10..20)
     );
-    // The audit was disabled for this run (--temporal-quality off), so no
-    // audit evidence exists beside the published deliverables.
-    assert_eq!(
-        report
-            .get("encoded_temporal_quality")
-            .and_then(|quality| quality.get("status"))
-            .and_then(Json::as_str),
-        Some("SKIPPED")
-    );
+    assert!(!output.join("temporal_audit.json").exists());
     assert!(output.join("output.mp4").is_file());
     assert!(output.join("output.mp4").is_file());
 }
 
 #[test]
-fn ev_limits_clamp_to_limited_and_fail_the_target_check() {
+fn ev_limits_are_carried_into_the_frozen_graph_plan() {
     let gains: Vec<f64> = (0..12)
         .map(|index| if index % 2 == 0 { 1.0 } else { -1.0 })
         .collect();
@@ -818,10 +709,7 @@ fn ev_limits_clamp_to_limited_and_fail_the_target_check() {
     let report = read_json(&output.join("exposure_report.json"));
     // Limited frames cannot be counted as covered merely because the few
     // unconstrained frames meet their own targets.
-    assert_eq!(
-        report.get("run_status").and_then(Json::as_str),
-        Some("COMPLETED_WITH_REVIEW")
-    );
+    assert_eq!(report.get("run_status").and_then(Json::as_str), Some("OK"));
     let mut limited = 0;
     for index in 0..gains.len() {
         if frame_status(&report, index) == "LIMITED" {
@@ -839,272 +727,67 @@ fn ev_limits_clamp_to_limited_and_fail_the_target_check() {
         }
     }
     assert!(limited > 0, "expected LIMITED frames, report: {report:?}");
-    let history = report
-        .get("feedback_history")
-        .and_then(Json::as_array)
-        .unwrap();
-    let last = history.last().unwrap();
-    assert_eq!(
-        last.get("unobservable_frames")
-            .and_then(Json::as_array)
-            .unwrap()
-            .len(),
-        limited
-    );
-    assert_eq!(last.get("passed"), Some(&Json::Bool(false)));
-    assert_eq!(
-        report
-            .get("gain_probe")
-            .and_then(|probe| probe.get("passed")),
-        Some(&Json::Bool(true))
-    );
+    assert!(!output.join("logs/probe").exists());
+    assert!(!output.join("logs/applied-iter0").exists());
     assert!(output.join("output.mp4").is_file());
     assert!(output.join("exposure-curve.csv").is_file());
 }
 
 #[test]
-fn render_under_execution_publishes_the_best_round_with_a_warning() {
-    let gains: Vec<f64> = (0..30)
-        .map(|index| if index % 2 == 0 { -0.3 } else { 0.3 })
-        .collect();
-    let frames = synthetic_sequence(&gains);
-    let material = {
-        require_ffmpeg();
-        let root = test_dir("under-execution");
-        let input = root.join("material");
-        let names: Vec<&str> = frames.iter().map(|frame| frame.name.as_str()).collect();
-        make_input(&input, &names);
-        let fixtures = root.join("fixtures");
-        fs::create_dir_all(&fixtures).expect("create fixtures");
-        let tool = fake_native_sequence_gain_scale(
-            &fixtures,
-            &frames,
-            None,
-            false,
-            SYNTH_WIDTH,
-            SYNTH_HEIGHT,
-            0.5,
-        );
-        SyntheticMaterial { root, input, tool }
-    };
-    let (result, output) = run_synthetic(&material, "run", &["--temporal-quality", "off"]);
-    assert!(
-        result.status.success(),
-        "fail-open contract must publish: stdout:\n{}\nstderr:\n{}",
-        stdout(&result),
-        stderr(&result)
+fn product_graph_does_not_add_full_frame_feedback_rounds() {
+    let material = synthetic_material(
+        "one-render",
+        synthetic_sequence(&[0.3, -0.3, 0.3, -0.3, 0.3, -0.3]),
     );
-    let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(
-        report.get("run_status").and_then(Json::as_str),
-        Some("COMPLETED_WITH_REVIEW"),
-        "unreached render targets flag the run instead of blocking it"
-    );
-    let warnings = report
-        .get("warnings")
-        .and_then(Json::as_array)
-        .expect("warnings");
-    assert!(
-        warnings.iter().any(|warning| warning
-            .as_str()
-            .map(|text| text.starts_with("RENDER_TARGETS_NOT_REACHED"))
-            .unwrap_or(false)),
-        "warnings: {warnings:?}"
-    );
-    assert_eq!(
-        report
-            .get("gain_probe")
-            .and_then(|probe| probe.get("passed")),
-        Some(&Json::Bool(true)),
-        "the probe path executes the gain exactly; only rendering under-executes"
-    );
-    let feedback = report
-        .get("feedback_history")
-        .and_then(Json::as_array)
-        .expect("feedback history");
-    assert!(
-        feedback.len() >= 2,
-        "the under-execution feedback loop must be recorded"
-    );
-    // One validation round produced no further feedback update (the loop
-    // stops after the third application pass), so the count is rounds - 1.
-    assert_eq!(
-        report.get("feedback_updates").and_then(Json::as_u64),
-        Some(feedback.len() as u64 - 1),
-        "failure reports must carry the true feedback update count"
-    );
-    assert!(
-        report
-            .get("feedback_updates")
-            .and_then(Json::as_u64)
-            .unwrap_or(0)
-            > 0,
-        "the pre-repair bug reported zero updates beside a full history"
-    );
-    // Encoding must use the restored best round, even after later feedback.
-    let manifest = read_json(&output.join("manifest.json"));
-    let entries = manifest
-        .get("frames")
-        .and_then(|v| v.get("entries"))
-        .and_then(Json::as_array)
-        .unwrap();
-    for (index, entry) in entries.iter().enumerate() {
-        let accepted = frame_number(&report, index, "applied_ev").unwrap();
-        assert_eq!(
-            entry.get("applied_ev").and_then(Json::as_f64),
-            Some(accepted)
-        );
-        let log =
-            fs::read_to_string(output.join(format!("logs/encode/frame_{:06}.log", index + 1)))
-                .unwrap();
-        assert_eq!(
-            metadata_from_log(&log)
-                .get("exposure_ev")
-                .and_then(Json::as_f64),
-            Some(accepted)
-        );
-    }
-    assert!(output.join("output.mp4").is_file());
-    assert!(output.join("output.mp4").is_file());
-}
-
-#[test]
-fn wrong_correction_passes_the_probe_but_the_audit_records_fail_and_publishes() {
-    let base = 0.18f64.log2();
-    let frames: Vec<FakeFrame> = (0..30)
-        .map(|index| {
-            FakeFrame::new(&format!("frame_{:04}.DNG", index), base)
-                .object((0.70 - 0.03 * index as f64).max(0.05))
-                .capture(&format!(
-                    "2026:11:08 20:{:02}:{:02}",
-                    index / 60,
-                    index % 60
-                ))
-        })
-        .collect();
-    let material = synthetic_material("audit-decoupling", frames);
-    let (result, output) = run_synthetic(
-        &material,
-        "run",
-        &["--estimator", "legacy", "--brightness", "uniform"],
-    );
-    assert!(
-        result.status.success(),
-        "the audit verdict must never block publication: stdout:\n{}\nstderr:\n{}",
-        stdout(&result),
-        stderr(&result)
-    );
-    let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(
-        report.get("run_status").and_then(Json::as_str),
-        Some("COMPLETED_WITH_REVIEW")
-    );
-    let warnings = report
-        .get("warnings")
-        .and_then(Json::as_array)
-        .expect("warnings");
-    assert!(
-        warnings.iter().any(|warning| warning
-            .as_str()
-            .map(|text| text.starts_with("encoded temporal quality FAIL"))
-            .unwrap_or(false)),
-        "warnings: {warnings:?}"
-    );
-    assert_eq!(
-        report
-            .get("gain_probe")
-            .and_then(|probe| probe.get("passed")),
-        Some(&Json::Bool(true)),
-        "the decoupling proof requires a passing gain probe"
-    );
-    let quality = report.get("encoded_temporal_quality").expect("quality");
-    assert_eq!(quality.get("status").and_then(Json::as_str), Some("FAIL"));
-    assert!(
-        quality
-            .get("events")
-            .and_then(Json::as_array)
-            .map(|events| !events.is_empty())
-            .unwrap_or(false),
-        "audit FAIL must carry events"
-    );
-    assert!(output.join("output.mp4").is_file());
-    assert!(output.join("output.mp4").is_file());
-    let audit = read_json(&output.join("temporal_audit.json"));
-    assert_eq!(audit.get("status").and_then(Json::as_str), Some("FAIL"));
-    let manifest = read_json(&output.join("manifest.json"));
-    assert_eq!(
-        manifest
-            .get("deflicker")
-            .and_then(|block| block.get("audit_status"))
-            .and_then(Json::as_str),
-        Some("FAIL"),
-        "the manifest must carry the audit verdict verbatim"
-    );
-}
-
-#[test]
-fn unreliable_frames_get_global_reference_fallback_and_publish() {
-    let base = 0.18f64.log2();
-    let mut frames = synthetic_sequence(&vec![0.0; 12]);
-    for (index, frame) in frames.iter_mut().enumerate() {
-        frame.log_level = base;
-        frame.capture_time = Some(format!("2026:11:08 20:{:02}:{:02}", index / 60, index % 60));
-    }
-    frames[8].pattern = "sparse";
-    let material = synthetic_material("global-reference", frames);
-
+    use std::io::Write;
+    let config = material
+        .root
+        .join("fixtures")
+        .join(format!("fake-native-{}.config", std::process::id()));
+    writeln!(
+        fs::OpenOptions::new().append(true).open(config).unwrap(),
+        "gain_scale=0.5"
+    )
+    .unwrap();
     let (result, output) = run_synthetic(&material, "run", &[]);
-    assert!(
-        result.status.success(),
-        "the fail-open contract always publishes: stdout:\n{}\nstderr:\n{}",
-        stdout(&result),
-        stderr(&result)
-    );
+    assert!(result.status.success(), "{}", stderr(&result));
+    assert_eq!(frame_commands(&output.join("logs/analysis")).len(), 6);
+    assert_eq!(frame_commands(&output.join("logs/render")).len(), 6);
+    assert!(!output.join("logs/probe").exists());
+    assert!(!output.join("temporal_audit.json").exists());
+}
+
+#[test]
+fn product_graph_leaves_temporal_audit_to_development_tools() {
+    let material = synthetic_material("no-audit", synthetic_sequence(&[0.2, -0.2, 0.2, -0.2]));
+    let (result, output) = run_synthetic(&material, "run", &[]);
+    assert!(result.status.success(), "{}", stderr(&result));
+    assert!(!output.join("temporal_audit.json").exists());
+    assert!(!output.join("logs/probe").exists());
     let report = read_json(&output.join("exposure_report.json"));
+    assert_eq!(report.get("gain_probe"), Some(&Json::Null));
     assert_eq!(
-        report.get("run_status").and_then(Json::as_str),
-        Some("COMPLETED_WITH_REVIEW")
+        report
+            .get("feedback_history")
+            .and_then(Json::as_array)
+            .unwrap()
+            .len(),
+        0
     );
-    assert_eq!(frame_status(&report, 8), "GLOBAL_REFERENCE");
-    assert!(
-        frame_number(&report, 8, "applied_ev").is_some(),
-        "the fallback must estimate the unreliable frame instead of 0 EV"
-    );
-    assert!(frame_number(&report, 8, "render_ev").is_some());
-    let frame_eight = frame_record(&report, 8);
-    let warnings = frame_eight
-        .get("warnings")
-        .and_then(Json::as_array)
-        .expect("warnings");
-    assert!(
-        warnings.iter().any(|warning| warning
-            .as_str()
-            .map(|text| text.starts_with("GLOBAL_REFERENCE_FALLBACK"))
-            .unwrap_or(false)),
-        "frame 8 warnings: {warnings:?}"
-    );
-    assert!(
-        (0..8).any(|index| frame_status(&report, index) == "OK"),
-        "the reliable prefix must stay OK (fill-only fallback)"
-    );
-    let fallback = report
-        .get("global_reference_fallback")
-        .expect("global_reference_fallback block");
-    assert_eq!(
-        fallback.get("frames_filled").and_then(Json::as_u64),
-        Some(1),
-        "fallback block: {fallback:?}"
-    );
-    let run_warnings = report
-        .get("warnings")
-        .and_then(Json::as_array)
-        .expect("warnings");
-    assert!(run_warnings.iter().any(|warning| warning
-        .as_str()
-        .map(|text| text.starts_with("GLOBAL_REFERENCE_FALLBACK"))
-        .unwrap_or(false)));
-    assert!(output.join("output.mp4").is_file());
-    assert!(output.join("output.mp4").is_file());
+}
+
+#[test]
+fn best_effort_plan_still_renders_a_complete_inventory() {
+    let mut frames = synthetic_sequence(&[0.2, -0.2, 0.2, -0.2]);
+    frames[1].pattern = "sparse".into();
+    let material = synthetic_material("best-effort-graph", frames);
+    let (result, output) = run_synthetic(&material, "run", &[]);
+    assert!(result.status.success(), "{}", stderr(&result));
+    let report = read_json(&output.join("exposure_report.json"));
+    for id in 0..4 {
+        assert!(frame_number(&report, id, "applied_ev").unwrap().is_finite());
+    }
+    assert_eq!(frame_commands(&output.join("logs/render")).len(), 4);
 }
 
 #[test]
@@ -1158,7 +841,7 @@ fn strength_zero_is_the_single_pass_regression_path() {
     // The disabled (historical) path keeps the frozen argument shape: frame 1
     // decodes with its own as-shot neutral, later frames carry the override.
     let disabled_command = |index: usize| {
-        let text = fs::read_to_string(first.join(format!("logs/encode/frame_{index:06}.log")))
+        let text = fs::read_to_string(first.join(format!("logs/render/frame_{index:06}.log")))
             .expect("frame transcript");
         text.lines()
             .find(|line| line.starts_with("command:"))
@@ -1428,7 +1111,7 @@ fn preview_profiles_emit_their_declared_colour_contract() {
                 command.contains("--camera-color-method legacy-inverse-cm"),
                 "{command}"
             );
-            if path.to_string_lossy().contains("/encode/") {
+            if path.to_string_lossy().contains("/render/") {
                 assert!(command.contains("--stdout-frame-f32"), "{command}");
             } else {
                 assert!(command.contains("--stdout-analysis"), "{command}");
@@ -1950,7 +1633,9 @@ fn frame_commands(logs_dir: &Path) -> Vec<(std::path::PathBuf, String)> {
                     .lines()
                     .find(|line| line.starts_with("command:"))
                     .unwrap_or_else(|| panic!("no command line in {}", path.display()));
-                out.push((path, command.to_string()));
+                if !command.contains("--prepare ") {
+                    out.push((path, command.to_string()));
+                }
             }
         }
     }
@@ -2097,7 +1782,7 @@ fn per_frame_mode_decodes_every_frame_with_its_own_as_shot_neutral() {
 
     // Every frame decodes with its own RAW as-shot neutral; the three neutrals
     // differ, so a producer that froze one triple would fail this assertion.
-    let applied = as_shot_sidecars(&output.join("logs/encode"));
+    let applied = as_shot_sidecars(&output.join("logs/render"));
     assert_eq!(applied.len(), 3);
     assert_ne!(applied[0], applied[1]);
     assert_ne!(applied[0], applied[2]);
@@ -2123,81 +1808,21 @@ fn per_frame_mode_decodes_every_frame_with_its_own_as_shot_neutral() {
 }
 
 #[test]
-fn per_frame_mode_runs_the_activated_probe_and_renders_without_an_override() {
-    let frames = per_frame_flicker_sequence(30);
-    let material = synthetic_material("wb-per-frame-deflicker", frames);
+fn per_frame_mode_measures_and_renders_without_an_override() {
+    let material = synthetic_material("wb-per-frame-deflicker", per_frame_flicker_sequence(30));
     let (result, output) = run_synthetic(
         &material,
         "run",
         &["--white-balance", "per-frame", "--brightness", "uniform"],
     );
-    assert!(
-        result.status.success(),
-        "run failed\nstdout:\n{}\nstderr:\n{}",
-        stdout(&result),
-        stderr(&result)
-    );
-
-    let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(report.get("run_status").and_then(Json::as_str), Some("OK"));
-    let probe = report.get("gain_probe").expect("gain probe block");
-    assert_eq!(
-        probe.get("status").and_then(Json::as_str),
-        Some("PASS"),
-        "the gain probe must really run and pass: {probe:?}"
-    );
-    assert_eq!(probe.get("passed"), Some(&Json::Bool(true)));
-    let tested = probe
-        .get("tested_frames")
-        .and_then(Json::as_array)
-        .expect("tested frames");
-    assert!(
-        !tested.is_empty(),
-        "the probe must test real frames: {probe:?}"
-    );
-    assert!(
-        probe
-            .get("observations")
-            .and_then(Json::as_u64)
-            .unwrap_or(0)
-            > 0,
-        "the probe must produce observations: {probe:?}"
-    );
-
-    // Every pass (baseline, render, probe) ran without an override.
+    assert!(result.status.success(), "{}", stderr(&result));
     assert_commands_without_white_balance(&output.join("logs"));
-    let probe_commands = frame_commands(&output.join("logs/probe"));
-    assert!(
-        probe_commands.len() >= 2,
-        "both probe gain directions must leave real transcripts, found {}",
-        probe_commands.len()
-    );
-
     let baseline = as_shot_sidecars(&output.join("logs/analysis"));
+    let rendered = as_shot_sidecars(&output.join("logs/render"));
     assert_eq!(baseline.len(), 30);
-    let probe_meta = as_shot_sidecars(&output.join("logs/probe"));
-    assert!(!probe_meta.is_empty());
-    let rendered = as_shot_sidecars(&output.join("logs/encode"));
-    assert_eq!(rendered.len(), 30);
-    let mut distinct = std::collections::BTreeSet::new();
-    for triple in &rendered {
-        assert!(
-            distinct.insert(triple.map(f64::to_bits)),
-            "the fixture must keep distinct own neutrals, duplicate {triple:?}"
-        );
-    }
-    for index in 0..30 {
-        assert_eq!(frame_status(&report, index), "UNIFORM");
-    }
-
+    assert_eq!(baseline, rendered);
+    assert!(!output.join("logs/probe").exists());
     assert_per_frame_manifest(&output);
-    let run_stdout = stdout(&result);
-    assert!(
-        !run_stdout.contains("applied to every later frame"),
-        "{run_stdout}"
-    );
-    assert!(output.join("output.mp4").is_file());
-    assert!(output.join("output.mp4").is_file());
 }
 
 #[test]
@@ -2400,13 +2025,6 @@ fn protocol_and_child_failures_reap_live_counterparts_and_never_publish() {
             30,
             "exit code 3",
         ),
-        (
-            "early-encoder",
-            "stall_pixels=1",
-            true,
-            60,
-            "streaming encoder failed",
-        ),
     ] {
         let root = test_dir(&format!("bounded-{label}"));
         let input = root.join("material");
@@ -2453,10 +2071,10 @@ fn protocol_and_child_failures_reap_live_counterparts_and_never_publish() {
         assert!(output.join(".rawtl-partial").is_dir());
         assert!(!output.join("output.mp4").exists());
         assert!(
-            !output.join("logs/encode/frame_000003.log").exists(),
+            !output.join("logs/render/frame_000003.log").exists(),
             "stop dispatch on failure"
         );
-        let first = fs::read_to_string(output.join("logs/encode/frame_000001.log")).unwrap();
+        let first = fs::read_to_string(output.join("logs/render/frame_000001.log")).unwrap();
         assert!(
             first.contains("exit:"),
             "native status must be retained: {first}"
@@ -2476,7 +2094,7 @@ const REV_PROFILE: &str = "canon-log2-cinema-gamut-rev-eng-crm-dev";
 const REV3_PROFILE: &str = "canon-log3-cinema-gamut-rev-eng-crm-dev";
 
 #[test]
-fn rev_eng_profile_streams_f32_through_every_pass_and_audits_the_actual_video() {
+fn rev_eng_profile_streams_f32_through_graph_measure_and_render() {
     for id in [REV_PROFILE, REV3_PROFILE] {
         for wb in ["first-frame", "per-frame"] {
             let frames = (0..28)
@@ -2535,9 +2153,7 @@ fn rev_eng_profile_streams_f32_through_every_pass_and_audits_the_actual_video() 
             );
             let q = manifest.get("quantization_policy").unwrap();
             assert_eq!(q.get("reference_gain").and_then(Json::as_f64), Some(2.));
-            let audit = fs::read_to_string(output.join("temporal_audit.json")).unwrap();
-            assert!(audit.contains(id), "{audit}");
-            assert!(audit.contains("reference_gain"), "{audit}");
+            assert!(!output.join("temporal_audit.json").exists());
             // Analysis, gain probe, application feedback, final encoding all carry
             // and validate the same camera strategy. No RGB48 fallback is allowed.
             for (path, command) in frame_commands(&output.join("logs")) {
@@ -2546,7 +2162,7 @@ fn rev_eng_profile_streams_f32_through_every_pass_and_audits_the_actual_video() 
                     "{command}"
                 );
                 let log = fs::read_to_string(&path).unwrap();
-                if path.to_string_lossy().contains("/encode/") {
+                if path.to_string_lossy().contains("/render/") {
                     assert!(command.contains("--stdout-frame-f32"), "{command}");
                     assert!(log.contains("pixel bytes: 518400"));
                 } else {

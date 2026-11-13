@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 namespace frame {
+void install_stop_handlers();
+void check_cancelled();
 namespace fs = std::filesystem;
 struct Error : std::runtime_error {
   int code;

@@ -18,17 +18,45 @@ pub struct Captured {
 /// `spawn_code` is used when the executable cannot be started; a nonzero exit
 /// status is returned to the caller for context-specific handling.
 pub fn run_capture(program: &Path, args: &[String], spawn_code: i32) -> Result<Captured> {
-    let output = Command::new(program).args(args).output().map_err(|err| {
-        io_error(
-            spawn_code,
-            &format!("failed to run {} {}", program.display(), args.join(" ")),
-            err,
-        )
-    })?;
+    use std::io::Read;
+    use std::process::Stdio;
+    check_stop()?;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            io_error(
+                spawn_code,
+                &format!("failed to run {}", program.display()),
+                err,
+            )
+        })?;
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        stdout.read_to_end(&mut b).map(|_| b)
+    });
+    let err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        stderr.read_to_end(&mut b).map(|_| b)
+    });
+    let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+    let status = wait_owned(&child, false, spawn_code)?;
+    let stdout = out
+        .join()
+        .unwrap()
+        .map_err(|e| io_error(spawn_code, "stdout read", e))?;
+    let stderr = err
+        .join()
+        .unwrap()
+        .map_err(|e| io_error(spawn_code, "stderr read", e))?;
     Ok(Captured {
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        status,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
     })
 }
 
@@ -109,6 +137,8 @@ pub struct OwnedProcess {
     started: Instant,
     finished: bool,
     code: i32,
+    monitor: Option<std::thread::JoinHandle<()>>,
+    stop_monitor: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl OwnedProcess {
@@ -121,6 +151,7 @@ impl OwnedProcess {
     ) -> Result<Self> {
         use std::io::Write;
         use std::process::Stdio;
+        check_stop()?;
         if let Some(parent) = log.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::new(code, e.to_string()))?;
         }
@@ -152,14 +183,34 @@ impl OwnedProcess {
             .stderr(stderr)
             .spawn()
             .map_err(|e| Error::new(code, format!("failed to start {}: {e}", program.display())))?;
-        let process = Self {
+        let mut process = Self {
             child: std::sync::Arc::new(std::sync::Mutex::new(child)),
             log: log.to_path_buf(),
             started: Instant::now(),
             finished: false,
             code,
+            monitor: None,
+            stop_monitor: Default::default(),
         };
         process.note(&format!("pid: {}", process.child.lock().unwrap().id()));
+        let child = process.child.clone();
+        let stop = process.stop_monitor.clone();
+        process.monitor = Some(std::thread::spawn(move || {
+            let mut sent = None;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if check_stop().is_err() {
+                    if sent.is_none() {
+                        terminate(&child);
+                        sent = Some(Instant::now());
+                    }
+                    if sent.is_some_and(|at| at.elapsed() > Duration::from_secs(3)) {
+                        let _ = child.lock().unwrap().kill();
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }));
         Ok(process)
     }
     pub fn abort_if_running(&mut self) {
@@ -174,19 +225,14 @@ impl OwnedProcess {
         }
     }
     pub fn finish(&mut self, abort: bool) -> Result<std::process::ExitStatus> {
-        if abort {
-            let _ = self.child.lock().unwrap().kill();
-        }
-        let status = loop {
-            match self.child.lock().unwrap().try_wait() {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) => {}
-                Err(e) => break Err(Error::new(self.code, format!("cannot reap child: {e}"))),
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        };
+        let status = wait_owned(&self.child, abort, self.code);
         if let Ok(status) = status {
             self.finished = true;
+            self.stop_monitor
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(monitor) = self.monitor.take() {
+                let _ = monitor.join();
+            }
             self.note(&format!(
                 "exit: {} ({:.3}s)",
                 exit_description(&status),
@@ -201,5 +247,61 @@ impl Drop for OwnedProcess {
         if !self.finished {
             let _ = self.finish(true);
         }
+    }
+}
+
+// Signal handlers only store an atomic flag. Ordinary Rust code owns signals,
+// escalation and wait/reap; no allocation or mutex runs inside a handler.
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+unsafe extern "C" {
+    fn signal(sig: i32, handler: usize) -> usize;
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+extern "C" fn stopped(_: i32) {
+    STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+pub fn install_stop_handlers() {
+    unsafe {
+        signal(2, stopped as *const () as usize);
+        signal(15, stopped as *const () as usize);
+    }
+}
+pub fn check_stop() -> Result<()> {
+    if STOP.load(std::sync::atomic::Ordering::SeqCst) {
+        Err(Error::new(
+            130,
+            "run cancelled; retained cache/partial paths are in the run logs",
+        ))
+    } else {
+        Ok(())
+    }
+}
+pub fn terminate(child: &ChildHandle) {
+    let mut child = child.lock().unwrap();
+    if matches!(child.try_wait(), Ok(None)) {
+        unsafe {
+            kill(child.id() as i32, 15);
+        }
+    }
+}
+fn wait_owned(child: &ChildHandle, abort: bool, code: i32) -> Result<std::process::ExitStatus> {
+    let mut cancelled = None;
+    loop {
+        if let Some(status) = child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .map_err(|e| Error::new(code, format!("cannot reap child: {e}")))?
+        {
+            return Ok(status);
+        }
+        if (abort || check_stop().is_err()) && cancelled.is_none() {
+            terminate(child);
+            cancelled = Some(Instant::now());
+        }
+        if cancelled.is_some_and(|at| at.elapsed() > Duration::from_secs(3)) {
+            let _ = child.lock().unwrap().kill();
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }

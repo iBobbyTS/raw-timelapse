@@ -263,6 +263,7 @@ FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
 } // namespace
 int main(int argc, char **argv) {
   using namespace frame;
+  install_stop_handlers();
   try {
     // The stdout grammar is flag-first: only argv[1] selects a streaming or
     // prepare mode, so the positional path slots stay paths even when a path
@@ -317,6 +318,7 @@ int main(int argc, char **argv) {
         throw Error(2, "--prepare requires --emit-prepared");
       PreparedFrame prepared =
           prepare_frame(input, scratch, converter, timeout, false);
+      check_cancelled();
       write_prepared(prepared, context);
       std::cerr << "prepared " << prepared.source << " -> "
                 << prepared.prepared_dng << " context=" << context << '\n';
@@ -540,6 +542,7 @@ int main(int argc, char **argv) {
                wb.has_value());
     if (temp)
       temp->clear();
+    check_cancelled();
     write_all(f32 ? "RAWTLST2" : kStdoutMagic, sizeof kStdoutMagic);
     write_record_text(kRecordMetadata, frame.metadata + "\n");
     if (want_analysis) {
