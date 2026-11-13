@@ -232,6 +232,55 @@ fn refuses_to_overwrite_an_existing_video_or_log() {
 }
 
 #[test]
+fn refuses_a_preexisting_dangling_video_symlink_and_preserves_it() {
+    require_ffmpeg();
+    let root = test_dir("dangling-video-link");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_tool(&fixtures, &frames, None, false);
+    let directory = run_directory(&root, "run");
+    fs::create_dir_all(&directory).expect("create run dir");
+    let video = video_in(&directory);
+    let link_target = PathBuf::from("missing-user-target.mov");
+    std::os::unix::fs::symlink(&link_target, &video).expect("dangling video link");
+    assert!(!video.exists(), "the fixture link must dangle");
+
+    let result = run_cli(&base_args(&input, &video, &tool));
+    assert_eq!(result.status.code(), Some(12), "{}", stderr(&result));
+    assert!(
+        stderr(&result).contains("refusing to overwrite"),
+        "{}",
+        stderr(&result)
+    );
+
+    // The user entry is preserved exactly: still a symlink to the same target.
+    let metadata = fs::symlink_metadata(&video).expect("link metadata");
+    assert!(metadata.file_type().is_symlink(), "the link was replaced");
+    assert_eq!(fs::read_link(&video).expect("link target"), link_target);
+    assert!(!video.exists(), "the link must still dangle");
+
+    // Refusal happens before any log, scratch or RAW work.
+    let mut entries: Vec<String> = fs::read_dir(&directory)
+        .expect("read run dir")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, vec![VIDEO_NAME.to_string()], "only the user link remains");
+    assert!(!log_in(&directory).exists());
+    assert!(
+        !fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".rawtl-")),
+        "no scratch may be created for a refused output"
+    );
+}
+
+#[test]
 fn old_run_directory_output_is_rejected_with_a_migration_message() {
     let root = test_dir("migration");
     let input = root.join("material");

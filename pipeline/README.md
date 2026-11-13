@@ -91,7 +91,8 @@ The log is line-oriented; every entry carries `wall=<epoch seconds>` and
 - `delete` events naming each deleted cache DNG
 - `exposure` events for an explicit exposure node
 - `encoder.command` with the exact FFmpeg argv once
-- `timing`, `video`, `publish`, `run.complete`
+- `timing`, `video`, `publish`, `retained-cache` (custom graph left generated
+  cache behind), `run.complete`
 - on failure: `node.error` / `run.error` with the error family, a bounded
   Converter/FFmpeg stderr tail and the retained scratch path
 
@@ -103,11 +104,15 @@ frame inventory, the white-balance mode, the final video/log paths, and errors.
 
 Each run creates a hidden run-specific scratch directory next to the video
 (`.rawtl-<name>-<pid>-<nonce>`). It holds the converted LinearRaw DNG cache and
-child-process transcripts. On success the video is renamed to its final name and
-the whole scratch directory is removed. On failure or a stop request the run
-stops dispatch, reaps its owned native/encoder children, keeps the remaining
-cache, transcripts and any partial output, names that directory in the single
-log, and exits non-zero without publishing a formal video.
+child-process transcripts. After a successful publication the whole scratch
+directory is removed when the graph's delete nodes consumed every run-generated
+cache file (the default graph does). A valid custom graph that omits deletion
+keeps the generated cache: the scratch is retained, the log records
+`kind=retained-cache count=… path=…`, and the original RAW/DNG sources stay
+untouched. On failure or a stop request the run stops dispatch, reaps its owned
+native/encoder children, keeps the remaining cache, transcripts and any partial
+output, names that directory in the single log, and exits non-zero without
+publishing a formal video.
 
 A failed run must be re-run from the source. There is no checkpoint, resume or
 automatic recovery, and a new run never picks up an earlier run's cache. A long

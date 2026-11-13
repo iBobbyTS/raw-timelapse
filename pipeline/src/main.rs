@@ -73,6 +73,8 @@ pub struct EncodedStage {
     pub timings: BTreeMap<String, Duration>,
     pub video_artifact: DataEnvelope,
     pub resize: Option<video::ResizeRecord>,
+    /// Run-generated cache DNGs that the graph did not delete.
+    pub retained_cache: Vec<std::path::PathBuf>,
 }
 
 fn run(options: &Options) -> Result<()> {
@@ -268,14 +270,27 @@ fn execute(
         published.as_secs_f64(),
         total.as_secs_f64()
     ));
-    if let Err(err) = fs::remove_dir_all(scratch) {
-        eprintln!(
-            "warning: could not remove run scratch {}: {err}",
-            scratch.display()
-        );
+    // The graph owns deletion. Remove the scratch only when its delete nodes
+    // consumed every run-generated cache DNG; otherwise retain the cache and
+    // name it in the log (S03 custom-graph contract).
+    if stage.retained_cache.is_empty() {
+        if let Err(err) = fs::remove_dir_all(scratch) {
+            eprintln!(
+                "warning: could not remove run scratch {}: {err}",
+                scratch.display()
+            );
+            log.line_best_effort(&format!(
+                "kind=warning message={}",
+                quote(&format!("could not remove run scratch: {err}"))
+            ));
+        }
+    } else {
+        let cache = scratch.join("cache");
+        println!("retained graph cache: {}", cache.display());
         log.line_best_effort(&format!(
-            "kind=warning message={}",
-            quote(&format!("could not remove run scratch: {err}"))
+            "kind=retained-cache count={} path={}",
+            stage.retained_cache.len(),
+            quote(&cache.display().to_string())
         ));
     }
     log.line_best_effort("kind=run.complete");

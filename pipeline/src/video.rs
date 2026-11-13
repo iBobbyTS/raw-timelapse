@@ -694,14 +694,26 @@ impl Drop for StreamingEncoder {
 pub fn publish(video: &DataEnvelope, destination: &Path) -> Result<()> {
     let source = video_artifact_path(video)
         .ok_or_else(|| Error::new(EXIT_PUBLISH, "invalid video artifact handoff"))?;
-    if destination.exists() {
-        return Err(Error::new(
-            EXIT_PUBLISH,
-            format!(
-                "refusing to overwrite existing deliverable {}",
-                destination.display()
-            ),
-        ));
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(Error::new(
+                EXIT_PUBLISH,
+                format!(
+                    "refusing to overwrite existing deliverable {}",
+                    destination.display()
+                ),
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(Error::new(
+                EXIT_PUBLISH,
+                format!(
+                    "cannot inspect publication destination {}: {err}",
+                    destination.display()
+                ),
+            ));
+        }
     }
     fs::rename(source, destination).map_err(|e| {
         Error::new(
@@ -1001,6 +1013,36 @@ mod publication_tests {
         publish(&envelope, &destination).unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"validated");
         assert!(!source.exists());
+    }
+
+    #[test]
+    fn publication_refuses_a_dangling_destination_symlink() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-tmp")
+            .join(format!("publish-dangling-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("temporary.mov");
+        let destination = root.join("output.mov");
+        fs::write(&source, b"validated").unwrap();
+        let link_target = std::path::PathBuf::from("missing-user-target.mov");
+        std::os::unix::fs::symlink(&link_target, &destination).unwrap();
+        let envelope = video_envelope(
+            &source,
+            "video/quicktime",
+            "prores",
+            1,
+            "test",
+            crate::color_profile::default_profile(),
+        )
+        .unwrap();
+        let err = publish(&envelope, &destination).unwrap_err();
+        assert_eq!(err.code, EXIT_PUBLISH);
+        let metadata = fs::symlink_metadata(&destination).expect("link metadata");
+        assert!(metadata.file_type().is_symlink(), "the link was replaced");
+        assert_eq!(fs::read_link(&destination).unwrap(), link_target);
+        assert_eq!(fs::read(&source).unwrap(), b"validated");
+        let _ = fs::remove_dir_all(&root);
     }
 }
 

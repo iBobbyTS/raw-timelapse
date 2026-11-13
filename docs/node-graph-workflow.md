@@ -96,6 +96,7 @@ wall=<epoch 秒.毫秒> elapsed=<单调秒.毫秒> kind=<事件> <有界字段..
 | `timing` / `timing.publish` | preflight / graph / validate / publish / total |
 | `video` | 最终视频路径、字节、codec/profile/几何/帧数/像素格式/range/resize |
 | `publish` / `run.complete` | 发布与正常结束 |
+| `retained-cache` | 自定义图未删除生成缓存时的保留位置与数量 |
 | `node.error` / `run.error` | 错误家族、有界 Converter/FFmpeg stderr 片段、scratch 保留路径 |
 
 日志不写逐帧 metadata 文档、矩阵或像素；不写去闪 PASS/FAIL/REVIEW/质量评分。
@@ -115,7 +116,11 @@ stderr 只保留错误与 scratch 保留提示。
 ```
 
 - 选在视频同目录是为了同文件系统的一次 rename 发布，并让大缓存落在输出卷上。
-- 正常结束：校验 → rename 发布 → 删除整个 scratch。目录内最终只剩视频与日志。
+- 正常结束：校验 → rename 发布。删除由 graph 决定：若 delete 节点已消费全部本 run
+  生成的缓存文件（默认图如此），随后删除整个 scratch，目录内最终只剩视频与日志；
+  若自定义图未删除生成的 DNG，则保留 scratch/cache，并在日志写
+  `kind=retained-cache count=… path=<scratch>/cache`，stdout 同行提示
+  `retained graph cache: …`。原始 RAW/DNG 永远不是删除目标。
 - 失败/停止：停止调度、回收子进程、保留剩余 cache/transcripts/partial，在单条
   `run.error` 中写入 scratch 路径，退出非零且不发布正式视频。
 - 重试：新 nonce 的新 scratch；不复用旧缓存，不覆盖旧视频/日志。没有恢复或
