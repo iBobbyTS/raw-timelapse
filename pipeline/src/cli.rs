@@ -11,23 +11,20 @@ pub const DEFAULT_FFMPEG: &str = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg";
 pub const DEFAULT_FFPROBE: &str = "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe";
 pub const LEGACY_FPS_PROVENANCE: &str =
     "legacy/python/src/rawtl/cli.py:91 (argparse default Fraction(30))";
-pub const DEFLICKER_DEFAULTS_PROVENANCE: &str = "legacy/python/src/rawtl/cli.py:95-114 \
-(strength=1.0, period=60, brightness=smooth, estimator=pairwise, \
-ev_limits=none, roi=0,0,1,1) amended 2026-11-11: publication gates removed; \
-unreliable frames fall back to the global-reference curve; the temporal \
-audit records but never blocks (temporal_quality=report)";
-
 pub const USAGE: &str = "\
-rawtl-linear-video — DNG frame sequence -> one configured video file
-(default: V4 deflicker enabled, ProRes 4444 at the source geometry)
+rawtl-linear-video — RAW/DNG frame sequence -> one video file and one run log
+(default: best-effort deflicker, ProRes 4444 at the source geometry)
 
 USAGE:
-    rawtl-linear-video --input <DIR> --output <DIR> [OPTIONS]
+    rawtl-linear-video --input <DIR> --output <VIDEO_FILE> [OPTIONS]
 
 REQUIRED:
     --input <DIR>              Directory of RAW or DNG frames: one file extension per directory;
-                               hidden files and .xmp sidecars are skipped (read only, not overlapping output)
-    --output <DIR>             Run directory; must be absent or empty
+                               hidden files and .xmp sidecars are skipped (read only)
+    --output <VIDEO_FILE>      Output video file, e.g. /data/timelapse.mov. Its extension must
+                               match the configured container (default .mov). The run log is
+                               written beside it as <name>.log. Existing files are never
+                               overwritten; choose a new name or remove the old run first.
 
 OPTIONS:
     --graph <FILE>            Typed graph JSON (default: prepared-frame graph)
@@ -67,7 +64,6 @@ OPTIONS:
     --roi <X,Y,W,H>            Analysis ROI in normalized image coordinates (default: 0,0,1,1)
     --exclude-roi <X0,Y0,X1,Y1>  Exclude tiles from estimation; repeatable
     --step <START:EV>          Confirmed exposure step at 0-based frame START; repeatable
-    --temporal-quality <MODE>  report | off (default: report; records, never blocks)
     -h, --help                 Print this help
     --version                  Print version
 
@@ -77,14 +73,31 @@ CONFIGURATION PRIORITY:
     colour parameters are rejected before RAW preparation; no encoder or
     pixel format is silently substituted.
 
-OUTPUT LAYOUT:
-    <output>/logs/                        per-frame, encoder and audit transcripts
-    <output>/exposure_report.json         per-frame exposure decisions and run status
-    <output>/exposure-curve.csv           legacy write_curve fields, one row per frame
-    <output>/temporal_audit.json          independent encoded-video audit (when enabled)
-    <output>/pairs.csv, frames.csv        audit pair/frame evidence
-    <output>/output.<ext>                 the single configured video (default output.mov)
-    <output>/manifest.json                run provenance and validation record
+OUTPUT SURFACE:
+    <VIDEO_FILE>               validated deliverable, published by a single rename
+    <name>.log                 one run log: wall-clock + monotonic elapsed, node/frame
+                               events, per-frame timings, cache-deletion events and
+                               bounded error summaries (Converter/FFmpeg stderr tails)
+    No logs directory, manifest, CSV or audit JSON is produced. A normal run leaves
+    exactly the video and its log beside any files that already existed there.
+
+RESOLUTION:
+    The default keeps the source geometry; ProRes 4444 needs odd/even-any geometry
+    and no implicit 4096 cap applies. Pass --resize to resample explicitly.
+
+SCRATCH AND FAILURE:
+    A run-specific scratch directory (<video dir>/.rawtl-<name>-<pid>-<nonce>) holds
+    the converted LinearRaw DNG cache and child-process transcripts. It is removed
+    after a successful publication; on failure or stop it is retained and named in
+    the log together with any partial output. Converting and caching a long
+    full-resolution sequence needs disk space for the cache peak. A failed run must
+    be re-run from the source: there is no checkpoint, resume or automatic
+    recovery, and an earlier cache is never picked up again.
+
+MIGRATION:
+    --output used to name a run directory. Pass the video file instead; the log is
+    <name>.log beside it. --temporal-quality (report|off) belonged to the removed
+    quality-report workflow and is rejected; a run never reports a deflicker verdict.
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,36 +203,6 @@ impl Estimator {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TemporalQuality {
-    Report,
-    Off,
-}
-
-impl TemporalQuality {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TemporalQuality::Report => "report",
-            TemporalQuality::Off => "off",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "report" => Ok(TemporalQuality::Report),
-            "off" => Ok(TemporalQuality::Off),
-            other => Err(Error::new(
-                EXIT_USAGE,
-                format!(
-                    "invalid --temporal-quality {other:?}: expected report or off \
-                     (strict was removed: the audit records its verdict but never \
-                     blocks publication)"
-                ),
-            )),
-        }
-    }
-}
-
 /// How the sequence derives its camera neutral.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhiteBalance {
@@ -270,7 +253,6 @@ pub struct DeflickerConfig {
     /// Exclusion boxes in [x0, y0, x1, y1] normalized coordinates.
     pub exclude_rois: Vec<[f64; 4]>,
     pub steps: Vec<ExposureStep>,
-    pub temporal_quality: TemporalQuality,
 }
 
 impl Default for DeflickerConfig {
@@ -284,7 +266,6 @@ impl Default for DeflickerConfig {
             roi: [0.0, 0.0, 1.0, 1.0],
             exclude_rois: vec![],
             steps: vec![],
-            temporal_quality: TemporalQuality::Report,
         }
     }
 }
@@ -293,13 +274,23 @@ impl DeflickerConfig {
     pub fn enabled(&self) -> bool {
         self.strength != 0.0
     }
+
+    pub fn ev_limits_text(&self) -> String {
+        match self.ev_limits {
+            Some((low, high)) => format!("{low},{high}"),
+            None => "none".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Options {
     pub graph: Option<PathBuf>,
     pub input: PathBuf,
-    pub output: PathBuf,
+    /// The single deliverable video file named by `--output`.
+    pub video: PathBuf,
+    /// The run log beside it: same file stem, `.log` extension.
+    pub log: PathBuf,
     pub fps: Fps,
     pub fps_explicit: bool,
     pub white_balance: WhiteBalance,
@@ -327,7 +318,7 @@ pub enum Parsed {
 pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut graph = None;
     let mut input: Option<PathBuf> = None;
-    let mut output: Option<PathBuf> = None;
+    let mut output: Option<(PathBuf, PathBuf)> = None;
     let mut fps = Fps::DEFAULT;
     let mut fps_explicit = false;
     let mut white_balance = WhiteBalance::DEFAULT;
@@ -378,12 +369,13 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                     return Err(Error::new(EXIT_USAGE, "--output may be given only once"));
                 }
                 seen_output = true;
-                output = Some(PathBuf::from(take_value(
+                let (video, log) = parse_video_target(&take_value(
                     args,
                     &mut index,
                     flag,
                     inline_value,
-                )?))
+                )?)?;
+                output = Some((video, log));
             }
             "--fps" => {
                 fps = Fps::parse(&take_value(args, &mut index, flag, inline_value)?)?;
@@ -501,8 +493,49 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 inline_value,
             )?)?),
             "--temporal-quality" => {
-                deflicker.temporal_quality =
-                    TemporalQuality::parse(&take_value(args, &mut index, flag, inline_value)?)?
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                return Err(Error::new(
+                    EXIT_USAGE,
+                    format!(
+                        "--temporal-quality {value:?} was removed: a run no longer produces a \
+                         quality report or gate. Operational events and errors are recorded in \
+                         the single run log; remove the flag"
+                    ),
+                ));
+            }
+            "--on-review" => {
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                return Err(Error::new(
+                    EXIT_USAGE,
+                    format!(
+                        "--on-review {value:?} belonged to the removed quality-gate workflow; \
+                         estimate completeness never blocks a run. Remove the flag"
+                    ),
+                ));
+            }
+            "--save-frames" | "--overwrite" => {
+                return Err(Error::new(
+                    EXIT_USAGE,
+                    format!(
+                        "{flag} was removed: intermediate frames stay in run scratch and are \
+                         deleted after a successful run, and an existing video or log is never \
+                         overwritten"
+                    ),
+                ));
+            }
+            "--exclude-rois" => {
+                let _ = take_value(args, &mut index, flag, inline_value)?;
+                return Err(Error::new(
+                    EXIT_USAGE,
+                    "--exclude-rois (file form) was removed; repeat --exclude-roi X0,Y0,X1,Y1",
+                ));
+            }
+            "--steps" => {
+                let _ = take_value(args, &mut index, flag, inline_value)?;
+                return Err(Error::new(
+                    EXIT_USAGE,
+                    "--steps (file form) was removed; repeat --step START:EV",
+                ));
             }
             "--encoder" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
@@ -576,7 +609,8 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     }
 
     let input = input.ok_or_else(|| Error::new(EXIT_USAGE, "--input <DIR> is required"))?;
-    let output = output.ok_or_else(|| Error::new(EXIT_USAGE, "--output <DIR> is required"))?;
+    let (video, log) =
+        output.ok_or_else(|| Error::new(EXIT_USAGE, "--output <VIDEO_FILE> is required"))?;
 
     if log_reference_gain.is_some() && !preview_profile.is_rev_eng() {
         return Err(Error::new(
@@ -594,7 +628,8 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     Ok(Parsed::Run(Options {
         graph,
         input,
-        output,
+        video,
+        log,
         fps,
         fps_explicit,
         white_balance,
@@ -609,6 +644,46 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         encoder,
         resize,
     }))
+}
+
+/// Resolve the single `--output` value into the deliverable video file and the
+/// run log beside it. The old run-directory form is a migration error, never a
+/// guessed file name.
+pub fn parse_video_target(value: &str) -> Result<(PathBuf, PathBuf)> {
+    let path = PathBuf::from(value);
+    if value.ends_with('/') || path.is_dir() || path.file_name().is_none() {
+        return Err(Error::new(
+            EXIT_USAGE,
+            format!(
+                "--output {value:?} names a directory; this version writes one video file. \
+                 Pass the video path instead, e.g. {}/timelapse.mov; the run log is written \
+                 beside it as timelapse.log",
+                value.trim_end_matches('/')
+            ),
+        ));
+    }
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    if extension.is_none_or(str::is_empty) {
+        return Err(Error::new(
+            EXIT_USAGE,
+            format!(
+                "--output {value:?} must name the video file including its container \
+                 extension, e.g. {value}.mov; the run log is written beside it as {value}.log"
+            ),
+        ));
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                EXIT_USAGE,
+                format!("--output {value:?} has no usable file name for its run log"),
+            )
+        })?;
+    let log = path.with_file_name(format!("{stem}.log"));
+    Ok((path, log))
 }
 
 fn parse_rate(value: &str, min: u64, max: u64) -> Result<u64> {
@@ -849,7 +924,7 @@ mod tests {
 
     #[test]
     fn default_fps_is_legacy_thirty() {
-        let options = parse_run(&["--input", "in", "--output", "out"]).expect("parse");
+        let options = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");
         assert_eq!(options.fps, Fps::DEFAULT);
         assert_eq!(options.fps.arg(), "30/1");
         assert!(!options.fps_explicit);
@@ -859,7 +934,7 @@ mod tests {
     #[test]
     fn parses_rational_fps_and_equals_form() {
         let options =
-            parse_run(&["--input=in", "--output=out", "--fps=30000/1001"]).expect("parse");
+            parse_run(&["--input=in", "--output=out.mov", "--fps=30000/1001"]).expect("parse");
         assert_eq!(
             options.fps,
             Fps {
@@ -874,15 +949,15 @@ mod tests {
     #[test]
     fn rejects_invalid_fps() {
         for value in ["0", "-30", "30/0", "1001", "abc"] {
-            let args = ["--input", "in", "--output", "out", "--fps", value];
+            let args = ["--input", "in", "--output", "out.mov", "--fps", value];
             assert!(parse_run(&args).is_err(), "must reject fps {value}");
         }
-        assert!(parse_run(&["--input", "in", "--output", "out", "--fps", "1000"]).is_ok());
+        assert!(parse_run(&["--input", "in", "--output", "out.mov", "--fps", "1000"]).is_ok());
     }
 
     #[test]
     fn white_balance_defaults_to_first_frame_and_parses_both_modes() {
-        let options = parse_run(&["--input", "in", "--output", "out"]).expect("parse");
+        let options = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");
         assert_eq!(options.white_balance, WhiteBalance::FirstFrame);
         assert_eq!(WhiteBalance::DEFAULT, WhiteBalance::FirstFrame);
         assert!(options.white_balance.freezes_reference());
@@ -891,7 +966,7 @@ mod tests {
             "--input",
             "in",
             "--output",
-            "out",
+            "out.mov",
             "--white-balance",
             "first-frame",
         ])
@@ -902,7 +977,7 @@ mod tests {
             "--input",
             "in",
             "--output",
-            "out",
+            "out.mov",
             "--white-balance",
             "per-frame",
         ])
@@ -911,7 +986,7 @@ mod tests {
         assert!(!per_frame.white_balance.freezes_reference());
 
         let inline =
-            parse_run(&["--input=in", "--output=out", "--white-balance=per-frame"]).expect("parse");
+            parse_run(&["--input=in", "--output=out.mov", "--white-balance=per-frame"]).expect("parse");
         assert_eq!(inline.white_balance, WhiteBalance::PerFrame);
 
         assert_eq!(WhiteBalance::FirstFrame.as_str(), "first-frame");
@@ -923,7 +998,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_white_balance_modes() {
-        let base = ["--input", "in", "--output", "out"];
+        let base = ["--input", "in", "--output", "out.mov"];
         for extra in [
             vec!["--white-balance", "bogus"],
             vec!["--white-balance", ""],
@@ -946,7 +1021,71 @@ mod tests {
     fn requires_input_and_output() {
         assert!(parse_run(&[]).is_err());
         assert!(parse_run(&["--input", "in"]).is_err());
-        assert!(parse_run(&["--output", "out"]).is_err());
+        assert!(parse_run(&["--output", "out.mov"]).is_err());
+    }
+
+    #[test]
+    fn output_names_one_video_file_and_a_sibling_log() {
+        let options = parse_run(&["--input", "in", "--output", "/data/timelapse.mov"])
+            .expect("parse");
+        assert_eq!(options.video, PathBuf::from("/data/timelapse.mov"));
+        assert_eq!(options.log, PathBuf::from("/data/timelapse.log"));
+
+        let relative = parse_run(&["--input", "in", "--output=clip.v2.mkv"]).expect("parse");
+        assert_eq!(relative.video, PathBuf::from("clip.v2.mkv"));
+        assert_eq!(relative.log, PathBuf::from("clip.v2.log"));
+    }
+
+    #[test]
+    fn old_run_directory_output_is_an_explicit_migration_error() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-tmp")
+            .join(format!("cli-output-migration-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create migration dir");
+        let directory = root.to_str().expect("utf8");
+        let with_slash = format!("{directory}/");
+        for value in [directory, with_slash.as_str()] {
+            let error = parse_run(&["--input", "in", "--output", value]).expect_err("directory");
+            assert_eq!(error.code, EXIT_USAGE);
+            assert!(error.message.contains("names a directory"), "{}", error.message);
+            assert!(error.message.contains("timelapse.mov"), "{}", error.message);
+        }
+        for value in ["run", "out"] {
+            let error = parse_run(&["--input", "in", "--output", value]).expect_err("usage");
+            assert_eq!(error.code, EXIT_USAGE);
+            assert!(error.message.contains("--output"), "{}", error.message);
+            assert!(
+                error.message.contains("extension") || error.message.contains("video file"),
+                "{}",
+                error.message
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removed_quality_workflow_flags_are_rejected_with_migration_text() {
+        let base = ["--input", "in", "--output", "out.mov"];
+        for (extra, marker) in [
+            (vec!["--temporal-quality", "off"], "temporal-quality"),
+            (vec!["--temporal-quality=report"], "temporal-quality"),
+            (vec!["--on-review", "error"], "on-review"),
+            (vec!["--save-frames"], "save-frames"),
+            (vec!["--overwrite"], "overwrite"),
+            (vec!["--steps", "steps.json"], "--step"),
+            (vec!["--exclude-rois", "rois.json"], "--exclude-roi"),
+        ] {
+            let mut args: Vec<&str> = base.to_vec();
+            args.extend(extra.iter());
+            let error = parse_run(&args).expect_err("removed flag");
+            assert_eq!(error.code, EXIT_USAGE, "{extra:?}: {}", error.message);
+            assert!(
+                error.message.contains(marker),
+                "{extra:?}: {}",
+                error.message
+            );
+        }
     }
 
     #[test]
@@ -955,7 +1094,7 @@ mod tests {
             "--input",
             "in",
             "--output",
-            "out",
+            "out.mov",
             "--converter",
             "relative/tool"
         ])
@@ -964,7 +1103,7 @@ mod tests {
             "--input",
             "in",
             "--output",
-            "out",
+            "out.mov",
             "--converter",
             "/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter"
         ])
@@ -973,7 +1112,7 @@ mod tests {
             "--input",
             "in",
             "--output",
-            "out",
+            "out.mov",
             "--converter-timeout",
             "0"
         ])
@@ -982,7 +1121,7 @@ mod tests {
             "--input",
             "in",
             "--output",
-            "out",
+            "out.mov",
             "--converter-timeout",
             "120"
         ])
@@ -991,7 +1130,7 @@ mod tests {
 
     #[test]
     fn deflicker_defaults_match_legacy_v4() {
-        let options = parse_run(&["--input", "in", "--output", "out"]).expect("parse");
+        let options = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");
         let d = &options.deflicker;
         assert!(d.enabled());
         assert_eq!(d.strength, 1.0);
@@ -1002,8 +1141,6 @@ mod tests {
         assert_eq!(d.roi, [0.0, 0.0, 1.0, 1.0]);
         assert!(d.exclude_rois.is_empty());
         assert!(d.steps.is_empty());
-        assert_eq!(d.temporal_quality, TemporalQuality::Report);
-        assert!(DEFLICKER_DEFAULTS_PROVENANCE.contains("strength=1.0"));
     }
 
     #[test]
@@ -1012,7 +1149,7 @@ mod tests {
             "--input",
             "in",
             "--output",
-            "out",
+            "out.mov",
             "--strength",
             "0.5",
             "--period",
@@ -1033,8 +1170,6 @@ mod tests {
             "10:0.5",
             "--step",
             "20:-0.25",
-            "--temporal-quality",
-            "off",
         ])
         .expect("parse");
         let d = &options.deflicker;
@@ -1049,15 +1184,14 @@ mod tests {
         assert_eq!(d.steps[0].start_frame, 10);
         assert_eq!(d.steps[0].delta_ev, 0.5);
         assert_eq!(d.steps[1].start_frame, 20);
-        assert_eq!(d.temporal_quality, TemporalQuality::Off);
     }
 
     #[test]
     fn parses_preview_profile_and_defaults_to_srgb() {
-        let options = parse_run(&["--input", "in", "--output", "out"]).expect("parse");
+        let options = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");
         assert_eq!(options.preview_profile.id, "srgb-preview");
         for id in color_profile::PROFILES.iter().map(|profile| profile.id) {
-            let options = parse_run(&["--input", "in", "--output", "out", "--preview-profile", id])
+            let options = parse_run(&["--input", "in", "--output", "out.mov", "--preview-profile", id])
                 .expect("parse");
             assert_eq!(options.preview_profile.id, id);
         }
@@ -1065,7 +1199,7 @@ mod tests {
             "--input",
             "in",
             "--output",
-            "out",
+            "out.mov",
             "--preview-profile=nikon-nlog-bt2020",
         ])
         .expect("parse");
@@ -1079,7 +1213,7 @@ mod tests {
                 "--input",
                 "in",
                 "--output",
-                "out",
+                "out.mov",
                 "--preview-profile",
                 value,
             ];
@@ -1091,10 +1225,10 @@ mod tests {
                 error.message
             );
         }
-        let error = parse_run(&["--input", "in", "--output", "out", "--preview-profile"])
+        let error = parse_run(&["--input", "in", "--output", "out.mov", "--preview-profile"])
             .expect_err("missing value");
         assert!(error.message.contains("missing value"));
-        let error = parse_run(&["--input", "in", "--output", "out", "--preview-profile="])
+        let error = parse_run(&["--input", "in", "--output", "out.mov", "--preview-profile="])
             .expect_err("empty inline value");
         assert_eq!(error.code, EXIT_USAGE);
     }
@@ -1105,7 +1239,7 @@ mod tests {
             "--input",
             "in",
             "--output",
-            "out",
+            "out.mov",
             "--encoder",
             "libx264",
             "--pix-fmt",
@@ -1137,19 +1271,19 @@ mod tests {
         assert_eq!(options.resize, Some((4096, 2734)));
         assert!(USAGE.contains("--encoder"));
         assert!(USAGE.contains("--resize"));
-        assert!(USAGE.contains("output.<ext>"));
+        assert!(USAGE.contains("--output <VIDEO_FILE>"));
     }
 
     #[test]
     fn defaults_leave_the_cli_layer_empty_for_graph_inheritance() {
-        let options = parse_run(&["--input", "in", "--output", "out"]).expect("parse");
+        let options = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");
         assert!(options.encoder.is_empty());
         assert_eq!(options.resize, None);
     }
 
     #[test]
     fn rejects_conflicting_or_invalid_encoder_flags() {
-        let base = ["--input", "in", "--output", "out"];
+        let base = ["--input", "in", "--output", "out.mov"];
         for extra in [
             vec!["--encoder", "h264_videotoolbox"],
             vec!["--container", "avi"],
@@ -1170,24 +1304,24 @@ mod tests {
             let error = parse_run(&args).expect_err("must reject");
             assert_eq!(error.code, EXIT_USAGE, "{extra:?}: {}", error.message);
         }
-        let error = parse_run(&["--input", "in", "--output", "out", "--crf", "18", "--qscale", "2"])
+        let error = parse_run(&["--input", "in", "--output", "out.mov", "--crf", "18", "--qscale", "2"])
             .expect_err("conflict");
         assert!(error.message.contains("conflicts"), "{}", error.message);
     }
 
     #[test]
     fn duplicate_input_or_output_is_rejected() {
-        let error = parse_run(&["--input", "a", "--input", "b", "--output", "out"])
+        let error = parse_run(&["--input", "a", "--input", "b", "--output", "out.mov"])
             .expect_err("duplicate input");
         assert!(error.message.contains("--input"));
-        let error = parse_run(&["--input", "in", "--output", "a", "--output", "b"])
+        let error = parse_run(&["--input", "in", "--output", "a.mov", "--output", "b.mov"])
             .expect_err("duplicate output");
         assert!(error.message.contains("--output"));
     }
 
     #[test]
     fn rejects_invalid_deflicker_options() {
-        let base = ["--input", "in", "--output", "out"];
+        let base = ["--input", "in", "--output", "out.mov"];
         for extra in [
             vec!["--strength", "-0.1"],
             vec!["--strength", "1.1"],
@@ -1211,12 +1345,12 @@ mod tests {
             args.extend(extra.iter());
             assert!(parse_run(&args).is_err(), "must reject {extra:?}");
         }
-        assert!(parse_run(&["--input", "in", "--output", "out", "--ev-limits", "none"]).is_ok());
+        assert!(parse_run(&["--input", "in", "--output", "out.mov", "--ev-limits", "none"]).is_ok());
         assert!(parse_run(&[
             "--input",
             "in",
             "--output",
-            "out",
+            "out.mov",
             "--ev-limits",
             "unbounded"
         ])

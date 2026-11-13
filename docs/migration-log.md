@@ -519,3 +519,59 @@ native 新增回归覆盖：非 TIFF 输入与 TIFF 无 DNGVersion（CR2/NEF/ARW
 - Tests use both fake-native stdout modes and malformed framing, descriptor/metadata geometry conflict, short pixels, missing metadata, mid-run failure, complete-record/nonzero-exit and early encoder failure. Bounded large-frame tests check no owned PID survives. Controlled decoded-frame tests traverse production audit and assert ±1 EV across every profile plus persisted caller error summaries. The under-execution regression retains its feedback-count assertions and checks the encoder receives the restored EV vector. Faithful-gain PASS fixtures use a uniform target: the former short smooth target crosses H.264 quantization bins and can truthfully trigger the unchanged audit thresholds.
 - Validation: from the repository root, `cargo clean --manifest-path pipeline/Cargo.toml` and `cargo test --manifest-path pipeline/Cargo.toml` exited **0**. Final run: **232 tests passed** (141 library, 60 binary, 31 integration), plus **3 compile-fail doctests**. Complete stdout/stderr and actual test-process exits: `.agent-work/tmp/streaming-encode-pipeline/s02-cargo-clean-handoff.log` / `.exit` and `s02-cargo-test-handoff.log` / `.exit`. Earlier failures/diagnostic runs remain separate under the same directory with `s02-` prefixes.
 - NOT_TESTED here: real-material composed smoke runs (assigned to Main), native ctest (native implementation unchanged), other OS/toolchain/FFmpeg/VideoToolbox versions, disk-full/interruption injection and calibrated playback. This entry records local implementation/check evidence, not independent review or Feature acceptance. Main owns commits and acceptance.
+
+## 单一视频 + 单一运行日志的 CLI 表面（2026-11-13）
+
+- 权威：`.agent-work/REQUIREMENTS.md` U05/U06 与 R05；`.agent-work/PLAN-FULL.md` 的 S05
+  业务合同；已接受的 S03 图运行时与 S04 编码/预检/发布接口。
+- 表面迁移：`--output` 从“运行目录”变为视频文件。扩展名必须匹配解析后的容器
+  （默认 ProRes 4444/MOV → `.mov`）；日志固定为同目录同 stem 的 `<name>.log`。正常
+  运行只留下视频和日志（忽略用户原有文件），不存在 `logs/` 目录、manifest、CSV、
+  审计 JSON 或第二份 encoder 日志。已存在的视频或日志拒绝覆盖（12）。旧目录形式、
+  `--temporal-quality`（report/off）、`--on-review`、`--save-frames`、`--overwrite`
+  以及文件形式的 `--steps` / `--exclude-rois` 都给出明确迁移错误，不再静默忽略。
+- 运行日志：新增 `pipeline/src/run_log.rs`。每行 `wall=<epoch> elapsed=<单调秒>
+  kind=...`；记录 run/settings/inventory/graph/encoder/colour、逐帧 prepare/measure/
+  develop（EV、应用/自身 WB、源与像素摘要、耗时）、所有节点完成事件、delete 事件、
+  显式 exposure 事件、实际 FFmpeg argv、timing/video/publish/run.complete，以及失败
+  时的 node.error/run.error（有界 Converter/FFmpeg stderr 尾部与保留的 scratch 路径）。
+  不写逐帧 metadata/矩阵/像素，不写去闪 PASS/FAIL/REVIEW/质量评分；stdout/stderr
+  同样只保留操作信息与错误。
+- Scratch：每次运行在视频同目录创建 `.rawtl-<stem>-<pid>-<nonce>/`，包含转换缓存、
+  子进程 transcript 与编码 partial；成功后一次 rename 发布并整体删除，失败/停止时
+  保留并在单条 `run.error` 中给出路径。配置错误在创建任何目录/日志/scratch 之前
+  拒绝；失败重试使用新 nonce，不复用旧缓存也不覆盖旧视频/日志。
+- 代码清理（SIMP-002）：删除 `pipeline/src/audit.rs`（独立成品审计全部实现，无
+  非产品调用者）、`pipeline/src/fallback.rs`（旧编排全局参考兜底）、
+  `pipeline/src/manifest.rs`、`pipeline/src/deflicker_run.rs`（报告/CSV/连续性报告
+  机器）以及 `record_audit_failure`/`audit_failure_summary`。`frame.rs` 的
+  `produce`/`produce_single` 删除；`produce_with_evs`/`stream_frames`/
+  `ProduceConfig`/`analyze_prepared`/`develop_prepared` 以 `cfg(test)` 保留，仅由
+  既有模块测试消费。移除 `EXIT_ENCODE`/`EXIT_GAIN_PROBE`/`EXIT_RENDER_VALIDATION`/
+  `EXIT_AUDIT`。连续性计算移到新的 `pipeline/src/continuity.rs`（仅 capture-time
+  gap，文件名跳变不产生边界）。`cargo check --all-targets` 零警告。
+- 新增：`pipeline/src/continuity.rs`、`pipeline/src/run_log.rs`、
+  `docs/node-graph-workflow.md`。更新：`pipeline/README.md`（产品表面、日志、scratch、
+  失败/重试、图、编码、颜色、退出码）、`native/dng-linear-frame/README.md`
+  （消费关系指向产品表面文档）、`docs/architecture-v2.6.md` 历史标识说明。
+- 测试迁移：`pipeline/tests/pipeline_cli.rs` 重写为视频+日志表面（43 项），覆盖
+  单视频单日志与 scratch 清理、拒绝覆盖与重试新鲜度、旧目录/质量旗标迁移错误、
+  容器扩展名匹配、节点顺序与 delete 事件、无质量/审计内容、失败帧/编码器/探针失败、
+  typed handoff 缺陷、白平衡两种模式、EV 计划/限制、degraded 测光与单帧、比例 fps、
+  颜色 profile 端到端、以及一段有前置条件保护的真实 Canon R7 CR3 三帧旅程
+  （素材/Converter/native 缺失时打印说明并跳过）。`encode_node.rs`（10 项）与
+  `graph_configuration.rs`（2 项）改为视频+日志断言；`stop_handoff.py` 改用
+  `timelapse.mov`/`timelapse.log` 与 1-based 节点帧号。
+- 检查（本机 macOS arm64，仓库根执行，PATH 前置 `/opt/homebrew/opt/ffmpeg-full/bin`）：
+  `cargo clean --manifest-path pipeline/Cargo.toml` 退出码 **0**；`cargo check
+  --all-targets` 退出码 0 且零 warning；`cargo test --manifest-path
+  pipeline/Cargo.toml` 退出码 **0**：187 lib + 58 bin（1 ignored）+ 3 canon_log3 +
+  10 encode_node + 2 graph_configuration + 43 pipeline_cli（含真实 CR3 旅程）+
+  1 stop_handoff = **304 passed, 0 failed**，另有 3 个 compile-fail doctest 通过；
+  `cargo build --release --manifest-path pipeline/Cargo.toml` 退出码 **0**。完整
+  stdout/stderr 与真实退出码见 `.agent-work/tmp/node-graph-product/cli-surface/`
+  下的 `final-full-suite.log`、`final-check.log`、`release-build.*`、`real-release-run.*` 及各专项 suite 日志。
+- 未覆盖：native 源码未改，未重跑 ctest；476 帧整批真实组合、独立成品审计与四边界
+  对照属于 Main 的最终候选验收，本条目未运行；Windows/Linux、其它 FFmpeg 版本、
+  磁盘写满/断电故障注入未测。本条目记录本地实现与检查证据，不代表独立评审或
+  Feature 验收；提交由 Main 负责。

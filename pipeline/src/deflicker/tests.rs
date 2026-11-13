@@ -1321,60 +1321,6 @@ mod contract_and_boundaries {
             .all(|v| v.is_nan()));
     }
     #[test]
-    fn report_contract_is_finite_and_complete() {
-        let mut e = estimate(&sequence(5));
-        e.frames[0].common_residual_ev = Some(f64::NAN);
-        e.frames[0].applied_ev = Some(2000.);
-        let names = vec!["frame.dng".into(); 5];
-        let times = vec![None; 5];
-        let mut r =
-            report::ExposureReport::from_exposure(&e, &Default::default(), &names, &times).unwrap();
-        r.gain_probe = Json::Float(f64::INFINITY);
-        let text = r.serialize();
-        assert!(!text.contains("NaN") && !text.contains("inf"));
-        let j = crate::json::parse(&text).unwrap();
-        for key in [
-            "run_status",
-            "config",
-            "frames",
-            "pairwise_estimation",
-            "scene_cuts",
-            "source_discontinuities",
-            "gain_probe",
-            "feedback_history",
-            "encoded_temporal_quality",
-            "status_counts",
-        ] {
-            assert!(j.get(key).is_some(), "{key}");
-        }
-        let f = &j.get("frames").unwrap().as_array().unwrap()[0];
-        for key in [
-            "index",
-            "filename",
-            "status",
-            "valid_tile_count",
-            "consensus_fraction",
-            "residual_mad_ev",
-            "common_residual_ev",
-            "cumulative_confirmed_step_ev",
-            "requested_ev",
-            "applied_ev",
-            "render_ev",
-            "gain",
-            "render_target_error_ev",
-            "analysis_highlight_increase_fraction",
-            "measured_level_ev",
-            "desired_level_ev",
-            "segment_id",
-            "warnings",
-            "capture_time",
-        ] {
-            assert!(f.get(key).is_some(), "{key}");
-        }
-        assert_eq!(f.get("common_residual_ev"), Some(&Json::Null));
-        assert_eq!(f.get("gain"), Some(&Json::Null));
-    }
-    #[test]
     fn malformed_inputs_return_errors_without_panics() {
         assert!(estimate_exposure(&[], &Default::default()).is_err());
         for c in [

@@ -762,6 +762,114 @@ pub fn read_json(path: &Path) -> rawtl_linear_video::json::Json {
         .unwrap_or_else(|err| panic!("invalid JSON {}: {err}", path.display()))
 }
 
+// ---------------------------------------------------------------------------
+// Product surface helpers: one video file and its sibling run log
+// ---------------------------------------------------------------------------
+
+pub const VIDEO_NAME: &str = "timelapse.mov";
+pub const VIDEO_MP4_NAME: &str = "timelapse.mp4";
+pub const VIDEO_MKV_NAME: &str = "timelapse.mkv";
+
+pub fn video_in(directory: &Path) -> PathBuf {
+    directory.join(VIDEO_NAME)
+}
+
+pub fn log_in(directory: &Path) -> PathBuf {
+    directory.join("timelapse.log")
+}
+
+pub fn read_log(directory: &Path) -> String {
+    let path = log_in(directory);
+    fs::read_to_string(&path).unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()))
+}
+
+/// Every log line whose `kind=` field equals `kind`.
+pub fn log_kind<'a>(log: &'a str, kind: &str) -> Vec<&'a str> {
+    let needle = format!("kind={kind}");
+    log.lines()
+        .filter(|line| line.split_whitespace().any(|token| token == needle))
+        .collect()
+}
+
+/// Read one `key=value` field from a log line; quoted values are unescaped at
+/// the caller's discretion (paths never contain the escape set in tests).
+pub fn log_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!(" {key}=");
+    let start = line.find(&needle)? + needle.len();
+    let rest = &line[start..];
+    if let Some(rest) = rest.strip_prefix('"') {
+        let mut escaped = false;
+        for (index, character) in rest.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if character == '\\' {
+                escaped = true;
+                continue;
+            }
+            if character == '"' {
+                return Some(&rest[..index]);
+            }
+        }
+        None
+    } else {
+        Some(rest.split_whitespace().next().unwrap_or(""))
+    }
+}
+
+/// The run-specific scratch directory recorded at run.start.
+pub fn scratch_from_log(log: &str) -> PathBuf {
+    let start = log_kind(log, "run.start");
+    let line = start.first().expect("run.start line");
+    PathBuf::from(log_field(line, "scratch").expect("scratch field"))
+}
+
+/// Per-frame applied EV in frame order, read from the develop events.
+pub fn develop_evs(log: &str) -> Vec<f64> {
+    let mut frames: Vec<(usize, f64)> = log_kind(log, "develop")
+        .iter()
+        .map(|line| {
+            let frame: usize = log_field(line, "frame")
+                .expect("develop frame")
+                .parse()
+                .expect("frame number");
+            let ev: f64 = log_field(line, "ev")
+                .expect("develop ev")
+                .parse()
+                .expect("ev value");
+            (frame, ev)
+        })
+        .collect();
+    frames.sort_by_key(|(frame, _)| *frame);
+    frames.into_iter().map(|(_, ev)| ev).collect()
+}
+
+/// Product-surface leftovers: only the named video and its log may remain.
+pub fn assert_only_video_and_log(
+    directory: &Path,
+    video_name: &str,
+    allowed_existing: &[&str],
+) {
+    let mut names: Vec<String> = fs::read_dir(directory)
+        .unwrap_or_else(|err| panic!("cannot read {}: {err}", directory.display()))
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    let log_name = Path::new(video_name)
+        .file_stem()
+        .map(|stem| format!("{}.log", stem.to_string_lossy()))
+        .expect("video file stem");
+    let mut expected = vec![log_name, video_name.to_string()];
+    expected.extend(allowed_existing.iter().map(|name| (*name).to_string()));
+    expected.sort();
+    assert_eq!(
+        names, expected,
+        "the deliverable directory must hold exactly the video, the log and pre-existing files"
+    );
+}
+
 pub fn frame_record(
     report: &rawtl_linear_video::json::Json,
     index: usize,

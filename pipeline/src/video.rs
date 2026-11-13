@@ -31,7 +31,7 @@ const SCENE_LINEAR_SPACE: &str = "ACEScg AP1/D60 scene-linear";
 #[cfg(test)]
 const SCENE_LINEAR_TRANSFER: &str = "linear";
 
-/// Explicit resize actually applied by the graph, for the manifest.
+/// Explicit resize actually applied by the graph, recorded in the run log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResizeRecord {
     pub source_width: u32,
@@ -558,7 +558,7 @@ pub fn preflight(
     ffmpeg: &Path,
     explicit_geometry: Option<(u32, u32)>,
     fps: Fps,
-    partial_dir: &Path,
+    scratch: &Path,
 ) -> Result<()> {
     if let Some((width, height)) = explicit_geometry {
         if let Err(message) = config.validate_geometry(width, height) {
@@ -579,7 +579,7 @@ pub fn preflight(
         }
     }
     let geometry = explicit_geometry.unwrap_or((32, 32));
-    let output = partial_dir.join(format!("preflight.{}", config.container.extension()));
+    let output = scratch.join(format!("preflight.{}", config.container.extension()));
     let _ = fs::remove_file(&output);
     let args = config.preflight_args(profile, geometry, &fps.arg(), &output);
     let captured = proc::run_capture(ffmpeg, &args, EXIT_PREVIEW)?;
@@ -782,17 +782,23 @@ fn signal_bytes(signal: &[u16]) -> std::borrow::Cow<'_, [u8]> {
 pub struct GraphEncoder {
     config: ResolvedConfig,
     frames: usize,
+    output_name: String,
     encoder: Option<StreamingEncoder>,
     output: Option<std::path::PathBuf>,
+    transcript: Option<std::path::PathBuf>,
+    command: Option<String>,
     pub active: proc::ActiveNative,
 }
 impl GraphEncoder {
-    pub fn new(config: ResolvedConfig, frames: usize) -> Self {
+    pub fn new(config: ResolvedConfig, frames: usize, output_name: &str) -> Self {
         Self {
             config,
             frames,
+            output_name: output_name.to_string(),
             encoder: None,
             output: None,
+            transcript: None,
+            command: None,
             active: Default::default(),
         }
     }
@@ -829,9 +835,7 @@ impl GraphEncoder {
             if let Err(message) = self.config.validate_geometry(info.width, info.height) {
                 return Err(Error::new(EXIT_USAGE_FOR_PREFLIGHT, message));
             }
-            let output = context
-                .partial_dir
-                .join(self.config.output_name());
+            let output = context.scratch.join(&self.output_name);
             let args = self.config.encoder_args(
                 options.preview_profile,
                 info.width,
@@ -840,11 +844,14 @@ impl GraphEncoder {
                 &options.fps.arg(),
                 &output,
             );
+            let transcript = context.scratch.join("transcripts/encode.log");
+            self.command = Some(proc::display_command(&options.ffmpeg, &args));
             self.output = Some(output);
+            self.transcript = Some(transcript.clone());
             self.encoder = Some(StreamingEncoder::spawn(
                 &options.ffmpeg,
                 &args,
-                &context.output.join("logs/encode.log"),
+                &transcript,
                 self.active.clone(),
             )?);
         }
@@ -885,8 +892,12 @@ impl GraphEncoder {
             return Err(Error::new(
                 EXIT_PREVIEW,
                 format!(
-                    "streaming encoder failed: {}",
-                    proc::exit_description(&status)
+                    "streaming encoder failed: {}; transcript {}: {}",
+                    proc::exit_description(&status),
+                    self.transcript
+                        .as_ref()
+                        .map_or_else(|| "unavailable".to_string(), |path| path.display().to_string()),
+                    self.transcript_tail()
                 ),
             ));
         }
@@ -896,7 +907,31 @@ impl GraphEncoder {
                 .ok_or_else(|| Error::new(EXIT_PREVIEW, "empty encoder input"))?,
             EXIT_PREVIEW,
             "streaming encoder produced no video",
-        )
+        )?;
+        Ok(())
+    }
+
+    /// The argv of the spawned encoder, recorded once in the run log.
+    pub fn command(&self) -> Option<&str> {
+        self.command.as_deref()
+    }
+
+    /// Bounded encoder transcript tail for the single run log when the encoder
+    /// is the failing node.
+    pub fn failure_detail(&self) -> String {
+        self.transcript_tail()
+    }
+
+    /// Bounded tail of the FFmpeg transcript, so the single run log carries the
+    /// necessary encoder error without a second log file.
+    fn transcript_tail(&self) -> String {
+        let Some(path) = &self.transcript else {
+            return String::new();
+        };
+        match fs::read_to_string(path) {
+            Ok(text) => proc::tail(&text, 1200),
+            Err(err) => format!("unreadable: {err}"),
+        }
     }
 }
 

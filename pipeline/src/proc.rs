@@ -270,7 +270,7 @@ pub fn check_stop() -> Result<()> {
     if STOP.load(std::sync::atomic::Ordering::SeqCst) {
         Err(Error::new(
             130,
-            "run cancelled; retained cache/partial paths are in the run logs",
+            "run cancelled; the run log names the retained scratch directory",
         ))
     } else {
         Ok(())
