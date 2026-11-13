@@ -737,12 +737,9 @@ fn confirmed_step_is_preserved_and_not_corrected_away() {
         "run",
         &["--step", "10:0.5", "--temporal-quality", "off"],
     );
-    // Legacy semantics for the estimator (a genuine level step is not part of
-    // the frozen target, so the shared-offset render check reports it as a
-    // target error) combined with the fail-open publication contract: the
-    // best round is published as COMPLETED_WITH_REVIEW with a recorded
-    // warning, never blocked. The estimator side must still preserve the
-    // declared step (pairwise intent).
+    // Confirmed steps now belong to the desired physical signal as well as
+    // the estimator. Correct execution preserves the step without inventing
+    // a render-target error or feedback correction.
     assert!(
         result.status.success(),
         "stdout:\n{}\nstderr:\n{}",
@@ -750,16 +747,13 @@ fn confirmed_step_is_preserved_and_not_corrected_away() {
         stderr(&result)
     );
     let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(
-        report.get("run_status").and_then(Json::as_str),
-        Some("COMPLETED_WITH_REVIEW")
-    );
+    assert_eq!(report.get("run_status").and_then(Json::as_str), Some("OK"));
     let warnings = report
         .get("warnings")
         .and_then(Json::as_array)
         .expect("warnings");
     assert!(
-        warnings.iter().any(|warning| warning
+        !warnings.iter().any(|warning| warning
             .as_str()
             .map(|text| text.starts_with("RENDER_TARGETS_NOT_REACHED"))
             .unwrap_or(false)),
@@ -822,7 +816,12 @@ fn ev_limits_clamp_to_limited_and_fail_the_target_check() {
         stderr(&result)
     );
     let report = read_json(&output.join("exposure_report.json"));
-    assert_eq!(report.get("run_status").and_then(Json::as_str), Some("OK"));
+    // Limited frames cannot be counted as covered merely because the few
+    // unconstrained frames meet their own targets.
+    assert_eq!(
+        report.get("run_status").and_then(Json::as_str),
+        Some("COMPLETED_WITH_REVIEW")
+    );
     let mut limited = 0;
     for index in 0..gains.len() {
         if frame_status(&report, index) == "LIMITED" {
@@ -840,6 +839,19 @@ fn ev_limits_clamp_to_limited_and_fail_the_target_check() {
         }
     }
     assert!(limited > 0, "expected LIMITED frames, report: {report:?}");
+    let history = report
+        .get("feedback_history")
+        .and_then(Json::as_array)
+        .unwrap();
+    let last = history.last().unwrap();
+    assert_eq!(
+        last.get("unobservable_frames")
+            .and_then(Json::as_array)
+            .unwrap()
+            .len(),
+        limited
+    );
+    assert_eq!(last.get("passed"), Some(&Json::Bool(false)));
     assert_eq!(
         report
             .get("gain_probe")
@@ -2575,9 +2587,18 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
                 "rev_defect=skipped-hsm",
                 "incomplete camera profile calibration",
             ),
-            ("rev_defect=skipped-fixed", "incomplete camera profile calibration"),
-            ("rev_defect=auto-tone", "incomplete camera profile calibration"),
-            ("rev_defect=double-scale", "incomplete camera profile calibration"),
+            (
+                "rev_defect=skipped-fixed",
+                "incomplete camera profile calibration",
+            ),
+            (
+                "rev_defect=auto-tone",
+                "incomplete camera profile calibration",
+            ),
+            (
+                "rev_defect=double-scale",
+                "incomplete camera profile calibration",
+            ),
             ("rev_defect=infinity", "nonfinite FP32"),
             ("short_pixels=1", "short record payload"),
             ("descriptor_geometry_mismatch=1", "descriptor geometry"),

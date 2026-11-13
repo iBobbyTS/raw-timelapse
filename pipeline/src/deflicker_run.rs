@@ -278,7 +278,7 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         .expect("exposure set")
         .frames
         .iter()
-        .filter(|frame| frame.applied_ev.is_none())
+        .filter(|frame| frame.applied_ev.is_none() || frame.status == fallback::STATUS)
         .count();
     let mut fallback_engaged = false;
     if unestimated > 0 {
@@ -304,14 +304,17 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         };
         let summary = {
             let exposure = state.exposure.as_mut().expect("exposure set");
-            fallback::fill_holes(&measurements, exposure, &boundaries, &fallback_config).map_err(
-                |err| {
-                    Error::new(
-                        EXIT_FRAME,
-                        format!("global-reference fallback failed: {err}"),
-                    )
-                },
-            )?
+            let summary = if exposure.frames.iter().any(|f| f.applied_ev.is_none()) {
+                fallback::fill_holes(&measurements, exposure, &boundaries, &fallback_config)
+            } else {
+                fallback::describe_completed_holds(&measurements, exposure)
+            };
+            summary.map_err(|err| {
+                Error::new(
+                    EXIT_FRAME,
+                    format!("global-reference fallback failed: {err}"),
+                )
+            })?
         };
         println!(
             "review policy: global-reference fallback filled {} of {} unestimated \
@@ -320,7 +323,7 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         );
         state.warnings.push(format!(
             "GLOBAL_REFERENCE_FALLBACK: {} of {} frame(s) had no reliable pairwise \
-             estimate and were corrected from the whole-frame reference curve",
+             estimate; finite conservative gains were selected from local references",
             summary.filled, unestimated
         ));
         if summary.rendered_at_zero_ev > 0 {
@@ -582,14 +585,21 @@ fn run_deflicker(context: &RunContext<'_>, state: &mut RunState) -> Result<()> {
         }
     }
 
-    let evs: Vec<f64> = state
-        .exposure
-        .as_ref()
-        .expect("exposure set")
-        .frames
-        .iter()
-        .map(|f| f.applied_ev.unwrap_or(0.0))
-        .collect();
+    {
+        let exposure = state.exposure.as_mut().expect("exposure set");
+        exposure.plan_quality = rawtl_linear_video::deflicker::validation::evaluate_plan(
+            &measurements,
+            exposure,
+            &engine_config,
+        )
+        .map_err(|err| Error::new(EXIT_FRAME, format!("invalid exposure plan evidence: {err}")))?;
+    }
+    let final_plan = rawtl_linear_video::deflicker::estimation::ExposurePlan::from_result(
+        &measurements,
+        state.exposure.as_ref().expect("exposure set"),
+    )
+    .map_err(|err| Error::new(EXIT_FRAME, format!("invalid exposure plan: {err}")))?;
+    let evs: Vec<f64> = final_plan.entries().iter().map(|entry| entry.ev).collect();
     let (final_sequence, mut stage) = encode_and_validate(context, &evs)?;
     if final_sequence.width != best.sequence.width || final_sequence.height != best.sequence.height
     {
@@ -729,15 +739,18 @@ fn apply_pass(
         .clone()
         .ok_or_else(|| Error::new(EXIT_FRAME, "baseline measurements are missing"))?;
     let exposure = state.exposure.as_mut().expect("exposure set");
-    let evs: Vec<f64> = exposure
-        .frames
-        .iter_mut()
-        .map(|frame| {
-            let ev = frame.applied_ev.unwrap_or(0.0);
-            frame.render_ev = Some(ev);
-            ev
-        })
-        .collect();
+    let plan =
+        rawtl_linear_video::deflicker::estimation::ExposurePlan::from_result(&baseline, exposure)
+            .map_err(|err| {
+            Error::new(
+                EXIT_FRAME,
+                format!("invalid application exposure plan: {err}"),
+            )
+        })?;
+    let evs: Vec<f64> = plan.entries().iter().map(|entry| entry.ev).collect();
+    for (frame, entry) in exposure.frames.iter_mut().zip(plan.entries()) {
+        frame.render_ev = Some(entry.ev);
+    }
     let config = ProduceConfig {
         logs_dir: &logs_dir,
         exposure_ev: None,
@@ -1086,6 +1099,7 @@ impl RunState {
         let frames: Vec<FrameEstimate> = (0..n)
             .map(|index| FrameEstimate {
                 index,
+                source_sha256: String::new(),
                 status: "DISABLED".to_string(),
                 common_residual_ev: None,
                 requested_ev: Some(0.0),
@@ -1115,6 +1129,7 @@ impl RunState {
             scene_cuts: vec![],
             time_gaps: vec![],
             pairwise_summary: Json::Null,
+            plan_quality: Default::default(),
         });
         self.continuity = Json::obj(vec![
             ("coverage", Json::Str("not_executed".into())),
@@ -2003,6 +2018,7 @@ mod tests {
     fn curve_csv_header_matches_legacy_fields() {
         let frames = vec![ReportFrame {
             estimate: FrameEstimate {
+                source_sha256: String::new(),
                 index: 0,
                 status: "OK".into(),
                 common_residual_ev: None,

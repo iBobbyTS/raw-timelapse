@@ -1,9 +1,11 @@
 use super::{
-    graph::solve_exposure_graph,
+    graph::{solve_exposure_graph, GraphEdge, GraphResult},
     measurement::compatible,
-    pairwise::{build_edges, persistent_background, DEFAULT_LAGS},
+    pairwise::{
+        build_edges, local_common_change, persistent_background, reference_tile_valid, DEFAULT_LAGS,
+    },
     stats::{finite, interpolate, mad, median, need},
-    trends::huber_whittaker,
+    trends::{huber_whittaker, lambda_for_period, solve_weighted},
     FrameMeasurement, Result,
 };
 use crate::json::Json;
@@ -45,6 +47,7 @@ impl Default for ExposureConfig {
 #[derive(Debug, Clone)]
 pub struct FrameEstimate {
     pub index: usize,
+    pub source_sha256: String,
     pub status: String,
     pub common_residual_ev: Option<f64>,
     pub requested_ev: Option<f64>,
@@ -86,6 +89,50 @@ pub struct ExposureResult {
     pub scene_cuts: Vec<SceneCut>,
     pub time_gaps: Vec<usize>,
     pub pairwise_summary: Json,
+    pub plan_quality: super::validation::PlanQuality,
+}
+/// A frozen, complete handoff for render/graph consumers. Fields are private;
+/// callers receive an ordered slice and cannot mutate the published gains.
+#[derive(Debug, Clone)]
+pub struct ExposurePlan {
+    entries: Vec<PlannedExposure>,
+}
+#[derive(Debug, Clone)]
+pub struct PlannedExposure {
+    pub frame_id: usize,
+    pub source_sha256: String,
+    pub ev: f64,
+}
+impl ExposurePlan {
+    pub fn from_result(ms: &[FrameMeasurement], result: &ExposureResult) -> Result<Self> {
+        if result.frames.len() != ms.len() {
+            return Err("exposure plan frame count mismatch".into());
+        }
+        let entries = result
+            .frames
+            .iter()
+            .zip(ms)
+            .enumerate()
+            .map(|(id, (f, m))| {
+                if f.index != id || f.source_sha256 != m.source_sha256 {
+                    return Err("exposure plan frame identity mismatch".into());
+                }
+                let ev = f
+                    .applied_ev
+                    .filter(|v| v.is_finite() && v.exp2().is_finite() && v.exp2() > 0.)
+                    .ok_or("exposure plan requires a finite representable gain")?;
+                Ok(PlannedExposure {
+                    frame_id: id,
+                    source_sha256: m.source_sha256.clone(),
+                    ev,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { entries })
+    }
+    pub fn entries(&self) -> &[PlannedExposure] {
+        &self.entries
+    }
 }
 pub fn step_vector(n: usize, steps: &[ExposureStep]) -> Result<Vec<f64>> {
     let mut s = vec![0.; n];
@@ -165,6 +212,7 @@ struct State {
     counts: Vec<usize>,
     reliable: Vec<bool>,
     interpolated: Vec<bool>,
+    trend_nonconverged: Vec<bool>,
     labels: Vec<String>,
     measured: Vec<f64>,
     desired: Vec<f64>,
@@ -179,34 +227,90 @@ impl State {
             counts: vec![0; n],
             reliable: vec![false; n],
             interpolated: vec![false; n],
+            trend_nonconverged: vec![false; n],
             labels: vec!["REVIEW_REQUIRED".into(); n],
             measured: vec![f64::NAN; n],
             desired: vec![f64::NAN; n],
         }
     }
 }
-fn row_level(m: &FrameMeasurement) -> f64 {
-    median(
-        &m.log_luminance
-            .iter()
-            .zip(&m.valid)
-            .filter(|(_, q)| **q)
-            .map(|(x, _)| *x)
-            .collect::<Vec<_>>(),
-    )
-}
-fn edge_const(comp: &[usize], start: bool, ms: &[FrameMeasurement], b: &[f64]) -> f64 {
-    let member: Vec<_> = comp.iter().copied().filter(|&t| b[t].is_finite()).collect();
-    let sel = if start {
-        &member[..member.len().min(3)]
-    } else {
-        &member[member.len().saturating_sub(3)..]
-    };
-    median(
-        &sel.iter()
-            .map(|&t| row_level(&ms[t]) - b[t])
-            .collect::<Vec<_>>(),
-    )
+/// Place every primary component in one temporal reference. Only offsets are
+/// solved: primary within-component differences are preserved. Adjacent frame
+/// constraints, rather than component iteration order or endpoint windows,
+/// also handle interleaved components and singleton frames.
+pub(super) fn aligned_brightness(
+    ms: &[FrameMeasurement],
+    graph: &GraphResult,
+    uniform: bool,
+    train: &[bool],
+) -> Result<(Vec<f64>, usize)> {
+    let n = ms.len();
+    let base: Vec<_> = graph
+        .brightness
+        .iter()
+        .map(|b| if b.is_finite() { *b } else { 0. })
+        .collect();
+    if graph.components.len() == 1 {
+        return Ok((base, 0));
+    }
+    let mut bridges = vec![];
+    let mut conservative = 0;
+    for t in 1..n {
+        let i = graph.component[t - 1] as usize;
+        let j = graph.component[t] as usize;
+        if i == j {
+            continue;
+        }
+        let local = local_common_change(&ms[t - 1], &ms[t], Some(train))?;
+        let observed = local.delta_ev;
+        // Without coherent shared tiles, smooth holds the correction across
+        // the boundary. Uniform can use the declared whole-frame level intent
+        // when both frames have enough in-ROI measurements. Neither is trusted.
+        let delta = observed.unwrap_or_else(|| {
+            conservative += 1;
+            if uniform {
+                let level = |m: &FrameMeasurement| {
+                    median(
+                        &(0..train.len())
+                            .filter(|&k| train[k] && reference_tile_valid(m, k))
+                            .map(|k| m.log_luminance[k])
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                let enough = |m: &FrameMeasurement| {
+                    (0..train.len())
+                        .filter(|&k| train[k] && reference_tile_valid(m, k))
+                        .count()
+                        >= need(train.len())
+                };
+                if enough(&ms[t - 1]) && enough(&ms[t]) {
+                    return finite(level(&ms[t]) - level(&ms[t - 1])).unwrap_or(0.);
+                }
+            }
+            0.
+        });
+        bridges.push(GraphEdge {
+            i,
+            j,
+            delta_ev: delta - base[t] + base[t - 1],
+            // Observable local evidence wins over an explicit fallback assumption.
+            weight: if observed.is_some() { 1. } else { 0.0001 },
+            support: local.support,
+            consensus_fraction: local.consensus_fraction,
+            spatial_mad_ev: local.spatial_mad_ev.unwrap_or(f64::INFINITY),
+            quadrants: local.quadrants,
+            lag: 1,
+            rejects: Default::default(),
+        });
+    }
+    let offsets = solve_exposure_graph(graph.components.len(), &bridges)?;
+    if !offsets.converged {
+        return Ok((vec![0.; n], bridges.len()));
+    }
+    let placed = (0..n)
+        .map(|t| base[t] + offsets.brightness[graph.component[t] as usize])
+        .collect();
+    Ok((placed, conservative))
 }
 fn pairwise_path(
     ms: &[FrameMeasurement],
@@ -226,142 +330,136 @@ fn pairwise_path(
     }
     let (edges, stats) = build_edges(ms, &[0], Some(&train), &DEFAULT_LAGS)?;
     let graph = solve_exposure_graph(n, &edges)?;
-    let b = &graph.brightness;
-    let persistent = persistent_background(ms, b)?;
-    let mut bh = b.clone();
-    let mut anchors = vec![];
-    if graph.components.len() > 1 {
-        let mut prev: Option<f64> = None;
-        for comp in &graph.components {
-            let start = edge_const(comp, true, ms, b);
-            if let Some(p) = prev.filter(|v| v.is_finite()) {
-                if start.is_finite() {
-                    let shift = start - p;
-                    for &t in comp {
-                        bh[t] += shift;
-                    }
-                    anchors.push(Json::obj(vec![
-                        ("boundary", Json::Int(comp[0] as i64)),
-                        ("local_const_before", Json::Float(p)),
-                        ("local_const_after", Json::Float(start)),
-                        ("applied_shift_ev", Json::Float(-shift)),
-                    ]));
-                } else {
-                    anchors.push(Json::obj(vec![("boundary",Json::Int(comp[0] as i64)),("note",Json::Str("unverifiable island interrupts level chaining; the following component keeps its graph-gauge placement".into()))]));
-                }
-            }
-            prev = Some(edge_const(comp, false, ms, b));
-        }
-    }
-    for (t, m) in ms.iter().enumerate() {
-        st.counts[t] = (0..k).filter(|&i| m.valid[i] && persistent[i]).count();
-    }
-    let mut requested = vec![f64::NAN; n];
     let uniform = cfg.brightness == "uniform";
-    let target = median(&bh);
-    if uniform {
-        let finite_all: Vec<_> = (0..n).filter(|&t| bh[t].is_finite()).collect();
-        for &t in &finite_all {
-            st.reliable[t] = true;
-            for i in 0..k {
-                st.consensus[t][i] = ms[t].valid[i] && persistent[i];
-            }
-            st.residual[t] = bh[t] - target;
-            requested[t] = cfg.strength * (target - bh[t]);
-            st.labels[t] = "UNIFORM".into();
-            st.measured[t] = bh[t];
-            st.desired[t] = target;
+    let (bh, conservative) = aligned_brightness(ms, &graph, uniform, &train)?;
+    // Gauge placement must precede persistence. A genuinely nonpersistent
+    // sequence remains untrusted; local evidence still gives a usable plan.
+    let persistent = persistent_background(ms, &bh)?;
+    let badj: Vec<_> = bh.iter().zip(s).map(|(b, s)| b - s).collect();
+    let valid: Vec<_> = ms
+        .iter()
+        .map(|m| {
+            (0..k)
+                .filter(|&i| train[i] && reference_tile_valid(m, i))
+                .count()
+                >= need(k)
+        })
+        .collect();
+    let mut trend = badj.clone();
+    if !uniform {
+        // Fit across locally connected evidence, retaining real frame spacing.
+        // A spatial scene change without a shared reference does not authorize
+        // smoothing two unrelated baselines into an exposure ramp.
+        let mut connectivity = edges.clone();
+        for edge in &mut connectivity {
+            edge.delta_ev = 0.;
+            edge.weight = 1.;
         }
-        if target.is_finite() {
-            let global = median(
-                &finite_all
-                    .iter()
-                    .map(|&t| row_level(&ms[t]) - bh[t])
-                    .collect::<Vec<_>>(),
-            );
-            if global.is_finite() {
-                for comp in &graph.components {
-                    if comp.len() != 1 {
-                        continue;
-                    }
-                    let t = comp[0];
-                    if bh[t].is_finite() || !ms[t].valid.iter().any(|q| *q) {
-                        continue;
-                    }
-                    let level = row_level(&ms[t]) - global;
-                    if !level.is_finite() {
-                        continue;
-                    }
-                    requested[t] = cfg.strength * (target - level);
-                    st.interpolated[t] = true;
-                    st.labels[t] = "ABSOLUTE_LEVEL".into();
-                    st.consensus[t] = ms[t].valid.clone();
-                    st.measured[t] = level;
-                    st.desired[t] = target;
-                }
+        for t in 1..n {
+            if graph.component[t - 1] != graph.component[t]
+                && local_common_change(&ms[t - 1], &ms[t], Some(&train))?
+                    .delta_ev
+                    .is_some()
+            {
+                connectivity.push(GraphEdge {
+                    i: t - 1,
+                    j: t,
+                    delta_ev: 0.,
+                    weight: 1.,
+                    support: 0,
+                    consensus_fraction: 0.,
+                    spatial_mad_ev: 0.,
+                    quadrants: 0,
+                    lag: 1,
+                    rejects: Default::default(),
+                });
             }
         }
-    } else {
-        let badj: Vec<_> = b.iter().zip(s).map(|(b, s)| b - s).collect();
-        let mut trend = vec![f64::NAN; n];
-        for comp in &graph.components {
-            if comp.len() < 8 {
+        for group in solve_exposure_graph(n, &connectivity)?.components {
+            if group.iter().filter(|&&t| valid[t]).count() < 8 {
                 continue;
             }
-            let vals: Vec<_> = comp.iter().map(|&t| badj[t]).collect();
-            let fit = huber_whittaker(
-                &vals,
-                &vals.iter().map(|v| v.is_finite()).collect::<Vec<_>>(),
-                cfg.period,
-            )?;
-            if fit.converged {
-                for (&t, &v) in comp.iter().zip(&fit.trend) {
-                    trend[t] = v;
-                }
+            let start = group[0];
+            let end = group[group.len() - 1] + 1;
+            let mut observed = vec![false; end - start];
+            for &t in &group {
+                observed[t - start] = valid[t];
             }
-        }
-        for t in 0..n {
-            if badj[t].is_finite() && trend[t].is_finite() {
-                st.reliable[t] = true;
-                for i in 0..k {
-                    st.consensus[t][i] = ms[t].valid[i] && persistent[i];
-                }
-                st.residual[t] = badj[t] - trend[t];
-                requested[t] = cfg.strength * (trend[t] - badj[t]);
-                st.labels[t] = "OK".into();
-                st.measured[t] = badj[t];
-                st.desired[t] = trend[t];
-            }
-        }
-        for comp in &graph.components {
-            let anchor = -median(&comp.iter().map(|&t| requested[t]).collect::<Vec<_>>());
-            if anchor.is_finite() {
-                for &t in comp {
-                    if requested[t].is_finite() {
-                        requested[t] += anchor;
-                    }
-                }
+            let fit = huber_whittaker(&badj[start..end], &observed, cfg.period)?;
+            // Saturated Huber weights can exhaust the fixed iteration budget.
+            // A single weighted Whittaker solve is the bounded conservative
+            // alternative, not another RAW pass or an unbounded IRLS retry.
+            let selected = if fit.converged {
+                fit.trend
+            } else {
+                solve_weighted(
+                    &badj[start..end],
+                    &observed
+                        .iter()
+                        .map(|v| if *v { 1. } else { 0. })
+                        .collect::<Vec<_>>(),
+                    lambda_for_period(cfg.period.min(end - start))?,
+                )?
+            };
+            for &t in &group {
+                trend[t] = selected[t - start];
+                st.trend_nonconverged[t] = !fit.converged;
             }
         }
     }
-    let good: Vec<_> = (0..n).filter(|&t| requested[t].is_finite()).collect();
-    for ab in good.windows(2) {
-        let (a, b) = (ab[0], ab[1]);
-        let missing = b - a - 1;
-        if missing >= 1
-            && missing <= if uniform { 3 } else { 7 }
-            && (a + 1..b).all(|t| ms[t].valid.iter().filter(|q| **q).count() >= need(k))
-        {
-            for t in a + 1..b {
-                requested[t] = interpolate(t, a, b, requested[a], requested[b]);
-                st.interpolated[t] = true;
-                st.labels[t] = "INTERPOLATED_ESTIMATE".into();
-            }
+    let target = median(
+        &bh.iter()
+            .zip(&valid)
+            .filter(|(_, q)| **q)
+            .map(|(b, _)| *b)
+            .collect::<Vec<_>>(),
+    );
+    let mut requested = vec![0.; n];
+    for t in 0..n {
+        st.counts[t] = (0..k)
+            .filter(|&i| train[i] && ms[t].valid[i] && persistent[i])
+            .count();
+        st.consensus[t] = (0..k)
+            .map(|i| train[i] && ms[t].valid[i] && persistent[i])
+            .collect();
+        st.reliable[t] = valid[t]
+            && st.counts[t] >= need(k)
+            && graph.brightness[t].is_finite()
+            && graph.converged
+            && !st.trend_nonconverged[t];
+        let desired = if uniform { target } else { trend[t] + s[t] };
+        st.measured[t] = bh[t];
+        st.desired[t] = desired;
+        st.residual[t] = bh[t] - desired;
+        requested[t] = finite(cfg.strength * (desired - bh[t])).unwrap_or(0.);
+        // Render feedback must target the requested strength, not silently
+        // drive a deliberately partial correction toward full strength.
+        if cfg.strength != 1. {
+            st.desired[t] = bh[t] + requested[t];
+        }
+        st.labels[t] = if !valid[t] {
+            "GLOBAL_REFERENCE"
+        } else if !graph.brightness[t].is_finite() {
+            "LOCAL_REFERENCE"
+        } else if uniform {
+            "UNIFORM"
+        } else {
+            "OK"
+        }
+        .into();
+        st.interpolated[t] = !valid[t] || !graph.brightness[t].is_finite();
+    }
+    // One sequence-wide gauge, never independent per-component re-anchoring.
+    if !uniform {
+        let anchor = median(&requested);
+        for t in 0..n {
+            requested[t] -= anchor;
+            st.desired[t] -= anchor;
         }
     }
     let mut summary=Json::obj(vec![
-        ("target_provenance",Json::obj(vec![("intent",Json::Str(cfg.brightness.clone())),("reference_scope",Json::Str(if uniform{"global"}else{"trend"}.into())),("defined_before_iteration",Json::Bool(true)),("measured",Json::Str(if uniform{"graph brightness b on persistent matched background"}else{"b minus confirmed steps"}.into())),("desired",Json::Str(if uniform{"constant level (global median of the stitched graph brightness)".into()}else{format!("Huber-Whittaker trend, period={} (lambda=1/(16 sin(pi/P)^4))",cfg.period)}))])),
-        ("cross_boundary_anchors",Json::obj(vec![("method",Json::Str("whole-frame all-valid-tile median level const across the boundary (owner whole-sequence intent: perceived overall brightness stays continuous); explicit assumption, not evidence".into())),("entries",Json::Array(anchors))])),
+        ("target_provenance",Json::obj(vec![("intent",Json::Str(cfg.brightness.clone())),("reference_scope",Json::Str(if uniform{"global"}else{"trend"}.into())),("defined_before_iteration",Json::Bool(true)),("measured",Json::Str(if uniform{"graph brightness in a shared local temporal reference"}else{"b minus confirmed steps"}.into())),("desired",Json::Str(if uniform{"constant level (global median of the stitched graph brightness)".into()}else{format!("Huber-Whittaker trend, period={} (lambda=1/(16 sin(pi/P)^4))",cfg.period)}))])),
+        ("cross_boundary_anchors",Json::obj(vec![("method",Json::Str("joint component offsets from adjacent shared-tile changes; low-weight explicit continuity fallback".into())),("conservative_pairs",Json::Int(conservative as i64))])),
         ("edges",Json::Int(edges.len() as i64)),("candidate_edges",Json::Int(stats.candidate_edges as i64)),("rejected_edges",Json::Int(stats.rejected_edges as i64)),
         ("edges_by_lag",Json::Object(stats.by_lag.iter().map(|(l,(a,b))|(l.to_string(),Json::obj(vec![("kept",Json::Int(*a as i64)),("rejected",Json::Int(*b as i64))]))).collect())),
         ("edge_reject_reasons",Json::Object(stats.reject_reasons.iter().map(|(k,v)|(k.clone(),Json::Int(*v as i64))).collect())),
@@ -532,9 +630,15 @@ pub fn estimate_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Resul
         }
     }
     let accepted: Vec<_> = (0..n)
-        .map(|t| st.reliable[t] || st.interpolated[t])
+        .map(|t| {
+            st.reliable[t]
+                || st.interpolated[t]
+                || pairwise_requested
+                    .as_ref()
+                    .is_some_and(|r| r[t].is_finite())
+        })
         .collect();
-    let requested = if let Some(r) = pairwise_requested {
+    let mut requested = if let Some(r) = pairwise_requested {
         r
     } else {
         let raw: Vec<_> = (0..n)
@@ -561,6 +665,23 @@ pub fn estimate_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Resul
         };
         raw.iter().map(|v| v + anchor).collect()
     };
+    let known: Vec<_> = (0..n).filter(|&t| requested[t].is_finite()).collect();
+    for t in 0..n {
+        if !requested[t].is_finite() {
+            let right = known.partition_point(|&i| i < t);
+            requested[t] = match (
+                right.checked_sub(1).map(|p| known[p]),
+                known.get(right).copied(),
+            ) {
+                (Some(a), Some(b)) => interpolate(t, a, b, requested[a], requested[b]),
+                (Some(a), None) => requested[a],
+                (None, Some(b)) => requested[b],
+                _ => 0.,
+            };
+            st.labels[t] = "GLOBAL_REFERENCE".into();
+            st.interpolated[t] = true;
+        }
+    }
     let mut frozen = vec![vec![f64::NAN; k]; n];
     let mut frames = vec![];
     for t in 0..n {
@@ -568,6 +689,12 @@ pub fn estimate_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Resul
         let applied = val.map(|v| v.clamp(low, high));
         let mut status = st.labels[t].clone();
         let mut warnings = vec![];
+        if st.trend_nonconverged[t] {
+            warnings.push("TREND_REFERENCE_NONCONVERGED".into());
+        }
+        if cfg.estimator == "pairwise" && cfg.strength != 0. && st.counts[t] < need(k) {
+            warnings.push("LOCAL_REFERENCE_NOT_PERSISTENT".into());
+        }
         if cfg.brightness == "smooth"
             && cfg.strength != 0.
             && n < cfg.period.saturating_mul(2)
@@ -581,7 +708,7 @@ pub fn estimate_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Resul
         if applied.is_some() && val != applied {
             status = "LIMITED".into();
             warnings.push("EXPOSURE_LIMITED".into());
-        } else if !accepted[t] {
+        } else if !accepted[t] && !st.interpolated[t] {
             status = "REVIEW_REQUIRED".into();
         }
         if st.interpolated[t] {
@@ -603,6 +730,7 @@ pub fn estimate_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Resul
         }
         frames.push(FrameEstimate {
             index: t,
+            source_sha256: ms[t].source_sha256.clone(),
             status,
             common_residual_ev: finite(st.residual[t]),
             requested_ev: val,
@@ -632,7 +760,7 @@ pub fn estimate_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Resul
         .collect();
     gaps.sort_unstable();
     gaps.dedup();
-    Ok(ExposureResult {
+    let mut result = ExposureResult {
         frames,
         tile_log_luminance: x,
         tile_valid: q,
@@ -644,5 +772,9 @@ pub fn estimate_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Resul
         scene_cuts: cuts,
         time_gaps: gaps,
         pairwise_summary: summary,
-    })
+        plan_quality: Default::default(),
+    };
+    result.plan_quality = super::validation::evaluate_plan(ms, &result, cfg)?;
+    ExposurePlan::from_result(ms, &result)?;
+    Ok(result)
 }

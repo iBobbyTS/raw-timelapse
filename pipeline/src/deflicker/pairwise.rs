@@ -233,3 +233,70 @@ pub fn persistent_background_with(
     }
     Ok(out)
 }
+
+pub(super) fn reference_tile_valid(m: &FrameMeasurement, i: usize) -> bool {
+    m.valid[i] && m.saturation_fraction[i] < 0.01 && m.log_luminance[i] > 0.002_f64.log2()
+}
+
+/// Local shared-tile evidence for component placement and independent plan
+/// assessment. This deliberately measures luminance change, not exposure cause:
+/// spatial coherence is required, but fine structure/chroma need not remain
+/// fixed over the entire sequence. It never establishes persistent background.
+#[derive(Debug, Clone)]
+pub struct LocalCommonChange {
+    pub delta_ev: Option<f64>,
+    pub support: usize,
+    pub consensus_fraction: f64,
+    pub spatial_mad_ev: Option<f64>,
+    pub quadrants: usize,
+}
+pub fn local_common_change(
+    a: &FrameMeasurement,
+    b: &FrameMeasurement,
+    train: Option<&[bool]>,
+) -> Result<LocalCommonChange> {
+    a.validate()?;
+    b.validate()?;
+    if a.centers != b.centers || a.grid_nx != b.grid_nx || a.grid_ny != b.grid_ny {
+        return Err("local reference shape mismatch".into());
+    }
+    let k = a.valid.len();
+    if train.is_some_and(|q| q.len() != k) {
+        return Err("local reference mask shape".into());
+    }
+    let ids: Vec<_> = (0..k)
+        .filter(|&i| {
+            reference_tile_valid(a, i) && reference_tile_valid(b, i) && train.is_none_or(|q| q[i])
+        })
+        .collect();
+    let d: Vec<_> = ids
+        .iter()
+        .map(|&i| b.log_luminance[i] - a.log_luminance[i])
+        .collect();
+    let center = median(&d);
+    let spread = mad(&d, center);
+    let inliers: Vec<_> = ids
+        .iter()
+        .zip(&d)
+        .filter(|(_, d)| (**d - center).abs() <= 0.06)
+        .map(|(i, _)| *i)
+        .collect();
+    let fraction = if ids.is_empty() {
+        0.
+    } else {
+        inliers.len() as f64 / ids.len() as f64
+    };
+    let quadrants = quadrants(inliers.into_iter(), a.grid_nx, a.grid_ny);
+    Ok(LocalCommonChange {
+        delta_ev: (ids.len() >= 24.max(k.div_ceil(4))
+            && fraction >= 0.6
+            && spread <= 0.06
+            && quadrants >= 3)
+            .then_some(center)
+            .filter(|v| v.is_finite()),
+        support: ids.len(),
+        consensus_fraction: fraction,
+        spatial_mad_ev: spread.is_finite().then_some(spread),
+        quadrants,
+    })
+}

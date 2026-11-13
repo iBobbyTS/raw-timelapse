@@ -503,7 +503,11 @@ mod test_scene_cut_segmentation {
         let mut c = cfg("smooth", "legacy");
         c.scene_cut_median_ev = 1e9;
         let e = estimate_exposure(&frames(&x), &c).unwrap();
-        assert!(e.frames.iter().any(|f| f.applied_ev.is_none()));
+        assert!(e.frames.iter().any(|f| !e.trusted_indices[f.index]));
+        assert!(e
+            .frames
+            .iter()
+            .all(|f| f.applied_ev.is_some_and(f64::is_finite)));
         assert!(e.scene_cuts.is_empty());
     }
     #[test]
@@ -576,17 +580,17 @@ mod test_scene_cut_segmentation {
         assert!(range(&output_level(&x, &e)) < 0.05);
     }
     #[test]
-    fn test_uniform_levels_a_lone_frame_absolutely() {
+    fn test_uniform_places_a_lone_frame_in_the_local_reference() {
         let (mut x, _) = spliced(120, 120);
         for (i, v) in x[60].iter_mut().enumerate() {
             *v += 1. + 1.5 * i as f64 / K as f64;
         }
         let e = estimate_exposure(&frames(&x), &cfg("uniform", "pairwise")).unwrap();
-        assert_eq!(e.frames[60].status, "ABSOLUTE_LEVEL");
+        assert_eq!(e.frames[60].status, "LOCAL_REFERENCE");
         assert!(e.frames[60]
             .warnings
             .iter()
-            .any(|w| w == "LONE_FRAME_ABSOLUTE_LEVEL"));
+            .any(|w| w == "INTERPOLATED_NOT_VERIFIED"));
         assert!(e.frames.iter().all(|f| f.applied_ev.is_some()));
         assert!(range(&output_level(&x, &e)) < 0.05);
     }
@@ -613,15 +617,16 @@ mod test_scene_cut_segmentation {
             .collect();
         let e = estimate_exposure(&frames(&x), &cfg("uniform", "pairwise")).unwrap();
         assert!(e.frames.iter().all(|f| f.segment_id == 0));
-        assert!(!e
-            .pairwise_summary
-            .get("cross_boundary_anchors")
-            .unwrap()
-            .get("entries")
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(
+            e.pairwise_summary
+                .get("cross_boundary_anchors")
+                .unwrap()
+                .get("conservative_pairs")
+                .unwrap()
+                .as_u64()
+                .unwrap()
+                > 0
+        );
         let out = output_level(&x, &e);
         assert!((out[20] - out[19]).abs() < 0.05);
     }
@@ -649,14 +654,15 @@ mod test_scene_cut_segmentation {
 mod test_exposure_states {
     use super::*;
     #[test]
-    fn test_long_gap_and_edge_are_review() {
+    fn test_long_gap_and_edge_hold_unverified_finite_gains() {
         let mut s = sequence(90);
         for i in [0, 1, 20, 21, 22, 23, 24, 25, 26] {
             s[i].valid.fill(false);
         }
         let e = estimate(&s);
-        assert_eq!(e.frames[0].status, "REVIEW_REQUIRED");
-        assert!(e.frames[22].applied_ev.is_none());
+        assert_eq!(e.frames[0].status, "GLOBAL_REFERENCE");
+        assert!(e.frames[22].applied_ev.unwrap().is_finite());
+        assert!(!e.trusted_indices[0] && !e.trusted_indices[22]);
         assert!(e.frames[28].applied_ev.is_some());
     }
     #[test]
@@ -784,13 +790,14 @@ mod test_brightness_uniform {
             .all(|f| f.status == "DISABLED" && f.applied_ev == Some(0.)));
     }
     #[test]
-    fn test_uniform_unmeasurable_frame_still_review() {
+    fn test_uniform_unmeasurable_frame_keeps_a_finite_unverified_gain() {
         let mut ms = frames(&evolving(90, 45, 0.02));
         ms[40].valid.fill(false);
         ms[40].log_luminance.fill(f64::NAN);
         let e = estimate_exposure(&ms, &cfg("uniform", "pairwise")).unwrap();
-        assert_eq!(e.frames[40].status, "REVIEW_REQUIRED");
-        assert!(e.frames[40].applied_ev.is_none());
+        assert_eq!(e.frames[40].status, "GLOBAL_REFERENCE");
+        assert!(e.frames[40].applied_ev.unwrap().is_finite());
+        assert!(!e.trusted_indices[40]);
         assert_eq!(e.frames[41].status, "UNIFORM");
     }
     #[test]
@@ -833,6 +840,7 @@ fn validation_summary(
     p95: Option<f64>,
 ) -> ValidationSummary {
     ValidationSummary {
+        coverage: Coverage::default(),
         errors,
         median_abs_error_ev: med,
         p95_abs_error_ev: p95,
@@ -1470,16 +1478,15 @@ mod contract_and_boundaries {
                     ]);
                 }
                 let e = estimate_exposure(&ms, &cfg(intent, "pairwise")).unwrap();
-                if gap <= max_gap {
-                    assert!(e.frames[25..25 + gap]
-                        .iter()
-                        .all(|f| f.status == "INTERPOLATED_ESTIMATE"
-                            || intent == "uniform" && f.status == "ABSOLUTE_LEVEL"));
-                } else if intent == "smooth" {
-                    assert!(e.frames[25..25 + gap]
-                        .iter()
-                        .any(|f| f.applied_ev.is_none()));
-                }
+                assert!(e.frames[25..25 + gap]
+                    .iter()
+                    .all(|f| f.applied_ev.is_some_and(f64::is_finite)));
+                assert!(e.frames[25..25 + gap]
+                    .iter()
+                    .all(|f| !e.trusted_indices[f.index]));
+                assert!(e.frames[25..25 + gap]
+                    .iter()
+                    .all(|f| f.warnings.iter().any(|w| w == "INTERPOLATED_NOT_VERIFIED")));
             }
         }
         // Legacy interpolates <=3 even when no tile is valid, never edge gaps.
@@ -1490,11 +1497,15 @@ mod contract_and_boundaries {
                 f.valid.fill(false);
             }
             let e = estimate_exposure(&m, &cfg("smooth", "legacy")).unwrap();
-            assert_eq!(e.frames[0].status, "REVIEW_REQUIRED");
+            assert_eq!(e.frames[0].status, "GLOBAL_REFERENCE");
+            assert!(e
+                .frames
+                .iter()
+                .all(|f| f.applied_ev.is_some_and(f64::is_finite)));
             assert!(e.frames[25..25 + gap].iter().all(|f| if gap == 3 {
                 f.status == "INTERPOLATED_ESTIMATE"
             } else {
-                f.status == "REVIEW_REQUIRED"
+                f.status == "GLOBAL_REFERENCE"
             }));
         }
     }
@@ -1508,18 +1519,18 @@ mod contract_and_boundaries {
         ms[35].valid.fill(false);
         ms[35].log_luminance.fill(f64::NAN);
         let e = estimate_exposure(&ms, &cfg("uniform", "pairwise")).unwrap();
-        let entries = e
-            .pairwise_summary
-            .get("cross_boundary_anchors")
-            .unwrap()
-            .get("entries")
-            .unwrap()
-            .as_array()
-            .unwrap();
-        assert!(entries.iter().any(|v| v
-            .get("note")
-            .is_some_and(|v| v.as_str().unwrap().contains("interrupts"))));
-        assert!(e.frames[35].applied_ev.is_none());
+        assert!(
+            e.pairwise_summary
+                .get("cross_boundary_anchors")
+                .unwrap()
+                .get("conservative_pairs")
+                .unwrap()
+                .as_u64()
+                .unwrap()
+                >= 2
+        );
+        assert!(e.frames[35].applied_ev.unwrap().is_finite());
+        assert!(!e.trusted_indices[35]);
     }
     #[test]
     fn pair_gates_structure_color_saturation_and_quadrants() {
@@ -1632,7 +1643,9 @@ mod contract_and_boundaries {
         let mut d = d;
         let s = evaluate_render(&mut d, &sequence(5), 0).unwrap();
         assert!(
-            !s.passed && s.errors.iter().all(Option::is_none) && s.unobservable_frames.is_empty()
+            !s.passed
+                && s.errors.iter().all(Option::is_none)
+                && s.unobservable_frames.len() == d.frames.len()
         );
     }
     #[test]
@@ -1717,5 +1730,450 @@ mod audit_evidence_boundaries {
             audit_features(&[], 24, 18, &[]).unwrap().status,
             "UNOBSERVABLE"
         );
+    }
+}
+
+mod exposure_continuity {
+    use super::*;
+
+    fn disconnected_sequence(n: usize, slope: f64, step: f64) -> (Vec<FrameMeasurement>, Vec<f64>) {
+        let gain: Vec<_> = (0..n)
+            .map(|t| alt(t, 0.12) + [0., 0.7, -0.5, 0.2][(t / 40).min(3)])
+            .collect();
+        let ms = (0..n)
+            .map(|t| {
+                // No tile persists after removing exposure: equal/opposite texture
+                // drift preserves the common level but changes every tile >0.1 EV.
+                let row = (0..K)
+                    .map(|i| {
+                        -2. + gain[t]
+                            + slope * t as f64
+                            + if t >= 80 { step } else { 0. }
+                            + if i % 2 == 0 {
+                                0.004 * t as f64
+                            } else {
+                                -0.004 * t as f64
+                            }
+                    })
+                    .collect();
+                let mut m = measurement(row, true);
+                m.source_sha256 = format!("{t:064x}");
+                for c in m.log_channel_means.as_mut().unwrap() {
+                    c[0] += (t / 40) as f64 * 0.3;
+                }
+                if t == 80 {
+                    // A structurally incompatible singleton inside a known-gain sequence.
+                    for sample in m.log_pixel_samples.as_mut().unwrap() {
+                        for (i, v) in sample.iter_mut().enumerate() {
+                            *v += 0.2 * i as f64;
+                        }
+                    }
+                }
+                m
+            })
+            .collect();
+        (ms, gain)
+    }
+    fn corrected(ms: &[FrameMeasurement], e: &ExposureResult) -> Vec<FrameMeasurement> {
+        ms.iter()
+            .zip(&e.frames)
+            .map(|(m, e)| {
+                let mut m = m.clone();
+                for v in &mut m.log_luminance {
+                    *v += e.applied_ev.unwrap();
+                }
+                m
+            })
+            .collect()
+    }
+    #[test]
+    fn zero_persistent_disconnected_and_singleton_known_gains_have_no_seam() {
+        let (ms, gain) = disconnected_sequence(160, 0., 0.);
+        let e = estimate_exposure(&ms, &cfg("uniform", "pairwise")).unwrap();
+        assert_eq!(
+            e.pairwise_summary.get("persistent_tiles").unwrap().as_u64(),
+            Some(0)
+        );
+        assert!(
+            e.pairwise_summary
+                .get("components")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len()
+                >= 5
+        );
+        assert_eq!(e.frames[80].status, "LOCAL_REFERENCE");
+        let c = corrected(&ms, &e);
+        for t in 1..ms.len() {
+            let delta = local_common_change(&c[t - 1], &c[t], None)
+                .unwrap()
+                .delta_ev
+                .unwrap();
+            assert!(delta.abs() <= 0.02, "frame {t}: {delta}");
+        }
+        assert!(
+            range(
+                &gain
+                    .iter()
+                    .zip(evs(&e))
+                    .map(|(g, ev)| g + ev)
+                    .collect::<Vec<_>>()
+            ) < 1e-8
+        );
+        assert_eq!(
+            e.plan_quality.coverage,
+            Coverage {
+                eligible: 159,
+                evaluated: 159,
+                skipped: 0
+            }
+        );
+        assert!(e.plan_quality.common_jump_frames.is_empty());
+    }
+    #[test]
+    fn smooth_preserves_known_trend_and_confirmed_step_across_disconnected_gauges() {
+        let (mut ms, mut gain) = disconnected_sequence(160, 0.003, 0.7);
+        // Smooth distinguishes high-frequency flicker from a sustained physical
+        // change. Remove the uniform test's long camera-gain plateaus here;
+        // the explicit physical step and smooth trend remain in the input.
+        for (t, m) in ms.iter_mut().enumerate() {
+            let plateau = [0., 0.7, -0.5, 0.2][(t / 40).min(3)];
+            gain[t] -= plateau;
+            for v in &mut m.log_luminance {
+                *v -= plateau;
+            }
+            for sample in m.log_pixel_samples.as_mut().unwrap() {
+                for v in sample {
+                    *v -= plateau;
+                }
+            }
+            for channel in m.log_channel_means.as_mut().unwrap() {
+                for v in channel {
+                    *v -= plateau;
+                }
+            }
+        }
+        let mut config = cfg("smooth", "pairwise");
+        config.steps.push(ExposureStep {
+            start_frame: 80,
+            delta_ev: 0.7,
+        });
+        let e = estimate_exposure(&ms, &config).unwrap();
+        assert!(e.frames.iter().all(|f| f
+            .warnings
+            .iter()
+            .any(|w| w == "TREND_REFERENCE_NONCONVERGED")));
+        let c = corrected(&ms, &e);
+        for t in 1..ms.len() {
+            let delta = local_common_change(&c[t - 1], &c[t], None)
+                .unwrap()
+                .delta_ev
+                .unwrap();
+            let expected = 0.003 + if t == 80 { 0.7 } else { 0. };
+            assert!(
+                (delta - expected).abs() <= 0.02,
+                "frame {t}: {delta} vs {expected}"
+            );
+        }
+        // The known camera gains are removed; low-frequency physical evolution remains.
+        let out: Vec<_> = gain.iter().zip(evs(&e)).map(|(g, ev)| g + ev).collect();
+        assert!(range(&out) < 0.04);
+        assert!(e.plan_quality.common_jump_frames.is_empty());
+    }
+    #[test]
+    fn plan_is_complete_finite_ordered_and_bound_to_source_ids() {
+        let (mut ms, _) = disconnected_sequence(160, 0., 0.);
+        for t in (0..7).chain(50..70).chain(150..160) {
+            ms[t].valid.fill(false);
+        }
+        let e = estimate_exposure(&ms, &cfg("uniform", "pairwise")).unwrap();
+        let p = ExposurePlan::from_result(&ms, &e).unwrap();
+        assert_eq!(p.entries().len(), ms.len());
+        for (t, x) in p.entries().iter().enumerate() {
+            assert_eq!(x.frame_id, t);
+            assert_eq!(x.source_sha256, ms[t].source_sha256);
+            assert!(x.ev.is_finite());
+        }
+        let mut bad = e.clone();
+        bad.frames.swap(1, 2);
+        assert!(ExposurePlan::from_result(&ms, &bad).is_err());
+        bad = e.clone();
+        bad.frames[2].index = 1;
+        assert!(ExposurePlan::from_result(&ms, &bad).is_err());
+        bad = e.clone();
+        bad.frames.pop();
+        assert!(ExposurePlan::from_result(&ms, &bad).is_err());
+        bad = e.clone();
+        bad.frames[2].applied_ev = Some(f64::NAN);
+        assert!(ExposurePlan::from_result(&ms, &bad).is_err());
+        bad = e.clone();
+        bad.frames[2].source_sha256 = "other".into();
+        assert!(ExposurePlan::from_result(&ms, &bad).is_err());
+    }
+    #[test]
+    fn entirely_unobserved_sequence_uses_zero_without_claiming_coverage() {
+        for intent in ["smooth", "uniform"] {
+            let mut ms = sequence(30);
+            for m in &mut ms {
+                m.valid.fill(false);
+                m.log_luminance.fill(f64::NAN);
+            }
+            let mut e = estimate_exposure(&ms, &cfg(intent, "pairwise")).unwrap();
+            assert!(evs(&e).iter().all(|v| *v == 0.));
+            assert!(e.trusted_indices.iter().all(|v| !*v));
+            assert_eq!(
+                e.plan_quality.coverage,
+                Coverage {
+                    eligible: 29,
+                    evaluated: 0,
+                    skipped: 29
+                }
+            );
+            let s = evaluate_render(&mut e, &ms, 0).unwrap();
+            assert_eq!(
+                s.coverage,
+                Coverage {
+                    eligible: 30,
+                    evaluated: 0,
+                    skipped: 30
+                }
+            );
+            assert_eq!(s.unobservable_frames.len(), 30);
+            assert!(s.median_abs_error_ev.is_none() && !s.passed);
+        }
+        let ms: Vec<_> = (0..10)
+            .map(|t| measurement(vec![-50. + t as f64; K], false))
+            .collect();
+        let e = estimate_exposure(&ms, &cfg("uniform", "pairwise")).unwrap();
+        assert!(evs(&e).iter().all(|v| *v == 0.));
+        assert_eq!(e.plan_quality.coverage.evaluated, 0);
+    }
+    #[test]
+    fn local_observation_separates_known_gain_from_mixed_natural_change() {
+        let a = measurement(vec![-2.; K], true);
+        let mut gain = a.clone();
+        for x in &mut gain.log_luminance {
+            *x += 0.7;
+        }
+        near(
+            local_common_change(&a, &gain, None)
+                .unwrap()
+                .delta_ev
+                .unwrap(),
+            0.7,
+            1e-12,
+        );
+        let mut natural = a.clone();
+        for i in 0..K {
+            natural.log_luminance[i] += if i % 12 < 6 { 0.7 } else { -0.7 };
+        }
+        assert!(local_common_change(&a, &natural, None)
+            .unwrap()
+            .delta_ev
+            .is_none());
+        let ms: Vec<_> = (0..80)
+            .map(|t| if t < 40 { a.clone() } else { natural.clone() })
+            .collect();
+        let e = estimate(&ms);
+        assert!(e.plan_quality.coverage.skipped >= 1);
+        // A mixed scene transition is retained, not removed as an exposure jump.
+        assert!((e.frames[40].applied_ev.unwrap() - e.frames[39].applied_ev.unwrap()).abs() < 0.02);
+    }
+    #[test]
+    fn plan_check_rejects_a_common_jump_even_when_frozen_targets_execute_exactly() {
+        let ms = sequence(60);
+        let config = cfg("uniform", "pairwise");
+        let mut e = estimate_exposure(&ms, &config).unwrap();
+        for t in 30..60 {
+            e.frames[t].applied_ev = Some(e.frames[t].applied_ev.unwrap() + 0.4);
+            e.frames[t].desired_level_ev = e.frames[t].desired_level_ev.map(|v| v + 0.4);
+            for v in &mut e.frozen_target[t] {
+                *v += 0.4;
+            }
+        }
+        let c = corrected(&ms, &e);
+        assert!(evaluate_render(&mut e, &c, 0).unwrap().passed);
+        let quality = evaluate_plan(&ms, &e, &config).unwrap();
+        assert!(quality.common_jump_frames.contains(&30));
+        near(
+            quality
+                .pairs
+                .iter()
+                .find(|p| p.frame_id == 30)
+                .unwrap()
+                .corrected_change_ev,
+            0.4,
+            1e-9,
+        );
+    }
+    #[test]
+    fn fractional_strength_target_does_not_request_full_strength_feedback() {
+        let rows = background(
+            &(0..60).map(|t| alt(t, 0.1)).collect::<Vec<_>>(),
+            -2.1,
+            -1.9,
+        );
+        let ms = frames(&rows);
+        for intent in ["uniform", "smooth"] {
+            let mut config = cfg(intent, "pairwise");
+            config.strength = 0.5;
+            let mut e = estimate_exposure(&ms, &config).unwrap();
+            let c = corrected(&ms, &e);
+            let summary = evaluate_render(&mut e, &c, 0).unwrap();
+            assert!(
+                summary.passed,
+                "{intent} partial-strength execution: {:?}",
+                summary.median_abs_error_ev
+            );
+            assert!(e.plan_quality.common_jump_frames.is_empty());
+        }
+    }
+    #[test]
+    fn local_reference_obeys_roi_and_ignores_valid_set_level_changes() {
+        let mut a = measurement((0..K).map(|i| -2. + i as f64 / K as f64).collect(), false);
+        let mut b = a.clone();
+        b.valid[..K / 3].fill(false);
+        near(
+            local_common_change(&a, &b, None).unwrap().delta_ev.unwrap(),
+            0.,
+            1e-12,
+        );
+        let train: Vec<_> = (0..K).map(|i| i % 12 < 6).collect();
+        for i in 0..K {
+            if !train[i] {
+                b.log_luminance[i] += 1.;
+            }
+        }
+        // A half-plane has only two quadrants, so it cannot masquerade as a common change.
+        assert!(local_common_change(&a, &b, Some(&train))
+            .unwrap()
+            .delta_ev
+            .is_none());
+        a.valid.fill(false);
+        assert!(local_common_change(&a, &b, None)
+            .unwrap()
+            .delta_ev
+            .is_none());
+    }
+
+    fn measured_fixture() -> (Vec<FrameMeasurement>, GraphResult, Vec<f64>, Vec<bool>) {
+        let bytes = include_bytes!("fixtures/exposure-seam.bin");
+        assert_eq!(&bytes[..8], b"EXPOSURE");
+        let mut p = 8;
+        let u = |p: &mut usize| {
+            let x = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap()) as usize;
+            *p += 4;
+            x
+        };
+        let f = |p: &mut usize| {
+            let x = f64::from_le_bytes(bytes[*p..*p + 8].try_into().unwrap());
+            *p += 8;
+            x
+        };
+        let n = u(&mut p);
+        let edge_count = u(&mut p);
+        let ms = (0..n)
+            .map(|_| {
+                let hash = String::from_utf8(bytes[p..p + 64].to_vec()).unwrap();
+                p += 64;
+                let mut m = measurement(vec![0.; K], false);
+                m.source_sha256 = hash;
+                for i in 0..K {
+                    m.log_luminance[i] = f(&mut p);
+                    m.valid[i] = bytes[p] != 0;
+                    p += 1;
+                }
+                m
+            })
+            .collect::<Vec<_>>();
+        let edges = (0..edge_count)
+            .map(|_| {
+                let i = u(&mut p);
+                let j = u(&mut p);
+                let delta = f(&mut p);
+                let weight = f(&mut p);
+                let mut e = graph_edge(i, j, delta);
+                e.weight = weight;
+                e
+            })
+            .collect::<Vec<_>>();
+        // Strict independent pair projection (delta, observable) is retained as
+        // a historical control, not repurposed as primary graph evidence.
+        p += (n - 1) * 9;
+        let mut old = vec![];
+        let mut evaluated = vec![];
+        for _ in 0..n {
+            old.push(f(&mut p));
+            evaluated.push(bytes[p] != 0);
+            p += 1;
+        }
+        assert_eq!(p, bytes.len());
+        (ms, solve_exposure_graph(n, &edges).unwrap(), old, evaluated)
+    }
+    #[test]
+    fn saved_measurements_reproduce_old_seams_and_joint_placement_removes_them() {
+        let (ms, graph, old, evaluated) = measured_fixture();
+        assert_eq!(ms.len(), 476);
+        assert_eq!(graph.components.len(), 23);
+        assert_eq!(
+            persistent_background(&ms, &graph.brightness)
+                .unwrap()
+                .iter()
+                .filter(|q| **q)
+                .count(),
+            0
+        );
+        assert_eq!(evaluated.iter().filter(|v| **v).count(), 10);
+        assert!(graph
+            .components
+            .iter()
+            .any(|c| c.contains(&43) && c.contains(&45) && !c.contains(&44)));
+        let (b, conservative) = aligned_brightness(&ms, &graph, true, &[true; K]).unwrap();
+        let (again, _) = aligned_brightness(&ms, &graph, true, &[true; K]).unwrap();
+        assert_eq!(b, again);
+        assert_eq!(conservative, 0);
+        for (t, expected) in [
+            (45, -0.7336516109640834),
+            (49, 0.3946572881147092),
+            (95, 0.34470985938868587),
+            (211, -0.21951951066982994),
+        ] {
+            near(old[t] - old[t - 1], expected, 1e-12);
+            let raw = local_common_change(&ms[t - 1], &ms[t], None)
+                .unwrap()
+                .delta_ev
+                .unwrap();
+            assert!((raw + old[t] - old[t - 1]).abs() > 0.2);
+            assert!((raw - b[t] + b[t - 1]).abs() <= 0.02);
+        }
+        for t in 1..ms.len() {
+            let raw = local_common_change(&ms[t - 1], &ms[t], None)
+                .unwrap()
+                .delta_ev
+                .unwrap();
+            assert!((raw - b[t] + b[t - 1]).abs() <= 0.02);
+        }
+    }
+    #[test]
+    fn component_gauge_constants_and_renumbering_do_not_change_physical_differences() {
+        let (ms, mut graph, _, _) = measured_fixture();
+        let (base, _) = aligned_brightness(&ms, &graph, true, &[true; K]).unwrap();
+        let n = graph.components.len();
+        for (c, members) in graph.components.iter().enumerate() {
+            for &t in members {
+                if graph.brightness[t].is_finite() {
+                    graph.brightness[t] += c as f64 * 2.3 - 15.;
+                }
+            }
+        }
+        graph.components.reverse();
+        for id in &mut graph.component {
+            *id = n as isize - 1 - *id;
+        }
+        let (changed, _) = aligned_brightness(&ms, &graph, true, &[true; K]).unwrap();
+        for t in 1..ms.len() {
+            near(changed[t] - changed[t - 1], base[t] - base[t - 1], 1e-8);
+        }
     }
 }

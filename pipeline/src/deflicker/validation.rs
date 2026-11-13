@@ -7,6 +7,7 @@ use super::{
 #[derive(Debug, Clone)]
 pub struct ValidationSummary {
     pub errors: Vec<Option<f64>>,
+    pub coverage: Coverage,
     pub median_abs_error_ev: Option<f64>,
     pub p95_abs_error_ev: Option<f64>,
     pub outlier_frames: Vec<usize>,
@@ -80,6 +81,11 @@ pub fn evaluate_render_with(
     }
     let mut summary = ValidationSummary {
         errors: vec![None; n],
+        coverage: Coverage {
+            eligible: n,
+            evaluated: 0,
+            skipped: n,
+        },
         median_abs_error_ev: None,
         p95_abs_error_ev: None,
         outlier_frames: vec![],
@@ -97,6 +103,7 @@ pub fn evaluate_render_with(
             || est.desired_level_ev.is_none()
             || !original.iter().any(|v| *v)
         {
+            summary.unobservable_frames.push(t);
             continue;
         }
         let m = &rendered[t];
@@ -139,6 +146,8 @@ pub fn evaluate_render_with(
         }
     }
     let abs: Vec<_> = summary.errors.iter().flatten().map(|v| v.abs()).collect();
+    summary.coverage.evaluated = abs.len();
+    summary.coverage.skipped = n - abs.len();
     summary.median_abs_error_ev = finite(median(&abs));
     summary.p95_abs_error_ev = finite(percentile(&abs, 95.));
     summary.passed = summary.median_abs_error_ev.is_some_and(|v| v <= 0.01)
@@ -211,4 +220,106 @@ pub fn feedback_diverged(old: &ValidationSummary, new: &ValidationSummary) -> bo
         (Some(a), Some(b)) => b - a > (a * 0.10).max(0.002),
         _ => false,
     })
+}
+
+/// Internal accounting. Eligible counts potential observations, including those
+/// skipped for empty masks, missing targets, clipping or low spatial support.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Coverage {
+    pub eligible: usize,
+    pub evaluated: usize,
+    pub skipped: usize,
+}
+#[derive(Debug, Clone)]
+pub struct PlanPair {
+    pub frame_id: usize,
+    pub raw_change_ev: f64,
+    pub corrected_change_ev: f64,
+    pub intended_change_ev: f64,
+    pub residual_ev: f64,
+}
+#[derive(Debug, Clone, Default)]
+pub struct PlanQuality {
+    pub coverage: Coverage,
+    pub pairs: Vec<PlanPair>,
+    pub common_jump_frames: Vec<usize>,
+}
+/// Assess physical local changes before handing gains to a renderer. This is
+/// independent of frozen per-frame targets constructed by adding our own EV.
+/// Smooth trends/confirmed steps and intentional partial strength are retained.
+/// Absence of local evidence remains uncovered, never a zero-error observation.
+pub fn evaluate_plan(
+    ms: &[FrameMeasurement],
+    e: &ExposureResult,
+    cfg: &super::ExposureConfig,
+) -> Result<PlanQuality> {
+    compatible(ms)?;
+    if ms.len() != e.frames.len() {
+        return Err("plan measurement count mismatch".into());
+    }
+    let train: Vec<_> = ms[0]
+        .centers
+        .iter()
+        .map(|c| {
+            !cfg.exclude_rois
+                .iter()
+                .any(|r| c[0] >= r[0] && c[0] < r[2] && c[1] >= r[1] && c[1] < r[3])
+        })
+        .collect();
+    let eligible = ms.len().saturating_sub(1);
+    let mut quality = PlanQuality {
+        coverage: Coverage {
+            eligible,
+            evaluated: 0,
+            skipped: eligible,
+        },
+        ..Default::default()
+    };
+    for t in 1..ms.len() {
+        let local = super::pairwise::local_common_change(&ms[t - 1], &ms[t], Some(&train))?;
+        let (Some(raw), Some(a), Some(b)) = (
+            local.delta_ev,
+            e.frames[t - 1].applied_ev,
+            e.frames[t].applied_ev,
+        ) else {
+            continue;
+        };
+        let intended = if cfg.brightness == "uniform" {
+            (1. - cfg.strength) * raw
+        } else {
+            let (Some(da), Some(db)) = (
+                e.frames[t - 1].desired_level_ev,
+                e.frames[t].desired_level_ev,
+            ) else {
+                continue;
+            };
+            let (Some(ma), Some(mb)) = (
+                e.frames[t - 1].measured_level_ev,
+                e.frames[t].measured_level_ev,
+            ) else {
+                continue;
+            };
+            // Desired levels include partial strength. Retain the observed
+            // uncorrected part while independently testing the graph's change.
+            db - da + (1. - cfg.strength) * (raw - (mb - ma))
+        };
+        let corrected = raw + b - a;
+        let residual = corrected - intended;
+        if !residual.is_finite() {
+            return Err("nonfinite plan residual".into());
+        }
+        if residual.abs() > 0.05 {
+            quality.common_jump_frames.push(t);
+        }
+        quality.pairs.push(PlanPair {
+            frame_id: t,
+            raw_change_ev: raw,
+            corrected_change_ev: corrected,
+            intended_change_ev: intended,
+            residual_ev: residual,
+        });
+    }
+    quality.coverage.evaluated = quality.pairs.len();
+    quality.coverage.skipped = eligible - quality.pairs.len();
+    Ok(quality)
 }
