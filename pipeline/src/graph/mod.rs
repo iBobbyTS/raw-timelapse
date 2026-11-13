@@ -290,23 +290,47 @@ impl Graph {
                 return Err("graph: data/event dependency cycle".into());
             }
         }
-        // An image cannot wait for its own upstream sequence to close: that
-        // closure may need its occupied single slot drained first.
+        // A sequence completion requires its transitive data/event producers
+        // to finish every frame. Reject waits that would hold an image slot
+        // while any such prerequisite still needs that slot drained.
         for (i, n) in self.nodes.iter().enumerate() {
             if matches!(
                 n.kind,
                 Kind::Develop | Kind::Identity | Kind::Exposure(_) | Kind::Color | Kind::Encode
             ) {
                 for w in n.waits.iter().filter(|w| w.scope == Scope::Sequence) {
-                    if self.image_ancestor(i, w.node) {
-                        return Err(
-                            "graph: sequence wait would block bounded image draining".into()
-                        );
+                    if let Some(producer) =
+                        self.completion_image_ancestor(i, w.node, &mut BTreeSet::new())
+                    {
+                        return Err(format!(
+                            "graph: {} sequence wait on {} would block bounded image draining: completion requires upstream image producer {}",
+                            n.id, self.nodes[w.node].id, self.nodes[producer].id
+                        ));
                     }
                 }
             }
         }
         Ok(())
+    }
+    fn completion_image_ancestor(
+        &self,
+        consumer: usize,
+        target: usize,
+        visited: &mut BTreeSet<usize>,
+    ) -> Option<usize> {
+        if !visited.insert(target) {
+            return None;
+        }
+        if self.image_ancestor(consumer, target) {
+            return Some(target);
+        }
+        // Even a frame-scoped prerequisite must cover the complete inventory
+        // before its dependent node can publish sequence completion.
+        self.nodes[target]
+            .inputs
+            .values()
+            .chain(self.nodes[target].waits.iter().map(|wait| &wait.node))
+            .find_map(|producer| self.completion_image_ancestor(consumer, *producer, visited))
     }
     fn image_ancestor(&self, i: usize, wanted: usize) -> bool {
         self.nodes[i].inputs.values().any(|p| {
