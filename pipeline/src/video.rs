@@ -506,9 +506,52 @@ pub fn validate_output(
     Ok(probe)
 }
 
-/// Early capability check before any RAW preparation. Encoder, pixel format,
-/// profile and output options are exercised by a one-frame synthetic encode
-/// into the partial directory; the file is removed immediately.
+/// Ask FFmpeg which pixel formats an encoder declares. This is the encoder's
+/// own capability list (`AVCodec.pix_fmts`), not a decoder bit-depth label, so
+/// it can establish exact input-format support before any RAW work.
+fn supported_encoder_pixel_formats(ffmpeg: &Path, encoder: &str) -> Result<Option<Vec<String>>> {
+    let args = vec![
+        "-hide_banner".to_string(),
+        "-h".to_string(),
+        format!("encoder={encoder}"),
+    ];
+    let captured = proc::run_capture(ffmpeg, &args, EXIT_USAGE_FOR_PREFLIGHT)?;
+    let text = format!("{}\n{}", captured.stdout, captured.stderr);
+    let formats = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Supported pixel formats:"))
+        .map(|rest| rest.split_whitespace().map(str::to_string).collect::<Vec<_>>());
+    if formats.is_none() && !captured.status.success() {
+        return Err(Error::new(
+            EXIT_USAGE_FOR_PREFLIGHT,
+            format!(
+                "cannot query encoder {encoder:?}: {}; output: {}",
+                proc::exit_description(&captured.status),
+                proc::tail(&text, 600)
+            ),
+        ));
+    }
+    Ok(formats)
+}
+
+/// FFmpeg's own substitution diagnostics. These are treated as configuration
+/// errors: the requested pixel format must be the encoded one.
+fn substituted_pixel_format(stderr: &str) -> bool {
+    let text = stderr.to_ascii_lowercase();
+    [
+        "auto-selecting format",
+        "incompatible pixel format",
+        "incompatible pix_fmt",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+/// Early capability check before any RAW preparation. The encoder's declared
+/// pixel formats, profile, rate control, options and container are checked, then
+/// exercised by a one-frame synthetic encode into the partial directory; the
+/// file is removed immediately. An unsupported pixel format (or FFmpeg
+/// substitution) is fatal here, before any RAW processing.
 pub fn preflight(
     config: &ResolvedConfig,
     profile: &ColorProfile,
@@ -520,6 +563,19 @@ pub fn preflight(
     if let Some((width, height)) = explicit_geometry {
         if let Err(message) = config.validate_geometry(width, height) {
             return Err(Error::new(EXIT_USAGE_FOR_PREFLIGHT, message));
+        }
+    }
+    if let Some(formats) = supported_encoder_pixel_formats(ffmpeg, &config.encoder)? {
+        if !formats.iter().any(|format| format == &config.pix_fmt) {
+            return Err(Error::new(
+                EXIT_USAGE_FOR_PREFLIGHT,
+                format!(
+                    "encoder {} does not support pixel format {:?}; supported: {}",
+                    config.encoder,
+                    config.pix_fmt,
+                    formats.join(", ")
+                ),
+            ));
         }
     }
     let geometry = explicit_geometry.unwrap_or((32, 32));
@@ -535,6 +591,17 @@ pub fn preflight(
                 "encoder preflight failed for {}: {}; stderr: {}",
                 config.summary(profile),
                 proc::exit_description(&captured.status),
+                proc::tail(&captured.stderr, 1200)
+            ),
+        ));
+    }
+    if substituted_pixel_format(&captured.stderr) {
+        return Err(Error::new(
+            EXIT_USAGE_FOR_PREFLIGHT,
+            format!(
+                "encoder preflight substituted the requested pixel format {:?} for {}; stderr: {}",
+                config.pix_fmt,
+                config.encoder,
                 proc::tail(&captured.stderr, 1200)
             ),
         ));

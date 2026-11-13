@@ -92,7 +92,9 @@ impl RateControl {
     pub fn args(self) -> Vec<String> {
         match self {
             RateControl::Crf(value) => vec!["-crf".into(), value.to_string()],
-            RateControl::QScale(value) => vec!["-q:v".into(), value.to_string()],
+            // libx264 ignores the generic `-q:v`; `-qp` selects its constant
+            // quantization-parameter mode explicitly.
+            RateControl::QScale(value) => vec!["-qp".into(), value.to_string()],
             RateControl::Bitrate(value) => vec!["-b:v".into(), value.to_string()],
         }
     }
@@ -319,18 +321,23 @@ impl ResolvedConfig {
     /// Resolve `built-in < graph node < explicit CLI`. Each named field wins
     /// independently; unnamed fields inherit the next lower layer.
     pub fn resolve(graph: Option<&Patch>, cli: &Patch) -> Result<Self, String> {
+        let graph = graph.unwrap_or(&EMPTY_PATCH);
+        // The lower layer's effective encoder includes the built-in default:
+        // restating the encoder that is already in effect is not a codec change.
+        let lower_encoder = graph
+            .encoder
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ENCODER.to_string());
         let encoder = cli
             .encoder
             .clone()
-            .or_else(|| graph.and_then(|patch| patch.encoder.clone()))
-            .unwrap_or_else(|| DEFAULT_ENCODER.to_string());
+            .unwrap_or_else(|| lower_encoder.clone());
         let preset = preset(&encoder).ok_or_else(|| {
             format!(
                 "unsupported encoder {encoder:?}; supported encoders: {}",
                 SUPPORTED_ENCODERS.join(", ")
             )
         })?;
-        let graph = graph.unwrap_or(&EMPTY_PATCH);
         let pix_fmt = cli
             .pix_fmt
             .clone()
@@ -343,8 +350,10 @@ impl ResolvedConfig {
         // Codec profile and rate control are encoder-scoped. When the CLI names
         // a different encoder, inheriting them from another encoder would either
         // be meaningless or impossible to clear; CLI intent wins instead.
-        let encoder_changed_by_cli =
-            cli.encoder.is_some() && graph.encoder.as_deref() != cli.encoder.as_deref();
+        let encoder_changed_by_cli = cli
+            .encoder
+            .as_deref()
+            .is_some_and(|named| named != lower_encoder);
         let codec_profile = cli
             .profile
             .clone()
@@ -477,7 +486,7 @@ impl ResolvedConfig {
             2 => Some("Standard"),
             3 => Some("HQ"),
             4 => Some("4444"),
-            5 => Some("4444 XQ"),
+            5 => Some("XQ"),
             _ => None,
         }
     }
@@ -502,11 +511,22 @@ impl ResolvedConfig {
                 }
             }
             "libx264" => {
+                // The encoder preserves the configured depth/subsampling; an
+                // 8-bit full-range stream may decode under the legacy yuvj*
+                // alias. Keep configured-format validation, not a fixed 4:2:0.
+                let mut formats = vec![self.pix_fmt.as_str()];
                 if range == PreviewRange::Pc {
-                    vec!["yuv420p", "yuvj420p"]
-                } else {
-                    vec!["yuv420p"]
+                    let alias = match self.pix_fmt.as_str() {
+                        "yuv420p" => Some("yuvj420p"),
+                        "yuv422p" => Some("yuvj422p"),
+                        "yuv444p" => Some("yuvj444p"),
+                        _ => None,
+                    };
+                    if let Some(alias) = alias {
+                        formats.push(alias);
+                    }
                 }
+                formats
             }
             // FFV1 is lossless and preserves the configured pixel format.
             _ => vec![self.pix_fmt.as_str()],
@@ -660,8 +680,10 @@ impl ResolvedConfig {
         let mut args = vec![
             "-hide_banner".into(),
             "-nostdin".into(),
+            // Warnings expose an encoder pixel-format substitution instead of
+            // hiding it; the transcript is ever only surfaced on failure.
             "-v".into(),
-            "error".into(),
+            "warning".into(),
             "-f".into(),
             "lavfi".into(),
             "-i".into(),
@@ -976,6 +998,88 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn h264_decoder_formats_follow_the_configured_pixel_format() {
+        let cli = Patch {
+            encoder: Some("libx264".into()),
+            pix_fmt: Some("yuv444p10le".into()),
+            profile: Some("high444".into()),
+            ..Default::default()
+        };
+        let config = ResolvedConfig::resolve(None, &cli).unwrap();
+        assert_eq!(config.decoder_pix_fmts(PreviewRange::Tv), vec!["yuv444p10le"]);
+
+        let cli = Patch {
+            encoder: Some("libx264".into()),
+            pix_fmt: Some("yuv420p".into()),
+            ..Default::default()
+        };
+        let config = ResolvedConfig::resolve(None, &cli).unwrap();
+        assert_eq!(config.decoder_pix_fmts(PreviewRange::Tv), vec!["yuv420p"]);
+        assert_eq!(
+            config.decoder_pix_fmts(PreviewRange::Pc),
+            vec!["yuv420p", "yuvj420p"]
+        );
+
+        let cli = Patch {
+            encoder: Some("libx264".into()),
+            pix_fmt: Some("yuv422p10le".into()),
+            profile: Some("high422".into()),
+            ..Default::default()
+        };
+        let config = ResolvedConfig::resolve(None, &cli).unwrap();
+        assert_eq!(config.decoder_pix_fmts(PreviewRange::Pc), vec!["yuv422p10le"]);
+    }
+
+    #[test]
+    fn naming_the_effective_encoder_keeps_graph_scoped_fields() {
+        let graph = Patch {
+            profile: Some("5".into()),
+            ..Default::default()
+        };
+        let cli = Patch {
+            encoder: Some("prores_ks".into()),
+            ..Default::default()
+        };
+        let config = ResolvedConfig::resolve(Some(&graph), &cli).unwrap();
+        assert_eq!(config.encoder, "prores_ks");
+        assert_eq!(config.codec_profile.as_deref(), Some("5"));
+
+        let graph = Patch {
+            profile: Some("hq".into()),
+            pix_fmt: Some("yuv422p10le".into()),
+            ..Default::default()
+        };
+        for cli in [
+            Patch {
+                encoder: Some("prores_ks".into()),
+                ..Default::default()
+            },
+            Patch::default(),
+        ] {
+            let config = ResolvedConfig::resolve(Some(&graph), &cli).unwrap();
+            assert_eq!(config.codec_profile.as_deref(), Some("hq"));
+            assert_eq!(config.pix_fmt, "yuv422p10le");
+        }
+
+        // A real codec change still drops the inherited encoder-scoped fields.
+        let cli = Patch {
+            encoder: Some("ffv1".into()),
+            ..Default::default()
+        };
+        let config = ResolvedConfig::resolve(Some(&graph), &cli).unwrap();
+        assert_eq!(config.codec_profile, None);
+        assert_eq!(config.encoder, "ffv1");
+    }
+
+    #[test]
+    fn fixed_quantizer_uses_libx264s_constant_qp_control() {
+        assert_eq!(
+            RateControl::QScale(20).args(),
+            vec!["-qp".to_string(), "20".to_string()]
+        );
     }
 
     #[test]

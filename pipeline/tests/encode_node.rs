@@ -529,3 +529,205 @@ fn software_h264_and_ffv1_configurations_produce_their_declared_formats() {
         assert!(probe.contains(expected), "{probe}");
     }
 }
+
+fn graph_with_encoder_config(encoder: &str) -> String {
+    include_str!("../src/graph/default.json").replace(
+        "\"kind\":\"encode\",",
+        &format!("\"kind\":\"encode\",\"encoder\":{encoder},"),
+    )
+}
+
+#[test]
+fn configured_h264_high_bit_format_is_accepted_end_to_end() {
+    let (root, input, tool) = gradient_material("repair-h264-high444", 64, 48, 1);
+    let output = root.join("run");
+    let mut args = base_args(&input, &output, &tool);
+    args.extend([
+        "--strength",
+        "0",
+        "--encoder",
+        "libx264",
+        "--pix-fmt",
+        "yuv444p10le",
+        "--codec-profile",
+        "high444",
+    ]);
+    let result = run_cli(&args);
+    assert!(
+        result.status.success(),
+        "a valid configured H.264 format must not fail validation after encoding:\n{}",
+        stderr(&result)
+    );
+    assert_eq!(video_files(&output), vec!["output.mp4".to_string()]);
+    let probe = ffprobe_color(&output.join("output.mp4"));
+    for expected in [
+        "codec_name=h264",
+        "pix_fmt=yuv444p10le",
+        "profile=High 4:4:4 Predictive",
+        "width=64",
+        "height=48",
+    ] {
+        assert!(probe.contains(expected), "{probe}");
+    }
+    let manifest = read_json(&output.join("manifest.json"));
+    let video = manifest.get("video").unwrap();
+    assert_eq!(
+        video.get("pix_fmt").and_then(Json::as_str),
+        Some("yuv444p10le")
+    );
+    assert_eq!(
+        video.get("decoder_pix_fmt").and_then(Json::as_str),
+        Some("yuv444p10le")
+    );
+}
+
+#[test]
+fn unsupported_encoder_pixel_format_is_rejected_before_raw_work() {
+    let (root, input, tool) = gradient_material("repair-pix-fmt", 64, 48, 1);
+    let output = root.join("run");
+    let mut args = base_args(&input, &output, &tool);
+    args.extend(["--strength", "0", "--pix-fmt", "yuv444p12le"]);
+    let result = run_cli(&args);
+    assert_eq!(result.status.code(), Some(50), "{}", stderr(&result));
+    let text = stderr(&result);
+    assert!(
+        text.contains("does not support pixel format") && text.contains("yuv444p12le"),
+        "{text}"
+    );
+    assert!(
+        !output.join("logs/prepare").exists(),
+        "the pixel-format request must be rejected before RAW preparation"
+    );
+    assert!(!output.join("output.mov").exists());
+
+    // A supported ProRes format with a matching profile still succeeds.
+    let supported = root.join("supported");
+    let mut args = base_args(&input, &supported, &tool);
+    args.extend([
+        "--strength",
+        "0",
+        "--pix-fmt",
+        "yuv422p10le",
+        "--codec-profile",
+        "hq",
+    ]);
+    let result = run_cli(&args);
+    assert!(result.status.success(), "{}", stderr(&result));
+    let probe = ffprobe_color(&supported.join("output.mov"));
+    for expected in ["codec_name=prores", "profile=HQ"] {
+        assert!(probe.contains(expected), "{probe}");
+    }
+    assert!(
+        probe.contains("pix_fmt=yuv422p12le") || probe.contains("pix_fmt=yuv422p10le"),
+        "{probe}"
+    );
+}
+
+#[test]
+fn libx264_fixed_quantizer_changes_the_encoded_output() {
+    let (root, input, tool) = gradient_material("repair-qscale", 64, 48, 2);
+    let mut encoded = Vec::new();
+    let mut parameters = Vec::new();
+    for qscale in ["1", "40"] {
+        let output = root.join(format!("q{qscale}"));
+        let mut args = base_args(&input, &output, &tool);
+        args.extend([
+            "--strength",
+            "0",
+            "--encoder",
+            "libx264",
+            "--qscale",
+            qscale,
+        ]);
+        let result = run_cli(&args);
+        assert!(result.status.success(), "qscale {qscale}: {}", stderr(&result));
+        let manifest = read_json(&output.join("manifest.json"));
+        parameters.push(
+            manifest
+                .get("video")
+                .unwrap()
+                .get("encoder_parameters")
+                .and_then(Json::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        );
+        encoded.push(fs::read(output.join("output.mp4")).expect("encoded file"));
+    }
+    assert_ne!(
+        encoded[0], encoded[1],
+        "distinct fixed-quantizer settings must produce distinct output"
+    );
+    for (qscale, parameters) in ["1", "40"].iter().zip(&parameters) {
+        assert!(
+            parameters.iter().any(|value| value == "-qp"),
+            "qscale {qscale}: fixed quantizer must use libx264's -qp control: {parameters:?}"
+        );
+        assert!(
+            !parameters.iter().any(|value| value == "-q:v"),
+            "qscale {qscale}: libx264 ignores -q:v: {parameters:?}"
+        );
+    }
+}
+
+#[test]
+fn naming_the_effective_encoder_keeps_graph_profile_and_pixel_format() {
+    let (root, input, tool) = gradient_material("repair-effective-encoder", 64, 48, 1);
+
+    // Reported shape 1: graph sets only the ProRes profile; naming the default
+    // encoder on the CLI must not silently reset it to profile 4.
+    let config = root.join("profile5.json");
+    fs::write(&config, graph_with_encoder_config(r#"{"profile":"5"}"#)).unwrap();
+    let output = root.join("profile5");
+    let mut args = base_args(&input, &output, &tool);
+    args.extend([
+        "--strength",
+        "0",
+        "--encoder",
+        "prores_ks",
+        "--graph",
+        config.to_str().unwrap(),
+    ]);
+    let result = run_cli(&args);
+    assert!(result.status.success(), "{}", stderr(&result));
+    let manifest = read_json(&output.join("manifest.json"));
+    assert_eq!(
+        manifest
+            .get("video")
+            .unwrap()
+            .get("codec_profile")
+            .and_then(Json::as_str),
+        Some("5")
+    );
+    let probe = ffprobe_color(&output.join("output.mov"));
+    assert!(probe.contains("profile=XQ"), "{probe}");
+
+    // Reported shape 2: an omitted graph encoder with HQ/422 must stay valid
+    // when the CLI names the already-effective default encoder.
+    let config = root.join("hq422.json");
+    fs::write(
+        &config,
+        graph_with_encoder_config(r#"{"profile":"hq","pix_fmt":"yuv422p10le"}"#),
+    )
+    .unwrap();
+    let output = root.join("hq422");
+    let mut args = base_args(&input, &output, &tool);
+    args.extend([
+        "--strength",
+        "0",
+        "--encoder",
+        "prores_ks",
+        "--graph",
+        config.to_str().unwrap(),
+    ]);
+    let result = run_cli(&args);
+    assert!(result.status.success(), "{}", stderr(&result));
+    let probe = ffprobe_color(&output.join("output.mov"));
+    assert!(probe.contains("profile=HQ"), "{probe}");
+    assert!(
+        probe.contains("pix_fmt=yuv422p12le") || probe.contains("pix_fmt=yuv422p10le"),
+        "{probe}"
+    );
+}
