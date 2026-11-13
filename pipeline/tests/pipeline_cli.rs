@@ -1762,7 +1762,7 @@ fn vendor_previews_auto_decode_from_their_own_tags() {
         ("sony-slog3-sgamut3", "output.mp4", [59u8, 147, 20]),
         ("sony-slog3-sgamut3-cine", "output.mp4", [0, 145, 49]),
         ("canon-log2-cinema-gamut", "output.mp4", [48, 140, 96]),
-        (REV3_PROFILE, "output.mp4", [40, 139, 80]),
+        (REV3_PROFILE, "output.mp4", [39, 135, 77]),
         ("nikon-nlog-bt2020", "output.mp4", [0, 154, 0]),
         ("dji-dlog-dgamut", "output.mp4", [0, 145, 74]),
     ] {
@@ -2575,6 +2575,9 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
                 "rev_defect=skipped-hsm",
                 "incomplete camera profile calibration",
             ),
+            ("rev_defect=skipped-fixed", "incomplete camera profile calibration"),
+            ("rev_defect=auto-tone", "incomplete camera profile calibration"),
+            ("rev_defect=double-scale", "incomplete camera profile calibration"),
             ("rev_defect=infinity", "nonfinite FP32"),
             ("short_pixels=1", "short record payload"),
             ("descriptor_geometry_mismatch=1", "descriptor geometry"),
@@ -2586,6 +2589,9 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
                     "rev_defect=mixed-model",
                     "rev_defect=old-calibration",
                     "rev_defect=skipped-hsm",
+                    "rev_defect=skipped-fixed",
+                    "rev_defect=auto-tone",
+                    "rev_defect=double-scale",
                 ]
                 .contains(&knob)
             {

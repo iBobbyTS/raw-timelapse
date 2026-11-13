@@ -514,7 +514,8 @@ fn run_frame(
         }
 
         if config.camera_color_method.requires_canon_cr3()
-            && (color.get("algorithm_revision").and_then(Json::as_u64) != Some(2)
+            && (color.get("algorithm_revision").and_then(Json::as_u64) != Some(3)
+                || !valid_fixed_calibration(color)
                 || !matches!(
                     (
                         color.get("hue_sat_map_present"),
@@ -1138,4 +1139,27 @@ mod protocol_tests {
         assert_eq!(&*parser.record(4, Some(6)).unwrap(), &[0; 6]);
         parser.end().unwrap();
     }
+}
+
+// Matched native/Rust contract: no silent fallback to sensor-relative exposure.
+fn valid_fixed_calibration(color: &Json) -> bool {
+    let Some(c) = color.get("exposure_calibration") else { return false };
+    let number = |k| c.get(k).and_then(Json::as_f64).filter(|v| v.is_finite());
+    let (Some(max), Some(black), Some(white), Some(dw), Some(db), Some(gain), Some(scale), Some(normal)) =
+        (number("adc_maximum"), number("black"), number("normal_white"), number("dng_white"),
+         number("dng_black"), number("native_scene_gain"), number("storage_scale"), number("normal_white_gain"))
+        else { return false };
+    let close = |a: f64,b: f64| (a-b).abs() <= 1e-9 * b.abs().max(1.0);
+    c.get("applied") == Some(&Json::Bool(true))
+        && c.get("method").and_then(Json::as_str) == Some("canon-normal-white-fixed-v1")
+        && c.get("auto_tone_normalization") == Some(&Json::Bool(false))
+        && c.get("baseline_exposure_applied") == Some(&Json::Bool(false))
+        && number("scene_to_reflection") == Some(0.9)
+        && number("fixed_scene_gain") == Some(1.8)
+        && max >= 255.0 && max <= 65535.0 && (max + 1.0).fract() == 0.0
+        && ((max as u64)+1).is_power_of_two()
+        && black >= 0.0 && black < white && white <= max && white > max/2.0
+        && dw == 65535.0 && db >= 0.0 && (db-black*scale).abs() <= scale+1e-6
+        && close(scale, (dw+1.0)/(max+1.0))
+        && close(normal, (dw-db)/(scale*(white-black))) && close(gain, 1.8*normal)
 }

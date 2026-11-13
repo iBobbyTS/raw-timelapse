@@ -257,6 +257,8 @@ Prepared prepare(Temp &temp, const fs::path &input,
       convert();
   }
   out.decoded = decode(decoded_path, wb ? wb : std::optional<Vec>(out.own), method);
+  if (method == CameraColorMethod::dng_camera_to_pcs && out.kind == Route::vendor_raw)
+    calibrate_canon_cr3(input, out.decoded);
   out.capture_time = read_capture_time(out.kind == Route::vendor_raw
                                            ? decoded_path
                                            : input);
@@ -294,7 +296,7 @@ FrameOutput render(const Prepared &prepared,
                     : Vec{d.calibrated_scene[i], d.calibrated_scene[i + 1],
                           d.calibrated_scene[i + 2]};
     for (int c = 0; c < 3; ++c) {
-      float x = static_cast<float>(scene[c] * gain);
+      float x = static_cast<float>(scene[c] * d.reference_gain * gain);
       if (!std::isfinite(x))
         throw Error(40, "nonfinite color result");
       low = std::min(low, double(x));
@@ -344,7 +346,8 @@ FrameOutput render(const Prepared &prepared,
       {"applied_white_balance", vec(d.applied)},
       {"white_balance_source",
        prepared.wb_override ? Json("override") : Json("as-shot")},
-      {"color", d.color},
+      {"color", [&] { Json v = d.color; v.text.pop_back();
+        v.text += ",\"exposure_calibration\":" + d.exposure_calibration.text + "}"; return v; }()},
       {"decode_semantics", d.semantics},
       {"observed_scene_min", low},
       {"observed_scene_max", high},

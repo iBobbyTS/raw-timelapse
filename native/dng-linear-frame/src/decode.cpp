@@ -232,6 +232,15 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMe
     }
     for (int p = 0; p < 3; ++p)
       white_levels.emplace_back(ifd.fWhiteLevel[p]);
+    // Scalar calibration requires uniform endpoints and no spatial black deltas.
+    if (ifd.fBlackLevelRepeatRows == 1 && ifd.fBlackLevelRepeatCols == 1 &&
+        ifd.fBlackLevelDeltaHCount == 0 && ifd.fBlackLevelDeltaVCount == 0) {
+      bool uniform = true;
+      for (int c = 1; c < 3; ++c)
+        uniform &= ifd.fBlackLevel[0][0][c] == ifd.fBlackLevel[0][0][0] &&
+                   ifd.fWhiteLevel[c] == ifd.fWhiteLevel[0];
+      if (uniform) { d.storage_black = ifd.fBlackLevel[0][0][0]; d.storage_white = ifd.fWhiteLevel[0]; }
+    }
     double baseline = n->BaselineExposure();
     n->ReadStage1Image(host, stream, info);
     n->BuildStage2Image(host);
@@ -266,7 +275,7 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMe
         {"profile_index", 0},
         {"profile_name", profile.Name().Get()},
         {"profile_fingerprint", profile.Fingerprint().ToUtf8HexString().Get()},
-        {"algorithm_revision", pcs ? 2 : 1},
+        {"algorithm_revision", pcs ? 3 : 1},
         {"calibration_illuminants",
          std::vector<Json>{int(profile.CalibrationIlluminant1()),
                            int(profile.CalibrationIlluminant2()),

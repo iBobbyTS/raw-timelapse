@@ -47,10 +47,15 @@ struct Decoded {
   Vec as_shot{}, applied{};
   Mat camera_to_d50{}, camera_to_ap1{};
   Json color, semantics;
+  double storage_black = -1, storage_white = -1, reference_gain = 1;
+  Json exposure_calibration = Json{{"applied", false}};
 };
 enum class CameraColorMethod { legacy_inverse_cm, dng_camera_to_pcs };
 Decoded decode(const fs::path &, const std::optional<Vec> &,
                CameraColorMethod = CameraColorMethod::legacy_inverse_cm);
+double canon_normal_white_gain(double maximum, double black, double white,
+                               double dng_white, double dng_black);
+void calibrate_canon_cr3(const fs::path &, Decoded &);
 struct ProcessResult {
   int exit_code;
   bool timed_out;

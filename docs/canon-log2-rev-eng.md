@@ -1,5 +1,8 @@
 # Canon CR3 双 Canon Log 2 路线
 
+当前为固定标定 revision4（native revision3）：原CR3 NormalWhite → 固定scene倍率1.8 → 反射率×0.9。详见[固定标定合同](canon-fixed-calibration.md)。旧验证记录保留历史含义。
+
+
 实现及统一 FP32 更新日期：2026-11-12。两个独立预设沿用同一内存流式输出架构，最终产物是 `output.mp4`。
 
 | 显示名 | `--preview-profile` ID | 相机矩阵 / native 帧交接 |
@@ -32,7 +35,7 @@ pipeline/target/release/rawtl-linear-video --input /path/to/canon-cr3 \
 
 输出目录必须为空或尚不存在。Adobe DNG Converter 与授权 DNG SDK 的准备见 [native 文档](../native/dng-linear-frame/README.md)。`--strength 0` 可隔离去闪影响，仅执行最终单趟编码。
 
-`--log-reference-gain` 只允许搭配 rev-eng Canon Log2 或 Log3 预设；必须是正有限标量，默认 1。当前没有灰卡校准数据，任何手动数值均记录 `unverified`、`calibration_id=null`。不能把 SDK 白电平归一化理解为实拍灰卡天然得到 0.18。校准需要在基础 EV=0、固定照明/机型/ISO/读出模式/profile 下测中性灰 ROI；若测得线性 Y 为 m，可评估 `0.18/m`。不使用每通道增益替代该曝光标量。
+`--log-reference-gain` 只允许搭配 rev-eng Canon Log2 或 Log3 预设；必须是正有限标量，默认 1。当前没有灰卡校准数据，额外用户倍率记录为固定标定后的 reference gain，`calibration_id=canon-normal-white-fixed-v1`。不能把 SDK 白电平归一化理解为实拍灰卡天然得到 0.18。校准需要在基础 EV=0、固定照明/机型/ISO/读出模式/profile 下测中性灰 ROI；若测得线性 Y 为 m，可评估 `0.18/m`。不使用每通道增益替代该曝光标量。
 
 ## 共用空间和曝光合同
 
@@ -102,7 +105,7 @@ native/build/dng-linear-frame --stdout-frame-f32 /path/to/input.CR3 \
 
 所有 profile 的完整帧统一 RAWTLST2；analysis 仍用 RAWTLST1 封装小 JSON。Rust 对全部路线校验实际颜色方法、3×3有限矩阵、profile 指纹、source hash、几何/长度/分配上限、像素 hash/finite、严格记录顺序、EOF及子进程退出；Canon 型号/同型号限制仅属于rev-eng。格式不再由 `is_rev_eng()` 决定，不回退RGB48。共用 `rawtl.ap1-f32-frame@1` F32 HWC/LE；最后转换为RGB24/U8交给FFmpeg。原native RGB48和位置参数接口作为显式兼容工具保留，不参与默认RAW流水线。每帧处理后释放像素，不积累完整序列。
 
-所有 analysis/probe/application/final pass 使用同一策略。analysis 仍是小 JSON/v1，无完整像素。VIDEO_ARTIFACT 保存独立 profile ID、显示名和 reference gain。真实 output.mp4 审核先用对应反曲线恢复 Cinema Gamut 线性值，再除 reference gain 一次、用其 XYZ 的 Y 行求亮度。标签不能代替独立 profile 身份；身份/标签冲突报告不可观测或错误。时序审核继续 report/off、失败不阻止发布；字节损坏、native/encoder/交付完整性失败不发布。
+所有 analysis/probe/application/final pass 使用同一策略。analysis 仍是小 JSON/v1，无完整像素。VIDEO_ARTIFACT 保存独立 profile ID、显示名和 reference gain。真实 output.mp4 审核先用对应反曲线恢复 Cinema Gamut 线性值，再除 reference gain 和 scene→reflection 的0.9各一次、用其 XYZ 的 Y 行求亮度。标签不能代替独立 profile 身份；身份/标签冲突报告不可观测或错误。时序审核继续 report/off、失败不阻止发布；字节损坏、native/encoder/交付完整性失败不发布。
 
 manifest schema仍为2；逆向路线的颜色 pipeline_revision 为3，其他路线为2。`final_signal_clipping` 对全部profile记录最终transfer定义域上下限裁切，native负值/高值仅是观测而非裁切。
 

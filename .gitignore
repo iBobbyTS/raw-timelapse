@@ -2,3 +2,20 @@
 /native/vendor/
 /outputs/
 /native/build/
+
+# macOS Finder and resource-fork metadata
+.DS_Store
+._*
+.AppleDouble/
+__MACOSX/
+
+# Local Python caches and editor recovery files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.swp
+*.swo
+*~
+
+# Local agent scratch work; durable evidence belongs in docs/
+.agent-work/

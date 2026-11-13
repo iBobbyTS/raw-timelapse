@@ -213,9 +213,15 @@ fn run() -> Result<(), (i32, String)> {
         } else if options.camera_method == "dng-camera-to-pcs" {
             "dng-camera-to-pcs-forward-matrix"
         } else { "legacy-inverse-cm" };
-        let contract = format!("\"color_contract_version\":1,\"color\":{{\"profile_fingerprint\":\"controlled-test-profile\",\"algorithm_revision\":2,\"hue_sat_map_present\":false,\"hue_sat_map_applied\":false,\"camera_to_xyz_d50\":[[1,0,0],[0,1,0],[0,0,1]],\"camera_to_acescg\":[[1,0,0],[0,1,0],[0,0,1]],\"method_requested\":\"{method}\",\"method_effective\":\"{effective}\",\"camera_model\":\"{model}\"}},");
+        let contract = format!("\"color_contract_version\":1,\"color\":{{\"profile_fingerprint\":\"controlled-test-profile\",\"algorithm_revision\":3,\"exposure_calibration\":{{\"applied\":true,\"method\":\"canon-normal-white-fixed-v1\",\"adc_maximum\":65535,\"black\":0,\"normal_white\":65535,\"dng_white\":65535,\"dng_black\":0,\"storage_scale\":1,\"normal_white_gain\":1,\"fixed_scene_gain\":1.8,\"native_scene_gain\":1.8,\"scene_to_reflection\":0.9,\"auto_tone_normalization\":false,\"baseline_exposure_applied\":false}},\"hue_sat_map_present\":false,\"hue_sat_map_applied\":false,\"camera_to_xyz_d50\":[[1,0,0],[0,1,0],[0,0,1]],\"camera_to_acescg\":[[1,0,0],[0,1,0],[0,0,1]],\"method_requested\":\"{method}\",\"method_effective\":\"{effective}\",\"camera_model\":\"{model}\"}},");
         let contract = if defect == Some("old-calibration") {
-            contract.replace("\"algorithm_revision\":2", "\"algorithm_revision\":1")
+            contract.replace("\"algorithm_revision\":3", "\"algorithm_revision\":1")
+        } else if defect == Some("skipped-fixed") {
+            contract.replace("\"applied\":true", "\"applied\":false")
+        } else if defect == Some("auto-tone") {
+            contract.replace("\"auto_tone_normalization\":false", "\"auto_tone_normalization\":true")
+        } else if defect == Some("double-scale") {
+            contract.replace("\"native_scene_gain\":1.8", "\"native_scene_gain\":3.6")
         } else if defect == Some("skipped-hsm") {
             contract.replace(
                 "\"hue_sat_map_present\":false",

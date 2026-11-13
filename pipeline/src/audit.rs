@@ -504,7 +504,7 @@ fn luminance(rgb: &[[u16; 3]], out: &mut [f64], profile: &ColorProfile, referenc
             .zip(weights)
             .map(|(code, weight)| profile.transfer.inverse(*code as f64 / 65535.0) * weight)
             .sum::<f64>()
-            / reference_gain;
+            / (reference_gain * profile.scene_to_reflection_scale());
     }
 }
 
@@ -912,7 +912,7 @@ mod tests {
         luminance(&[[128 * 257; 3]], &mut value, p, 2.0);
         // Independently evaluated inverse CRD curve at 128/255 is .5015687810705871;
         // Cinema Gamut neutral has Y equal to its RGB value.
-        assert!((value[0] - 0.5015687810705871 / 2.0).abs() < 1e-10);
+        assert!((value[0] - 0.5015687810705871 / (2.0 * 0.9)).abs() < 1e-10);
     }
 
     #[test]
@@ -921,7 +921,7 @@ mod tests {
         let mut value = [0.0];
         luminance(&[[128 * 257; 3]], &mut value, p, 2.0);
         // Independent inverse from scripts/canon_log3.py, y=128/255.
-        assert!((value[0] - 0.5887039959607215 / 2.0).abs() < 1e-10);
+        assert!((value[0] - 0.5887039959607215 / (2.0 * 0.9)).abs() < 1e-10);
     }
 
     #[test]
@@ -985,7 +985,7 @@ mod tests {
                         let signal = *v as f64 / 255.0;
                         let lo = profile.transfer.inverse(signal - 0.5 / 255.0);
                         let hi = profile.transfer.inverse(signal + 0.5 / 255.0);
-                        (hi - lo).abs() * w.abs()
+                        (hi - lo).abs() * w.abs() / profile.scene_to_reflection_scale()
                     })
                     .sum::<f64>()
                     + 0.0003; // Published D-Log inverse coefficients have finite precision.
