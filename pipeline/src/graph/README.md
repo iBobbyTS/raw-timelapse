@@ -21,12 +21,17 @@ Registered kinds and inputs:
 | develop | frames, plan | owned signed FP32 AP1/D60 image, stream |
 | identity | image (linear) | unchanged owned linear image, stream |
 | exposure | image (linear), config `ev` | explicit additional linear exposure, stream |
-| color | image (linear) | existing profile's temporary RGB24 encoder input, stream |
-| encode | image (color) | streaming sink with begin/push/end |
+| resize | image (linear), config `width`, `height` | explicit scene-linear FP32 resample, stream |
+| color | image (linear) | profile-owned 10-bit 4:4:4 target signal (single quantizer), stream |
+| encode | image (color), optional `encoder` object | streaming configured-FFmpeg sink with begin/push/end |
 | delete | frames, explicit waits required | deletes generated prepared DNG only, stream |
 
 One source, prepare, exposure-table producer, develop, color and encoder are
-required. Reference streams can fork and cross repeated sequence barriers;
+required. At most one optional resize node is allowed; it must sit between the
+linear image chain and color, so resampling always happens in scene-linear FP32
+after EV and before the target Log curve. `--resize WxH` on the CLI overrides
+that node's geometry or inserts an equivalent node before color; omitted, the
+source geometry is used unchanged (no implicit scaling). Reference streams can fork and cross repeated sequence barriers;
 references and small measurements may grow with sequence length. Image outputs
 have one consumer and one slot. The scheduler drains downstream first and starts
 another develop only after all image slots are empty, keeping one full-resolution
@@ -67,6 +72,27 @@ No interrupted frame is completed or final video published. Cache/partial paths
 and process exits remain in the existing logs. Host SIGKILL/crash recovery and
 arbitrary descendant recovery are outside the contract.
 
-The existing H.264 geometry/color adapter and report files remain temporary
-endpoints. Encoder configuration and product CLI/log migration have separate
-owners; the graph never invokes the old whole-source encoder orchestration.
+The encode node carries an optional bounded `encoder` object:
+
+```json
+{"id":"encode","kind":"encode","inputs":{"image":"color"},
+ "encoder":{"encoder":"libx264","pix_fmt":"yuv420p","container":"mp4",
+            "profile":"high","crf":18,"options":["-preset","medium"]}}
+```
+
+Supported fields are `encoder` (`prores_ks`, `libx264`, `ffv1`), `pix_fmt`,
+`container` (`mov`, `mp4`, `matroska`), `profile`, one of `crf`/`qscale`/`bitrate`,
+and an `options` array of `-flag value` or `-flag=value` pairs from the fixed
+allowlist `-preset -tune -vendor -threads -g -bf -level`. Unknown fields,
+encoders, containers, options, alpha pixel formats, conflicting rate control and
+incompatible encoder/profile/pixel-format combinations are configuration errors
+before any RAW preparation. Resolution priority is built-in default < this
+object < explicit CLI flags; a CLI `encoder` change drops the graph's
+encoder-scoped profile/rate rather than inheriting them across codecs.
+
+The colour node writes planar `yuv444p10le` target signal; that is the single
+quantization boundary. FFmpeg only subsamples/reduces it for a configured codec.
+The delivered range follows the encoder node (ProRes is limited range because
+MOV `colr` is `nclc`; MP4/Matroska express the profile range). Product report and
+CLI/log migration are separate owners; the graph never invokes the old
+whole-source encoder orchestration.

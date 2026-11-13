@@ -2,6 +2,7 @@
 //! image outputs have one slot, with a single consumer and downstream-first
 //! draining. Events are distinct from data, and deletion runs before image
 //! consumers on each scheduling turn.
+use crate::encoder::Patch as EncoderPatch;
 use crate::json::{self, Json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -27,6 +28,7 @@ pub enum Kind {
     Develop,
     Identity,
     Exposure(f64),
+    Resize { width: u32, height: u32 },
     Color,
     Encode,
     Delete,
@@ -37,7 +39,7 @@ impl Kind {
             Self::Source => Type::Source,
             Self::Prepare | Self::Barrier | Self::References => Type::Frames,
             Self::Solve | Self::Zero => Type::Plan,
-            Self::Develop | Self::Identity | Self::Exposure(_) => Type::Linear,
+            Self::Develop | Self::Identity | Self::Exposure(_) | Self::Resize { .. } => Type::Linear,
             Self::Color => Type::Color,
             _ => Type::None,
         }
@@ -50,12 +52,25 @@ impl Kind {
                 vec![("frames", Type::Frames)]
             }
             Self::Develop => vec![("frames", Type::Frames), ("plan", Type::Plan)],
-            Self::Identity | Self::Exposure(_) | Self::Color => vec![("image", Type::Linear)],
+            Self::Identity | Self::Exposure(_) | Self::Resize { .. } | Self::Color => {
+                vec![("image", Type::Linear)]
+            }
             Self::Encode => vec![("image", Type::Color)],
         }
     }
     fn sequence_only(self) -> bool {
         matches!(self, Self::Solve | Self::Zero | Self::Barrier)
+    }
+    fn image_node(self) -> bool {
+        matches!(
+            self,
+            Self::Develop
+                | Self::Identity
+                | Self::Exposure(_)
+                | Self::Resize { .. }
+                | Self::Color
+                | Self::Encode
+        )
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +89,7 @@ pub struct Node {
     pub kind: Kind,
     pub inputs: BTreeMap<String, usize>,
     pub waits: Vec<Wait>,
+    pub encoder: Option<EncoderPatch>,
 }
 #[derive(Clone, Debug)]
 pub struct Graph {
@@ -91,6 +107,12 @@ fn object(j: &Json) -> Result<&[(String, Json)]> {
     } else {
         Err("graph: expected object".into())
     }
+}
+fn dimension(node: &Json, key: &str) -> Result<u32> {
+    node.get(key)
+        .and_then(Json::as_u32)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("graph: resize requires a positive integer {key}"))
 }
 fn keys(j: &Json, allowed: &[&str]) -> Result<()> {
     let mut seen = BTreeSet::new();
@@ -139,7 +161,10 @@ impl Graph {
         };
         let mut nodes = Vec::new();
         for n in raw {
-            keys(n, &["id", "kind", "inputs", "waits", "ev"])?;
+            keys(
+                n,
+                &["id", "kind", "inputs", "waits", "ev", "width", "height", "encoder"],
+            )?;
             let kind = match string(n, "kind")? {
                 "source" => Kind::Source,
                 "prepare" => Kind::Prepare,
@@ -155,6 +180,11 @@ impl Graph {
                         .filter(|e| e.is_finite() && e.exp2().is_finite() && e.exp2() > 0.)
                         .ok_or("graph: exposure requires finite representable ev")?,
                 ),
+                "resize" => {
+                    let width = dimension(n, "width")?;
+                    let height = dimension(n, "height")?;
+                    Kind::Resize { width, height }
+                }
                 "color" => Kind::Color,
                 "encode" => Kind::Encode,
                 "delete" => Kind::Delete,
@@ -163,6 +193,19 @@ impl Graph {
             if n.get("ev").is_some() && !matches!(kind, Kind::Exposure(_)) {
                 return Err("graph: ev only belongs to exposure".into());
             }
+            if !matches!(kind, Kind::Resize { .. })
+                && (n.get("width").is_some() || n.get("height").is_some())
+            {
+                return Err("graph: width/height only belong to resize".into());
+            }
+            let encoder = if let Some(config) = n.get("encoder") {
+                if kind != Kind::Encode {
+                    return Err("graph: encoder configuration only belongs to encode".into());
+                }
+                Some(EncoderPatch::from_json(config)?)
+            } else {
+                None
+            };
             let mut inputs = BTreeMap::new();
             if let Some(input) = n.get("inputs") {
                 for (port, id) in object(input)? {
@@ -196,6 +239,7 @@ impl Graph {
                 kind,
                 inputs,
                 waits,
+                encoder,
             });
         }
         let mut graph = Self {
@@ -212,6 +256,70 @@ impl Graph {
             }
         }
     }
+
+    /// Encoder configuration declared by the single encode node, when present.
+    pub fn encoder_patch(&self) -> Option<&EncoderPatch> {
+        self.nodes.iter().find_map(|node| node.encoder.as_ref())
+    }
+
+    /// The single explicit resize geometry, when the graph declares one.
+    pub fn resize_geometry(&self) -> Option<(u32, u32)> {
+        self.nodes.iter().find_map(|node| match node.kind {
+            Kind::Resize { width, height } => Some((width, height)),
+            _ => None,
+        })
+    }
+
+    /// Explicit CLI resize. It overrides the graph's single resize node, or
+    /// inserts one immediately before the colour node when the graph has none.
+    /// Resampling stays in the scene-linear FP32 image chain and only runs when
+    /// this method or a resize node declares it.
+    pub fn apply_resize(&mut self, width: u32, height: u32) -> Result<()> {
+        if width == 0 || height == 0 {
+            return Err("graph: resize requires positive dimensions".into());
+        }
+        let existing: Vec<usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| matches!(node.kind, Kind::Resize { .. }))
+            .map(|(index, _)| index)
+            .collect();
+        if existing.len() > 1 {
+            return Err("graph: at most one resize node is supported".into());
+        }
+        if let Some(index) = existing.first() {
+            self.nodes[*index].kind = Kind::Resize { width, height };
+        } else {
+            let color = self
+                .nodes
+                .iter()
+                .position(|node| node.kind == Kind::Color)
+                .ok_or("graph: resize requires exactly one color node")?;
+            let producer = *self.nodes[color]
+                .inputs
+                .get("image")
+                .ok_or("graph: color node has no image input")?;
+            let mut id = "cli-resize".to_string();
+            let mut suffix = 1;
+            while self.nodes.iter().any(|node| node.id == id) {
+                suffix += 1;
+                id = format!("cli-resize-{suffix}");
+            }
+            let index = self.nodes.len();
+            self.nodes.push(Node {
+                id,
+                kind: Kind::Resize { width, height },
+                inputs: BTreeMap::from([("image".to_string(), producer)]),
+                waits: vec![],
+                encoder: None,
+            });
+            self.nodes[color].inputs.insert("image".into(), index);
+        }
+        self.order.clear();
+        self.validate()
+    }
+
     fn validate(&mut self) -> Result<()> {
         for kind in [
             Kind::Source,
@@ -232,6 +340,15 @@ impl Graph {
             != 1
         {
             return Err("graph: exactly one exposure plan producer required".into());
+        }
+        if self
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, Kind::Resize { .. }))
+            .count()
+            > 1
+        {
+            return Err("graph: at most one resize node is supported".into());
         }
         let mut consumers = vec![0; self.nodes.len()];
         for n in &self.nodes {
@@ -294,10 +411,7 @@ impl Graph {
         // to finish every frame. Reject waits that would hold an image slot
         // while any such prerequisite still needs that slot drained.
         for (i, n) in self.nodes.iter().enumerate() {
-            if matches!(
-                n.kind,
-                Kind::Develop | Kind::Identity | Kind::Exposure(_) | Kind::Color | Kind::Encode
-            ) {
+            if n.kind.image_node() {
                 for w in n.waits.iter().filter(|w| w.scope == Scope::Sequence) {
                     if let Some(producer) =
                         self.completion_image_ancestor(i, w.node, &mut BTreeSet::new())
@@ -399,6 +513,12 @@ pub trait Backend {
     fn solve(&mut self) -> Result<Vec<Gain>>;
     fn develop(&mut self, id: usize, r: &Self::Reference, ev: f64) -> Result<Self::Image>;
     fn exposure(&mut self, image: &mut Self::Image, ev: f64) -> Result<()>;
+    /// Explicit scene-linear resample. Backends that carry linear pixels
+    /// implement this; others reject a resize configuration explicitly.
+    fn resize(&mut self, image: &mut Self::Image, width: u32, height: u32) -> Result<()> {
+        let _ = (image, width, height);
+        Err("graph: this backend cannot resize scene-linear images".into())
+    }
     fn color(&mut self, image: Self::Image) -> Result<Self::Image>;
     fn begin(&mut self) -> Result<()>;
     fn push(&mut self, id: usize, image: Self::Image) -> Result<()>;
@@ -628,7 +748,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                         }
                     }
                 }
-                Kind::Identity | Kind::Exposure(_) | Kind::Color | Kind::Encode => {
+                Kind::Identity | Kind::Exposure(_) | Kind::Resize { .. } | Kind::Color | Kind::Encode => {
                     let p = input("image");
                     if states[i].image.is_none()
                         && states[p]
@@ -644,6 +764,10 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                         match node.kind {
                             Kind::Exposure(ev) => {
                                 b.exposure(&mut image, ev)?;
+                                states[i].image = Some((frame, image));
+                            }
+                            Kind::Resize { width, height } => {
+                                b.resize(&mut image, width, height)?;
                                 states[i].image = Some((frame, image));
                             }
                             Kind::Color => {

@@ -9,7 +9,7 @@ pub const EXIT_OUTPUT_GUARD: i32 = 11;
 pub const EXIT_OUTPUT_NOT_EMPTY: i32 = 12;
 pub const EXIT_TOOL: i32 = 20;
 pub const EXIT_FRAME: i32 = 30;
-#[allow(dead_code)] // Reserved legacy family; default H.264 encoding uses 60.
+#[allow(dead_code)] // Reserved legacy family; product encoding failures use 60.
 pub const EXIT_ENCODE: i32 = 40;
 pub const EXIT_VALIDATION: i32 = 50;
 pub const EXIT_PREVIEW: i32 = 60;

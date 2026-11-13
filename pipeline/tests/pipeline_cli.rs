@@ -64,7 +64,7 @@ fn publishes_one_streamed_video_with_manifest_and_no_frame_files() {
             "frames.csv",
             "logs",
             "manifest.json",
-            "output.mp4",
+            "output.mov",
             "pairs.csv",
         ]
     );
@@ -72,8 +72,8 @@ fn publishes_one_streamed_video_with_manifest_and_no_frame_files() {
     assert!(manifest.get("linear_video").is_none());
     assert!(manifest.get("preview").is_none());
     let video = manifest.get("video").unwrap();
-    assert_eq!(video.get("codec").and_then(Json::as_str), Some("h264"));
-    assert_eq!(video.get("file").and_then(Json::as_str), Some("output.mp4"));
+    assert_eq!(video.get("codec").and_then(Json::as_str), Some("prores"));
+    assert_eq!(video.get("file").and_then(Json::as_str), Some("output.mov"));
     assert_eq!(video.get("frames").and_then(Json::as_u64), Some(3));
     assert!(video.get("bytes").and_then(Json::as_u64).unwrap() > 0);
     let entries = manifest
@@ -126,15 +126,22 @@ fn publishes_one_streamed_video_with_manifest_and_no_frame_files() {
     );
     let text = fs::read_to_string(output.join("exposure_report.json")).unwrap();
     assert!(!text.contains("baseline_dir") && !text.contains("applied_dir"));
-    let probe = ffprobe(&output.join("output.mp4"));
-    for expected in ["codec_name=h264", "width=8", "height=6", "nb_read_frames=3"] {
+    let probe = ffprobe(&output.join("output.mov"));
+    for expected in [
+        "codec_name=prores",
+        "profile=4444",
+        "pix_fmt=yuv444p12le",
+        "width=8",
+        "height=6",
+        "nb_read_frames=3",
+    ] {
         assert!(probe.contains(expected), "{probe}");
     }
     let log = fs::read_to_string(output.join("logs/encode.log")).unwrap();
     assert!(log.contains("-i pipe:0"));
     assert!(!log.contains("-nostdin"));
-    assert!(log.contains("-c:v h264_videotoolbox -allow_sw 0"));
-    assert!(log.contains("scale=out_color_matrix=bt709:out_range=tv"));
+    assert!(log.contains("-c:v prores_ks -pix_fmt yuv444p10le"));
+    assert!(log.contains("setparams=color_primaries=bt709"));
     let timings = manifest.get("timings_s").unwrap();
     for key in ["graph", "validate_video"] {
         assert!(timings.get(key).is_some(), "{key}");
@@ -166,14 +173,14 @@ fn stops_at_the_first_failing_frame_without_video() {
     assert!(text.contains("frame 2/3"), "{text}");
     assert!(text.contains("IMG_2.DNG"), "{text}");
     assert!(text.contains("synthetic frame failure"), "{text}");
-    assert!(!output.join("output.mp4").exists());
+    assert!(!output.join("output.mov").exists());
 
     // The analysis pass runs first and produces no PNG; its measurement sidecar
     // and transcript are retained, and no final frames directory was created.
     assert!(!output.join("frames").exists());
 
-    assert!(!output.join("output.mp4").exists());
-    assert!(!output.join("output.mp4").exists());
+    assert!(!output.join("output.mov").exists());
+    assert!(!output.join("output.mov").exists());
     assert!(output.join(".rawtl-partial").is_dir());
     assert!(!output.join("analysis").exists());
     let log =
@@ -204,9 +211,9 @@ fn encoder_failure_after_bytes_written_publishes_nothing() {
         "{text}"
     );
 
-    assert!(!output.join("output.mp4").exists());
-    assert!(!output.join("output.mp4").exists());
-    let partial = output.join(".rawtl-partial/output.mp4");
+    assert!(!output.join("output.mov").exists());
+    assert!(!output.join("output.mov").exists());
+    let partial = output.join(".rawtl-partial/output.mov");
     assert!(
         partial.is_file(),
         "partial diagnostic file must be retained"
@@ -249,14 +256,14 @@ fn probe_rejection_publishes_nothing() {
     assert_eq!(result.status.code(), Some(60), "{}", stderr(&result));
     let text = stderr(&result);
     assert!(text.contains("codec is \"ffv1\""), "{text}");
-    assert!(text.contains("expected \"h264\""), "{text}");
+    assert!(text.contains("expected \"prores\""), "{text}");
     assert!(
         text.contains("partial/intermediate artifacts retained"),
         "{text}"
     );
-    assert!(!output.join("output.mp4").exists());
-    assert!(!output.join("output.mp4").exists());
-    assert!(output.join(".rawtl-partial/output.mp4").is_file());
+    assert!(!output.join("output.mov").exists());
+    assert!(!output.join("output.mov").exists());
+    assert!(output.join(".rawtl-partial/output.mov").is_file());
 }
 
 #[test]
@@ -355,7 +362,7 @@ fn assert_final_source_hash_rejected(defect: &str) {
         result.status.code(),
         Some(30),
         "{defect}: final video published={}; stderr: {}",
-        output.join("output.mp4").exists(),
+        output.join("output.mov").exists(),
         stderr(&result)
     );
     let error = stderr(&result);
@@ -367,7 +374,7 @@ fn assert_final_source_hash_rejected(defect: &str) {
         error.contains("metadata is missing or invalid field \"source_sha256\""),
         "{error}"
     );
-    assert!(!output.join("output.mp4").exists());
+    assert!(!output.join("output.mov").exists());
     assert!(output.join(".rawtl-partial").is_dir());
     assert!(output.join("exposure_report.json").is_file());
     assert!(
@@ -539,7 +546,7 @@ fn detects_a_native_tool_that_ignores_the_frozen_override() {
         text.contains("should use the frozen override white balance"),
         "{text}"
     );
-    assert!(!output.join("output.mp4").exists());
+    assert!(!output.join("output.mov").exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -685,8 +692,8 @@ fn confirmed_step_is_preserved_and_not_corrected_away() {
         mean(10..20)
     );
     assert!(!output.join("temporal_audit.json").exists());
-    assert!(output.join("output.mp4").is_file());
-    assert!(output.join("output.mp4").is_file());
+    assert!(output.join("output.mov").is_file());
+    assert!(output.join("output.mov").is_file());
 }
 
 #[test]
@@ -729,7 +736,7 @@ fn ev_limits_are_carried_into_the_frozen_graph_plan() {
     assert!(limited > 0, "expected LIMITED frames, report: {report:?}");
     assert!(!output.join("logs/probe").exists());
     assert!(!output.join("logs/applied-iter0").exists());
-    assert!(output.join("output.mp4").is_file());
+    assert!(output.join("output.mov").is_file());
     assert!(output.join("exposure-curve.csv").is_file());
 }
 
@@ -923,7 +930,7 @@ fn late_encoder_failure_on_disabled_path_reports_failed_status() {
         Some("FAILED")
     );
     assert!(report.get("error").and_then(Json::as_str).is_some());
-    assert!(!output.join("output.mp4").exists());
+    assert!(!output.join("output.mov").exists());
 }
 
 #[test]
@@ -973,7 +980,7 @@ fn fractional_applied_ev_survives_sidecar_precision() {
         exercised,
         "the fixture must contain an EV that does not round-trip at 10 significant digits"
     );
-    assert!(output.join("output.mp4").is_file());
+    assert!(output.join("output.mov").is_file());
     assert!(!output.join("frames").exists());
 }
 
@@ -1028,64 +1035,33 @@ fn run_profile(root: &Path, input: &Path, tool: &Path, id: &str) -> Output {
 
 #[test]
 fn preview_profiles_emit_their_declared_colour_contract() {
-    let cases: [(&str, &str, &str, &[&str], bool, &str, &str); 6] = [
-        (
-            "srgb-preview",
-            "output.mp4",
-            "tv",
-            &["yuv420p"],
-            false,
-            "bt709",
-            "iec.ch",
-        ),
-        (
-            "sony-slog3-sgamut3",
-            "output.mp4",
-            "pc",
-            &["yuv420p", "yuvj420p"],
-            true,
-            "bt2020nc",
-            "sony.jp",
-        ),
+    // The default deliverable is ProRes 4444 in MOV. Primaries and transfer are
+    // profile-accurate, the coding matrix is declared, and the delivered signal
+    // is limited range: MOV `colr` is `nclc`, which has no range field, and
+    // ProRes decoders assume video range. A full-range profile convention is
+    // therefore delivered as limited at the encoder node.
+    let cases: [(&str, &str, bool, &str, &str); 6] = [
+        ("srgb-preview", "bt709", false, "bt709", "iec.ch"),
+        ("sony-slog3-sgamut3", "bt2020nc", true, "unknown", "sony.jp"),
         (
             "sony-slog3-sgamut3-cine",
-            "output.mp4",
-            "pc",
-            &["yuv420p", "yuvj420p"],
-            true,
             "bt2020nc",
+            true,
+            "unknown",
             "sony.jp",
         ),
         (
             "canon-log2-cinema-gamut",
-            "output.mp4",
-            "pc",
-            &["yuv420p", "yuvj420p"],
-            true,
             "bt2020nc",
+            true,
+            "unknown",
             "canon.com",
         ),
-        (
-            "nikon-nlog-bt2020",
-            "output.mp4",
-            "pc",
-            &["yuv420p", "yuvj420p"],
-            true,
-            "bt2020nc",
-            "nikon",
-        ),
-        (
-            "dji-dlog-dgamut",
-            "output.mp4",
-            "pc",
-            &["yuv420p", "yuvj420p"],
-            true,
-            "bt2020nc",
-            "djicdn",
-        ),
+        ("nikon-nlog-bt2020", "bt2020nc", true, "bt2020", "nikon"),
+        ("dji-dlog-dgamut", "bt2020nc", true, "unknown", "djicdn"),
     ];
 
-    for (id, filename, range, pix_fmts, vendor, matrix, source_marker) in cases {
+    for (id, matrix, vendor, primaries, source_marker) in cases {
         let (root, input, fixtures) = run_success_setup(&format!("profile-contract-{id}"));
         let frames = standard_frames(&fixtures);
         let tool = fake_native_tool(&fixtures, &frames, None, false);
@@ -1106,6 +1082,14 @@ fn preview_profiles_emit_their_declared_colour_contract() {
                 .and_then(Json::as_str),
             Some("signed f32 LE AP1/D60")
         );
+        assert_eq!(
+            manifest
+                .get("quantization_policy")
+                .unwrap()
+                .get("final_denominator")
+                .and_then(Json::as_u64),
+            Some(1023)
+        );
         for (path, command) in frame_commands(&output.join("logs")) {
             assert!(
                 command.contains("--camera-color-method legacy-inverse-cm"),
@@ -1117,177 +1101,135 @@ fn preview_profiles_emit_their_declared_colour_contract() {
                 assert!(command.contains("--stdout-analysis"), "{command}");
             }
         }
-        let preview = output.join(filename);
-        assert!(preview.is_file(), "{id}: missing {filename}");
+        let preview = output.join("output.mov");
+        assert!(preview.is_file(), "{id}: missing output.mov");
 
         let probe = ffprobe_color(&preview);
-        for expected in ["codec_name=h264", "width=8", "height=6", "nb_read_frames=3"] {
+        for expected in [
+            "codec_name=prores",
+            "profile=4444",
+            "pix_fmt=yuv444p12le",
+            "width=8",
+            "height=6",
+            "nb_read_frames=3",
+            "color_range=unknown",
+        ] {
             assert!(probe.contains(expected), "{id}: {probe}");
         }
-        assert!(
-            probe.contains(&format!("color_range={range}")),
-            "{id}: {probe}"
-        );
-        let pix_fmt = probe
-            .lines()
-            .find_map(|line| line.strip_prefix("pix_fmt="))
-            .expect("pix_fmt");
-        assert!(
-            pix_fmts.contains(&pix_fmt),
-            "{id}: pix_fmt {pix_fmt:?} not in {pix_fmts:?}"
-        );
-        let expected = if !vendor {
-            ColorCodes {
-                primaries: 1,
-                transfer: 13,
-                matrix: 1,
-                full: 0,
-            }
-        } else {
-            ColorCodes {
-                primaries: if id == "nikon-nlog-bt2020" { 9 } else { 2 },
-                transfer: 2,
-                matrix: 9,
-                full: 1,
-            }
-        };
-        let primaries = if !vendor {
-            "bt709"
-        } else if id == "nikon-nlog-bt2020" {
-            "bt2020"
-        } else {
-            "unknown"
-        };
+        let transfer = if vendor { "unknown" } else { "iec61966-2-1" };
         for tag in [
             format!("color_space={matrix}"),
             format!("color_primaries={primaries}"),
-            format!(
-                "color_transfer={}",
-                if vendor { "unknown" } else { "iec61966-2-1" }
-            ),
+            format!("color_transfer={transfer}"),
         ] {
             assert!(probe.contains(&tag), "{id}: {probe}");
         }
-        let container = mp4_nclx(&preview);
-        let bitstream = h264_sps_vui(&preview);
-        assert_eq!(container, expected, "{id}: container");
-        assert_eq!(bitstream, expected, "{id}: SPS VUI");
-        assert_eq!(container, bitstream, "{id}: layers disagree");
-        println!(
-            "tags {id}: MP4 nclx {container:?}; H.264 SPS VUI {bitstream:?}; ffprobe\n{probe}"
-        );
+        println!("tags {id}: ffprobe\n{probe}");
 
-        let manifest = fs::read_to_string(output.join("manifest.json")).expect("manifest");
-        let json = rawtl_linear_video::json::parse(&manifest).expect("manifest JSON");
-        let tags = json
+        let (expected_primaries, expected_transfer, expected_matrix) = if vendor {
+            (if id == "nikon-nlog-bt2020" { 9 } else { 2 }, 2, 9)
+        } else {
+            (1, 13, 1)
+        };
+        let tags = manifest
             .get("video")
             .unwrap()
             .get("emitted_tags")
             .expect("emitted_tags");
-        for layer in ["h264_sps_vui", "mp4_colr_nclx"] {
-            let fields = tags.get(layer).expect(layer);
-            for (field, value) in [
-                ("colour_primaries", expected.primaries),
-                ("transfer_characteristics", expected.transfer),
-                ("matrix_coefficients", expected.matrix),
-                ("video_full_range_flag", expected.full),
-            ] {
-                assert_eq!(
-                    fields.get(field).and_then(|v| v.as_u64()),
-                    Some(value as u64),
-                    "{id} {layer} {field}"
-                );
-            }
+        for (field, value) in [
+            ("colour_primaries", expected_primaries),
+            ("transfer_characteristics", expected_transfer),
+            ("matrix_coefficients", expected_matrix),
+            ("video_full_range_flag", 0),
+        ] {
+            assert_eq!(
+                tags.get(field).and_then(|v| v.as_u64()),
+                Some(value as u64),
+                "{id} {field}"
+            );
         }
+        let manifest_text = fs::read_to_string(output.join("manifest.json")).expect("manifest");
         for expected in [
-            format!("\"file\": \"{filename}\""),
+            "\"file\": \"output.mov\"".to_string(),
             format!("\"profile\": \"{id}\""),
             "\"dither\": false".to_string(),
-            format!("\"range\": \"{range}\""),
+            "\"range\": \"tv\"".to_string(),
             format!("\"ycbcr_matrix\": \"{matrix}\""),
             "\"full_decode\": \"pass\"".to_string(),
+            "\"encoder\": \"prores_ks\"".to_string(),
+            "\"container\": \"mov\"".to_string(),
         ] {
             assert!(
-                manifest.contains(&expected),
+                manifest_text.contains(&expected),
                 "{id}: manifest missing {expected:?}"
             );
         }
         assert!(
-            manifest.contains(source_marker),
+            manifest_text.contains(source_marker),
             "{id}: manifest must cite the vendor source ({source_marker})"
         );
         assert!(
-            manifest.contains("\"reference_codes\""),
+            manifest_text.contains("\"reference_codes\""),
             "{id}: manifest must record official reference codes"
         );
     }
 }
 
-/// Independent transcription of BT.2020-2 (10/2015), Table 4 NCL equations:
-/// https://www.itu.int/rec/R-REC-BT.2020-2-201510-I/en
-/// Y'=Kr*R'+(1-Kr-Kb)*G'+Kb*B', Cb=(B'-Y')/2(1-Kb), Cr=(R'-Y')/2(1-Kr).
-/// Compare the actual swscale token used by the pipeline with those equations,
-/// before lossy H.264 encoding; allow one code for fixed-point rounding.
+/// Independent transcription of the BT.709 and BT.2020-2 (10/2015) Table 4
+/// NCL equations: Y'=Kr*R'+(1-Kr-Kb)*G'+Kb*B', Cb=(B'-Y')/2(1-Kb),
+/// Cr=(R'-Y')/2(1-Kr). The production quantizer must produce the same 10-bit
+/// codes for the same target signal; the expectations below are written with
+/// the published constants, not with the registry's coefficients.
 #[test]
-fn bt2020_ncl_swscale_matches_the_standard_derivation() {
-    require_ffmpeg();
-    let root = test_dir("bt2020-standard");
-    for rgb in [
-        [255u8, 0, 0],
-        [0, 255, 0],
-        [0, 0, 255],
-        [196, 64, 32],
-        [128; 3],
-    ] {
-        let input = root.join(format!("{rgb:?}.rgb"));
-        fs::write(&input, rgb.repeat(64 * 48)).expect("write RGB fixture");
-        let [r, g, b] = rgb.map(|code| code as f64 / 255.0);
-        let y = 0.2627 * r + 0.6780 * g + 0.0593 * b;
-        let cb = (b - y) / 1.8814;
-        let cr = (r - y) / 1.4746;
-        for (range, y_scale, c_scale, y_offset) in
-            [("tv", 219.0, 224.0, 16.0), ("pc", 255.0, 255.0, 0.0)]
-        {
-            let output = root.join(format!("{rgb:?}-{range}.yuv"));
-            let filter = format!("scale=out_color_matrix=bt2020:out_range={range},format=yuv444p");
-            let result = std::process::Command::new(FFMPEG)
-                .args([
-                    "-v",
-                    "error",
-                    "-nostdin",
-                    "-f",
-                    "rawvideo",
-                    "-pixel_format",
-                    "rgb24",
-                    "-video_size",
-                    "64x48",
-                    "-i",
-                ])
-                .arg(&input)
-                .args(["-frames:v", "1", "-vf", &filter, "-f", "rawvideo"])
-                .arg(&output)
-                .output()
-                .expect("run swscale");
-            assert!(result.status.success(), "{}", stderr(&result));
-            let bytes = fs::read(output).expect("YCbCr fixture");
-            assert_eq!(bytes.len(), 64 * 48 * 3);
-            let actual = [bytes[0], bytes[64 * 48], bytes[2 * 64 * 48]];
+fn production_ycbcr_quantization_matches_the_standard_derivation() {
+    use rawtl_linear_video::color_profile::{lookup, quantize_chroma, quantize_luma};
+    let cases = [
+        ("srgb-preview", 0.2126, 0.7152, 0.0722, 1.8556, 1.5748),
+        ("canon-log3-cinema-gamut-rev-eng-crm-dev", 0.2627, 0.6780, 0.0593, 1.8814, 1.4746),
+        ("nikon-nlog-bt2020", 0.2627, 0.6780, 0.0593, 1.8814, 1.4746),
+    ];
+    for (id, kr, kg, kb, div_cb, div_cr) in cases {
+        let profile = lookup(id).expect(id);
+        for signal in [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.18, 0.18, 0.18],
+            [0.4, 0.18, 0.09],
+            [-0.05, 0.6, 1.2],
+        ] {
+            let y = kr * signal[0] + kg * signal[1] + kb * signal[2];
             let expected = [
-                y_offset + y_scale * y,
-                128.0 + c_scale * cb,
-                128.0 + c_scale * cr,
-            ]
-            .map(|code| code.round().clamp(0.0, 255.0) as u8);
-            for channel in 0..3 {
-                assert!(
-                    (actual[channel] as i32 - expected[channel] as i32).abs() <= 1,
-                    "{rgb:?} {range}: swscale {actual:?} vs BT.2020-2 {expected:?}"
-                );
-            }
-            println!(
-                "BT.2020 NCL {rgb:?} {range}: standard {expected:?}, swscale {actual:?}: PASS"
+                quantize_luma(y, profile.range),
+                quantize_chroma((signal[2] - y) / div_cb, profile.range),
+                quantize_chroma((signal[0] - y) / div_cr, profile.range),
+            ];
+            assert_eq!(
+                profile.encode_signal_yuv10(signal, profile.range).unwrap(),
+                expected,
+                "{id} {signal:?}"
             );
         }
+        // Limited range uses 64..940 for luma and centres chroma at 512; full
+        // range uses 0..1023. The tag written with the output follows this
+        // choice, and ProRes delivery forces limited.
+        let limited = [64u16, 512, 512];
+        assert_eq!(
+            [
+                quantize_luma(0.0, rawtl_linear_video::color_profile::PreviewRange::Tv),
+                quantize_chroma(0.0, rawtl_linear_video::color_profile::PreviewRange::Tv),
+                quantize_chroma(0.0, rawtl_linear_video::color_profile::PreviewRange::Tv),
+            ],
+            limited
+        );
+        assert_eq!(
+            quantize_luma(1.0, rawtl_linear_video::color_profile::PreviewRange::Tv),
+            940
+        );
+        assert_eq!(
+            quantize_luma(1.0, rawtl_linear_video::color_profile::PreviewRange::Pc),
+            1023
+        );
     }
 }
 
@@ -1304,40 +1246,40 @@ fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
     const VENDOR_TOLERANCE: i32 = 3;
     const SRGB_TOLERANCE: i32 = 12;
     let cases: [(&str, &str, &str, &str, [u8; 3]); 6] = [
-        ("srgb-preview", "output.mp4", "bt709", "tv", [0, 255, 0]),
+        ("srgb-preview", "output.mov", "bt709", "tv", [0, 255, 0]),
         (
             "sony-slog3-sgamut3",
-            "output.mp4",
+            "output.mov",
             "bt2020",
-            "pc",
+            "tv",
             [59, 147, 20],
         ),
         (
             "sony-slog3-sgamut3-cine",
-            "output.mp4",
+            "output.mov",
             "bt2020",
-            "pc",
+            "tv",
             [0, 145, 49],
         ),
         (
             "canon-log2-cinema-gamut",
-            "output.mp4",
+            "output.mov",
             "bt2020",
-            "pc",
+            "tv",
             [48, 140, 96],
         ),
         (
             "nikon-nlog-bt2020",
-            "output.mp4",
+            "output.mov",
             "bt2020",
-            "pc",
+            "tv",
             [0, 154, 0],
         ),
         (
             "dji-dlog-dgamut",
-            "output.mp4",
+            "output.mov",
             "bt2020",
-            "pc",
+            "tv",
             [0, 145, 74],
         ),
     ];
@@ -1378,33 +1320,14 @@ fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
         );
 
         if id != "srgb-preview" {
-            for (name, from, to) in [
-                (
-                    "wrong-matrix",
-                    "out_color_matrix=bt2020",
-                    "out_color_matrix=bt709",
-                ),
-                ("wrong-range", "out_range=pc", "out_range=tv"),
+            // Counterfactuals decode the same encoded signal under the wrong
+            // matrix and the wrong range. Metadata cannot make a wrong inverse
+            // pass; the encoded 4:4:4 samples are unchanged.
+            for (name, wrong_matrix, wrong_range) in [
+                ("wrong-matrix", "bt709", range),
+                ("wrong-range", matrix, "pc"),
             ] {
-                // Mutate only the preview's pixel conversion, preserving all
-                // tags and encoder arguments. Decode under the declared matrix
-                // and range, so metadata cannot make a wrong conversion pass.
-                let shim = root.join(format!("ffmpeg-{name}"));
-                write_executable(&shim, &format!(
-                    "#!/bin/bash\nargs=()\nfor arg in \"$@\"; do\n  args+=(\"${{arg//{from}/{to}}}\")\ndone\nexec {} \"${{args[@]}}\"\n",
-                    shell_quote(FFMPEG)
-                ));
-                let output = root.join(name);
-                let mut args = base_args(&input, &output, &tool);
-                args.extend_from_slice(&[
-                    "--preview-profile",
-                    id,
-                    "--ffmpeg",
-                    shim.to_str().expect("utf8"),
-                ]);
-                let result = run_cli(&args);
-                assert!(result.status.success(), "{id} {name}: {}", stderr(&result));
-                let wrong = decode_first_pixel(&output.join(filename), matrix, range);
+                let wrong = decode_first_pixel(&preview, wrong_matrix, wrong_range);
                 let wrong_difference = (0..3)
                     .map(|channel| (wrong[channel] as i32 - expected[channel] as i32).abs())
                     .max()
@@ -1448,18 +1371,18 @@ fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
 }
 
 /// No decoder colour/range overrides: tags must select the same conversion as
-/// the forced-correct path. Uniform 64x48 patches isolate matrix/range errors
-/// from edge chroma sampling. Correct hardware-codec error is <=3 codes; wrong
-/// matrix green-patch error is >=5. Keep the same three-code acceptance margin.
+/// the forced-correct path. ProRes in MOV carries matrix/primaries/transfer in
+/// `colr nclc` but no range field, so the decoder's video-range default is the
+/// contract; a full-range read is visibly wrong.
 #[test]
 fn vendor_previews_auto_decode_from_their_own_tags() {
-    for (id, filename, expected) in [
-        ("sony-slog3-sgamut3", "output.mp4", [59u8, 147, 20]),
-        ("sony-slog3-sgamut3-cine", "output.mp4", [0, 145, 49]),
-        ("canon-log2-cinema-gamut", "output.mp4", [48, 140, 96]),
-        (REV3_PROFILE, "output.mp4", [39, 135, 77]),
-        ("nikon-nlog-bt2020", "output.mp4", [0, 154, 0]),
-        ("dji-dlog-dgamut", "output.mp4", [0, 145, 74]),
+    for (id, expected) in [
+        ("sony-slog3-sgamut3", [59u8, 147, 20]),
+        ("sony-slog3-sgamut3-cine", [0, 145, 49]),
+        ("canon-log2-cinema-gamut", [48, 140, 96]),
+        (REV3_PROFILE, [39, 135, 77]),
+        ("nikon-nlog-bt2020", [0, 154, 0]),
+        ("dji-dlog-dgamut", [0, 145, 74]),
     ] {
         let (root, input, tool) = profile_material_for_extension(
             &format!("auto-tags-{id}"),
@@ -1468,34 +1391,11 @@ fn vendor_previews_auto_decode_from_their_own_tags() {
         );
         let result = run_profile(&root, &input, &tool, id);
         assert!(result.status.success(), "{id}: {}", stderr(&result));
-        let preview = root.join("run").join(filename);
+        let preview = root.join("run").join("output.mov");
         let auto = decode_first_pixel_auto(&preview);
-        let correct = decode_first_pixel(&preview, "bt2020", "pc");
-        let wrong_matrix = decode_first_pixel(&preview, "bt709", "pc");
-        // On this FFmpeg build a scale in_range hint on a tagged yuvj420p
-        // stream is not a reliable counterfactual. Change the actual range
-        // declarations in BOTH layers, then decode without overrides again.
-        let limited = root.join("wrong-range-tags.mp4");
-        let retag = std::process::Command::new(FFMPEG)
-            .args(["-v", "error", "-nostdin", "-i"])
-            .arg(&preview)
-            .args([
-                "-c:v",
-                "copy",
-                "-color_range",
-                "tv",
-                "-bsf:v",
-                "h264_metadata=video_full_range_flag=0",
-                "-movflags",
-                "+faststart+write_colr",
-            ])
-            .arg(&limited)
-            .output()
-            .expect("retag range");
-        assert!(retag.status.success(), "{id}: {}", stderr(&retag));
-        assert_eq!(mp4_nclx(&limited).full, 0, "{id} limited nclx");
-        assert_eq!(h264_sps_vui(&limited).full, 0, "{id} limited SPS");
-        let wrong_range = decode_first_pixel_auto(&limited);
+        let correct = decode_first_pixel(&preview, "bt2020", "tv");
+        let wrong_matrix = decode_first_pixel(&preview, "bt709", "tv");
+        let wrong_range = decode_first_pixel(&preview, "bt2020", "pc");
         let distance = |a: [u8; 3], b: [u8; 3]| {
             (0..3)
                 .map(|c| (a[c] as i32 - b[c] as i32).abs())
@@ -1518,16 +1418,11 @@ fn vendor_previews_auto_decode_from_their_own_tags() {
             distance(auto, wrong_range) > 3,
             "{id} auto {auto:?} vs wrong range {wrong_range:?}"
         );
-        // Judge decoder selection against the forced-correct decode: codec
-        // error can cancel a wrong inverse's error against the pre-encode RGB
-        // reference (observed for Sony). The separate encode mutations below
-        // remain checked against that independent reference for every vendor.
         assert!(
             distance(wrong_range, expected) > 3,
             "{id}: wrong range passes reference"
         );
-        println!("auto {id}: reference={expected:?} auto={auto:?} forced={correct:?} wrong-matrix={wrong_matrix:?} wrong-range={wrong_range:?}; errors auto/ref={} auto/forced={} auto/wrong-matrix={} auto/wrong-range={}",
-            distance(auto,expected),distance(auto,correct),distance(auto,wrong_matrix),distance(auto,wrong_range));
+        println!("auto {id}: reference={expected:?} auto={auto:?} forced={correct:?} wrong-matrix={wrong_matrix:?} wrong-range={wrong_range:?}");
     }
 }
 
@@ -1537,7 +1432,7 @@ fn vendor_previews_auto_decode_from_their_own_tags() {
 fn wrong_ycbcr_matrix_is_rejected_by_the_patch_check() {
     // N-Log compresses highlights least in this range, so AP1/D60 red 3.5 maps
     // to a maximally chromatic coded triple [202,0,0]; the BT.709 inverse
-    // differs by 11 codes from the declared BT.2020 matrix, while H.264 error
+    // differs by 11 codes from the declared BT.2020 matrix, while ProRes error
     // on the uniform patch stays well below that.
     const CORRECT_TOLERANCE: i32 = 8;
     let (root, input, tool) = profile_material("profile-wrong-matrix", [57344, 0, 0]);
@@ -1548,9 +1443,9 @@ fn wrong_ycbcr_matrix_is_rejected_by_the_patch_check() {
         stdout(&result),
         stderr(&result)
     );
-    let preview = root.join("run").join("output.mp4");
+    let preview = root.join("run").join("output.mov");
     let expected = [202u8, 0, 0];
-    let decoded = decode_first_pixel(&preview, "bt2020", "pc");
+    let decoded = decode_first_pixel(&preview, "bt2020", "tv");
     let difference = (0..3)
         .map(|channel| (decoded[channel] as i32 - expected[channel] as i32).abs())
         .max()
@@ -1560,7 +1455,7 @@ fn wrong_ycbcr_matrix_is_rejected_by_the_patch_check() {
         "declared matrix: {decoded:?} vs {expected:?}"
     );
 
-    let wrong = decode_first_pixel(&preview, "bt709", "pc");
+    let wrong = decode_first_pixel(&preview, "bt709", "tv");
     let wrong_difference = (0..3)
         .map(|channel| (wrong[channel] as i32 - expected[channel] as i32).abs())
         .max()
@@ -1803,8 +1698,8 @@ fn per_frame_mode_decodes_every_frame_with_its_own_as_shot_neutral() {
     );
     assert!(!run_stdout.contains("frozen white balance"), "{run_stdout}");
 
-    assert!(output.join("output.mp4").is_file());
-    assert!(output.join("output.mp4").is_file());
+    assert!(output.join("output.mov").is_file());
+    assert!(output.join("output.mov").is_file());
 }
 
 #[test]
@@ -1853,8 +1748,8 @@ fn per_frame_mode_rejects_a_producer_that_invents_an_override() {
     );
     assert!(text.contains("frame 1/3"), "{text}");
     assert!(text.contains("override"), "{text}");
-    assert!(!output.join("output.mp4").exists());
-    assert!(!output.join("output.mp4").exists());
+    assert!(!output.join("output.mov").exists());
+    assert!(!output.join("output.mov").exists());
 }
 
 #[test]
@@ -1880,7 +1775,7 @@ fn rejects_a_producer_that_reports_as_shot_but_applies_another_neutral() {
     );
     assert!(text.contains("as_shot_neutral"), "{text}");
     assert!(text.contains("frame 1/3"), "{text}");
-    assert!(!output.join("output.mp4").exists());
+    assert!(!output.join("output.mov").exists());
 }
 
 #[test]
@@ -2047,11 +1942,15 @@ fn protocol_and_child_failures_reap_live_counterparts_and_never_publish() {
         let body = if encoder_exit {
             "exit 7"
         } else {
-            "exec /usr/bin/python3 -c 'import sys,time; sys.stdin.buffer.read(129600); time.sleep(60)'"
+            "exec /usr/bin/python3 -c 'import sys,time; sys.stdin.buffer.read(259200); time.sleep(60)'"
         };
+        // The capability preflight is a synthetic lavfi frame; only the real
+        // streaming invocation should stall or fail.
         write_executable(
             &encoder,
-            &format!("#!/bin/sh\necho $$ >> \"$FAKE_NATIVE_PIDS\"\n{body}\n"),
+            &format!(
+                "#!/bin/sh\necho $$ >> \"$FAKE_NATIVE_PIDS\"\ncase \" $* \" in *\" lavfi \"*) exit 0;; esac\n{body}\n"
+            ),
         );
         let output = root.join("run");
         let mut args = base_args(&input, &output, &native);
@@ -2069,7 +1968,7 @@ fn protocol_and_child_failures_reap_live_counterparts_and_never_publish() {
             stderr(&result)
         );
         assert!(output.join(".rawtl-partial").is_dir());
-        assert!(!output.join("output.mp4").exists());
+        assert!(!output.join("output.mov").exists());
         assert!(
             !output.join("logs/render/frame_000003.log").exists(),
             "stop dispatch on failure"
@@ -2126,17 +2025,30 @@ fn rev_eng_profile_streams_f32_through_graph_measure_and_render() {
                 stdout(&result),
                 stderr(&result)
             );
-            assert!(output.join("output.mp4").exists());
+            assert!(output.join("output.mov").exists());
             assert!(!output.join("frames").exists());
-            let expected_tags = ColorCodes {
-                primaries: 2,
-                transfer: 2,
-                matrix: 9,
-                full: 1,
-            };
-            assert_eq!(mp4_nclx(&output.join("output.mp4")), expected_tags);
-            assert_eq!(h264_sps_vui(&output.join("output.mp4")), expected_tags);
+            let video = output.join("output.mov");
+            let probe = ffprobe_color(&video);
+            for tag in [
+                "codec_name=prores",
+                "profile=4444",
+                "color_space=bt2020nc",
+                "color_primaries=unknown",
+                "color_transfer=unknown",
+                "color_range=unknown",
+            ] {
+                assert!(probe.contains(tag), "{probe}");
+            }
             let manifest = read_json(&output.join("manifest.json"));
+            let emitted = manifest
+                .get("video")
+                .unwrap()
+                .get("emitted_tags")
+                .unwrap();
+            assert_eq!(
+                emitted.get("video_full_range_flag").and_then(Json::as_u64),
+                Some(0)
+            );
             let contract = manifest
                 .get("video")
                 .unwrap()
@@ -2266,7 +2178,7 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
                 "{knob}: {}",
                 stderr(&result)
             );
-            assert!(!output.join("output.mp4").exists());
+            assert!(!output.join("output.mov").exists());
         }
     }
 }
@@ -2307,6 +2219,6 @@ fn log_reference_gain_is_finite_positive_and_exclusive_to_new_profile() {
         let result = run_cli(&args);
         assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
         assert!(stderr(&result).contains("requires Canon CR3"));
-        assert!(!output.join("output.mp4").exists());
+        assert!(!output.join("output.mov").exists());
     }
 }

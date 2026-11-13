@@ -2,7 +2,7 @@
 name = "rawtl-linear-video"
 version = "0.1.0"
 edition = "2021"
-description = "Frame-sequence pipeline and FFV1/sRGB video encoder for scene-linear ACEScg DNG frames"
+description = "Frame-sequence graph pipeline and configurable high-bit video encoder for scene-linear ACEScg DNG frames"
 publish = false
 
 [[bin]]

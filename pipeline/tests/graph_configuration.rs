@@ -59,7 +59,7 @@ fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
         .collect();
     let tool = fake_native_tool(&fixtures, &frames, None, false);
     let baseline = run(&root, "baseline", &input, &tool, &graph());
-    let base_pixel = decode_first_pixel(&baseline.join("output.mp4"), "bt709", "tv");
+    let base_pixel = decode_first_pixel(&baseline.join("output.mov"), "bt709", "tv");
     let trace = fs::read_to_string(baseline.join("logs/graph.log")).unwrap();
     assert_eq!(
         trace
@@ -95,7 +95,7 @@ fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
     let kept = run(&root, "identity", &input, &tool, &identity);
     assert_eq!(
         base_pixel,
-        decode_first_pixel(&kept.join("output.mp4"), "bt709", "tv")
+        decode_first_pixel(&kept.join("output.mov"), "bt709", "tv")
     );
     set(
         nodes(&mut identity).last_mut().unwrap(),
@@ -108,7 +108,7 @@ fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
         Json::Float(1.),
     );
     let exposed = run(&root, "exposure", &input, &tool, &identity);
-    let pixel = decode_first_pixel(&exposed.join("output.mp4"), "bt709", "tv");
+    let pixel = decode_first_pixel(&exposed.join("output.mov"), "bt709", "tv");
     let manifest = read_json(&exposed.join("manifest.json"));
     let entry = &manifest
         .get("frames")

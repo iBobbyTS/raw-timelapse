@@ -7,6 +7,7 @@ struct Fake {
     deleted: Vec<usize>,
     consumed: Vec<(usize, Vec<f32>)>,
     order: Vec<String>,
+    resizes: Vec<(u32, u32)>,
     zero: bool,
     bad_plan: bool,
     plan_defect: Option<&'static str>,
@@ -77,6 +78,11 @@ impl Backend for Fake {
         }
         Ok(())
     }
+    fn resize(&mut self, _image: &mut Vec<f32>, width: u32, height: u32) -> Result<()> {
+        self.resizes.push((width, height));
+        self.order.push(format!("resize {width}x{height}"));
+        Ok(())
+    }
     fn color(&mut self, image: Vec<f32>) -> Result<Vec<f32>> {
         Ok(image)
     }
@@ -111,6 +117,119 @@ impl Backend for Fake {
         Ok(())
     }
 }
+#[test]
+fn explicit_resize_node_stays_between_develop_and_colour() {
+    let text = include_str!("default.json").replace(
+        "{\"id\":\"color\", \"kind\":\"color\", \"inputs\":{\"image\":\"apply-ev\"}}",
+        "{\"id\":\"resize\",\"kind\":\"resize\",\"width\":16,\"height\":12,\"inputs\":{\"image\":\"apply-ev\"}},{\"id\":\"color\",\"kind\":\"color\",\"inputs\":{\"image\":\"resize\"}}",
+    );
+    let graph = Graph::parse(&text).unwrap();
+    assert_eq!(graph.resize_geometry(), Some((16, 12)));
+    let mut fake = Fake::default();
+    execute(&graph, 3, &mut fake).unwrap();
+    assert_eq!(fake.resizes, vec![(16, 12); 3]);
+    for id in 0..3 {
+        let resize = fake
+            .order
+            .iter()
+            .position(|entry| entry == "resize 16x12")
+            .unwrap();
+        let push = fake
+            .order
+            .iter()
+            .position(|entry| entry == &format!("push {id}"))
+            .unwrap();
+        assert!(resize < push);
+    }
+    // Resize is scene-linear: it cannot sit after the colour node.
+    let after_color = include_str!("default.json").replace(
+        "{\"id\":\"encode\", \"kind\":\"encode\", \"inputs\":{\"image\":\"color\"}}",
+        "{\"id\":\"resize\",\"kind\":\"resize\",\"width\":16,\"height\":12,\"inputs\":{\"image\":\"color\"}},{\"id\":\"encode\",\"kind\":\"encode\",\"inputs\":{\"image\":\"resize\"}}",
+    );
+    let error = Graph::parse(&after_color).unwrap_err();
+    assert!(error.contains("type mismatch"), "{error}");
+}
+
+#[test]
+fn cli_resize_inserts_or_overrides_the_single_explicit_node() {
+    let mut graph = Graph::default_graph(true);
+    assert_eq!(graph.resize_geometry(), None);
+    graph.apply_resize(16, 12).unwrap();
+    assert_eq!(graph.resize_geometry(), Some((16, 12)));
+    let mut fake = Fake::default();
+    execute(&graph, 3, &mut fake).unwrap();
+    assert_eq!(fake.resizes, vec![(16, 12); 3]);
+
+    graph.apply_resize(8, 6).unwrap();
+    assert_eq!(graph.resize_geometry(), Some((8, 6)));
+    let mut fake = Fake::default();
+    execute(&graph, 3, &mut fake).unwrap();
+    assert_eq!(fake.resizes, vec![(8, 6); 3]);
+
+    let duplicated = include_str!("default.json").replace(
+        "{\"id\":\"color\", \"kind\":\"color\", \"inputs\":{\"image\":\"apply-ev\"}}",
+        "{\"id\":\"resize-one\",\"kind\":\"resize\",\"width\":16,\"height\":12,\"inputs\":{\"image\":\"apply-ev\"}},{\"id\":\"resize-two\",\"kind\":\"resize\",\"width\":8,\"height\":6,\"inputs\":{\"image\":\"resize-one\"}},{\"id\":\"color\",\"kind\":\"color\",\"inputs\":{\"image\":\"resize-two\"}}",
+    );
+    assert!(Graph::parse(&duplicated)
+        .unwrap_err()
+        .contains("at most one resize"));
+}
+
+#[test]
+fn encode_node_owns_the_bounded_encoder_configuration() {
+    let text = include_str!("default.json").replace(
+        "\"kind\":\"encode\",",
+        "\"kind\":\"encode\",\"encoder\":{\"encoder\":\"ffv1\",\"container\":\"matroska\",\"pix_fmt\":\"yuv444p10le\"},",
+    );
+    let graph = Graph::parse(&text).unwrap();
+    let patch = graph.encoder_patch().expect("encoder patch");
+    assert_eq!(patch.encoder.as_deref(), Some("ffv1"));
+    assert_eq!(patch.container, Some(crate::encoder::Container::Matroska));
+    // The default graph has no encoder block and inherits built-in defaults.
+    assert!(Graph::default_graph(true).encoder_patch().is_none());
+
+    for (text, marker) in [
+        (
+            include_str!("default.json").replace(
+                "\"kind\":\"color\",",
+                "\"kind\":\"color\",\"encoder\":{\"encoder\":\"ffv1\"},",
+            ),
+            "only belongs to encode",
+        ),
+        (
+            include_str!("default.json").replace(
+                "\"kind\":\"color\",",
+                "\"kind\":\"color\",\"width\":10,",
+            ),
+            "only belong to resize",
+        ),
+        (
+            include_str!("default.json").replace(
+                "\"kind\":\"encode\",",
+                "\"kind\":\"encode\",\"encoder\":{\"scale\":2},",
+            ),
+            "unknown encoder field",
+        ),
+        (
+            include_str!("default.json").replace(
+                "\"kind\":\"encode\",",
+                "\"kind\":\"encode\",\"encoder\":{\"options\":[\"-vf\",\"scale\"]},",
+            ),
+            "not supported",
+        ),
+    ] {
+        let error = Graph::parse(&text).unwrap_err();
+        assert!(error.contains(marker), "{error}");
+    }
+    let missing = include_str!("default.json").replace(
+        "{\"id\":\"color\", \"kind\":\"color\", \"inputs\":{\"image\":\"apply-ev\"}}",
+        "{\"id\":\"resize\",\"kind\":\"resize\",\"width\":16,\"inputs\":{\"image\":\"apply-ev\"}},{\"id\":\"color\",\"kind\":\"color\",\"inputs\":{\"image\":\"resize\"}}",
+    );
+    assert!(Graph::parse(&missing)
+        .unwrap_err()
+        .contains("positive integer height"));
+}
+
 #[test]
 fn sealed_solver_owned_pixels_and_delete_before_sink_read() {
     let mut fake = Fake::default();

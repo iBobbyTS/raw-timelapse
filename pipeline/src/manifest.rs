@@ -1,10 +1,11 @@
 //! Run manifest: provenance and validation record written before publication.
 
 use crate::cli::{Options, LEGACY_FPS_PROVENANCE};
+use crate::encoder::ResolvedConfig;
 use crate::error::{Error, Result, EXIT_PUBLISH};
 use crate::frame::FrameSequence;
 use crate::json::{self, Json};
-use crate::video::{preview_filter, preview_geometry, ProbeInfo, FINAL_NAME};
+use crate::video::{ProbeInfo, ResizeRecord};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -21,11 +22,15 @@ pub struct ManifestInput<'a> {
     pub timings: &'a BTreeMap<String, Duration>,
     /// Process-owned deflicker block (config, status counts, audit summary).
     pub deflicker: Json,
+    pub encoder: &'a ResolvedConfig,
+    pub resize: Option<ResizeRecord>,
 }
 
 pub fn build(input: &ManifestInput<'_>) -> Json {
     let sequence = input.sequence;
-    let preview_scale = preview_geometry(sequence.width, sequence.height);
+    let profile = input.options.preview_profile;
+    let config = input.encoder;
+    let range = config.effective_range(profile);
     let frames: Vec<Json> = sequence
         .frames
         .iter()
@@ -258,36 +263,35 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
             Json::obj(vec![
                 ("linear_dtype", Json::Str("signed f32 LE AP1/D60".into())),
                 ("linear_clipping", Json::Str("none after camera-to-AP1; upstream limits remain".into())),
-                ("final_denominator", Json::Int(255)),
+                (
+                    "encoder_input",
+                    Json::Str("planar yuv444p10le target signal (single quantization boundary)".into()),
+                ),
+                ("final_denominator", Json::Int(1023)),
                 ("reference_gain", Json::Float(input.options.log_reference_gain)),
-                ("reference_status", Json::Str(if input.options.preview_profile.is_rev_eng() { "fixed-canon-normal-white; user gain is additional" } else { "not-applicable" }.into())),
-                ("calibration_id", if input.options.preview_profile.is_rev_eng() { Json::Str("canon-normal-white-fixed-v1".into()) } else { Json::Null }),
+                ("reference_status", Json::Str(if profile.is_rev_eng() { "fixed-canon-normal-white; user gain is additional" } else { "not-applicable" }.into())),
+                ("calibration_id", if profile.is_rev_eng() { Json::Str("canon-normal-white-fixed-v1".into()) } else { Json::Null }),
             ])
         ),
         (
             "video",
             {
-                let profile = input.options.preview_profile;
-                let mut encoder_parameters = vec![
-                    Json::Str("-c:v h264_videotoolbox".to_string()),
-                    Json::Str("-allow_sw 0".to_string()),
-                    Json::Str("-profile:v high".to_string()),
-                    Json::Str("-b:v 0 -q:v 65".to_string()),
-                    Json::Str("-pix_fmt yuv420p".to_string()),
-                    Json::Str(format!("-vf {}", preview_filter(preview_scale, profile))),
-                ];
-                encoder_parameters.push(Json::Str(format!(
-                    "-colorspace {} -color_primaries {} -color_trc {} -color_range {}",
-                    profile.tag_policy.matrix_token(), profile.tag_policy.primaries_token(),
-                    profile.tag_policy.transfer_token(), profile.range.as_str()
-                )));
-                if profile.tag_policy != crate::color_profile::TagPolicy::SRGB {
-                    encoder_parameters.push(Json::Str("-movflags +faststart+write_colr".to_string()));
-                }
+                let encoder_arguments: Vec<Json> = config
+                    .encoder_args(
+                        profile,
+                        sequence.width,
+                        sequence.height,
+                        sequence.frames.len(),
+                        &input.options.fps.arg(),
+                        Path::new("<output>"),
+                    )
+                    .into_iter()
+                    .map(Json::Str)
+                    .collect();
                 Json::obj(vec![
-                    ("file", Json::Str(FINAL_NAME.to_string())),
+                    ("file", Json::Str(config.output_name())),
                     ("profile", Json::Str(profile.id.to_string())),
-                    ("emitted_tags", profile.emitted_tags_json()),
+                    ("emitted_tags", profile.emitted_tags_json(range)),
                     ("bytes", Json::Int(input.bytes as i64)),
                     (
                         "purpose",
@@ -296,19 +300,46 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                                 .to_string(),
                         ),
                     ),
-                    ("codec", Json::Str("h264".to_string())),
+                    ("encoder", Json::Str(config.encoder.clone())),
+                    ("container", Json::Str(config.container.as_str().to_string())),
+                    ("codec", Json::Str(input.probe.codec_name.clone())),
+                    (
+                        "codec_profile",
+                        config
+                            .codec_profile
+                            .clone()
+                            .map(Json::Str)
+                            .unwrap_or(Json::Null),
+                    ),
                     ("width", Json::Int(input.probe.width as i64)),
                     ("height", Json::Int(input.probe.height as i64)),
                     ("frames", Json::Int(input.probe.frames as i64)),
                     ("duration_s", Json::Float(input.probe.frames as f64 / input.options.fps.as_f64())),
-                    ("pix_fmt", Json::Str("yuv420p".to_string())),
+                    ("pix_fmt", Json::Str(config.pix_fmt.clone())),
                     (
                         "decoder_pix_fmt",
                         Json::Str(input.probe.pix_fmt.clone()),
                     ),
                     (
+                        "bits_per_raw_sample",
+                        input
+                            .probe
+                            .bits_per_raw_sample
+                            .map(|bits| Json::Int(bits as i64))
+                            .unwrap_or(Json::Null),
+                    ),
+                    (
                         "range",
-                        Json::Str(profile.range.as_str().to_string()),
+                        Json::Str(range.as_str().to_string()),
+                    ),
+                    (
+                        "range_tag",
+                        Json::Str(if config.writes_range_tag() {
+                            "written by the container".to_string()
+                        } else {
+                            "not expressible by MOV nclc; ProRes decoders assume limited range"
+                                .to_string()
+                        }),
                     ),
                     (
                         "ycbcr_matrix",
@@ -316,33 +347,49 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
                     ),
                     (
                         "scale",
-                        Json::obj(vec![
-                            ("applied", Json::Bool(preview_scale.scaled)),
-                            (
-                                "algorithm",
-                                if preview_scale.scaled {
-                                    Json::Str("lanczos".to_string())
-                                } else {
-                                    Json::Null
-                                },
-                            ),
-                            (
-                                "source",
-                                Json::Array(vec![
-                                    Json::Int(sequence.width as i64),
-                                    Json::Int(sequence.height as i64),
-                                ]),
-                            ),
-                            (
-                                "preview",
-                                Json::Array(vec![
-                                    Json::Int(preview_scale.width as i64),
-                                    Json::Int(preview_scale.height as i64),
-                                ]),
-                            ),
-                        ]),
+                        match input.resize {
+                            Some(record) => Json::obj(vec![
+                                ("applied", Json::Bool(record.applied())),
+                                (
+                                    "algorithm",
+                                    Json::Str("lanczos3 scene-linear FP32".to_string()),
+                                ),
+                                (
+                                    "source",
+                                    Json::Array(vec![
+                                        Json::Int(record.source_width as i64),
+                                        Json::Int(record.source_height as i64),
+                                    ]),
+                                ),
+                                (
+                                    "output",
+                                    Json::Array(vec![
+                                        Json::Int(record.width as i64),
+                                        Json::Int(record.height as i64),
+                                    ]),
+                                ),
+                            ]),
+                            None => Json::obj(vec![
+                                ("applied", Json::Bool(false)),
+                                ("algorithm", Json::Null),
+                                (
+                                    "source",
+                                    Json::Array(vec![
+                                        Json::Int(sequence.width as i64),
+                                        Json::Int(sequence.height as i64),
+                                    ]),
+                                ),
+                                (
+                                    "output",
+                                    Json::Array(vec![
+                                        Json::Int(sequence.width as i64),
+                                        Json::Int(sequence.height as i64),
+                                    ]),
+                                ),
+                            ]),
+                        },
                     ),
-                    ("encoder_parameters", Json::Array(encoder_parameters)),
+                    ("encoder_parameters", Json::Array(encoder_arguments)),
                     ("color_contract", profile.contract_json()),
                     ("probe", input.probe.to_json()),
                     ("full_decode", Json::Str("pass".to_string())),
@@ -354,14 +401,14 @@ pub fn build(input: &ManifestInput<'_>) -> Json {
             Json::obj(vec![
                 (
                     "method",
-                    Json::Str(
-                        "streamed encoder output under .rawtl-partial; ffprobe and full decode validation; single rename to output.mp4"
-                            .to_string(),
-                    ),
+                    Json::Str(format!(
+                        "streamed encoder output under .rawtl-partial; ffprobe and full decode validation; single rename to {}",
+                        config.output_name()
+                    )),
                 ),
                 (
                     "final_names",
-                    Json::Array(vec![Json::Str(FINAL_NAME.to_string())]),
+                    Json::Array(vec![Json::Str(config.output_name())]),
                 ),
             ]),
         ),
