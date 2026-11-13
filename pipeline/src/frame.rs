@@ -64,6 +64,305 @@ pub struct ProduceConfig<'a> {
     pub log_relative_dir: &'a str,
 }
 
+/// Versioned prepared-context header. The context is a strict line document
+/// written by `dng-linear-frame --prepare`; both processes parse the same
+/// bytes and the native consumer revalidates every hash before decoding.
+#[allow(dead_code)] // consumed by the graph scheduling integration
+pub const PREPARED_CONTEXT_MAGIC: &str = "rawtl-prepared-frame/1";
+
+/// Routing identity carried by a prepared context. `Direct` is a LinearRaw
+/// source used as-is; the other two routes have a Converter-produced DNG.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the graph scheduling integration
+pub enum PreparedRoute {
+    Direct,
+    Converter,
+    VendorRaw,
+}
+impl PreparedRoute {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Direct => "linearraw-sdk",
+            Self::Converter => "cfa-converter-linearraw-sdk",
+            Self::VendorRaw => "vendor-raw-converter-linearraw-sdk",
+        }
+    }
+    fn from_token(text: &str) -> Option<Self> {
+        match text {
+            "linearraw-sdk" => Some(Self::Direct),
+            "cfa-converter-linearraw-sdk" => Some(Self::Converter),
+            "vendor-raw-converter-linearraw-sdk" => Some(Self::VendorRaw),
+            _ => None,
+        }
+    }
+    fn generates(self) -> bool {
+        self != Self::Direct
+    }
+}
+
+/// One validated prepared frame. `source` is always the original photograph;
+/// `dng` is the LinearRaw artifact the SDK decodes and is never used as the
+/// identity for Canon calibration, white balance or capture metadata.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // consumed by the graph scheduling integration
+pub struct PreparedFrame {
+    pub context: PathBuf,
+    pub source: PathBuf,
+    pub source_name: String,
+    pub source_sha256: String,
+    pub route: PreparedRoute,
+    pub dng: PathBuf,
+    pub dng_sha256: String,
+    pub generated: bool,
+    pub main_ifd_width: u32,
+    pub main_ifd_height: u32,
+    pub as_shot_neutral: [f64; 3],
+    pub capture_time: Option<String>,
+}
+
+#[allow(dead_code)] // consumed by the graph scheduling integration
+impl PreparedFrame {
+    /// Parse and structurally validate a context document. Hash *binding* is
+    /// revalidated by the native consumer against the actual files; this side
+    /// checks the versioned grammar, absolute identities, route/generated
+    /// consistency and file existence so a mis-wired graph fails before a
+    /// native process is started.
+    pub fn load(context: &Path) -> Result<Self> {
+        let bytes = fs::read(context)
+            .map_err(|e| failure(format!("cannot read prepared context {}: {e}", context.display())))?;
+        let fields = parse_context_fields(&bytes)?;
+        let get = |key: &str| -> Result<&str> {
+            fields
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.as_str())
+                .ok_or_else(|| failure(format!("prepared context is missing field {key}")))
+        };
+        let source_sha256 = hex64(get("source_sha256")?, "source_sha256")?;
+        let dng_sha256 = hex64(get("prepared_sha256")?, "prepared_sha256")?;
+        let route_text = get("route")?;
+        let route = PreparedRoute::from_token(route_text).ok_or_else(|| {
+            failure(format!("prepared context has an unknown route {route_text:?}"))
+        })?;
+        let generated = parse_flag(get("generated")?, "generated")?;
+        let main_ifd_width = parse_u32(get("main_ifd_width")?, "main_ifd_width")?;
+        let main_ifd_height = parse_u32(get("main_ifd_height")?, "main_ifd_height")?;
+        if main_ifd_width == 0 || main_ifd_height == 0 {
+            return Err(failure("prepared context geometry must be non-zero"));
+        }
+        let as_shot_neutral = parse_neutral(get("as_shot_neutral")?)?;
+        let has_capture = parse_flag(get("has_capture_time")?, "has_capture_time")?;
+        let capture_time = if has_capture {
+            let value = get("capture_time")?;
+            if value.is_empty() {
+                return Err(failure("prepared context capture_time must be non-empty"));
+            }
+            Some(value.to_string())
+        } else {
+            if fields.iter().any(|(name, _)| name == "capture_time") {
+                return Err(failure(
+                    "prepared context carries capture_time with has_capture_time=0",
+                ));
+            }
+            None
+        };
+        if generated != route.generates() {
+            return Err(failure("prepared context generated flag does not match its route"));
+        }
+        let source_raw = PathBuf::from(get("source")?);
+        let dng_raw = PathBuf::from(get("prepared_dng")?);
+        if !source_raw.is_absolute() || !dng_raw.is_absolute() {
+            return Err(failure("prepared context paths must be absolute"));
+        }
+        let source = fs::canonicalize(&source_raw).map_err(|e| {
+            failure(format!(
+                "prepared context original source cannot be resolved: {}: {e}",
+                source_raw.display()
+            ))
+        })?;
+        let dng = fs::canonicalize(&dng_raw).map_err(|e| {
+            failure(format!(
+                "prepared context prepared DNG cannot be resolved: {}: {e}",
+                dng_raw.display()
+            ))
+        })?;
+        if route == PreparedRoute::Direct {
+            if dng != source {
+                return Err(failure(
+                    "prepared context for a LinearRaw source must reference the original DNG",
+                ));
+            }
+            if dng_sha256 != source_sha256 {
+                return Err(failure(
+                    "prepared context prepared hash differs from the original source hash",
+                ));
+            }
+        } else if dng == source {
+            return Err(failure(
+                "prepared context cannot use the original source as its converted DNG",
+            ));
+        }
+        let source_name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| failure("prepared source path has no UTF-8 file name"))?
+            .to_string();
+        Ok(Self {
+            context: context.to_path_buf(),
+            source,
+            source_name,
+            source_sha256,
+            route,
+            dng,
+            dng_sha256,
+            generated,
+            main_ifd_width,
+            main_ifd_height,
+            as_shot_neutral,
+            capture_time,
+        })
+    }
+}
+
+#[allow(dead_code)] // consumed by the graph scheduling integration
+fn parse_context_fields(bytes: &[u8]) -> Result<Vec<(String, String)>> {
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err(failure("prepared context exceeds the size limit"));
+    }
+    let mut lines = bytes.split(|byte| *byte == b'\n');
+    let magic = lines
+        .next()
+        .ok_or_else(|| failure("prepared context is empty"))?;
+    if magic != PREPARED_CONTEXT_MAGIC.as_bytes() {
+        return Err(failure("prepared context has an unsupported header"));
+    }
+    let mut fields: Vec<(String, String)> = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if line.ends_with(b"\r") {
+            return Err(failure("prepared context must use LF line endings"));
+        }
+        let equals = line
+            .iter()
+            .position(|byte| *byte == b'=')
+            .filter(|index| *index > 0)
+            .ok_or_else(|| failure("prepared context field is malformed"))?;
+        let key = std::str::from_utf8(&line[..equals])
+            .map_err(|_| failure("prepared context field name is not UTF-8"))?;
+        if !key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(failure("prepared context field name is malformed"));
+        }
+        if fields.iter().any(|(name, _)| name == key) {
+            return Err(failure(format!("prepared context repeats field {key}")));
+        }
+        let value = percent_decode(&line[equals + 1..], key)?;
+        fields.push((key.to_string(), value));
+    }
+    Ok(fields)
+}
+
+#[allow(dead_code)] // consumed by the graph scheduling integration
+fn percent_decode(value: &[u8], field: &str) -> Result<String> {
+    fn digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let byte = value[index];
+        if byte == b'%' {
+            if index + 2 >= value.len() {
+                return Err(failure(format!(
+                    "prepared context field {field} has a truncated escape"
+                )));
+            }
+            let hi = digit(value[index + 1]);
+            let lo = digit(value[index + 2]);
+            match (hi, lo) {
+                (Some(hi), Some(lo)) => out.push((hi << 4) | lo),
+                _ => {
+                    return Err(failure(format!(
+                        "prepared context field {field} has an invalid escape"
+                    )))
+                }
+            }
+            index += 3;
+        } else if byte < 0x20 || byte == 0x7f {
+            return Err(failure(format!(
+                "prepared context field {field} contains a raw control byte"
+            )));
+        } else {
+            out.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8(out)
+        .map_err(|_| failure(format!("prepared context field {field} is not UTF-8")))
+}
+
+#[allow(dead_code)] // consumed by the graph scheduling integration
+fn parse_flag(text: &str, field: &str) -> Result<bool> {
+    match text {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(failure(format!(
+            "prepared context field {field} must be 0 or 1"
+        ))),
+    }
+}
+
+#[allow(dead_code)] // consumed by the graph scheduling integration
+fn parse_u32(text: &str, field: &str) -> Result<u32> {
+    if text.is_empty() || text.len() > 10 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(failure(format!(
+            "prepared context field {field} must be a non-negative integer"
+        )));
+    }
+    text.parse::<u32>().map_err(|_| {
+        failure(format!(
+            "prepared context field {field} must be a non-negative integer"
+        ))
+    })
+}
+
+#[allow(dead_code)] // consumed by the graph scheduling integration
+fn hex64(text: &str, field: &str) -> Result<String> {
+    if text.len() != 64 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(failure(format!(
+            "prepared context field {field} must be a 64-digit SHA-256"
+        )));
+    }
+    Ok(text.to_ascii_lowercase())
+}
+
+#[allow(dead_code)] // consumed by the graph scheduling integration
+fn parse_neutral(text: &str) -> Result<[f64; 3]> {
+    let parts: Vec<&str> = text.split(',').collect();
+    if parts.len() != 3 {
+        return Err(failure("prepared context as_shot_neutral requires three values"));
+    }
+    let mut out = [0.0f64; 3];
+    for (index, part) in parts.iter().enumerate() {
+        let value = part
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(|| failure("prepared context as_shot_neutral must be positive finite"))?;
+        out[index] = value;
+    }
+    Ok(out)
+}
+
 fn failure(message: impl Into<String>) -> Error {
     Error::new(EXIT_FRAME, message)
 }
@@ -251,6 +550,59 @@ impl Drop for NativeStream {
     }
 }
 
+struct NativeRun<'a> {
+    method: crate::color_profile::CameraColorMethod,
+    logs_dir: &'a Path,
+    log_relative_dir: &'a str,
+    converter: Option<&'a str>,
+    converter_timeout: Option<u64>,
+    analysis_roi: Option<[f64; 4]>,
+}
+
+impl<'a> NativeRun<'a> {
+    fn from_produce(config: &'a ProduceConfig<'a>) -> Self {
+        Self {
+            method: config.camera_color_method,
+            logs_dir: config.logs_dir,
+            log_relative_dir: config.log_relative_dir,
+            converter: config.converter,
+            converter_timeout: config.converter_timeout,
+            analysis_roi: config.analysis_roi,
+        }
+    }
+}
+
+/// Either an original source file or a validated prepared context. Both reach
+/// the same native consumer protocol; only the second may not carry Converter
+/// options because the conversion already happened during --prepare.
+#[derive(Clone, Copy)]
+enum FrameInput<'a> {
+    Source(&'a SourceFrame),
+    #[allow(dead_code)]
+    Prepared(&'a PreparedFrame),
+}
+
+impl FrameInput<'_> {
+    fn name(&self) -> &str {
+        match self {
+            Self::Source(source) => &source.name,
+            Self::Prepared(prepared) => &prepared.source_name,
+        }
+    }
+    fn path(&self) -> &Path {
+        match self {
+            Self::Source(source) => &source.path,
+            Self::Prepared(prepared) => &prepared.source,
+        }
+    }
+    fn prepared(&self) -> Option<&PreparedFrame> {
+        match self {
+            Self::Source(_) => None,
+            Self::Prepared(prepared) => Some(prepared),
+        }
+    }
+}
+
 pub fn produce(
     tool: &Path,
     sources: &[SourceFrame],
@@ -307,6 +659,7 @@ fn produce_inner(
         }
     }
     let started = Instant::now();
+    let run = NativeRun::from_produce(config);
     let mut frames: Vec<FrameInfo> = Vec::with_capacity(sources.len());
     for (offset, source) in sources.iter().enumerate() {
         let reference = frames
@@ -316,12 +669,12 @@ fn produce_inner(
         let ev = evs.map(|e| e[offset]).or(config.exposure_ev);
         let info = run_frame(
             tool,
-            source,
+            FrameInput::Source(source),
             offset + 1,
             sources.len(),
             reference,
             ev,
-            config,
+            &run,
             pixels,
             active.clone(),
             &mut |info, stream| {
@@ -408,54 +761,253 @@ pub fn produce_single(
     index: usize,
     config: &ProduceConfig<'_>,
 ) -> Result<FrameInfo> {
+    let run = NativeRun::from_produce(config);
     run_frame(
         tool,
-        source,
+        FrameInput::Source(source),
         index,
         1,
         override_wb,
         config.exposure_ev,
-        config,
+        &run,
         false,
         Default::default(),
         &mut |_, _| Ok(()),
     )
 }
-fn run_frame(
+
+/// Settings for `dng-linear-frame --prepare`. The caller owns the scratch
+/// directory (it must already exist), the context path and its log.
+#[allow(dead_code)] // consumed by the graph scheduling integration
+pub struct PrepareSettings<'a> {
+    pub scratch_dir: &'a Path,
+    pub context_path: &'a Path,
+    pub log: &'a Path,
+    pub converter: Option<&'a str>,
+    pub converter_timeout: Option<u64>,
+}
+
+/// Prepared-frame consumer settings. No Converter options exist here on
+/// purpose: a prepared context already records its conversion provenance.
+#[allow(dead_code)] // consumed by the graph scheduling integration
+pub struct PreparedSettings<'a> {
+    pub camera_color_method: crate::color_profile::CameraColorMethod,
+    pub logs_dir: &'a Path,
+    pub log_relative_dir: &'a str,
+}
+
+/// Run the native prepare operation once for one source and load the resulting
+/// context. The returned frame carries the original identity; the prepared DNG
+/// stays in the caller's scratch until the caller deletes it.
+#[allow(dead_code)] // consumed by the graph scheduling integration
+pub fn prepare(
     tool: &Path,
     source: &SourceFrame,
+    settings: &PrepareSettings<'_>,
+) -> Result<PreparedFrame> {
+    let mut args = vec![
+        "--prepare".to_string(),
+        source.path.display().to_string(),
+        "--scratch".into(),
+        settings.scratch_dir.display().to_string(),
+        "--emit-prepared".into(),
+        settings.context_path.display().to_string(),
+    ];
+    if let Some(path) = settings.converter {
+        args.extend(["--converter".into(), path.into()]);
+    }
+    if let Some(seconds) = settings.converter_timeout {
+        args.extend(["--converter-timeout".into(), seconds.to_string()]);
+    }
+    let captured = proc::run_capture(tool, &args, EXIT_FRAME)?;
+    write_prepare_log(settings.log, tool, &args, &captured)?;
+    if !captured.status.success() {
+        return Err(Error::new(
+            EXIT_FRAME,
+            format!(
+                "prepared-frame conversion failed for {}: {}; transcript {}: {}",
+                source.name,
+                proc::exit_description(&captured.status),
+                settings.log.display(),
+                proc::tail(&captured.stderr, 1200)
+            ),
+        ));
+    }
+    let prepared = PreparedFrame::load(settings.context_path)?;
+    let expected = fs::canonicalize(&source.path).map_err(|e| {
+        failure(format!(
+            "requested source {} cannot be resolved: {e}",
+            source.path.display()
+        ))
+    })?;
+    if prepared.source != expected {
+        return Err(failure(format!(
+            "prepared context {} describes {} instead of the requested source {}",
+            settings.context_path.display(),
+            prepared.source.display(),
+            expected.display()
+        )));
+    }
+    Ok(prepared)
+}
+
+#[allow(dead_code)] // consumed by the graph scheduling integration
+fn write_prepare_log(
+    log: &Path,
+    tool: &Path,
+    args: &[String],
+    captured: &proc::Captured,
+) -> Result<()> {
+    if let Some(parent) = log.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| Error::new(EXIT_FRAME, format!("cannot create {}: {e}", parent.display())))?;
+    }
+    let text = format!(
+        "command: {}\nexit: {}\nstdout:\n{}\nstderr:\n{}\n",
+        proc::display_command(tool, args),
+        proc::exit_description(&captured.status),
+        captured.stdout,
+        captured.stderr
+    );
+    fs::write(log, text)
+        .map_err(|e| Error::new(EXIT_FRAME, format!("cannot write {}: {e}", log.display())))
+}
+
+#[allow(dead_code)] // consumed by the graph scheduling integration
+fn prepared_native_run<'a>(
+    settings: &'a PreparedSettings<'a>,
+    analysis_roi: Option<[f64; 4]>,
+) -> NativeRun<'a> {
+    NativeRun {
+        method: settings.camera_color_method,
+        logs_dir: settings.logs_dir,
+        log_relative_dir: settings.log_relative_dir,
+        converter: None,
+        converter_timeout: None,
+        analysis_roi,
+    }
+}
+
+/// Analysis pass over a prepared context. Invokes no Converter and never
+/// deletes the prepared DNG.
+#[allow(dead_code)] // consumed by the graph scheduling integration
+pub fn analyze_prepared(
+    tool: &Path,
+    prepared: &PreparedFrame,
+    override_wb: Option<[f64; 3]>,
+    exposure_ev: Option<f64>,
+    analysis_roi: Option<[f64; 4]>,
+    settings: &PreparedSettings<'_>,
+) -> Result<FrameInfo> {
+    let run = prepared_native_run(settings, analysis_roi);
+    let log = settings.logs_dir.join("frame_000001.log");
+    run_frame(
+        tool,
+        FrameInput::Prepared(prepared),
+        1,
+        1,
+        override_wb,
+        exposure_ev,
+        &run,
+        false,
+        Default::default(),
+        &mut |_, _| Ok(()),
+    )
+    .map_err(|error| prepared_consumer_error(error, &log))
+}
+
+#[allow(dead_code)] // consumed by the graph scheduling integration
+fn prepared_consumer_error(error: Error, log: &Path) -> Error {
+    let detail = fs::read_to_string(log).unwrap_or_default();
+    Error::new(
+        error.code,
+        format!(
+            "prepared-frame consumer failed: {}; transcript {}: {}",
+            error.message,
+            log.display(),
+            proc::tail(&detail, 1200)
+        ),
+    )
+}
+
+/// FP32 develop pass over a prepared context. The caller reads pixels through
+/// the callback while the native process is still alive.
+#[allow(dead_code)] // consumed by the graph scheduling integration
+pub fn develop_prepared(
+    tool: &Path,
+    prepared: &PreparedFrame,
+    override_wb: Option<[f64; 3]>,
+    exposure_ev: Option<f64>,
+    settings: &PreparedSettings<'_>,
+    consume: &mut impl FnMut(&FrameInfo, &mut NativeStream) -> Result<()>,
+) -> Result<FrameInfo> {
+    let run = prepared_native_run(settings, None);
+    let log = settings.logs_dir.join("frame_000001.log");
+    run_frame(
+        tool,
+        FrameInput::Prepared(prepared),
+        1,
+        1,
+        override_wb,
+        exposure_ev,
+        &run,
+        true,
+        Default::default(),
+        consume,
+    )
+    .map_err(|error| prepared_consumer_error(error, &log))
+}
+
+fn run_frame(
+    tool: &Path,
+    input: FrameInput<'_>,
     index: usize,
     total: usize,
     override_wb: Option<[f64; 3]>,
     exposure_ev: Option<f64>,
-    config: &ProduceConfig<'_>,
+    run: &NativeRun<'_>,
     pixels: bool,
     active: ActiveNative,
     consume: &mut impl FnMut(&FrameInfo, &mut NativeStream) -> Result<()>,
 ) -> Result<FrameInfo> {
     let started = Instant::now();
-    let mut args = vec![
-        if pixels {
-            "--stdout-frame-f32"
-        } else {
-            "--stdout-analysis"
-        }
-        .to_string(),
-        source.path.display().to_string(),
-    ];
-    if config.camera_color_method.requires_canon_cr3() {
-        if source
-            .path
+    let mut args = vec![if pixels {
+        "--stdout-frame-f32"
+    } else {
+        "--stdout-analysis"
+    }
+    .to_string()];
+    if run.method.requires_canon_cr3()
+        && input
+            .path()
             .extension()
             .and_then(|e| e.to_str())
             .is_none_or(|e| !e.eq_ignore_ascii_case("cr3"))
-        {
-            return Err(failure("rev-eng Canon Log requires Canon CR3 photos"));
+    {
+        return Err(failure("rev-eng Canon Log requires Canon CR3 photos"));
+    }
+    match input {
+        FrameInput::Source(source) => args.push(source.path.display().to_string()),
+        FrameInput::Prepared(prepared) => {
+            // The context already records the conversion; never pass a
+            // Converter option on this path.
+            args.push("--prepared".into());
+            args.push(prepared.context.display().to_string());
+        }
+    }
+    if let FrameInput::Prepared(prepared) = input {
+        if run.converter.is_some() || run.converter_timeout.is_some() {
+            return Err(failure(
+                "a prepared context already carries its Converter provenance",
+            ));
+        }
+        if prepared.route == PreparedRoute::Direct && prepared.generated {
+            return Err(failure("prepared context route/generated mismatch"));
         }
     }
     args.extend([
         "--camera-color-method".into(),
-        config.camera_color_method.native_token().into(),
+        run.method.native_token().into(),
     ]);
     if let Some(wb) = override_wb {
         args.extend(["--white-balance".into(), format_wb(wb)]);
@@ -463,14 +1015,16 @@ fn run_frame(
     if let Some(ev) = exposure_ev {
         args.extend(["--exposure-ev".into(), format_ev(ev)]);
     }
-    if let Some(path) = config.converter {
-        args.extend(["--converter".into(), path.into()]);
-    }
-    if let Some(seconds) = config.converter_timeout {
-        args.extend(["--converter-timeout".into(), seconds.to_string()]);
+    if let FrameInput::Source(_) = input {
+        if let Some(path) = run.converter {
+            args.extend(["--converter".into(), path.into()]);
+        }
+        if let Some(seconds) = run.converter_timeout {
+            args.extend(["--converter-timeout".into(), seconds.to_string()]);
+        }
     }
     if !pixels {
-        if let Some(roi) = config.analysis_roi {
+        if let Some(roi) = run.analysis_roi {
             args.extend([
                 "--analysis-roi".into(),
                 roi.iter()
@@ -483,7 +1037,7 @@ fn run_frame(
     let mut stream = NativeStream::open(
         tool,
         &args,
-        &config.logs_dir.join(format!("frame_{index:06}.log")),
+        &run.logs_dir.join(format!("frame_{index:06}.log")),
         active,
     )?;
     let bytes = stream.json(1)?;
@@ -513,7 +1067,7 @@ fn run_frame(
             return Err(failure("missing/invalid camera matrix/profile fingerprint"));
         }
 
-        if config.camera_color_method.requires_canon_cr3()
+        if run.method.requires_canon_cr3()
             && (color.get("algorithm_revision").and_then(Json::as_u64) != Some(3)
                 || !valid_fixed_calibration(color)
                 || !matches!(
@@ -531,8 +1085,8 @@ fn run_frame(
         }
         if sidecar.get("color_contract_version").and_then(Json::as_u64) != Some(1)
             || color.get("method_requested").and_then(Json::as_str)
-                != Some(config.camera_color_method.native_token())
-            || !(if config.camera_color_method.requires_canon_cr3() {
+                != Some(run.method.native_token())
+            || !(if run.method.requires_canon_cr3() {
                 matches!(
                     effective,
                     Some("dng-camera-to-pcs-forward-matrix" | "dng-camera-to-pcs-inverse-fallback")
@@ -540,7 +1094,7 @@ fn run_frame(
             } else {
                 effective == Some("legacy-inverse-cm")
             })
-            || (config.camera_color_method.requires_canon_cr3()
+            || (run.method.requires_canon_cr3()
                 && !color
                     .get("camera_model")
                     .and_then(Json::as_str)
@@ -554,17 +1108,17 @@ fn run_frame(
     let frame_width = sidecar
         .get("width")
         .and_then(Json::as_u32)
-        .ok_or_else(|| missing_field(index, total, &source.name, "width"))?;
+        .ok_or_else(|| missing_field(index, total, input.name(), "width"))?;
     let frame_height = sidecar
         .get("height")
         .and_then(Json::as_u32)
-        .ok_or_else(|| missing_field(index, total, &source.name, "height"))?;
+        .ok_or_else(|| missing_field(index, total, input.name(), "height"))?;
     if frame_width == 0 || frame_height == 0 {
         return Err(Error::new(
             EXIT_FRAME,
             format!(
                 "frame {index}/{total} ({}) reports an empty image {}x{}",
-                source.name, frame_width, frame_height
+                input.name(), frame_width, frame_height
             ),
         ));
     }
@@ -572,13 +1126,13 @@ fn run_frame(
     let schema_version = sidecar
         .get("schema_version")
         .and_then(Json::as_u64)
-        .ok_or_else(|| missing_field(index, total, &source.name, "schema_version"))?;
+        .ok_or_else(|| missing_field(index, total, input.name(), "schema_version"))?;
     if schema_version != 1 {
         return Err(Error::new(
             EXIT_FRAME,
             format!(
                 "frame {index}/{total} ({}) has unsupported metadata schema_version {schema_version}",
-                source.name
+                input.name()
             ),
         ));
     }
@@ -599,7 +1153,7 @@ fn run_frame(
             .get("source_sha256")
             .and_then(Json::as_str)
             .filter(|hash| !hash.is_empty())
-            .ok_or_else(|| missing_field(index, total, &source.name, "source_sha256"))?
+            .ok_or_else(|| missing_field(index, total, input.name(), "source_sha256"))?
             .to_string(),
     );
     let metadata_envelope = frame_metadata_envelope(
@@ -610,20 +1164,20 @@ fn run_frame(
         source_sha256.as_deref(),
         index,
         total,
-        &source.name,
+        input.name(),
     )?;
     let applied_wb = parse_wb(
         &sidecar,
         "applied_white_balance",
         index,
         total,
-        &source.name,
+        input.name(),
     )?;
-    let as_shot_neutral = parse_wb(&sidecar, "as_shot_neutral", index, total, &source.name)?;
+    let as_shot_neutral = parse_wb(&sidecar, "as_shot_neutral", index, total, input.name())?;
     let wb_source = sidecar
         .get("white_balance_source")
         .and_then(Json::as_str)
-        .ok_or_else(|| missing_field(index, total, &source.name, "white_balance_source"))?
+        .ok_or_else(|| missing_field(index, total, input.name(), "white_balance_source"))?
         .to_string();
 
     if override_wb.is_none() {
@@ -632,7 +1186,7 @@ fn run_frame(
                 EXIT_FRAME,
                 format!(
                     "frame {index}/{total} ({}) should use its as-shot white balance, metadata reports {wb_source:?}",
-                    source.name
+                    input.name()
                 ),
             ));
         }
@@ -641,7 +1195,7 @@ fn run_frame(
             EXIT_FRAME,
             format!(
                 "frame {index}/{total} ({}) should use the frozen override white balance, metadata reports {wb_source:?}",
-                source.name
+                input.name()
             ),
         ));
     }
@@ -656,7 +1210,7 @@ fn run_frame(
             EXIT_FRAME,
             format!(
                 "frame {index}/{total} ({}) reports as-shot white balance but applied {:?} differs from its own as_shot_neutral {:?}",
-                source.name, applied_wb, as_shot_neutral
+                input.name(), applied_wb, as_shot_neutral
             ),
         ));
     }
@@ -664,16 +1218,16 @@ fn run_frame(
     let source_field = sidecar
         .get("source")
         .and_then(Json::as_str)
-        .ok_or_else(|| missing_field(index, total, &source.name, "source"))?;
+        .ok_or_else(|| missing_field(index, total, input.name(), "source"))?;
     // The native producer resolves the input path (symlinks included), so
     // compare canonical identities rather than the literal argument text.
     let (expected_source, reported_source) =
-        canonical_source_pair(source_field, &source.path).map_err(|err| {
+        canonical_source_pair(source_field, input.path()).map_err(|err| {
             Error::new(
                 EXIT_FRAME,
                 format!(
                     "frame {index}/{total} ({}) metadata source {source_field:?} cannot be resolved against the requested input: {err}",
-                    source.name
+                    input.name()
                 ),
             )
         })?;
@@ -682,7 +1236,7 @@ fn run_frame(
             EXIT_FRAME,
             format!(
                 "frame {index}/{total} ({}) metadata source {source_field:?} does not resolve to the requested input {}",
-                source.name,
+                input.name(),
                 expected_source.display()
             ),
         ));
@@ -695,13 +1249,13 @@ fn run_frame(
     let reported_ev = sidecar
         .get("exposure_ev")
         .and_then(Json::as_f64)
-        .ok_or_else(|| missing_field(index, total, &source.name, "exposure_ev"))?;
+        .ok_or_else(|| missing_field(index, total, input.name(), "exposure_ev"))?;
     if !reported_ev.is_finite() {
         return Err(Error::new(
             EXIT_FRAME,
             format!(
                 "frame {index}/{total} ({}) reports a non-finite exposure_ev",
-                source.name
+                input.name()
             ),
         ));
     }
@@ -711,7 +1265,7 @@ fn run_frame(
             EXIT_FRAME,
             format!(
                 "frame {index}/{total} ({}) reports exposure_ev {reported_ev} but {requested_ev} was requested",
-                source.name
+                input.name()
             ),
         ));
     }
@@ -724,7 +1278,7 @@ fn run_frame(
                 EXIT_FRAME,
                 format!(
                     "frame {index}/{total} ({}) capture_time must be a non-empty string or null",
-                    source.name
+                    input.name()
                 ),
             ))
         }
@@ -733,9 +1287,63 @@ fn run_frame(
     if sidecar.get("analysis_sidecar") != Some(&Json::Null) {
         return Err(failure("stdout metadata analysis_sidecar must be null"));
     }
+    // A prepared consumer proves it decoded the intended cache artifact while
+    // keeping the original photograph as the identity authority.
+    if let Some(prepared) = input.prepared() {
+        let block = sidecar
+            .get("prepared")
+            .ok_or_else(|| failure("prepared metadata block is missing"))?;
+        if block.get("schema_version").and_then(Json::as_u64) != Some(1)
+            || block.get("consumed_context") != Some(&Json::Bool(true))
+        {
+            return Err(failure("prepared metadata block is inconsistent"));
+        }
+        if block.get("generated") != Some(&Json::Bool(prepared.generated)) {
+            return Err(failure(
+                "prepared metadata generated flag does not match the context",
+            ));
+        }
+        let dng = block
+            .get("dng")
+            .and_then(Json::as_str)
+            .ok_or_else(|| failure("prepared metadata block has no DNG path"))?;
+        let dng_path = fs::canonicalize(dng).map_err(|e| {
+            failure(format!(
+                "prepared metadata DNG {dng:?} cannot be resolved: {e}"
+            ))
+        })?;
+        if dng_path != prepared.dng
+            || block.get("sha256").and_then(Json::as_str)
+                != Some(prepared.dng_sha256.as_str())
+        {
+            return Err(failure(
+                "prepared metadata DNG identity does not match the context",
+            ));
+        }
+        if sidecar.get("route").and_then(Json::as_str) != Some(prepared.route.token()) {
+            return Err(failure(
+                "prepared metadata route does not match the context",
+            ));
+        }
+        if source_sha256.as_deref() != Some(prepared.source_sha256.as_str()) {
+            return Err(failure(
+                "prepared metadata source_sha256 does not match the context",
+            ));
+        }
+        if !wb_close(as_shot_neutral, prepared.as_shot_neutral) {
+            return Err(failure(
+                "prepared metadata as_shot_neutral does not match the context",
+            ));
+        }
+        if capture_time.as_ref() != prepared.capture_time.as_ref() {
+            return Err(failure(
+                "prepared metadata capture_time does not match the context",
+            ));
+        }
+    }
     let mut info = FrameInfo {
         index,
-        source_name: source.name.clone(),
+        source_name: input.name().to_string(),
         camera_color: sidecar.get("color").cloned(),
         signal_clip_counts: None,
         source_sha256,
@@ -750,7 +1358,7 @@ fn run_frame(
         quantization,
         capture_time,
         exposure_ev: reported_ev,
-        log_relative: format!("{}/frame_{index:06}.log", config.log_relative_dir),
+        log_relative: format!("{}/frame_{index:06}.log", run.log_relative_dir),
         duration: Duration::ZERO,
         metadata_envelope,
         analysis_envelope: None,
@@ -1162,4 +1770,593 @@ fn valid_fixed_calibration(color: &Json) -> bool {
         && dw == 65535.0 && db >= 0.0 && (db-black*scale).abs() <= scale+1e-6
         && close(scale, (dw+1.0)/(max+1.0))
         && close(normal, (dw-db)/(scale*(white-black))) && close(gain, 1.8*normal)
+}
+
+#[cfg(test)]
+mod prepared_tests {
+    use super::*;
+    use crate::cli::WhiteBalance;
+    use crate::order::SourceFrame;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::sync::OnceLock;
+
+    fn fake_binary() -> PathBuf {
+        static BINARY: OnceLock<PathBuf> = OnceLock::new();
+        BINARY
+            .get_or_init(|| {
+                let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("fake-native-bin");
+                fs::create_dir_all(&directory).expect("create fake native dir");
+                let binary = directory.join("fake-native-prepared");
+                let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests")
+                    .join("common")
+                    .join("fake_native_main.rs");
+                let output = Command::new("rustc")
+                    .args(["--edition", "2021", "-O"])
+                    .arg(&source)
+                    .arg("-o")
+                    .arg(&binary)
+                    .output()
+                    .expect("run rustc for the fake native producer");
+                assert!(
+                    output.status.success(),
+                    "fake native compilation failed:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                binary
+            })
+            .clone()
+    }
+
+    fn shell_quote(text: &str) -> String {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+
+    fn work_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp")
+            .join(format!("prepared-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    fn source_frame(dir: &std::path::Path, name: &str) -> SourceFrame {
+        let input = dir.join("input");
+        fs::create_dir_all(&input).expect("create input dir");
+        let path = input.join(name);
+        fs::write(&path, b"synthetic raw bytes").expect("write source");
+        SourceFrame {
+            path,
+            name: name.to_string(),
+            key: Vec::new(),
+        }
+    }
+
+    /// Write a fake-producer config and a wrapper that records every argv.
+    fn fake_tool(dir: &std::path::Path, frames: &[&str], extra: &str) -> PathBuf {
+        let config = dir.join("fake.config");
+        let text = format!(
+            "width=8\nheight=6\ngrid_nx=4\ngrid_ny=2\n{extra}\n{}\n",
+            frames.join("\n")
+        );
+        fs::write(&config, text).expect("write fake config");
+        let argv = dir.join("argv.log");
+        let wrapper = dir.join("fake-dng-linear-frame");
+        let script = format!(
+            "#!/bin/sh\nexport FAKE_NATIVE_CONFIG={}\nprintf '%s\\n' \"$@\" >> {}\nexec {} \"$@\"\n",
+            shell_quote(&config.display().to_string()),
+            shell_quote(&argv.display().to_string()),
+            shell_quote(&fake_binary().display().to_string())
+        );
+        fs::write(&wrapper, script).expect("write wrapper");
+        let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions).expect("chmod wrapper");
+        wrapper
+    }
+
+    const FRAME_1: &str = "frame=IMG_1.DNG|0.5,1,0.8|0.0|0.0|-|-|flat";
+    const FRAME_2: &str = "frame=IMG_2.CR3|0.6,1,0.7|0.2|0.3|2026:11:13 04:05:06|-|flat";
+
+    fn prepared_settings<'a>(logs: &'a std::path::Path) -> PreparedSettings<'a> {
+        PreparedSettings {
+            camera_color_method: crate::color_profile::CameraColorMethod::LegacyInverseCm,
+            logs_dir: logs,
+            log_relative_dir: "logs",
+        }
+    }
+
+    fn prepare_one(
+        dir: &std::path::Path,
+        tool: &Path,
+        source: &SourceFrame,
+        name: &str,
+    ) -> PreparedFrame {
+        let scratch = dir.join(format!("scratch-{name}"));
+        fs::create_dir_all(&scratch).expect("create scratch");
+        prepare(
+            tool,
+            source,
+            &PrepareSettings {
+                scratch_dir: &scratch,
+                context_path: &dir.join(format!("{name}.ctx")),
+                log: &dir.join(format!("{name}-prepare.log")),
+                converter: None,
+                converter_timeout: None,
+            },
+        )
+        .expect("prepare")
+    }
+
+    #[test]
+    fn prepared_round_trip_uses_the_context_and_validates_metadata() {
+        let dir = work_dir("round-trip");
+        let source = source_frame(&dir, "IMG_1.DNG");
+        let tool = fake_tool(&dir, &[FRAME_1], "");
+        let prepared = prepare_one(&dir, &tool, &source, "direct");
+        assert_eq!(prepared.route, PreparedRoute::Direct);
+        assert!(!prepared.generated);
+        assert_eq!(prepared.source, fs::canonicalize(&source.path).unwrap());
+        assert_eq!(prepared.dng, prepared.source);
+        assert_eq!(prepared.source_sha256, prepared.dng_sha256);
+        assert_eq!(
+            (prepared.main_ifd_width, prepared.main_ifd_height),
+            (8, 6)
+        );
+        assert_eq!(prepared.capture_time, None);
+        assert_eq!(prepared.as_shot_neutral, [0.5, 1.0, 0.8]);
+
+        let logs = dir.join("logs");
+        let settings = prepared_settings(&logs);
+        let analysis =
+            analyze_prepared(&tool, &prepared, None, Some(0.0), None, &settings).expect("analyze");
+        assert_eq!(analysis.index, 1);
+        assert_eq!(analysis.source_name, "IMG_1.DNG");
+        assert_eq!(analysis.applied_wb, prepared.as_shot_neutral);
+        assert_eq!(analysis.wb_source, WB_SOURCE_AS_SHOT);
+        assert_eq!(
+            analysis.source_sha256.as_deref(),
+            Some(prepared.source_sha256.as_str())
+        );
+        assert!(analysis_bytes(&analysis)
+            .expect("sidecar")
+            .starts_with(b"{\"schema_version\":2"));
+
+        let mut pixel_bytes = 0usize;
+        let developed = develop_prepared(&tool, &prepared, None, Some(0.25), &settings, &mut |info, native| {
+            let pixels = native.pixels(info.width, info.height)?;
+            pixel_bytes = pixels.len();
+            assert!(pixels
+                .chunks_exact(4)
+                .all(|b| f32::from_le_bytes(b.try_into().unwrap()).is_finite()));
+            Ok(())
+        })
+        .expect("develop");
+        assert_eq!(pixel_bytes, 8 * 6 * 12);
+        assert!(developed.pixels_sha256.is_some());
+        assert_eq!(developed.exposure_ev, 0.25);
+
+        let overridden = analyze_prepared(
+            &tool,
+            &prepared,
+            Some([0.7, 1.0, 0.6]),
+            None,
+            Some([0.0, 0.0, 0.5, 0.5]),
+            &settings,
+        )
+        .expect("override analyze");
+        assert_eq!(overridden.wb_source, WB_SOURCE_OVERRIDE);
+        assert_eq!(overridden.applied_wb, [0.7, 1.0, 0.6]);
+
+        // Every consumer was invoked with --prepared and never with Converter
+        // options.
+        let argv = fs::read_to_string(dir.join("argv.log")).expect("argv log");
+        assert_eq!(argv.lines().filter(|line| *line == "--prepared").count(), 3);
+        assert!(!argv
+            .lines()
+            .any(|line| line == "--converter" || line == "--converter-timeout"));
+        assert_eq!(prepared.dng, fs::canonicalize(&source.path).unwrap());
+    }
+
+    #[test]
+    fn prepared_converter_route_and_canon_method_guard() {
+        let dir = work_dir("converter-route");
+        let source = source_frame(&dir, "IMG_2.CR3");
+        let tool = fake_tool(&dir, &[FRAME_2], "");
+        let prepared = prepare_one(&dir, &tool, &source, "vendor");
+        assert_eq!(prepared.route, PreparedRoute::VendorRaw);
+        assert!(prepared.generated);
+        assert_ne!(prepared.dng, prepared.source);
+        assert!(prepared.dng.exists());
+        assert_eq!(
+            prepared.dng,
+            fs::canonicalize(dir.join("scratch-vendor/linear/IMG_2.CR3")).unwrap()
+        );
+        assert_eq!(
+            prepared.capture_time.as_deref(),
+            Some("2026:11:13 04:05:06")
+        );
+
+        let logs = dir.join("canon-logs");
+        let settings = PreparedSettings {
+            camera_color_method: crate::color_profile::CameraColorMethod::DngCameraToPcs,
+            logs_dir: &logs,
+            log_relative_dir: "logs",
+        };
+        let info = analyze_prepared(&tool, &prepared, None, Some(0.0), None, &settings)
+            .expect("canon analyze");
+        assert_eq!(
+            info.camera_color
+                .as_ref()
+                .and_then(|color| color.get("camera_model"))
+                .and_then(Json::as_str),
+            Some("Canon EOS R7")
+        );
+        develop_prepared(&tool, &prepared, Some([0.6, 1.0, 0.7]), Some(0.0), &settings, &mut |info, native| {
+            native.pixels(info.width, info.height)?;
+            Ok(())
+        })
+        .expect("canon develop");
+        assert!(prepared.dng.exists(), "consumers must not delete the cache");
+
+        // The release Canon method refuses a prepared LinearRaw DNG before any
+        // native process starts.
+        let dng_source = source_frame(&dir, "IMG_1.DNG");
+        let dng_tool = fake_tool(&dir, &[FRAME_1], "");
+        let dng_prepared = prepare_one(&dir, &dng_tool, &dng_source, "dng");
+        let error = analyze_prepared(&tool, &dng_prepared, None, None, None, &settings)
+            .expect_err("Canon method requires CR3");
+        assert!(
+            error.message.contains("requires Canon CR3"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn prepared_metadata_identity_defects_are_rejected() {
+        let dir = work_dir("metadata-defects");
+        let source = source_frame(&dir, "IMG_2.CR3");
+        let base = fake_tool(&dir, &[FRAME_2], "");
+        let prepared = prepare_one(&dir, &base, &source, "base");
+        let logs = dir.join("logs");
+        let settings = prepared_settings(&logs);
+        for (defect, needle) in [
+            ("route", "route"),
+            ("dng", "DNG identity"),
+            ("sha", "DNG identity"),
+            ("generated", "generated"),
+            ("consumed", "inconsistent"),
+            ("missing", "missing"),
+        ] {
+            let tool = fake_tool(
+                &dir,
+                &[FRAME_2],
+                &format!("prepared_metadata_defect={defect}"),
+            );
+            let error = analyze_prepared(&tool, &prepared, None, None, None, &settings)
+                .expect_err(defect);
+            assert!(
+                error.message.contains(needle),
+                "{defect}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_context_parser_and_prepare_failures_are_explicit() {
+        let dir = work_dir("parser");
+        let source = source_frame(&dir, "IMG_1.DNG");
+        let tool = fake_tool(&dir, &[FRAME_1], "");
+        let scratch = dir.join("scratch");
+        fs::create_dir_all(&scratch).unwrap();
+        let context = dir.join("IMG_1.ctx");
+        let settings = PrepareSettings {
+            scratch_dir: &scratch,
+            context_path: &context,
+            log: &dir.join("prepare.log"),
+            converter: None,
+            converter_timeout: None,
+        };
+        prepare(&tool, &source, &settings).expect("prepare");
+        let valid = fs::read_to_string(&context).expect("context");
+
+        // A missing scratch directory is rejected before any conversion.
+        let missing = PrepareSettings {
+            scratch_dir: &dir.join("absent"),
+            context_path: &dir.join("absent.ctx"),
+            log: &dir.join("absent.log"),
+            converter: None,
+            converter_timeout: None,
+        };
+        assert!(prepare(&tool, &source, &missing).is_err());
+
+        // The fake fails the conversion and the Rust side surfaces its log.
+        let failing_tool = fake_tool(&dir, &[FRAME_1], "prepare_fail=1");
+        let error = prepare(&failing_tool, &source, &settings).expect_err("prepare failure");
+        assert!(error.message.contains("prepared-frame conversion failed"), "{}", error.message);
+        assert!(dir.join("prepare.log").exists());
+
+        // A context that names another source is rejected by prepare().
+        let other = source_frame(&dir, "OTHER.DNG");
+        let swapped_tool = fake_tool(
+            &dir,
+            &[FRAME_1],
+            &format!(
+                "prepared_source_override={}\nprepared_dng_override={}",
+                other.path.display(),
+                other.path.display()
+            ),
+        );
+        let error = prepare(&swapped_tool, &source, &settings).expect_err("source swap");
+        assert!(error.message.contains("instead of the requested source"), "{}", error.message);
+
+        // Structural grammar failures fail closed.
+        for (name, text) in [
+            ("header", valid.replacen("rawtl-prepared-frame/1", "rawtl-prepared-frame/2", 1)),
+            ("missing", valid.replace("route=linearraw-sdk\n", "")),
+            ("duplicate", format!("{valid}route=linearraw-sdk\n")),
+            ("escape", valid.replace("source=", "source=%zz")),
+        ] {
+            let path = dir.join(format!("{name}.ctx"));
+            fs::write(&path, text).unwrap();
+            assert!(PreparedFrame::load(&path).is_err(), "{name}");
+        }
+
+        // Relative identities are never resolved from the current directory.
+        let relative = valid
+            .replace(
+                &format!("source={}", source.path.display()),
+                "source=input/IMG_1.DNG",
+            )
+            .replace(
+                &format!("prepared_dng={}", source.path.display()),
+                "prepared_dng=input/IMG_1.DNG",
+            );
+        let path = dir.join("relative.ctx");
+        fs::write(&path, relative).unwrap();
+        assert!(PreparedFrame::load(&path).is_err());
+
+        // Route/generated consistency and the direct-cache rule.
+        let mismatched = valid.replace("generated=0", "generated=1");
+        let path = dir.join("generated.ctx");
+        fs::write(&path, mismatched).unwrap();
+        assert!(PreparedFrame::load(&path).is_err());
+
+        // A percent-escaped path round-trips through the parser.
+        let odd_dir = dir.join("odd % name");
+        fs::create_dir_all(&odd_dir).unwrap();
+        let odd = odd_dir.join("odd % frame.dng");
+        fs::write(&odd, b"odd").unwrap();
+        let canonical = fs::canonicalize(&odd).unwrap();
+        let sha = crate::digest::sha256(b"odd");
+        let escaped = canonical.display().to_string().replace('%', "%25").replace(' ', "%20");
+        let context_text = format!(
+            "rawtl-prepared-frame/1\nsource={escaped}\nsource_sha256={sha}\nroute=linearraw-sdk\nprepared_dng={escaped}\nprepared_sha256={sha}\ngenerated=0\nmain_ifd_width=8\nmain_ifd_height=6\nas_shot_neutral=0.5,1,0.8\nhas_capture_time=0\nconverter_used=0\n"
+        );
+        let path = dir.join("escaped.ctx");
+        fs::write(&path, context_text).unwrap();
+        let loaded = PreparedFrame::load(&path).expect("escaped context");
+        assert_eq!(loaded.dng, canonical);
+        assert_eq!(loaded.source, canonical);
+    }
+
+    fn converter_wrapper(dir: &std::path::Path, name: &str, counter: &std::path::Path) -> PathBuf {
+        let real = std::env::var("RAWTL_REAL_CONVERTER").unwrap_or_else(|_| {
+            "/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter".to_string()
+        });
+        let path = dir.join(name);
+        let script = format!(
+            "#!/bin/sh\necho call >> {}\nexec {} \"$@\"\n",
+            shell_quote(&counter.display().to_string()),
+            shell_quote(&real)
+        );
+        fs::write(&path, script).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    fn counter_lines(path: &std::path::Path) -> usize {
+        fs::read_to_string(path)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    fn pixel_digest(config: &ProduceConfig<'_>, tool: &Path, sources: &[SourceFrame], evs: &[f64], digests: &mut Vec<String>, infos: &mut Vec<FrameInfo>) {
+        let sequence = stream_frames(tool, sources, evs, config, Default::default(), &mut |info, native| {
+            let pixels = native.pixels(info.width, info.height)?;
+            digests.push(crate::digest::sha256(&pixels));
+            Ok(())
+        })
+        .expect("legacy stream");
+        infos.extend(sequence.frames);
+    }
+
+    /// Real-material oracle. Opt-in because it needs the built native tool and
+    /// staged Canon CR3s:
+    /// `RAWTL_NATIVE_TOOL=... RAWTL_REAL_CR3=a.CR3,b.CR3 RAWTL_PREPARED_WORK=dir \
+    ///  cargo test --bin rawtl-linear-video -- --ignored --test-threads=1`
+    #[test]
+    #[ignore = "requires RAWTL_NATIVE_TOOL, RAWTL_REAL_CR3 and RAWTL_PREPARED_WORK"]
+    fn prepared_context_on_real_native_frames() {
+        let tool = PathBuf::from(
+            std::env::var_os("RAWTL_NATIVE_TOOL").expect("RAWTL_NATIVE_TOOL"),
+        );
+        let materials: Vec<PathBuf> = std::env::var("RAWTL_REAL_CR3")
+            .expect("RAWTL_REAL_CR3")
+            .split(',')
+            .map(PathBuf::from)
+            .collect();
+        assert!(!materials.is_empty() && materials.len() <= 2);
+        let work = PathBuf::from(std::env::var_os("RAWTL_PREPARED_WORK").expect("RAWTL_PREPARED_WORK"));
+        fs::create_dir_all(&work).expect("create evidence dir");
+        // Only this test's own artifacts are removed; unknown entries stay.
+        for entry in fs::read_dir(&work).expect("read evidence dir") {
+            let entry = entry.expect("evidence entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let owned = name.starts_with("scratch-")
+                || name.ends_with(".ctx")
+                || name.ends_with(".log")
+                || name.starts_with("converter-")
+                || name.ends_with("-calls.txt")
+                || name.ends_with("-logs");
+            if !owned {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type().expect("entry type").is_dir() {
+                fs::remove_dir_all(&path).expect("remove old evidence dir");
+            } else {
+                fs::remove_file(&path).expect("remove old evidence file");
+            }
+        }
+        let prepared_counter = work.join("prepared-converter-calls.txt");
+        let legacy_counter = work.join("legacy-converter-calls.txt");
+        let prepared_converter = converter_wrapper(&work, "converter-prepared", &prepared_counter);
+        let legacy_converter = converter_wrapper(&work, "converter-legacy", &legacy_counter);
+        let prepared_logs = work.join("prepared-logs");
+        let legacy_logs = work.join("legacy-logs");
+        let settings = PreparedSettings {
+            camera_color_method: crate::color_profile::CameraColorMethod::DngCameraToPcs,
+            logs_dir: &prepared_logs,
+            log_relative_dir: "logs",
+        };
+        let sources: Vec<SourceFrame> = materials
+            .iter()
+            .map(|path| SourceFrame {
+                path: path.clone(),
+                name: path.file_name().unwrap().to_str().unwrap().to_string(),
+                key: Vec::new(),
+            })
+            .collect();
+
+        // Prepare both frames once; this is the only Converter invocation on
+        // the prepared path.
+        let mut prepared_frames = Vec::new();
+        for (index, source) in sources.iter().enumerate() {
+            let scratch = work.join(format!("scratch-{index}"));
+            fs::create_dir_all(&scratch).unwrap();
+            let frame = prepare(
+                &tool,
+                source,
+                &PrepareSettings {
+                    scratch_dir: &scratch,
+                    context_path: &work.join(format!("frame-{index}.ctx")),
+                    log: &work.join(format!("prepare-{index}.log")),
+                    converter: Some(prepared_converter.to_str().unwrap()),
+                    converter_timeout: Some(120),
+                },
+            )
+            .expect("real prepare");
+            assert_eq!(
+                frame.route,
+                PreparedRoute::VendorRaw,
+                "a CR3 must route through the Converter"
+            );
+            assert!(frame.generated);
+            assert!(frame.dng.exists());
+            prepared_frames.push(frame);
+        }
+        assert_eq!(counter_lines(&prepared_counter), sources.len());
+
+        // Analysis: the first frame uses its as-shot neutral, later frames the
+        // frozen first-frame reference (the product's default).
+        let first = analyze_prepared(&tool, &prepared_frames[0], None, Some(0.0), None, &settings)
+            .expect("prepare analysis");
+        let first_wb = first.applied_wb;
+        let legacy_config = ProduceConfig {
+            camera_color_method: crate::color_profile::CameraColorMethod::DngCameraToPcs,
+            logs_dir: &legacy_logs,
+            exposure_ev: None,
+            analysis_roi: None,
+            echo: false,
+            echo_tag: "",
+            white_balance: WhiteBalance::FirstFrame,
+            converter: Some(legacy_converter.to_str().unwrap()),
+            converter_timeout: Some(120),
+            log_relative_dir: "logs",
+        };
+        let baseline = produce_with_evs(&tool, &sources, &[0.0, 0.0][..sources.len()], &legacy_config)
+            .expect("legacy analysis");
+        for (index, (prepared, legacy)) in prepared_frames.iter().zip(&baseline.frames).enumerate() {
+            let wb = if index == 0 { None } else { Some(first_wb) };
+            let info = analyze_prepared(&tool, prepared, wb, Some(0.0), None, &settings)
+                .expect("prepared analysis");
+            assert_eq!(info.applied_wb, legacy.applied_wb, "frame {index} WB");
+            assert_eq!(info.as_shot_neutral, legacy.as_shot_neutral);
+            assert_eq!(info.camera_color, legacy.camera_color, "frame {index} color");
+            assert_eq!(info.source_sha256, legacy.source_sha256);
+            assert_eq!(
+                analysis_bytes(&info),
+                analysis_bytes(legacy),
+                "frame {index} analysis sidecar bytes"
+            );
+        }
+
+        // FP32 develop at 0 and a known EV: bitwise digest and metadata equality
+        // against the old same-source single-shot path.
+        for ev in [0.0f64, 0.25] {
+            let mut legacy_digests = Vec::new();
+            let mut legacy_infos = Vec::new();
+            pixel_digest(
+                &legacy_config,
+                &tool,
+                &sources,
+                &[ev; 2][..sources.len()],
+                &mut legacy_digests,
+                &mut legacy_infos,
+            );
+            for (index, prepared) in prepared_frames.iter().enumerate() {
+                let wb = if index == 0 { None } else { Some(first_wb) };
+                let mut digest = String::new();
+                let info = develop_prepared(&tool, prepared, wb, Some(ev), &settings, &mut |info, native| {
+                    let pixels = native.pixels(info.width, info.height)?;
+                    digest = crate::digest::sha256(&pixels);
+                    Ok(())
+                })
+                .expect("prepared develop");
+                assert_eq!(digest, legacy_digests[index], "frame {index} EV {ev} FP32 hash");
+                assert_eq!(info.pixels_sha256, legacy_infos[index].pixels_sha256);
+                assert_eq!(info.applied_wb, legacy_infos[index].applied_wb);
+                assert_eq!(info.as_shot_neutral, legacy_infos[index].as_shot_neutral);
+                assert_eq!(info.camera_color, legacy_infos[index].camera_color);
+                assert_eq!(info.width, legacy_infos[index].width);
+                assert_eq!(info.height, legacy_infos[index].height);
+            }
+        }
+        assert_eq!(counter_lines(&prepared_counter), sources.len());
+        for prepared in &prepared_frames {
+            assert!(prepared.dng.exists(), "prepared DNG must survive consumers");
+        }
+
+        // The caller's deletion is the only owner of the prepared artifact.
+        let scratch = work.join("scratch-delete");
+        fs::create_dir_all(&scratch).unwrap();
+        let deletion = prepare(
+            &tool,
+            &sources[0],
+            &PrepareSettings {
+                scratch_dir: &scratch,
+                context_path: &work.join("delete.ctx"),
+                log: &work.join("prepare-delete.log"),
+                converter: Some(prepared_converter.to_str().unwrap()),
+                converter_timeout: Some(120),
+            },
+        )
+        .expect("prepare deletion frame");
+        fs::remove_file(&deletion.dng).expect("caller deletes prepared DNG");
+        let error = analyze_prepared(&tool, &deletion, None, None, None, &settings)
+            .expect_err("deleted cache must fail");
+        assert!(error.message.contains("prepared"), "{}", error.message);
+        assert_eq!(counter_lines(&prepared_counter), sources.len() + 1);
+    }
 }

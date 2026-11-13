@@ -59,6 +59,8 @@ std::optional<Routing> inspect(const fs::path &path) {
   struct Candidate {
     uint32_t offset;
     std::optional<uint32_t> pi;
+    uint32_t width;
+    uint32_t height;
     uint64_t area;
   };
   std::vector<Candidate> candidates;
@@ -122,6 +124,7 @@ std::optional<Routing> inspect(const fs::path &path) {
     if (values[254] == 0 && values[256] > 0 && values[257] > 0)
       candidates.push_back(
           {at, values.count(262) ? std::optional(values[262]) : std::nullopt,
+           values[256], values[257],
            uint64_t(values[256]) * values[257]});
   }
   if (candidates.size() != 1)
@@ -129,7 +132,7 @@ std::optional<Routing> inspect(const fs::path &path) {
   auto c = candidates.front();
   if (!c.pi)
     throw Error(21, "main RAW IFD PhotometricInterpretation missing");
-  return Routing{c.offset, *c.pi};
+  return Routing{c.offset, *c.pi, c.width, c.height};
 }
 Route route(uint32_t p) {
   if (p == 34892)

@@ -57,6 +57,11 @@ struct Config {
     descriptor_geometry_mismatch: bool,
     nonzero_after_records: bool,
     frame_fail_on: Option<String>,
+    prepared_route: Option<String>,
+    prepared_source_override: Option<String>,
+    prepared_dng_override: Option<String>,
+    prepared_metadata_defect: Option<String>,
+    prepare_fail: bool,
     frames: Vec<FrameSpec>,
 }
 
@@ -74,6 +79,15 @@ struct Options {
     no_png: bool,
     stdout_mode: Option<String>,
     camera_method: String,
+    /// Prepared-context path for a --prepared consumer invocation.
+    prepared: Option<PathBuf>,
+    /// --prepare operation inputs.
+    prepare: Option<PrepareArgs>,
+}
+
+struct PrepareArgs {
+    scratch: PathBuf,
+    emit: PathBuf,
 }
 
 fn main() {
@@ -91,8 +105,18 @@ fn run() -> Result<(), (i32, String)> {
     let config_path = env::var("FAKE_NATIVE_CONFIG")
         .map_err(|_| (2, "FAKE_NATIVE_CONFIG is not set".to_string()))?;
     let config = load_config(Path::new(&config_path))?;
-    let name = options
-        .input
+    if let Some(prepare) = &options.prepare {
+        return run_prepare(&config, &options, prepare);
+    }
+    let context = match &options.prepared {
+        Some(path) => Some(FakeContext::load(path)?),
+        None => None,
+    };
+    let source_path = match &context {
+        Some(context) => context.source.clone(),
+        None => options.input.clone(),
+    };
+    let name = source_path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| (3, "input has no file name".to_string()))?
@@ -127,13 +151,24 @@ fn run() -> Result<(), (i32, String)> {
     } else {
         match (&options.white_balance, config.ignore_override) {
             (Some(override_wb), false) => (override_wb.clone(), "override"),
-            _ => (spec.own_neutral.clone(), "as-shot"),
+            _ => (
+                context
+                    .as_ref()
+                    .map(|context| context.as_shot_neutral.clone())
+                    .unwrap_or_else(|| spec.own_neutral.clone()),
+                "as-shot",
+            ),
         }
     };
-    let source_sha = if config.empty_source_sha256 {
-        String::new()
-    } else {
-        digest::sha256(&read_file(&options.input)?)
+    let source_sha = match &context {
+        Some(context) => context.source_sha256.clone(),
+        None => {
+            if config.empty_source_sha256 {
+                String::new()
+            } else {
+                digest::sha256(&read_file(&source_path)?)
+            }
+        }
     };
     let gain = options.exposure_ev.exp2();
     let tiles = tile_levels(
@@ -154,10 +189,18 @@ fn run() -> Result<(), (i32, String)> {
         }
     }
 
-    let capture = match &spec.capture_time {
+    let reported_capture = match &context {
+        Some(context) => context.capture_time.clone(),
+        None => spec.capture_time.clone(),
+    };
+    let capture = match &reported_capture {
         Some(value) => json_string(value),
         None => "null".to_string(),
     };
+    let own_neutral = context
+        .as_ref()
+        .map(|context| context.as_shot_neutral.clone())
+        .unwrap_or_else(|| spec.own_neutral.clone());
     let analysis_pointer = match &options.emit_analysis {
         Some(path) => json_string(&path.display().to_string()),
         None => "null".to_string(),
@@ -171,13 +214,51 @@ fn run() -> Result<(), (i32, String)> {
 \"negative_samples\":0,\"above_upper_samples\":0,\"transfer\":\"linear; no OETF\"}},\
 \"exposure_ev\":{ev},\"gain\":{gain},\"capture_time\":{capture},\
 \"analysis_sidecar\":{analysis_pointer}}}\n",
-        json_string(&options.input.display().to_string()),
+        json_string(&source_path.display().to_string()),
         json_string(&source_sha),
         config.width,
         config.height,
-        own = spec.own_neutral,
+        own = own_neutral,
         ev = options.exposure_ev,
     );
+    let mut metadata = metadata;
+    if let Some(context) = &context {
+        let defect = config.prepared_metadata_defect.as_deref();
+        if defect != Some("missing") {
+            let route = if defect == Some("route") {
+                "linearraw-sdk".to_string()
+            } else {
+                context.route.clone()
+            };
+            let dng = if defect == Some("dng") {
+                context.source.display().to_string()
+            } else {
+                context.dng.display().to_string()
+            };
+            let sha = if defect == Some("sha") {
+                "0".repeat(64)
+            } else {
+                context.dng_sha256.clone()
+            };
+            let generated = if defect == Some("generated") {
+                !context.generated
+            } else {
+                context.generated
+            };
+            let consumed = defect != Some("consumed");
+            metadata.insert_str(
+                1,
+                &format!(
+                    "\"route\":{},\"prepared\":{{\"schema_version\":1,\"dng\":{},\"sha256\":{},\"generated\":{},\"consumed_context\":{}}},",
+                    json_string(&route),
+                    json_string(&dng),
+                    json_string(&sha),
+                    generated,
+                    consumed
+                ),
+            );
+        }
+    }
     let metadata = if config.omit_metadata {
         metadata.replace(&format!("\"width\":{},", config.width), "")
     } else {
@@ -351,8 +432,241 @@ fn run() -> Result<(), (i32, String)> {
     Ok(())
 }
 
+struct FakeContext {
+    source: PathBuf,
+    source_sha256: String,
+    route: String,
+    dng: PathBuf,
+    dng_sha256: String,
+    generated: bool,
+    as_shot_neutral: String,
+    capture_time: Option<String>,
+}
+
+impl FakeContext {
+    fn load(path: &Path) -> Result<Self, (i32, String)> {
+        let text = fs::read_to_string(path)
+            .map_err(|error| (26, format!("cannot read prepared context: {error}")))?;
+        let mut lines = text.split('\n');
+        if lines.next() != Some("rawtl-prepared-frame/1") {
+            return Err((26, "unsupported prepared context header".to_string()));
+        }
+        let mut fields = std::collections::BTreeMap::new();
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                return Err((26, "malformed prepared context field".to_string()));
+            };
+            if fields
+                .insert(key.to_string(), percent_decode(value)?)
+                .is_some()
+            {
+                return Err((26, format!("duplicate prepared context field {key}")));
+            }
+        }
+        let get = |key: &str| -> Result<String, (i32, String)> {
+            fields
+                .get(key)
+                .cloned()
+                .ok_or_else(|| (26, format!("missing prepared context field {key}")))
+        };
+        let generated = match get("generated")?.as_str() {
+            "0" => false,
+            "1" => true,
+            _ => return Err((26, "invalid prepared generated flag".to_string())),
+        };
+        let capture_time = match get("has_capture_time")?.as_str() {
+            "1" => Some(get("capture_time")?),
+            "0" => None,
+            _ => return Err((26, "invalid has_capture_time".to_string())),
+        };
+        Ok(Self {
+            source: PathBuf::from(get("source")?),
+            source_sha256: get("source_sha256")?,
+            route: get("route")?,
+            dng: PathBuf::from(get("prepared_dng")?),
+            dng_sha256: get("prepared_sha256")?,
+            generated,
+            as_shot_neutral: get("as_shot_neutral")?,
+            capture_time,
+        })
+    }
+}
+
+fn percent_decode(text: &str) -> Result<String, (i32, String)> {
+    fn digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err((26, "truncated prepared context escape".to_string()));
+            }
+            match (digit(bytes[index + 1]), digit(bytes[index + 2])) {
+                (Some(hi), Some(lo)) => out.push((hi << 4) | lo),
+                _ => return Err((26, "invalid prepared context escape".to_string())),
+            }
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| (26, "prepared context is not UTF-8".to_string()))
+}
+
+fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte == b'%' || byte < 32 || byte == 127 {
+            out.push_str(&format!("%{byte:02x}"));
+        } else {
+            out.push(byte as char);
+        }
+    }
+    out
+}
+
+fn run_prepare(
+    config: &Config,
+    options: &Options,
+    prepare: &PrepareArgs,
+) -> Result<(), (i32, String)> {
+    if config.prepare_fail {
+        return Err((3, "synthetic prepare failure".to_string()));
+    }
+    let input = fs::canonicalize(&options.input)
+        .map_err(|error| (26, format!("cannot resolve source: {error}")))?;
+    let name = input
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| (3, "source has no file name".to_string()))?
+        .to_string();
+    let spec = config
+        .frames
+        .iter()
+        .find(|frame| frame.name == name)
+        .ok_or_else(|| (4, format!("no fixture for {name}")))?;
+    if !prepare.scratch.is_dir() {
+        return Err((26, "prepare scratch directory does not exist".to_string()));
+    }
+    let route = config.prepared_route.clone().unwrap_or_else(|| {
+        if input
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dng"))
+        {
+            "linearraw-sdk".to_string()
+        } else {
+            "vendor-raw-converter-linearraw-sdk".to_string()
+        }
+    });
+    let generated = route != "linearraw-sdk";
+    let source_sha = digest::sha256(&read_file(&input)?);
+    let dng = if generated {
+        let linear = prepare.scratch.join("linear");
+        if linear.exists() {
+            return Err((26, "prepare scratch already contains a linear directory".to_string()));
+        }
+        fs::create_dir(&linear)
+            .map_err(|error| (26, format!("cannot create scratch: {error}")))?;
+        let dng = linear.join(&name);
+        fs::copy(&input, &dng)
+            .map_err(|error| (26, format!("cannot stage prepared DNG: {error}")))?;
+        dng
+    } else {
+        input.clone()
+    };
+    let dng = config
+        .prepared_dng_override
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or(dng);
+    let dng_sha = if generated {
+        digest::sha256(&read_file(&dng)?)
+    } else {
+        source_sha.clone()
+    };
+    let source = config
+        .prepared_source_override
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or(input);
+    let capture = match &spec.capture_time {
+        Some(value) => format!("has_capture_time=1\ncapture_time={}\n", percent_encode(value)),
+        None => "has_capture_time=0\n".to_string(),
+    };
+    let text = format!(
+        "rawtl-prepared-frame/1\nsource={}\nsource_sha256={}\nroute={}\nprepared_dng={}\nprepared_sha256={}\ngenerated={}\nmain_ifd_width={}\nmain_ifd_height={}\nas_shot_neutral={}\n{}converter_used={}\n",
+        percent_encode(&source.display().to_string()),
+        source_sha,
+        route,
+        percent_encode(&dng.display().to_string()),
+        dng_sha,
+        if generated { 1 } else { 0 },
+        config.width,
+        config.height,
+        percent_encode(&spec.own_neutral),
+        capture,
+        if generated { 1 } else { 0 },
+    );
+    fs::write(&prepare.emit, text)
+        .map_err(|error| (26, format!("cannot write prepared context: {error}")))?;
+    Ok(())
+}
+
 fn parse_args() -> Result<Options, (i32, String)> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().is_some_and(|s| s == "--prepare") {
+        let input = PathBuf::from(args.get(1).ok_or((2, "missing source".to_string()))?);
+        let mut scratch = None;
+        let mut emit = None;
+        let mut index = 2;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--scratch" => {
+                    scratch = Some(PathBuf::from(value(&args, &mut index)?));
+                    index += 1;
+                }
+                "--emit-prepared" => {
+                    emit = Some(PathBuf::from(value(&args, &mut index)?));
+                    index += 1;
+                }
+                "--converter" | "--converter-timeout" => {
+                    let _ = value(&args, &mut index)?;
+                    index += 1;
+                }
+                other => return Err((2, format!("unexpected argument: {other}"))),
+            }
+        }
+        return Ok(Options {
+            input,
+            png: PathBuf::new(),
+            json: PathBuf::new(),
+            white_balance: None,
+            exposure_ev: 0.0,
+            emit_analysis: None,
+            analysis_roi: [0.0, 0.0, 1.0, 1.0],
+            no_png: false,
+            stdout_mode: None,
+            camera_method: "legacy-inverse-cm".to_string(),
+            prepared: None,
+            prepare: Some(PrepareArgs {
+                scratch: scratch.ok_or((2, "--prepare requires --scratch".to_string()))?,
+                emit: emit.ok_or((2, "--prepare requires --emit-prepared".to_string()))?,
+            }),
+        });
+    }
     let stdout_mode = args
         .first()
         .filter(|s| {
@@ -361,13 +675,17 @@ fn parse_args() -> Result<Options, (i32, String)> {
                 || s.as_str() == "--stdout-frame-f32"
         })
         .cloned();
+    let mut prepared = None;
     let (input, png, json, start) = if stdout_mode.is_some() {
-        (
-            PathBuf::from(args.get(1).ok_or((2, "missing input".into()))?),
-            PathBuf::new(),
-            PathBuf::new(),
-            2,
-        )
+        let first = args.get(1).ok_or((2, "missing input".to_string()))?;
+        if first == "--prepared" {
+            prepared = Some(PathBuf::from(
+                args.get(2).ok_or((2, "missing prepared context".to_string()))?,
+            ));
+            (PathBuf::new(), PathBuf::new(), PathBuf::new(), 3)
+        } else {
+            (PathBuf::from(first), PathBuf::new(), PathBuf::new(), 2)
+        }
     } else {
         if args.len() < 3 {
             return Err((2, "expected input png json".into()));
@@ -397,6 +715,9 @@ fn parse_args() -> Result<Options, (i32, String)> {
                 index += 1;
             }
             "--converter" | "--converter-timeout" => {
+                if prepared.is_some() {
+                    return Err((2, "converter options are not applicable to a prepared context".to_string()));
+                }
                 let _ = value(&args, &mut index)?;
                 index += 1;
             }
@@ -442,6 +763,8 @@ fn parse_args() -> Result<Options, (i32, String)> {
         no_png,
         stdout_mode,
         camera_method,
+        prepared,
+        prepare: None,
     })
 }
 
@@ -477,6 +800,11 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
         descriptor_geometry_mismatch: false,
         nonzero_after_records: false,
         frame_fail_on: None,
+        prepared_route: None,
+        prepared_source_override: None,
+        prepared_dng_override: None,
+        prepared_metadata_defect: None,
+        prepare_fail: false,
         frames: vec![],
     };
     for line in text.lines() {
@@ -539,6 +867,11 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
             "empty_source_sha256" => config.empty_source_sha256 = value == "1",
             "analysis_omit_kind" => config.analysis_omit_kind = value == "1",
             "analysis_sha_mismatch" => config.analysis_sha_mismatch = value == "1",
+            "prepared_route" => config.prepared_route = Some(value.into()),
+            "prepared_source_override" => config.prepared_source_override = Some(value.into()),
+            "prepared_dng_override" => config.prepared_dng_override = Some(value.into()),
+            "prepared_metadata_defect" => config.prepared_metadata_defect = Some(value.into()),
+            "prepare_fail" => config.prepare_fail = value == "1",
             other => return Err((2, format!("unknown config key: {other}"))),
         }
     }

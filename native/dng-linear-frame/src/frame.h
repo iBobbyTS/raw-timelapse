@@ -20,6 +20,10 @@ using Mat = std::array<Vec, 3>;
 struct Routing {
   uint32_t ifd;
   uint32_t photometric;
+  // Main RAW IFD storage dimensions. These are the full sensor-IFD geometry,
+  // not the SDK active-area output size; decode reports the latter.
+  uint32_t width = 0;
+  uint32_t height = 0;
 };
 // Recognized DNG (classic TIFF structure declaring DNGVersion) metadata.
 // nullopt means the file is not a recognized DNG; it is resolved by the
@@ -62,6 +66,68 @@ struct ProcessResult {
 };
 ProcessResult run_process(const std::vector<std::string> &, const fs::path &log,
                           int timeout_seconds);
+// One Converter invocation and its verified LinearRaw output. `linear_dir` is
+// a caller-created, empty directory; the Converter writes exactly one DNG into
+// it. `temporary` only selects the cleanup wording recorded in the provenance
+// block: the caller owns deletion either way. The provenance stays typed so a
+// prepared context never has to embed or parse arbitrary JSON text.
+struct ConversionInfo {
+  bool used = false;
+  std::string executable;
+  std::string version;
+  std::vector<std::string> command;
+  int exit_code = 0;
+  std::string transcript;
+  std::string output_name;
+  std::string output_sha256;
+  uint32_t photometric = 0;
+  std::string directory;
+  std::string cleanup;
+  Json record() const;
+};
+struct Conversion {
+  fs::path output;
+  ConversionInfo info;
+};
+Conversion convert_input(const fs::path &input, const fs::path &linear_dir,
+                         const std::string &converter, int timeout_seconds,
+                         bool temporary);
+// A PreparedFrame is one source file resolved to the LinearRaw DNG the SDK may
+// decode, plus the original identity every later consumer must keep using.
+// The prepared path is a cache/scratch artifact and is never the source of
+// Canon calibration, white balance identity or capture metadata.
+struct PreparedFrame {
+  fs::path source;              // canonical original input
+  std::string source_hash;      // sha256 of the original bytes
+  std::optional<Routing> routing; // recognized original DNG main IFD, if any
+  Route kind = Route::vendor_raw;
+  fs::path prepared_dng;        // canonical LinearRaw SDK input
+  std::string prepared_hash;    // sha256 of prepared_dng
+  bool generated = false;       // prepared_dng was produced in this run
+  uint32_t main_ifd_width = 0;  // prepared main IFD storage geometry
+  uint32_t main_ifd_height = 0;
+  ConversionInfo conversion;    // provenance copied into frame metadata
+  std::optional<std::string> capture_time;
+  Vec own{};                    // original/as-shot camera neutral
+};
+const char *route_name(Route);
+// Routing + optional Converter step + identity metadata. Performs no SDK
+// pixel decode. `scratch` must exist; a generated DNG is left in
+// `scratch/linear/` for the caller to delete. `temporary` only controls the
+// provenance cleanup wording.
+PreparedFrame prepare_frame(const fs::path &source, const fs::path &scratch,
+                            const std::string &converter, int timeout_seconds,
+                            bool temporary);
+// Deterministic versioned context document (not the metadata sidecar).
+void write_prepared(const PreparedFrame &, const fs::path &context_path);
+// Strictly parses the context and revalidates every original/prepared identity:
+// absolute paths, hashes, route recomputation and a three-channel LinearRaw
+// prepared artifact. Any mismatch is an explicit Error(26).
+PreparedFrame read_prepared(const fs::path &context_path);
+// SDK decode of the prepared artifact, then the unchanged fixed Canon CR3
+// calibration when requested. Never invokes the Converter or deletes a file.
+Decoded decode_prepared(const PreparedFrame &, const std::optional<Vec> &wb,
+                        CameraColorMethod method);
 std::string sha256(const fs::path &);
 void write_png(const fs::path &, uint32_t, uint32_t,
                const std::vector<uint16_t> &);
