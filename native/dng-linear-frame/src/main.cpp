@@ -2,7 +2,6 @@
 #include "analysis.h"
 #include "frame.h"
 #include <bit>
-#include <CoreFoundation/CoreFoundation.h>
 #include <algorithm>
 #include <cmath>
 #include <csignal>
@@ -13,10 +12,6 @@
 #include <unistd.h>
 namespace {
 using namespace frame;
-std::string read_text(const fs::path &p) {
-  std::ifstream f(p);
-  return {std::istreambuf_iterator<char>(f), {}};
-}
 void save(const fs::path &p, const std::string &s) {
   std::ofstream f(p);
   f << s << '\n';
@@ -57,25 +52,6 @@ struct Temp {
       std::cerr << "temporary directory cleaned: " << path << '\n';
   }
 };
-std::string converter_version(const fs::path &exe) {
-  auto bundle_path = exe.parent_path().parent_path().parent_path().string();
-  CFURLRef url = CFURLCreateFromFileSystemRepresentation(
-      nullptr, (const UInt8 *)bundle_path.data(), bundle_path.size(), true);
-  if (!url)
-    return "UNKNOWN";
-  CFBundleRef bundle = CFBundleCreate(nullptr, url);
-  CFRelease(url);
-  if (!bundle)
-    return "UNKNOWN";
-  CFTypeRef value = CFBundleGetValueForInfoDictionaryKey(
-      bundle, CFSTR("CFBundleShortVersionString"));
-  char text[256]{};
-  bool ok = value && CFGetTypeID(value) == CFStringGetTypeID() &&
-            CFStringGetCString((CFStringRef)value, text, sizeof text,
-                               kCFStringEncodingUTF8);
-  CFRelease(bundle);
-  return ok ? text : "UNKNOWN";
-}
 Vec parse_wb(std::string s) {
   std::stringstream in(s);
   Vec v;
@@ -174,97 +150,6 @@ void for_each_rgb48le_chunk(const std::vector<uint16_t> &pixels, Sink &&sink) {
   }
 }
 
-struct Prepared {
-  Decoded decoded;
-  fs::path source;
-  std::string source_hash;
-  Json conversion;
-  std::optional<Routing> routing;
-  Route kind = Route::vendor_raw;
-  std::optional<std::string> capture_time;
-  Vec own{};
-  bool wb_override = false;
-};
-
-// Routing, optional Converter step, decode and capture-time read. The run
-// temporary directory stays owned by the caller so positional publication and
-// stdout streaming keep their existing cleanup ordering.
-Prepared prepare(Temp &temp, const fs::path &input,
-                 const std::optional<Vec> &wb, const std::string &converter,
-                 int timeout, CameraColorMethod method = CameraColorMethod::legacy_inverse_cm) {
-  Prepared out;
-  out.source = input;
-  out.wb_override = wb.has_value();
-  out.routing = inspect(input);
-  // Recognition is DNG-structural: only a recognized DNG is routed by its
-  // main RAW photometric; every other file is a vendor/other RAW candidate for
-  // the converter alone.
-  out.kind = out.routing ? route(out.routing->photometric) : Route::vendor_raw;
-  out.source_hash = sha256(input);
-  fs::path decoded_path = input;
-  out.conversion = Json{{"used", false}};
-  auto convert = [&] {
-    fs::path dir = temp.path / "linear";
-    fs::create_directory(dir);
-    std::vector<std::string> command{converter, "-c",         "-l",
-                                     "-d",      dir.string(), input.string()};
-    auto log = temp.path / "converter.log";
-    auto result = run_process(command, log, timeout);
-    std::string transcript = read_text(log);
-    if (result.timed_out || result.exit_code != 0) {
-      std::cerr << transcript;
-      throw Error(result.timed_out ? 25 : 24,
-                  "Converter failed; exit=" + std::to_string(result.exit_code));
-    }
-    std::vector<fs::path> files;
-    for (auto &e : fs::directory_iterator(dir))
-      if (e.is_regular_file())
-        files.push_back(e.path());
-    if (files.size() != 1)
-      throw Error(23, "Converter must produce exactly one DNG");
-    decoded_path = files.front();
-    auto check = inspect(decoded_path);
-    if (!check || check->photometric != 34892)
-      throw Error(23,
-                  "Converter output main RAW IFD is not LinearRaw (34892)");
-    std::vector<Json> args;
-    for (auto &a : command)
-      args.emplace_back(a);
-    out.conversion = Json{
-        {"used", true},
-        {"executable", converter},
-        {"version", converter_version(converter)},
-        {"command", args},
-        {"exit_code", result.exit_code},
-        {"stdout_stderr", transcript},
-        {"output_name", decoded_path.filename().string()},
-        {"output_sha256", sha256(decoded_path)},
-        {"verified_main_ifd_photometric", int(check->photometric)},
-        {"temporary_directory", temp.path.string()},
-        {"cleanup", "removed before publishing sidecar"},
-        {"upstream_semantics", "Converter performs CFA demosaic; detailed "
-                               "clipping/metadata baking UNKNOWN"}};
-  };
-  // "as-shot" metadata comes from the recognized DNG itself. A vendor/other
-  // input is hashed as the original file, but its neutral and capture time
-  // exist only in the converter's DNG output (probed: ADC preserves both).
-  if (out.kind == Route::vendor_raw) {
-    convert();
-    out.own = read_neutral(decoded_path);
-  } else {
-    out.own = read_neutral(input);
-    if (out.kind == Route::converter)
-      convert();
-  }
-  out.decoded = decode(decoded_path, wb ? wb : std::optional<Vec>(out.own), method);
-  if (method == CameraColorMethod::dng_camera_to_pcs && out.kind == Route::vendor_raw)
-    calibrate_canon_cr3(input, out.decoded);
-  out.capture_time = read_capture_time(out.kind == Route::vendor_raw
-                                           ? decoded_path
-                                           : input);
-  return out;
-}
-
 struct FrameOutput {
   uint32_t width = 0, height = 0;
   std::string metadata;                // without the trailing newline
@@ -275,11 +160,11 @@ struct FrameOutput {
 
 // Gain, quantization, photometry and the metadata/analysis JSON documents.
 // The analysis_sidecar field is the requested positional path or null.
-FrameOutput render(const Prepared &prepared,
+FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
                    const std::optional<fs::path> &analysis_sidecar,
                    const analysis::Roi &roi, double exposure_ev,
-                   bool want_analysis, bool need_pixels, bool f32 = false) {
-  const Decoded &d = prepared.decoded;
+                   bool want_analysis, bool need_pixels, bool f32 = false,
+                   bool consumed_context = false, bool wb_override = false) {
   const double gain = std::exp2(exposure_ev);
   std::vector<uint16_t> pixels;
   if (need_pixels && !f32)
@@ -322,12 +207,13 @@ FrameOutput render(const Prepared &prepared,
        prepared.routing ? Json(int(prepared.routing->ifd)) : Json()},
       {"source_photometric",
        prepared.routing ? Json(int(prepared.routing->photometric)) : Json()},
-      {"route", prepared.kind == Route::direct
-                    ? "linearraw-sdk"
-                    : prepared.kind == Route::converter
-                          ? "cfa-converter-linearraw-sdk"
-                          : "vendor-raw-converter-linearraw-sdk"},
-      {"converter", prepared.conversion},
+      {"route", route_name(prepared.kind)},
+      {"converter", prepared.conversion.record()},
+      {"prepared", Json{{"schema_version", 1},
+                        {"dng", prepared.prepared_dng.string()},
+                        {"sha256", prepared.prepared_hash},
+                        {"generated", prepared.generated},
+                        {"consumed_context", consumed_context}}},
       {"sdk_version", kDNGSDK_GetInfoVersion},
       {"sdk_build",
        "C++20; qDNGUseXMP=1; qDNGXMPFiles=0; FP32 Linearize destination"},
@@ -345,7 +231,7 @@ FrameOutput render(const Prepared &prepared,
       {"decoded_as_shot_neutral", vec(d.as_shot)},
       {"applied_white_balance", vec(d.applied)},
       {"white_balance_source",
-       prepared.wb_override ? Json("override") : Json("as-shot")},
+       wb_override ? Json("override") : Json("as-shot")},
       {"color", [&] { Json v = d.color; v.text.pop_back();
         v.text += ",\"exposure_calibration\":" + d.exposure_calibration.text + "}"; return v; }()},
       {"decode_semantics", d.semantics},
@@ -378,13 +264,65 @@ FrameOutput render(const Prepared &prepared,
 int main(int argc, char **argv) {
   using namespace frame;
   try {
-    // The stdout grammar is flag-first: only argv[1] selects a streaming mode,
-    // so the positional path slots stay paths even when a path is spelled like
-    // a mode flag.
-    const bool stdout_mode =
-        argc >= 2 && (std::string(argv[1]) == "--stdout-analysis" ||
-                      std::string(argv[1]) == "--stdout-frame" ||
-                      std::string(argv[1]) == "--stdout-frame-f32");
+    // The stdout grammar is flag-first: only argv[1] selects a streaming or
+    // prepare mode, so the positional path slots stay paths even when a path
+    // is spelled like a mode flag.
+    const std::string mode = argc >= 2 ? std::string(argv[1]) : std::string();
+    const bool prepare_mode = mode == "--prepare";
+    const bool stdout_mode = mode == "--stdout-analysis" ||
+                             mode == "--stdout-frame" ||
+                             mode == "--stdout-frame-f32";
+    const std::string default_converter =
+        "/Applications/Adobe DNG "
+        "Converter.app/Contents/MacOS/Adobe DNG Converter";
+
+    if (prepare_mode) {
+      if (argc < 3)
+        throw Error(2, "usage: dng-linear-frame --prepare <source> --scratch "
+                       "DIR --emit-prepared PATH [--converter PATH] "
+                       "[--converter-timeout SECONDS]");
+      fs::path input = argv[2];
+      fs::path scratch, context;
+      bool scratch_set = false, context_set = false;
+      std::string converter = default_converter;
+      int timeout = 120;
+      for (int i = 3; i < argc; ++i) {
+        std::string a = argv[i];
+        if (i + 1 >= argc)
+          throw Error(2, "option value missing");
+        std::string value = argv[++i];
+        if (a == "--scratch") {
+          scratch = value;
+          scratch_set = true;
+        } else if (a == "--emit-prepared") {
+          context = value;
+          context_set = true;
+        } else if (a == "--converter")
+          converter = value;
+        else if (a == "--converter-timeout") {
+          size_t end = 0;
+          try {
+            timeout = std::stoi(value, &end);
+          } catch (...) {
+            throw Error(2, "invalid timeout");
+          }
+          if (end != value.size() || timeout < 1 || timeout > 3600)
+            throw Error(2, "timeout must be 1..3600 seconds");
+        } else
+          throw Error(2, "unknown option: " + a);
+      }
+      if (!scratch_set)
+        throw Error(2, "--prepare requires --scratch");
+      if (!context_set)
+        throw Error(2, "--prepare requires --emit-prepared");
+      PreparedFrame prepared =
+          prepare_frame(input, scratch, converter, timeout, false);
+      write_prepared(prepared, context);
+      std::cerr << "prepared " << prepared.source << " -> "
+                << prepared.prepared_dng << " context=" << context << '\n';
+      return 0;
+    }
+
     if (!stdout_mode) {
       if (argc < 4)
         throw Error(2, "usage: dng-linear-frame <input.dng> <output.png> "
@@ -392,8 +330,12 @@ int main(int argc, char **argv) {
                        "PATH] [--converter-timeout SECONDS] [--exposure-ev EV] "
                        "[--emit-analysis PATH] [--analysis-roi X,Y,W,H] "
                        "[--no-png]; or dng-linear-frame --stdout-analysis "
-                       "<input.dng> | --stdout-frame <input.dng> | --stdout-frame-f32 <input.dng> with the "
-                       "applicable options [--camera-color-method legacy-inverse-cm|dng-camera-to-pcs]");
+                       "<input.dng> | --stdout-frame <input.dng> | "
+                       "--stdout-frame-f32 <input.dng> with the applicable "
+                       "options [--camera-color-method "
+                       "legacy-inverse-cm|dng-camera-to-pcs]; or "
+                       "dng-linear-frame --prepare <source> --scratch DIR "
+                       "--emit-prepared PATH");
       fs::path input = fs::canonical(argv[1]),
                png = fs::weakly_canonical(argv[2]),
                json = fs::weakly_canonical(argv[3]);
@@ -402,8 +344,7 @@ int main(int argc, char **argv) {
           (fs::exists(json) && fs::equivalent(input, json)))
         throw Error(2, "input and output paths must be distinct");
       std::optional<Vec> wb;
-      std::string converter = "/Applications/Adobe DNG "
-                              "Converter.app/Contents/MacOS/Adobe DNG Converter";
+      std::string converter = default_converter;
       int timeout = 120;
       double exposure_ev = 0;
       fs::path analysis_path;
@@ -452,13 +393,17 @@ int main(int argc, char **argv) {
         throw Error(2, "analysis sidecar must be distinct from input and "
                        "outputs");
       Temp temp;
-      Prepared prepared = prepare(temp, input, wb, converter, timeout);
+      PreparedFrame prepared =
+          prepare_frame(input, temp.path, converter, timeout, true);
+      Decoded decoded = decode_prepared(
+          prepared, wb, CameraColorMethod::legacy_inverse_cm);
       FrameOutput frame =
-          render(prepared,
+          render(prepared, decoded,
                  analysis_path.empty()
                      ? std::optional<fs::path>()
                      : std::optional<fs::path>(analysis_path),
-                 roi, exposure_ev, !analysis_path.empty(), !no_png);
+                 roi, exposure_ev, !analysis_path.empty(), !no_png, false,
+                 false, wb.has_value());
       // Build artifacts in the run directory; cleanup is complete before
       // publishing.
       auto staged_png = temp.path / "frame.png";
@@ -504,66 +449,97 @@ int main(int argc, char **argv) {
       std::cout << '\n';
       return 0;
     }
-    // ---- stdout streaming modes -------------------------------------------
-    // argv[1] is the mode flag; argv[2] is the input path and options follow.
-    const bool want_analysis = std::string(argv[1]) == "--stdout-analysis";
-    const bool f32 = std::string(argv[1]) == "--stdout-frame-f32";
+
+    // ---- stdout streaming consumers ---------------------------------------
+    // argv[1] is the mode flag. argv[2] is either the source path or the
+    // literal --prepared followed by a prepared-context path; options follow.
+    const bool want_analysis = mode == "--stdout-analysis";
+    const bool f32 = mode == "--stdout-frame-f32";
     CameraColorMethod method = CameraColorMethod::legacy_inverse_cm;
     if (argc < 3)
       throw Error(2, "option value missing");
-    const fs::path input = fs::canonical(argv[2]);
+    const bool prepared_mode = std::string(argv[2]) == "--prepared";
+    fs::path input, context;
+    int option_start = 3;
+    if (prepared_mode) {
+      if (argc < 4)
+        throw Error(2, "--prepared requires a context path");
+      context = argv[3];
+      option_start = 4;
+    } else {
+      input = fs::canonical(argv[2]);
+    }
     std::optional<Vec> wb;
-    std::string converter = "/Applications/Adobe DNG "
-                            "Converter.app/Contents/MacOS/Adobe DNG Converter";
+    std::string converter = default_converter;
     int timeout = 120;
     double exposure_ev = 0;
     analysis::Roi roi;
-    for (int i = 3; i < argc; ++i) {
+    for (int i = option_start; i < argc; ++i) {
       std::string a = argv[i];
-      if (a == "--stdout-analysis" || a == "--stdout-frame" || a == "--stdout-frame-f32")
+      if (a == "--stdout-analysis" || a == "--stdout-frame" ||
+          a == "--stdout-frame-f32")
         throw Error(2, "specify exactly one of --stdout-analysis or "
                        "--stdout-frame");
       if (a == "--no-png" || a == "--emit-analysis")
         throw Error(2, a + " is not applicable to stdout modes");
+      if (a == "--prepared")
+        throw Error(2, "--prepared may be given once and replaces the source "
+                       "path");
       if (i + 1 >= argc)
         throw Error(2, "option value missing");
       std::string value = argv[++i];
       if (a == "--white-balance")
         wb = parse_wb(value);
-      else if (a == "--converter")
-        converter = value;
       else if (a == "--exposure-ev")
         exposure_ev = parse_ev(value);
       else if (a == "--camera-color-method") {
-        if (value == "dng-camera-to-pcs") method = CameraColorMethod::dng_camera_to_pcs;
-        else if (value == "legacy-inverse-cm") method = CameraColorMethod::legacy_inverse_cm;
-        else throw Error(2, "unknown camera color method");
-      }
-      else if (a == "--analysis-roi") {
+        if (value == "dng-camera-to-pcs")
+          method = CameraColorMethod::dng_camera_to_pcs;
+        else if (value == "legacy-inverse-cm")
+          method = CameraColorMethod::legacy_inverse_cm;
+        else
+          throw Error(2, "unknown camera color method");
+      } else if (a == "--analysis-roi") {
         if (!want_analysis)
           throw Error(2, "--analysis-roi requires --stdout-analysis");
         roi = parse_roi(value);
-      } else if (a == "--converter-timeout") {
-        size_t end = 0;
-        try {
-          timeout = std::stoi(value, &end);
-        } catch (...) {
-          throw Error(2, "invalid timeout");
+      } else if (a == "--converter" || a == "--converter-timeout") {
+        if (prepared_mode)
+          throw Error(2, a + " is not applicable to a prepared context; the "
+                             "Converter ran during --prepare");
+        if (a == "--converter")
+          converter = value;
+        else {
+          size_t end = 0;
+          try {
+            timeout = std::stoi(value, &end);
+          } catch (...) {
+            throw Error(2, "invalid timeout");
+          }
+          if (end != value.size() || timeout < 1 || timeout > 3600)
+            throw Error(2, "timeout must be 1..3600 seconds");
         }
-        if (end != value.size() || timeout < 1 || timeout > 3600)
-          throw Error(2, "timeout must be 1..3600 seconds");
       } else
         throw Error(2, "unknown option: " + a);
     }
     // A closed consumer pipe must surface as a write error, not a SIGPIPE
     // death: no record, artifact or success claim is published.
     std::signal(SIGPIPE, SIG_IGN);
-    Temp temp;
-    Prepared prepared = prepare(temp, input, wb, converter, timeout, method);
+    std::optional<Temp> temp;
+    PreparedFrame prepared;
+    if (prepared_mode) {
+      prepared = read_prepared(context);
+    } else {
+      temp.emplace();
+      prepared = prepare_frame(input, temp->path, converter, timeout, true);
+    }
+    Decoded decoded = decode_prepared(prepared, wb, method);
     FrameOutput frame =
-        render(prepared, std::optional<fs::path>(), roi, exposure_ev,
-               want_analysis, !want_analysis, f32);
-    temp.clear();
+        render(prepared, decoded, std::optional<fs::path>(), roi, exposure_ev,
+               want_analysis, !want_analysis, f32, prepared_mode,
+               wb.has_value());
+    if (temp)
+      temp->clear();
     write_all(f32 ? "RAWTLST2" : kStdoutMagic, sizeof kStdoutMagic);
     write_record_text(kRecordMetadata, frame.metadata + "\n");
     if (want_analysis) {

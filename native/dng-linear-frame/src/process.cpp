@@ -1,11 +1,13 @@
 #include "frame.h"
 #include <CommonCrypto/CommonDigest.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <fcntl.h>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <spawn.h>
 #include <sstream>
@@ -14,6 +16,68 @@
 #include <unistd.h>
 extern char **environ;
 namespace frame {
+namespace {
+std::string read_text(const fs::path &p) {
+  std::ifstream f(p);
+  return {std::istreambuf_iterator<char>(f), {}};
+}
+std::string converter_version(const fs::path &exe) {
+  auto bundle_path = exe.parent_path().parent_path().parent_path().string();
+  CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+      nullptr, (const UInt8 *)bundle_path.data(), bundle_path.size(), true);
+  if (!url)
+    return "UNKNOWN";
+  CFBundleRef bundle = CFBundleCreate(nullptr, url);
+  CFRelease(url);
+  if (!bundle)
+    return "UNKNOWN";
+  CFTypeRef value = CFBundleGetValueForInfoDictionaryKey(
+      bundle, CFSTR("CFBundleShortVersionString"));
+  char text[256]{};
+  bool ok = value && CFGetTypeID(value) == CFStringGetTypeID() &&
+            CFStringGetCString((CFStringRef)value, text, sizeof text,
+                               kCFStringEncodingUTF8);
+  CFRelease(bundle);
+  return ok ? text : "UNKNOWN";
+}
+} // namespace
+Conversion convert_input(const fs::path &input, const fs::path &linear_dir,
+                         const std::string &converter, int timeout,
+                         bool temporary) {
+  std::vector<std::string> command{converter, "-c",         "-l",
+                                   "-d",      linear_dir.string(), input.string()};
+  auto log = linear_dir.parent_path() / "converter.log";
+  auto result = run_process(command, log, timeout);
+  std::string transcript = read_text(log);
+  if (result.timed_out || result.exit_code != 0) {
+    std::cerr << transcript;
+    throw Error(result.timed_out ? 25 : 24,
+                "Converter failed; exit=" + std::to_string(result.exit_code));
+  }
+  std::vector<fs::path> files;
+  for (auto &e : fs::directory_iterator(linear_dir))
+    if (e.is_regular_file())
+      files.push_back(e.path());
+  if (files.size() != 1)
+    throw Error(23, "Converter must produce exactly one DNG");
+  auto check = inspect(files.front());
+  if (!check || check->photometric != 34892)
+    throw Error(23, "Converter output main RAW IFD is not LinearRaw (34892)");
+  ConversionInfo info;
+  info.used = true;
+  info.executable = converter;
+  info.version = converter_version(converter);
+  info.command = command;
+  info.exit_code = result.exit_code;
+  info.transcript = transcript;
+  info.output_name = files.front().filename().string();
+  info.output_sha256 = sha256(files.front());
+  info.photometric = check->photometric;
+  info.directory = linear_dir.string();
+  info.cleanup = temporary ? "removed before publishing sidecar"
+                           : "caller-owned; retained until caller deletes it";
+  return {files.front(), info};
+}
 ProcessResult run_process(const std::vector<std::string> &args,
                           const fs::path &log, int timeout) {
   std::vector<char *> argv;

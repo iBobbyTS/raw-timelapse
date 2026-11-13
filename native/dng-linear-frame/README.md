@@ -181,6 +181,67 @@ modes (exit 2). A closed or failing stdout pipe (EPIPE/partial write) exits
 nonzero (50) without any success claim. Payloads are written incrementally in
 bounded chunks; the frame is never buffered into an extra full-size byte copy.
 
+## Prepared frames (prepare once, analyze/develop repeatedly)
+
+A source can be resolved once to a validated LinearRaw DNG and then consumed by
+any number of analysis/develop calls without invoking the Converter again:
+
+```sh
+# Prepare: create the cache DNG below DIR and the context document.
+native/build/dng-linear-frame --prepare source.CR3 \
+  --scratch DIR --emit-prepared frame.context \
+  [--converter PATH] [--converter-timeout SECONDS]
+
+# Consume: identical records to the source-path streaming modes.
+native/build/dng-linear-frame --stdout-analysis --prepared frame.context \
+  [--white-balance R,G,B] [--exposure-ev EV] [--analysis-roi X,Y,W,H] \
+  [--camera-color-method legacy-inverse-cm|dng-camera-to-pcs]
+native/build/dng-linear-frame --stdout-frame-f32 --prepared frame.context \
+  [--white-balance R,G,B] [--exposure-ev EV] \
+  [--camera-color-method legacy-inverse-cm|dng-camera-to-pcs]
+```
+
+`DIR` must already exist. A generated DNG is written to `DIR/linear/`, which
+must not already exist; the Converter still produces exactly one LinearRaw
+output, verified before the context is published. Native never deletes a
+prepared DNG: the caller owns `DIR` and deletes it after the apply-EV
+completion event. A source LinearRaw DNG needs no conversion and the context
+points at that original file (`generated=0`); such a context must never be a
+deletion target. `--converter`/`--converter-timeout` are rejected
+(exit 2) on `--prepared` consumers because the conversion already happened.
+
+The context is a strict LF-terminated line document (not JSON; this runtime has
+no JSON parser). The first line is `rawtl-prepared-frame/1`; every following
+`key=value` row is percent-escaped (`%` and control bytes only) and unknown,
+duplicate or malformed rows fail with exit 26:
+
+| Field | Meaning |
+| --- | --- |
+| `source`, `source_sha256` | canonical original path and its SHA-256 |
+| `route` | `linearraw-sdk`, `cfa-converter-linearraw-sdk` or `vendor-raw-converter-linearraw-sdk` |
+| `prepared_dng`, `prepared_sha256` | canonical LinearRaw SDK input and its SHA-256 |
+| `generated` | `1` when the Converter produced the artifact |
+| `main_ifd_width`, `main_ifd_height` | prepared main-IFD storage geometry (not the active-area output size) |
+| `as_shot_neutral` | original/as-shot camera neutral (three positive numbers) |
+| `has_capture_time`, `capture_time` | optional original capture time |
+| `converter_used` plus `converter_*` | typed Converter provenance reconstructed into the frame metadata |
+
+Every consumer revalidates the context before decoding: absolute paths, both
+hashes, the route recomputed from the original source, `generated` versus route,
+and a three-channel LinearRaw prepared artifact with matching geometry. The
+original path is the only identity authority for the Canon fixed calibration,
+white balance and capture metadata; the cache path is never substituted for it.
+A missing/replaced source, a missing prepared DNG, a non-LinearRaw artifact, a
+hash mismatch, or a cache path equal to the original source is an explicit
+Error (exit 26), never a silent reconversion or another photo's EV.
+
+Frame metadata gains a `prepared` block:
+`{"schema_version":1,"dng":...,"sha256":...,"generated":bool,"consumed_context":bool}`.
+For the unchanged single-shot commands (`input.dng output.png output.json` and
+the source-path stdout modes) it reports the run temporary DNG and
+`consumed_context=false`; those commands run the same prepare/develop
+implementation and remove their temporary directory before publishing.
+
 Routing reads classic TIFF directory metadata **before SDK entry**. The
 classification predicate is *recognized DNG*, not *is TIFF*: a classic TIFF
 (magic 42) that declares `DNGVersion` is a DNG and must have exactly one
@@ -253,6 +314,7 @@ renames can leave a PNG without its new sidecar and returns failure.
 | 23 | Converter output absent/ambiguous/not LinearRaw; CFA SDK guard |
 | 24 | Converter spawn/process failure |
 | 25 | Converter timeout (process group killed/reaped) |
+| 26 | Prepared context or scratch contract violation: malformed/unknown fields, missing source/DNG, identity or hash mismatch, non-LinearRaw prepared artifact, existing scratch `linear` directory |
 | 30 | SDK parse/decode/unsupported channel/residual-black failure |
 | 40 | Missing/invalid color/WB metadata, singular matrix, nonfinite sample |
 | 50 | Other filesystem/output/runtime failure, including a stdout write failure |
@@ -314,6 +376,23 @@ reserved bytes, `0x01`/`0x02` byte equality against positional reference files
 `pixels_sha256` over the `0x04` payload, independently recomputed quantization
 bytes, zero on-disk artifacts, mode/option rejection (exit 2) and a closed
 consumer pipe (nonzero exit).
+
+`prepared-context` covers the prepare/consume boundary with generated fixtures:
+a LinearRaw source prepares with no cache and byte-identical analysis sidecars
+and FP32 payloads against the source path (including EV/WB/ROI), repeated
+prepare determinism, a CFA source that converts exactly once and is never
+reconverted or deleted by consumers, vendor-RAW metadata coming from the
+converted DNG, caller-owned deletion, tampered contexts (hash, route, geometry,
+provenance, relative paths, unknown/duplicate fields, truncated escapes,
+header) and the CLI grammar.
+
+The opt-in `prepared_real.py` probe runs two real Canon R7 CR3s through one
+prepare each, then analysis@0EV, FP32@0EV and FP32@±known EV with a counting
+Converter wrapper. It asserts zero consumer conversions, bitwise FP32 payload
+and sidecar equality against the old same-source command, identical fixed
+Canon calibration/white-balance metadata, both as-shot and frozen-override WB,
+the prepared DNG surviving native exit, and an explicit error after the caller
+deletes it:
 
 Opt-in real test (large outputs stay in the work directory):
 
