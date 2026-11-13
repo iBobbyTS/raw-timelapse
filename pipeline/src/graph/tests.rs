@@ -409,3 +409,45 @@ fn combined_data_and_event_cycle_is_rejected_with_valid_port_types() {
     );
     assert!(Graph::parse(&graph).unwrap_err().contains("cycle"));
 }
+
+#[test]
+fn indirect_sequence_wait_rejects_before_backend_side_effects() {
+    let configured = include_str!("default.json").replace(
+        "\"kind\":\"color\",",
+        "\"kind\":\"color\",\"waits\":[{\"node\":\"delete-cache\",\"scope\":\"sequence\"}],",
+    );
+    for text in [
+        configured.clone(),
+        configured.replace("\"kind\":\"solve\"", "\"kind\":\"zero\""),
+    ] {
+        let mut backend = Fake::default();
+        let parsed = Graph::parse(&text);
+        if let Ok(graph) = &parsed {
+            let _ = execute(graph, 3, &mut backend);
+        }
+        assert!(
+            backend.order.is_empty(),
+            "configuration reached backend operations: {:?}",
+            backend.order
+        );
+        assert!(backend.measured.is_empty());
+        assert!(backend.deleted.is_empty());
+        assert!(backend.events.is_empty());
+        let diagnostic = parsed.expect_err("reject the bounded-draining conflict during parse");
+        for name in ["sequence wait", "color", "delete-cache", "apply-ev"] {
+            assert!(diagnostic.contains(name), "{diagnostic}");
+        }
+    }
+}
+
+#[test]
+fn frame_wait_on_delete_completion_still_drains_images() {
+    let text = include_str!("default.json").replace(
+        "\"kind\":\"color\",",
+        "\"kind\":\"color\",\"waits\":[{\"node\":\"delete-cache\",\"scope\":\"frame\"}],",
+    );
+    let mut backend = Fake::default();
+    execute(&Graph::parse(&text).unwrap(), 3, &mut backend).unwrap();
+    assert_eq!(backend.deleted, vec![0, 1, 2]);
+    assert_eq!(backend.consumed.len(), 3);
+}
