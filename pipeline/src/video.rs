@@ -1,15 +1,23 @@
-//! Streaming RGB frame conversion, H.264 encoding, validation and publication.
+//! Streaming encoder node, generic output validation and publication.
+//!
+//! The graph hands this module owned 10-bit 4:4:4 target-signal planes from the
+//! colour node. One FFmpeg process receives them as `yuv444p10le`; codec
+//! configuration, format adaptation and the single quantization boundary are
+//! owned by [`crate::encoder`] and [`crate::color_profile`]. There is no
+//! second, 8-bit develop path.
 
 use crate::cli::Fps;
-use crate::color_profile::{ColorProfile, TagPolicy};
+use crate::color_profile::ColorProfile;
+use crate::encoder::ResolvedConfig;
 use crate::error::{Error, Result, EXIT_PREVIEW, EXIT_PUBLISH, EXIT_VALIDATION};
 use crate::json::Json;
 use crate::proc;
 #[cfg(test)]
 use crate::transport::RGB48_FRAME;
+#[cfg(test)]
+use crate::transport::{ArrayDescriptor, ArrayLayout, ByteOrder, DType};
 use crate::transport::{
-    self, ArrayDescriptor, ArrayLayout, ByteOrder, DType, DataEnvelope, DiskArtifact, MetadataDoc,
-    NdArray, Payload, Provenance, AP1_F32_FRAME, RGB24_FRAME, VIDEO_ARTIFACT,
+    self, DataEnvelope, DiskArtifact, MetadataDoc, Payload, Provenance, VIDEO_ARTIFACT,
 };
 use std::fs;
 use std::io::Write;
@@ -17,69 +25,24 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub const PREVIEW_CODEC: &str = "h264";
-pub const PREVIEW_PIX_FMT: &str = "yuv420p";
-pub const PREVIEW_MEDIA_TYPE: &str = "video/mp4";
-
 /// Native stdout supplies scene-linear ACEScg codes.
-/// RGB24 frames leaving the CPU conversion are described by the profile's
-/// transfer and gamut names.
+#[cfg(test)]
 const SCENE_LINEAR_SPACE: &str = "ACEScg AP1/D60 scene-linear";
+#[cfg(test)]
 const SCENE_LINEAR_TRANSFER: &str = "linear";
-const RGB24_PRODUCER: &str = "rawtl preview colour conversion";
 
-pub const FINAL_NAME: &str = "output.mp4";
-
-/// macOS VideoToolbox hardware H.264 rejects source widths above 4096
-/// (`cannot create compression session: -12903`), so the display-referred
-/// output is proportionally downscaled to this width.
-pub const PREVIEW_MAX_WIDTH: u32 = 4096;
-
-/// Applied preview geometry for one source frame size.
+/// Explicit resize actually applied by the graph, for the manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PreviewGeometry {
+pub struct ResizeRecord {
+    pub source_width: u32,
+    pub source_height: u32,
     pub width: u32,
     pub height: u32,
-    pub scaled: bool,
 }
 
-/// Proportional preview downscale policy: widths at or below
-/// [`PREVIEW_MAX_WIDTH`] are unchanged. Wider sources scale to that width; the
-/// height is rounded to the nearest integer and raised to the nearest even
-/// value (yuv420p chroma alignment), with a minimum of 2.
-pub fn preview_geometry(width: u32, height: u32) -> PreviewGeometry {
-    if width <= PREVIEW_MAX_WIDTH {
-        return PreviewGeometry {
-            width,
-            height,
-            scaled: false,
-        };
-    }
-    let numerator = u64::from(height) * u64::from(PREVIEW_MAX_WIDTH);
-    let mut scaled_height = ((numerator + u64::from(width) / 2) / u64::from(width)) as u32;
-    scaled_height = scaled_height.max(2);
-    if scaled_height % 2 == 1 {
-        scaled_height += 1;
-    }
-    PreviewGeometry {
-        width: PREVIEW_MAX_WIDTH,
-        height: scaled_height,
-        scaled: true,
-    }
-}
-
-/// The `-vf` value used by the preview encoder. The unscaled chain is the
-/// historical one; a scaled preview prepends RGB lanczos resampling before the
-/// profile's colour-matrix conversion.
-pub fn preview_filter(geometry: PreviewGeometry, profile: &ColorProfile) -> String {
-    let convert = profile.color_filter();
-    if geometry.scaled {
-        format!(
-            "scale={}:{}:flags=lanczos,{convert}",
-            geometry.width, geometry.height
-        )
-    } else {
-        convert
+impl ResizeRecord {
+    pub fn applied(&self) -> bool {
+        self.source_width != self.width || self.source_height != self.height
     }
 }
 
@@ -87,6 +50,7 @@ pub fn preview_filter(geometry: PreviewGeometry, profile: &ColorProfile) -> Stri
 /// `[height, width, channels]`; the declared byte length is the backing length,
 /// so a decoder buffer that does not match the declared geometry is rejected at
 /// construction time instead of reaching the pixel converter.
+#[cfg(test)]
 fn rgb_frame_descriptor(
     dtype: DType,
     width: usize,
@@ -106,6 +70,7 @@ fn rgb_frame_descriptor(
     }
 }
 
+#[cfg(test)]
 fn rgb_metadata(
     width: u32,
     height: u32,
@@ -132,56 +97,13 @@ fn rgb48_frame_envelope(
     producer: &str,
 ) -> transport::Result<DataEnvelope> {
     let byte_length = bytes.len();
-    let array = NdArray::new(
+    let array = transport::NdArray::new(
         bytes,
         rgb_frame_descriptor(DType::U16, width as usize, height as usize, byte_length),
     )?;
     let metadata = rgb_metadata(width, height, SCENE_LINEAR_SPACE, SCENE_LINEAR_TRANSFER)?;
     let provenance = Provenance::new(producer, Vec::new(), Vec::new())?;
     DataEnvelope::new(RGB48_FRAME, Payload::NdArray(array), metadata, provenance)
-}
-
-fn f32_frame_envelope(
-    bytes: Arc<[u8]>,
-    width: u32,
-    height: u32,
-) -> transport::Result<DataEnvelope> {
-    let length = bytes.len();
-    let array = NdArray::new(
-        bytes,
-        rgb_frame_descriptor(DType::F32, width as usize, height as usize, length),
-    )?;
-    DataEnvelope::new(
-        AP1_F32_FRAME,
-        Payload::NdArray(array),
-        rgb_metadata(width, height, SCENE_LINEAR_SPACE, SCENE_LINEAR_TRANSFER)?,
-        Provenance::new("dng-linear-frame FP32 stdout", vec![], vec![])?,
-    )
-}
-
-/// Wrap one converted preview frame as a validated `RGB24_FRAME`.
-fn rgb24_frame_envelope(
-    bytes: Arc<[u8]>,
-    width: u32,
-    height: u32,
-    profile: &ColorProfile,
-    producer: &str,
-) -> transport::Result<DataEnvelope> {
-    let byte_length = bytes.len();
-    let array = NdArray::new(
-        bytes,
-        rgb_frame_descriptor(DType::U8, width as usize, height as usize, byte_length),
-    )?;
-    let metadata = rgb_metadata(width, height, profile.gamut.name, profile.transfer.name())?;
-    let provenance = Provenance::new(producer, Vec::new(), Vec::new())?;
-    DataEnvelope::new(RGB24_FRAME, Payload::NdArray(array), metadata, provenance)
-}
-
-fn array_bytes(envelope: &DataEnvelope) -> &[u8] {
-    match envelope.payload() {
-        Payload::NdArray(array) => array.bytes(),
-        _ => unreachable!("RGB frame envelopes always carry an NdArray payload"),
-    }
 }
 
 /// Build the typed handoff for an encoded deliverable. `audit` consumes the
@@ -251,7 +173,9 @@ pub fn video_artifact_path(envelope: &DataEnvelope) -> Option<&Path> {
 #[derive(Debug, Clone)]
 pub struct ProbeInfo {
     pub codec_name: String,
+    pub profile: String,
     pub pix_fmt: String,
+    pub bits_per_raw_sample: Option<u32>,
     pub width: u32,
     pub height: u32,
     pub frames: u64,
@@ -269,7 +193,14 @@ impl ProbeInfo {
                 "codec_name",
                 crate::json::Json::Str(self.codec_name.clone()),
             ),
+            ("profile", crate::json::Json::Str(self.profile.clone())),
             ("pix_fmt", crate::json::Json::Str(self.pix_fmt.clone())),
+            (
+                "bits_per_raw_sample",
+                self.bits_per_raw_sample
+                    .map(|bits| crate::json::Json::Int(bits as i64))
+                    .unwrap_or(crate::json::Json::Null),
+            ),
             ("width", crate::json::Json::Int(self.width as i64)),
             ("height", crate::json::Json::Int(self.height as i64)),
             ("nb_read_frames", crate::json::Json::Int(self.frames as i64)),
@@ -305,7 +236,7 @@ pub fn probe_stream(ffprobe: &Path, file: &Path) -> Result<ProbeInfo> {
         "v:0".to_string(),
         "-count_frames".to_string(),
         "-show_entries".to_string(),
-        "stream=codec_name,pix_fmt,width,height,nb_read_frames,avg_frame_rate,color_space,color_primaries,color_transfer,color_range".to_string(),
+        "stream=codec_name,profile,pix_fmt,bits_per_raw_sample,width,height,nb_read_frames,avg_frame_rate,color_space,color_primaries,color_transfer,color_range".to_string(),
         "-of".to_string(),
         "default=noprint_wrappers=1".to_string(),
         file.display().to_string(),
@@ -387,9 +318,15 @@ pub fn probe_stream(ffprobe: &Path, file: &Path) -> Result<ProbeInfo> {
             .cloned()
             .unwrap_or_else(|| "unknown".to_string())
     };
+    let bits_per_raw_sample = fields
+        .get("bits_per_raw_sample")
+        .and_then(|text| text.parse::<u32>().ok())
+        .filter(|bits| *bits > 0);
     Ok(ProbeInfo {
         codec_name: required("codec_name")?,
+        profile: color("profile"),
         pix_fmt: required("pix_fmt")?,
+        bits_per_raw_sample,
         width,
         height,
         frames,
@@ -401,61 +338,97 @@ pub fn probe_stream(ffprobe: &Path, file: &Path) -> Result<ProbeInfo> {
     })
 }
 
-pub fn validate_preview(
+/// Everything the generic output check needs to know about the configured
+/// deliverable. No H.264-specific syntax is inspected.
+pub struct OutputContract<'a> {
+    pub config: &'a ResolvedConfig,
+    pub profile: &'a ColorProfile,
+    pub width: u32,
+    pub height: u32,
+    pub frames: usize,
+    pub fps: Fps,
+}
+
+/// Validate the encoded file generically: codec/profile/pixel format/geometry/
+/// frame count/rate, the profile's per-field colour tags, the range the
+/// container can express, and a complete decode.
+pub fn validate_output(
     ffprobe: &Path,
     ffmpeg: &Path,
     file: &Path,
-    width: u32,
-    height: u32,
-    count: usize,
-    fps: Fps,
-    profile: &ColorProfile,
+    contract: &OutputContract<'_>,
 ) -> Result<ProbeInfo> {
-    let expected = preview_geometry(width, height);
+    let config = contract.config;
+    let profile = contract.profile;
+    let range = config.effective_range(profile);
+    if let Err(message) = config.validate_geometry(contract.width, contract.height) {
+        return Err(Error::new(EXIT_PREVIEW, message));
+    }
     let probe = probe_stream(ffprobe, file)?;
-    if probe.codec_name != PREVIEW_CODEC {
+    if probe.codec_name != config.codec_name() {
         return Err(Error::new(
             EXIT_PREVIEW,
             format!(
-                "preview codec is {:?}, expected {:?}",
-                probe.codec_name, PREVIEW_CODEC
+                "output codec is {:?}, expected {:?} ({})",
+                probe.codec_name,
+                config.codec_name(),
+                config.encoder
             ),
         ));
     }
-    let accepted_pix_fmts = profile.range.accepted_decoder_pix_fmts();
-    if !accepted_pix_fmts.contains(&probe.pix_fmt.as_str()) {
+    let accepted = config.decoder_pix_fmts(range);
+    if !accepted.contains(&probe.pix_fmt.as_str()) {
         return Err(Error::new(
             EXIT_PREVIEW,
             format!(
-                "preview pixel format is {:?}, expected one of {:?} for {} range ({})",
-                probe.pix_fmt,
-                accepted_pix_fmts,
-                profile.range.as_str(),
-                profile.id
+                "output pixel format is {:?}, expected one of {:?} for {}",
+                probe.pix_fmt, accepted, config.encoder
             ),
         ));
     }
-    if probe.width != expected.width || probe.height != expected.height {
+    if config.encoder == "prores_ks" {
+        // ffprobe reports ProRes profiles by name; the configured value may be
+        // the numeric profile or the name.
+        let expected = config.probe_profile().ok_or_else(|| {
+            Error::new(
+                EXIT_PREVIEW,
+                format!("invalid ProRes profile {:?}", config.codec_profile),
+            )
+        })?;
+        if !probe.profile.eq_ignore_ascii_case(expected) {
+            return Err(Error::new(
+                EXIT_PREVIEW,
+                format!(
+                    "output codec profile is {:?}, expected {expected:?}",
+                    probe.profile
+                ),
+            ));
+        }
+    }
+    if probe.width != contract.width || probe.height != contract.height {
         return Err(Error::new(
             EXIT_PREVIEW,
             format!(
-                "preview is {}x{}, expected {}x{}",
-                probe.width, probe.height, expected.width, expected.height
+                "output is {}x{}, expected {}x{}",
+                probe.width, probe.height, contract.width, contract.height
             ),
         ));
     }
-    if probe.frames != count as u64 {
-        return Err(Error::new(
-            EXIT_PREVIEW,
-            format!("preview has {} frames, expected {}", probe.frames, count),
-        ));
-    }
-    if !rate_matches(&probe.avg_frame_rate, fps) {
+    if probe.frames != contract.frames as u64 {
         return Err(Error::new(
             EXIT_PREVIEW,
             format!(
-                "preview frame rate is {:?}, expected {}/{}",
-                probe.avg_frame_rate, fps.num, fps.den
+                "output has {} frames, expected {}",
+                probe.frames, contract.frames
+            ),
+        ));
+    }
+    if !rate_matches(&probe.avg_frame_rate, contract.fps) {
+        return Err(Error::new(
+            EXIT_PREVIEW,
+            format!(
+                "output frame rate is {:?}, expected {}/{}",
+                probe.avg_frame_rate, contract.fps.num, contract.fps.den
             ),
         ));
     }
@@ -477,7 +450,6 @@ pub fn validate_preview(
             profile.tag_policy.transfer_token(),
             &probe.color_transfer,
         ),
-        ("color_range", profile.range.as_str(), &probe.color_range),
     ] {
         let matches = observed == expected
             || (expected == "unknown"
@@ -487,9 +459,25 @@ pub fn validate_preview(
                 ));
         if !matches {
             return Err(Error::new(EXIT_PREVIEW, format!(
-                "preview {field} is {observed:?}, expected {expected:?} for {} (per-field colour contract)", profile.id
+                "output {field} is {observed:?}, expected {expected:?} for {} (per-field colour contract)", profile.id
             )));
         }
+    }
+    let expected_range = range.as_str();
+    let range_matches = probe.color_range == expected_range
+        || (!config.writes_range_tag()
+            && matches!(
+                probe.color_range.as_str(),
+                "" | "unknown" | "unspecified"
+            ));
+    if !range_matches {
+        return Err(Error::new(
+            EXIT_PREVIEW,
+            format!(
+                "output color_range is {:?}, expected {expected_range:?} for {} ({})",
+                probe.color_range, profile.id, config.encoder
+            ),
+        ));
     }
 
     // Full decode proves the file is actually playable, not merely indexable.
@@ -509,7 +497,7 @@ pub fn validate_preview(
         return Err(Error::new(
             EXIT_PREVIEW,
             format!(
-                "preview failed a full decode: {}; stderr: {}",
+                "output failed a full decode: {}; stderr: {}",
                 proc::exit_description(&captured.status),
                 proc::tail(&captured.stderr, 1200)
             ),
@@ -518,219 +506,44 @@ pub fn validate_preview(
     Ok(probe)
 }
 
-/// Start with the first frame's validated metadata/descriptor, then retain only
-/// one FP32 and one RGB24 backing allocation per frame. The encoder owns no
-/// input file; closing stdin is the end-of-sequence signal.
-pub fn encode_stream(
-    context: &crate::RunContext<'_>,
-    evs: &[f64],
-    output: &Path,
-) -> Result<crate::frame::FrameSequence> {
-    let options = context.options;
-    let logs = context.output.join("logs/encode");
-    let config = crate::frame::ProduceConfig {
-        logs_dir: &logs,
-        exposure_ev: None,
-        analysis_roi: None,
-        echo: true,
-        echo_tag: "encode ",
-        white_balance: options.white_balance,
-        camera_color_method: options.preview_profile.camera_color_method(),
-        converter: options.converter.as_deref(),
-        converter_timeout: options.converter_timeout,
-        log_relative_dir: "logs/encode",
-    };
-    let active: proc::ActiveNative = Default::default();
-    let mut encoder: Option<StreamingEncoder> = None;
-    let mut clipping = Vec::new();
-    let result = crate::frame::stream_frames(
-        &options.native_tool,
-        context.sources,
-        evs,
-        &config,
-        active.clone(),
-        &mut |info, native| {
-            if encoder.is_none() {
-                let args = encoder_args(
-                    info.width,
-                    info.height,
-                    context.sources.len(),
-                    options.fps,
-                    output,
-                    options.preview_profile,
-                );
-                encoder = Some(StreamingEncoder::spawn(
-                    &options.ffmpeg,
-                    &args,
-                    &context.output.join("logs/encode.log"),
-                    active.clone(),
-                )?);
-            }
-            let encoder = encoder.as_mut().unwrap();
-            if encoder.failed.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(Error::new(
-                    EXIT_PREVIEW,
-                    "encoder failed while native frame was active",
-                ));
-            }
-            let pixels = native.pixels(info.width, info.height)?;
-            let sent = f32_frame_envelope(pixels, info.width, info.height).map_err(|e| {
-                Error::new(
-                    crate::error::EXIT_FRAME,
-                    format!("invalid scene-linear frame: {e}"),
-                )
-            })?;
-            // The output backing is initialized and unique until envelope creation.
-            let mut rgb24 = unsafe {
-                Arc::<[u8]>::new_zeroed_slice(info.width as usize * info.height as usize * 3)
-                    .assume_init()
-            };
-            let conversion = options
-                .preview_profile
-                .convert_f32_frame(
-                    array_bytes(&sent),
-                    info.width as usize,
-                    info.height as usize,
-                    options.log_reference_gain,
-                    &mut rgb24,
-                )
-                .map(|counts| clipping.push(counts));
-            conversion.map_err(|e| Error::new(EXIT_PREVIEW, format!("colour conversion: {e}")))?;
-            let converted = rgb24_frame_envelope(
-                rgb24,
-                info.width,
-                info.height,
-                options.preview_profile,
-                RGB24_PRODUCER,
-            )
-            .map_err(|e| Error::new(EXIT_PREVIEW, format!("invalid RGB24 frame: {e}")))?;
-            encoder
-                .input
-                .as_mut()
-                .unwrap()
-                .write_all(array_bytes(&converted))
-                .map_err(|e| Error::new(EXIT_PREVIEW, format!("encoder stdin failed: {e}")))?;
-            encoder.bytes += array_bytes(&converted).len();
-            Ok(())
-        },
-    );
-    if let Some(encoder) = &mut encoder {
-        let counterpart_failed = encoder.failed.load(std::sync::atomic::Ordering::SeqCst);
-        let status = encoder.finish(result.is_err())?;
-        if counterpart_failed
-            || result
-                .as_ref()
-                .err()
-                .is_some_and(|e| e.code == EXIT_PREVIEW)
-        {
-            return Err(Error::new(
-                EXIT_PREVIEW,
-                format!(
-                    "streaming encoder failed: {}; {}",
-                    proc::exit_description(&status),
-                    result
-                        .as_ref()
-                        .err()
-                        .map(|e| e.message.as_str())
-                        .unwrap_or("see logs/encode.log")
-                ),
-            ));
-        }
-        if result.is_ok() && !status.success() {
-            return Err(Error::new(
-                EXIT_PREVIEW,
-                format!(
-                    "streaming encoder failed: {}",
-                    proc::exit_description(&status)
-                ),
-            ));
-        }
-    }
-    let mut sequence = result?;
-    for (frame, counts) in sequence.frames.iter_mut().zip(clipping) {
-        frame.signal_clip_counts = Some(counts);
-    }
-    ensure_nonempty(output, EXIT_PREVIEW, "streaming encoder produced no video")?;
-    Ok(sequence)
-}
-
-fn encoder_args(
-    width: u32,
-    height: u32,
-    count: usize,
-    fps: Fps,
-    output: &Path,
+/// Early capability check before any RAW preparation. Encoder, pixel format,
+/// profile and output options are exercised by a one-frame synthetic encode
+/// into the partial directory; the file is removed immediately.
+pub fn preflight(
+    config: &ResolvedConfig,
     profile: &ColorProfile,
-) -> Vec<String> {
-    let geometry = preview_geometry(width, height);
-    let mut args = vec![
-        "-hide_banner".to_string(),
-        "-v".to_string(),
-        "error".to_string(),
-        "-f".to_string(),
-        "rawvideo".to_string(),
-        "-pixel_format".to_string(),
-        "rgb24".to_string(),
-        "-video_size".to_string(),
-        format!("{width}x{height}"),
-        "-framerate".to_string(),
-        fps.arg(),
-        "-i".to_string(),
-        "pipe:0".to_string(),
-        "-frames:v".to_string(),
-        count.to_string(),
-        "-vf".to_string(),
-        preview_filter(geometry, profile),
-        "-c:v".to_string(),
-        "h264_videotoolbox".to_string(),
-        "-allow_sw".to_string(),
-        "0".to_string(),
-        "-profile:v".to_string(),
-        "high".to_string(),
-        "-b:v".to_string(),
-        "0".to_string(),
-        "-q:v".to_string(),
-        "65".to_string(),
-        "-pix_fmt".to_string(),
-        PREVIEW_PIX_FMT.to_string(),
-    ];
-    if profile.tag_policy == TagPolicy::SRGB {
-        // The historical sRGB argument sequence, kept byte-identical.
-        for (flag, value) in [
-            ("-colorspace", "bt709"),
-            ("-color_primaries", "bt709"),
-            ("-color_trc", "iec61966-2-1"),
-            ("-color_range", profile.range.as_str()),
-        ] {
-            args.push(flag.to_string());
-            args.push(value.to_string());
-        }
-    } else {
-        // VideoToolbox on the supported build propagates these fields to SPS
-        // VUI. Partial colour information needs write_colr for MP4 nclx.
-        for (flag, value) in [
-            ("-colorspace", profile.tag_policy.matrix_token()),
-            ("-color_primaries", profile.tag_policy.primaries_token()),
-            ("-color_trc", profile.tag_policy.transfer_token()),
-            ("-color_range", profile.range.as_str()),
-        ] {
-            args.push(flag.to_string());
-            args.push(value.to_string());
+    ffmpeg: &Path,
+    explicit_geometry: Option<(u32, u32)>,
+    fps: Fps,
+    partial_dir: &Path,
+) -> Result<()> {
+    if let Some((width, height)) = explicit_geometry {
+        if let Err(message) = config.validate_geometry(width, height) {
+            return Err(Error::new(EXIT_USAGE_FOR_PREFLIGHT, message));
         }
     }
-    let movflags = if profile.tag_policy == TagPolicy::SRGB {
-        "+faststart"
-    } else {
-        "+faststart+write_colr"
-    };
-    for (flag, value) in [("-movflags", movflags), ("-f", "mp4")] {
-        args.push(flag.to_string());
-        args.push(value.to_string());
+    let geometry = explicit_geometry.unwrap_or((32, 32));
+    let output = partial_dir.join(format!("preflight.{}", config.container.extension()));
+    let _ = fs::remove_file(&output);
+    let args = config.preflight_args(profile, geometry, &fps.arg(), &output);
+    let captured = proc::run_capture(ffmpeg, &args, EXIT_PREVIEW)?;
+    let _ = fs::remove_file(&output);
+    if !captured.status.success() {
+        return Err(Error::new(
+            EXIT_PREVIEW,
+            format!(
+                "encoder preflight failed for {}: {}; stderr: {}",
+                config.summary(profile),
+                proc::exit_description(&captured.status),
+                proc::tail(&captured.stderr, 1200)
+            ),
+        ));
     }
-    args.push(output.display().to_string());
-
-    args
+    Ok(())
 }
+
+/// Configuration/validation family for run-boundary encoder rejections.
+const EXIT_USAGE_FOR_PREFLIGHT: i32 = crate::error::EXIT_VALIDATION;
 
 struct StreamingEncoder {
     process: proc::OwnedProcess,
@@ -798,7 +611,7 @@ impl StreamingEncoder {
             let _ = w.join();
         }
         self.process
-            .note(&format!("pixel bytes (RGB24): {}", self.bytes));
+            .note(&format!("pixel bytes (yuv444p10le): {}", self.bytes));
         status
     }
 }
@@ -874,6 +687,152 @@ pub fn file_size(path: &Path) -> Option<u64> {
     fs::metadata(path).ok().map(|metadata| metadata.len())
 }
 
+/// Little-endian byte view of the 10-bit samples. The native architecture is
+/// little-endian, so the frame is written without a full-frame copy; other
+/// targets fall back to an explicit conversion.
+fn signal_bytes(signal: &[u16]) -> std::borrow::Cow<'_, [u8]> {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: every sample is a plain integer, the view covers exactly the
+        // same initialized memory, and `u8` has no stronger alignment.
+        std::borrow::Cow::Borrowed(unsafe {
+            std::slice::from_raw_parts(signal.as_ptr().cast::<u8>(), signal.len() * 2)
+        })
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        std::borrow::Cow::Owned(
+            signal
+                .iter()
+                .flat_map(|sample| sample.to_le_bytes())
+                .collect(),
+        )
+    }
+}
+
+/// The product encoder node. It accepts owned 10-bit 4:4:4 planes from the
+/// colour node and never re-enters source decoding.
+pub struct GraphEncoder {
+    config: ResolvedConfig,
+    frames: usize,
+    encoder: Option<StreamingEncoder>,
+    output: Option<std::path::PathBuf>,
+    pub active: proc::ActiveNative,
+}
+impl GraphEncoder {
+    pub fn new(config: ResolvedConfig, frames: usize) -> Self {
+        Self {
+            config,
+            frames,
+            encoder: None,
+            output: None,
+            active: Default::default(),
+        }
+    }
+
+    pub fn config(&self) -> &ResolvedConfig {
+        &self.config
+    }
+
+    pub fn begin(&mut self) -> Result<()> {
+        proc::check_stop()
+    }
+
+    pub fn push(
+        &mut self,
+        context: &crate::RunContext<'_>,
+        info: &crate::frame::FrameInfo,
+        signal: &[u16],
+    ) -> Result<()> {
+        proc::check_stop()?;
+        let options = context.options;
+        let expected = info.width as usize * info.height as usize * 3;
+        if signal.len() != expected {
+            return Err(Error::new(
+                EXIT_PREVIEW,
+                format!(
+                    "encoder input has {} samples, expected {expected} for {}x{} 4:4:4 10-bit",
+                    signal.len(),
+                    info.width,
+                    info.height
+                ),
+            ));
+        }
+        if self.encoder.is_none() {
+            if let Err(message) = self.config.validate_geometry(info.width, info.height) {
+                return Err(Error::new(EXIT_USAGE_FOR_PREFLIGHT, message));
+            }
+            let output = context
+                .partial_dir
+                .join(self.config.output_name());
+            let args = self.config.encoder_args(
+                options.preview_profile,
+                info.width,
+                info.height,
+                self.frames,
+                &options.fps.arg(),
+                &output,
+            );
+            self.output = Some(output);
+            self.encoder = Some(StreamingEncoder::spawn(
+                &options.ffmpeg,
+                &args,
+                &context.output.join("logs/encode.log"),
+                self.active.clone(),
+            )?);
+        }
+        let encoder = self.encoder.as_mut().unwrap();
+        if encoder
+            .failed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::new(
+                EXIT_PREVIEW,
+                "encoder failed while a graph image was active",
+            ));
+        }
+        // `yuv444p10le` is 16-bit little-endian words with the code in the low
+        // ten bits; the buffer is produced by the colour node.
+        let bytes = signal_bytes(signal);
+        encoder
+            .input
+            .as_mut()
+            .unwrap()
+            .write_all(&bytes)
+            .map_err(|e| Error::new(EXIT_PREVIEW, format!("encoder stdin failed: {e}")))?;
+        encoder.bytes += bytes.len();
+        Ok(())
+    }
+
+    pub fn end(&mut self) -> Result<()> {
+        proc::check_stop()?;
+        let encoder = self
+            .encoder
+            .as_mut()
+            .ok_or_else(|| Error::new(EXIT_PREVIEW, "empty encoder input"))?;
+        let failed = encoder
+            .failed
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let status = encoder.finish(false)?;
+        if failed || !status.success() {
+            return Err(Error::new(
+                EXIT_PREVIEW,
+                format!(
+                    "streaming encoder failed: {}",
+                    proc::exit_description(&status)
+                ),
+            ));
+        }
+        ensure_nonempty(
+            self.output
+                .as_ref()
+                .ok_or_else(|| Error::new(EXIT_PREVIEW, "empty encoder input"))?,
+            EXIT_PREVIEW,
+            "streaming encoder produced no video",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,98 +854,6 @@ mod tests {
     }
 
     #[test]
-    fn preview_geometry_keeps_material_at_or_below_the_limit() {
-        for (width, height) in [(4096, 2304), (4000, 2256), (8, 6), (1, 1)] {
-            assert_eq!(
-                preview_geometry(width, height),
-                PreviewGeometry {
-                    width,
-                    height,
-                    scaled: false
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn preview_geometry_scales_wider_material_proportionally() {
-        // The two 25 MP real-material sources (CR3 ADC output and DxO DNG).
-        assert_eq!(
-            preview_geometry(6984, 4660),
-            PreviewGeometry {
-                width: 4096,
-                height: 2734,
-                scaled: true
-            }
-        );
-        assert_eq!(
-            preview_geometry(6960, 4640),
-            PreviewGeometry {
-                width: 4096,
-                height: 2732,
-                scaled: true
-            }
-        );
-        // Aspect ratio is preserved within one pixel and the width is the cap.
-        for (width, height) in [(5000u32, 3000u32), (12000, 8000), (8192, 8192)] {
-            let geometry = preview_geometry(width, height);
-            assert!(geometry.scaled);
-            assert_eq!(geometry.width, PREVIEW_MAX_WIDTH);
-            let expected = f64::from(height) * f64::from(PREVIEW_MAX_WIDTH) / f64::from(width);
-            assert!((f64::from(geometry.height) - expected).abs() <= 1.5);
-        }
-    }
-
-    #[test]
-    fn preview_geometry_aligns_chroma_and_clamps_tiny_heights() {
-        // Nearest integer is 999 (odd), raised to 1000 for yuv420p.
-        assert_eq!(
-            preview_geometry(4100, 1000),
-            PreviewGeometry {
-                width: 4096,
-                height: 1000,
-                scaled: true
-            }
-        );
-        // A degenerate aspect still yields an even, non-zero height.
-        assert_eq!(
-            preview_geometry(20000, 1),
-            PreviewGeometry {
-                width: 4096,
-                height: 2,
-                scaled: true
-            }
-        );
-        for (width, height) in [(6984u32, 4660u32), (4100, 1000), (5000, 3000), (20000, 1)] {
-            assert_eq!(preview_geometry(width, height).height % 2, 0);
-        }
-    }
-
-    #[test]
-    fn preview_filter_only_prepends_lanczos_when_scaled() {
-        let srgb = crate::color_profile::lookup("srgb-preview").expect("srgb");
-        assert_eq!(
-            preview_filter(preview_geometry(8, 6), srgb),
-            "scale=out_color_matrix=bt709:out_range=tv,\
-             setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709:range=tv"
-        );
-        assert_eq!(
-            preview_filter(preview_geometry(5000, 3000), srgb),
-            format!("scale=4096:2458:flags=lanczos,{}", srgb.color_filter())
-        );
-    }
-
-    #[test]
-    fn vendor_preview_filter_writes_known_fields() {
-        let profile = crate::color_profile::lookup("dji-dlog-dgamut").expect("dji");
-        assert_eq!(
-            preview_filter(preview_geometry(8, 6), profile),
-            "scale=out_color_matrix=bt2020:out_range=pc,\
-             setparams=color_primaries=unknown:color_trc=unknown:colorspace=bt2020nc:range=pc"
-        );
-    }
-
-    #[test]
     fn rgb48_typed_frame_rejects_a_buffer_that_does_not_match_the_geometry() {
         let width = 8u32;
         let height = 6u32;
@@ -997,38 +864,6 @@ mod tests {
                 assert_eq!(actual, expected - 2);
             }
             other => panic!("unexpected constructor outcome: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rgb24_typed_frame_carries_the_profile_colour_metadata() {
-        let profile = crate::color_profile::lookup("srgb-preview").expect("srgb");
-        let bytes: Arc<[u8]> = vec![0u8; 8 * 6 * 3].into();
-        let envelope =
-            rgb24_frame_envelope(bytes, 8, 6, profile, RGB24_PRODUCER).expect("valid RGB24 frame");
-        assert_eq!(envelope.semantic_type(), RGB24_FRAME);
-        assert_eq!(envelope.transport_kind(), transport::TransportKind::NdArray);
-        assert_eq!(
-            envelope
-                .metadata()
-                .get("color.space")
-                .and_then(Json::as_str),
-            Some(profile.gamut.name)
-        );
-        assert_eq!(
-            envelope
-                .metadata()
-                .get("color.transfer")
-                .and_then(Json::as_str),
-            Some(profile.transfer.name())
-        );
-        match envelope.payload() {
-            Payload::NdArray(array) => {
-                assert_eq!(array.shape(), &[6, 8, 3]);
-                assert_eq!(array.byte_strides(), &[24, 3, 1]);
-                assert_eq!(array.dtype(), DType::U8);
-            }
-            other => panic!("unexpected payload {other:?}"),
         }
     }
 }
@@ -1043,14 +878,14 @@ mod publication_tests {
             .join(format!("publish-stream-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let source = root.join("temporary.mp4");
-        let destination = root.join("output.mp4");
+        let source = root.join("temporary.mov");
+        let destination = root.join("output.mov");
         fs::write(&source, b"validated").unwrap();
         fs::write(&destination, b"existing").unwrap();
         let envelope = video_envelope(
             &source,
-            "video/mp4",
-            "h264",
+            "video/quicktime",
+            "prores",
             1,
             "test",
             crate::color_profile::default_profile(),
@@ -1067,69 +902,16 @@ mod publication_tests {
     }
 }
 
-/// Temporary graph endpoint. It accepts owned prepared-frame pixels and never
-/// re-enters source decoding. The encoder section replaces this RGB24 adapter.
-pub struct GraphEncoder {
-    encoder: Option<StreamingEncoder>,
-    pub active: proc::ActiveNative,
-}
-impl GraphEncoder {
-    pub fn new() -> Self {
-        Self {
-            encoder: None,
-            active: Default::default(),
-        }
-    }
-    pub fn push(
-        &mut self,
-        context: &crate::RunContext<'_>,
-        info: &crate::frame::FrameInfo,
-        pixels: Arc<[u8]>,
-    ) -> Result<()> {
-        proc::check_stop()?;
-        let options = context.options;
-        if self.encoder.is_none() {
-            let args = encoder_args(
-                info.width,
-                info.height,
-                context.sources.len(),
-                options.fps,
-                &context.partial_dir.join("output.mp4"),
-                options.preview_profile,
-            );
-            self.encoder = Some(StreamingEncoder::spawn(
-                &options.ffmpeg,
-                &args,
-                &context.output.join("logs/encode.log"),
-                self.active.clone(),
-            )?);
-        }
-        let encoder = self.encoder.as_mut().unwrap();
-        encoder
-            .input
-            .as_mut()
-            .unwrap()
-            .write_all(&pixels)
-            .map_err(|e| Error::new(EXIT_PREVIEW, format!("encoder stdin failed: {e}")))?;
-        encoder.bytes += pixels.len();
-        Ok(())
-    }
-    pub fn end(&mut self) -> Result<()> {
-        let encoder = self
-            .encoder
-            .as_mut()
-            .ok_or_else(|| Error::new(EXIT_PREVIEW, "empty encoder input"))?;
-        let status = encoder.finish(false)?;
-        proc::check_stop()?;
-        if !status.success() {
-            return Err(Error::new(
-                EXIT_PREVIEW,
-                format!(
-                    "streaming encoder failed: {}",
-                    proc::exit_description(&status)
-                ),
-            ));
-        }
-        Ok(())
+#[cfg(test)]
+mod signal_byte_tests {
+    use super::*;
+
+    #[test]
+    fn ten_bit_samples_use_little_endian_words() {
+        let samples = [64u16, 512, 940, 1023];
+        let bytes = signal_bytes(&samples);
+        let expected: Vec<u8> = samples.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+        assert_eq!(&bytes[..], &expected[..]);
+        assert_eq!(bytes.len(), samples.len() * 2);
     }
 }

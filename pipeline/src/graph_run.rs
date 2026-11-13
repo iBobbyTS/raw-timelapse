@@ -1,10 +1,12 @@
 //! Product adapters for the typed graph. Numerical estimation and prepared
 //! contexts remain their accepted producers; this module owns scheduling I/O.
+use crate::encoder::ResolvedConfig;
 use crate::error::{Error, Result, EXIT_FRAME, EXIT_PREVIEW, EXIT_VALIDATION};
 use crate::frame::{
     self, FrameInfo, FrameSequence, PrepareSettings, PreparedFrame, PreparedSettings,
 };
-use crate::{proc, video, EncodedStage, RunContext};
+use crate::video::{self, ResizeRecord};
+use crate::{proc, EncodedStage, RunContext};
 use rawtl_linear_video::deflicker::estimation::ExposurePlan;
 use rawtl_linear_video::deflicker::measurement::AnalysisSidecar;
 use rawtl_linear_video::deflicker::{
@@ -16,16 +18,25 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
 pub struct Output {
     pub sequence: FrameSequence,
     pub stage: EncodedStage,
     pub exposure: Option<ExposureResult>,
 }
-pub struct Image {
-    info: FrameInfo,
-    pixels: Arc<[u8]>,
+
+/// One image travelling the stream chain. The colour node replaces scene-linear
+/// FP32 with the single 10-bit 4:4:4 encoder handoff; resize and explicit
+/// exposure only accept the linear form.
+enum Pixels {
+    Linear(Arc<[u8]>),
+    Target(Vec<u16>),
 }
+
+struct Image {
+    info: FrameInfo,
+    pixels: Pixels,
+}
+
 struct Runner<'a, 'b> {
     context: &'a RunContext<'b>,
     measurements: Vec<FrameMeasurement>,
@@ -34,6 +45,9 @@ struct Runner<'a, 'b> {
     generated_paths: Vec<std::path::PathBuf>,
     capture_times: Vec<Option<String>>,
     frames: Vec<FrameInfo>,
+    source_geometry: Option<(u32, u32)>,
+    resize_target: Option<(u32, u32)>,
+    resize: Option<ResizeRecord>,
     encoder: video::GraphEncoder,
     events: File,
     failure: Option<Error>,
@@ -227,17 +241,27 @@ impl Backend for Runner<'_, '_> {
         );
         let mut info = self.frame_result(id, result)?;
         info.log_relative = format!("logs/render/frame_{:06}.log", id + 1);
-        if let Some(first) = self.frames.first() {
-            if first.width != info.width || first.height != info.height {
+        if let Some((width, height)) = self.source_geometry {
+            if width != info.width || height != info.height {
                 return Err("graph: frame dimensions changed".into());
             }
-            if self
-                .context
-                .options
-                .preview_profile
-                .camera_color_method()
-                .requires_canon_cr3()
-                && first
+        } else {
+            self.source_geometry = Some((info.width, info.height));
+            // An explicit resize replaces the default source geometry; only the
+            // geometry that actually reaches the codec is validated here.
+            let geometry = self.resize_target.unwrap_or((info.width, info.height));
+            if let Err(message) = self.encoder.config().validate_geometry(geometry.0, geometry.1) {
+                return Err(message);
+            }
+        }
+        if self
+            .context
+            .options
+            .preview_profile
+            .camera_color_method()
+            .requires_canon_cr3()
+            && self.frames.first().is_some_and(|first_frame| {
+                first_frame
                     .camera_color
                     .as_ref()
                     .and_then(|c| c.get("camera_model"))
@@ -245,22 +269,25 @@ impl Backend for Runner<'_, '_> {
                         .camera_color
                         .as_ref()
                         .and_then(|c| c.get("camera_model"))
-            {
-                return Err("rev-eng Canon Log rejects mixed camera models".into());
-            }
+            })
+        {
+            return Err("rev-eng Canon Log rejects mixed camera models".into());
         }
         // pixels() checks EOF/hash and reaps native before returning owned data.
         self.check()?;
         Ok(Image {
             info,
-            pixels: pixels.ok_or("graph: develop returned no owned pixels")?,
+            pixels: Pixels::Linear(pixels.ok_or("graph: develop returned no owned pixels")?),
         })
     }
     fn exposure(&mut self, image: &mut Image, ev: f64) -> graph::Result<()> {
+        let Pixels::Linear(pixels) = &mut image.pixels else {
+            return Err("graph: exposure requires scene-linear pixels".into());
+        };
         let gain = ev.exp2();
         let mut minimum = f32::INFINITY;
         let mut maximum = f32::NEG_INFINITY;
-        for p in Arc::make_mut(&mut image.pixels).chunks_exact_mut(4) {
+        for p in Arc::make_mut(pixels).chunks_exact_mut(4) {
             let value = (f32::from_le_bytes(p.try_into().unwrap()) as f64 * gain) as f32;
             if !value.is_finite() {
                 return Err("graph: exposure overflow".into());
@@ -269,30 +296,75 @@ impl Backend for Runner<'_, '_> {
             maximum = maximum.max(value);
             p.copy_from_slice(&value.to_le_bytes());
         }
-        image.info.pixels_sha256 = Some(crate::digest::sha256(&image.pixels));
+        image.info.pixels_sha256 = Some(crate::digest::sha256(pixels));
         image.info.observed_min = Some(minimum as f64);
         image.info.observed_max = Some(maximum as f64);
         image.info.exposure_ev += ev;
         Ok(())
     }
-    fn color(&mut self, mut image: Image) -> graph::Result<Image> {
-        let mut pixels = vec![0; image.info.width as usize * image.info.height as usize * 3];
-        let counts = self.context.options.preview_profile.convert_f32_frame(
-            &image.pixels,
-            image.info.width as usize,
-            image.info.height as usize,
+    fn resize(&mut self, image: &mut Image, width: u32, height: u32) -> graph::Result<()> {
+        let Pixels::Linear(pixels) = &image.pixels else {
+            return Err("graph: resize requires scene-linear pixels before colour".into());
+        };
+        let source = (image.info.width, image.info.height);
+        let resized = crate::resample::resize_scene_linear(pixels, source.0, source.1, width, height)
+            .map_err(|e| format!("graph: resize: {e}"))?;
+        if self.resize.is_none() {
+            self.resize = Some(ResizeRecord {
+                source_width: source.0,
+                source_height: source.1,
+                width,
+                height,
+            });
+        }
+        let mut minimum = f64::INFINITY;
+        let mut maximum = f64::NEG_INFINITY;
+        for sample in resized.chunks_exact(4) {
+            let value = f32::from_le_bytes(sample.try_into().unwrap()) as f64;
+            minimum = minimum.min(value);
+            maximum = maximum.max(value);
+        }
+        let digest = crate::digest::sha256(&resized);
+        image.pixels = Pixels::Linear(Arc::from(resized));
+        image.info.width = width;
+        image.info.height = height;
+        image.info.observed_min = Some(minimum);
+        image.info.observed_max = Some(maximum);
+        image.info.pixels_sha256 = Some(digest);
+        Ok(())
+    }
+    fn color(&mut self, image: Image) -> graph::Result<Image> {
+        let Image { mut info, pixels } = image;
+        let Pixels::Linear(pixels) = pixels else {
+            return Err("graph: colour conversion requires scene-linear pixels".into());
+        };
+        let profile = self.context.options.preview_profile;
+        let range = self.encoder.config().effective_range(profile);
+        let mut signal = Vec::new();
+        let counts = profile.convert_f32_frame_to_yuv10(
+            &pixels,
+            info.width as usize,
+            info.height as usize,
             self.context.options.log_reference_gain,
-            &mut pixels,
+            range,
+            &mut signal,
         )?;
-        image.info.signal_clip_counts = Some(counts);
-        image.pixels = pixels.into();
-        Ok(image)
+        info.signal_clip_counts = Some(counts);
+        Ok(Image {
+            info,
+            pixels: Pixels::Target(signal),
+        })
     }
     fn begin(&mut self) -> graph::Result<()> {
-        self.check()
+        self.check()?;
+        let result = self.encoder.begin();
+        self.result(result)
     }
     fn push(&mut self, _id: usize, image: Image) -> graph::Result<()> {
-        let result = self.encoder.push(self.context, &image.info, image.pixels);
+        let Pixels::Target(signal) = &image.pixels else {
+            return Err("graph: encoder requires the 10-bit target signal".into());
+        };
+        let result = self.encoder.push(self.context, &image.info, signal);
         self.result(result)?;
         self.frames.push(image.info);
         Ok(())
@@ -341,6 +413,27 @@ pub fn run(context: &RunContext<'_>) -> Result<Output> {
     if !context.options.deflicker.enabled() {
         graph.disable_measurement();
     }
+    if let Some((width, height)) = context.options.resize {
+        graph
+            .apply_resize(width, height)
+            .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
+    }
+    let config = ResolvedConfig::resolve(
+        graph.encoder_patch(),
+        &context.options.encoder,
+    )
+    .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
+    let explicit_resize = graph.resize_geometry();
+    let preflight_started = Instant::now();
+    video::preflight(
+        &config,
+        context.options.preview_profile,
+        &context.options.ffmpeg,
+        explicit_resize,
+        context.options.fps,
+        &context.partial_dir,
+    )?;
+    let preflight_elapsed = preflight_started.elapsed();
     fs::create_dir_all(context.output.join("logs"))
         .map_err(|e| Error::new(EXIT_FRAME, e.to_string()))?;
     let events = File::create(context.output.join("logs/graph.log"))
@@ -353,7 +446,10 @@ pub fn run(context: &RunContext<'_>) -> Result<Output> {
         generated_paths: vec![],
         capture_times: vec![],
         frames: vec![],
-        encoder: video::GraphEncoder::new(),
+        source_geometry: None,
+        resize_target: explicit_resize,
+        resize: None,
+        encoder: video::GraphEncoder::new(config.clone(), context.sources.len()),
         events,
         failure: None,
     };
@@ -364,7 +460,7 @@ pub fn run(context: &RunContext<'_>) -> Result<Output> {
             runner.events,
             "error: {message}; retained cache root={} partial={}",
             context.partial_dir.join("cache").display(),
-            context.partial_dir.join("output.mp4").display()
+            context.partial_dir.join(config.output_name()).display()
         );
         if runner.encoder.active.lock().unwrap().cancelled {
             return Err(Error::new(
@@ -392,24 +488,28 @@ pub fn run(context: &RunContext<'_>) -> Result<Output> {
     };
     let mut timings = BTreeMap::new();
     timings.insert("graph".into(), graph_started.elapsed());
+    timings.insert("preflight".into(), preflight_elapsed);
     let validation_started = Instant::now();
-    let output = context.partial_dir.join("output.mp4");
-    let probe = video::validate_preview(
+    let output = context.partial_dir.join(config.output_name());
+    let probe = video::validate_output(
         &context.options.ffprobe,
         &context.options.ffmpeg,
         &output,
-        sequence.width,
-        sequence.height,
-        sequence.frames.len(),
-        context.options.fps,
-        context.options.preview_profile,
+        &video::OutputContract {
+            config: &config,
+            profile: context.options.preview_profile,
+            width: sequence.width,
+            height: sequence.height,
+            frames: sequence.frames.len(),
+            fps: context.options.fps,
+        },
     )?;
     timings.insert("validate_video".into(), validation_started.elapsed());
     let bytes = video::file_size(&output)
         .ok_or_else(|| Error::new(EXIT_PREVIEW, "graph encoder produced no video"))?;
     let artifact = video::video_envelope_with_gain(
         &output,
-        video::PREVIEW_MEDIA_TYPE,
+        config.media_type(),
         &probe.codec_name,
         probe.frames,
         "graph streaming encoder",
@@ -433,6 +533,8 @@ pub fn run(context: &RunContext<'_>) -> Result<Output> {
             bytes,
             timings,
             video_artifact: artifact,
+            encoder: config,
+            resize: runner.resize,
         },
         exposure: runner.exposure.take(),
     })

@@ -11,7 +11,8 @@
 //! * an explicit input domain derived from the official inverse curve at signal
 //!   0 and 1 (no tone mapping: negatives below the domain clip to the official
 //!   lower endpoint and highlights above it clip to the upper endpoint);
-//! * 8-bit quantization with round-half-away-from-zero and no dither;
+//! * one 10-bit planar 4:4:4 YCbCr handoff for the encoder node, quantized with
+//!   round-half-away-from-zero and no dither (the single quantization boundary);
 //! * the delivery range, YCbCr coding matrix and container/bitstream tag policy.
 //!
 //! The constants below are transcriptions, not values recalled from memory.
@@ -32,6 +33,12 @@ pub enum PreviewRange {
     Pc,
 }
 
+/// The encoder input handoff is a single 10-bit 4:4:4 YCbCr quantization. Both
+/// ProRes and lower-bit-depth codecs start from this same buffer; FFmpeg only
+/// subsamples/reduces it, never re-develops the RAW.
+pub const SIGNAL_BITS: u32 = 10;
+pub const SIGNAL_MAX: u16 = 1023;
+
 impl PreviewRange {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -45,14 +52,76 @@ impl PreviewRange {
         self.as_str()
     }
 
-    /// Pixel formats an H.264 decoder may report for this range. ffmpeg 8
-    /// reports full-range 8-bit 4:2:0 H.264 as the deprecated `yuvj420p`.
-    pub fn accepted_decoder_pix_fmts(self) -> &'static [&'static str] {
-        match self {
-            PreviewRange::Tv => &["yuv420p"],
-            PreviewRange::Pc => &["yuv420p", "yuvj420p"],
+}
+
+/// YCbCr coding matrix applied to the already-transferred target signal.
+/// Coefficients are the published H.273/H.274 values for the tag written with
+/// the output; coding is independent of the vendor gamut and transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YcbcrCoding {
+    /// ITU-R BT.709 / Rec.709 non-constant luminance.
+    Bt709,
+    /// ITU-R BT.2020 non-constant luminance.
+    Bt2020Ncl,
+}
+
+impl YcbcrCoding {
+    pub fn from_matrix(token: &str) -> Option<Self> {
+        match token {
+            "bt709" => Some(YcbcrCoding::Bt709),
+            "bt2020nc" => Some(YcbcrCoding::Bt2020Ncl),
+            _ => None,
         }
     }
+
+    /// `(Kr, Kg, Kb, 2(1-Kb), 2(1-Kr))` for non-constant-luminance coding.
+    pub fn coefficients(self) -> (f64, f64, f64, f64, f64) {
+        match self {
+            YcbcrCoding::Bt709 => (0.2126, 0.7152, 0.0722, 1.8556, 1.5748),
+            YcbcrCoding::Bt2020Ncl => (0.2627, 0.6780, 0.0593, 1.8814, 1.4746),
+        }
+    }
+
+    pub fn formula(self) -> &'static str {
+        match self {
+            YcbcrCoding::Bt709 => {
+                "Y'=0.2126*R'+0.7152*G'+0.0722*B'; Cb=(B'-Y')/1.8556; Cr=(R'-Y')/1.5748"
+            }
+            YcbcrCoding::Bt2020Ncl => {
+                "Y'=0.2627*R'+0.6780*G'+0.0593*B'; Cb=(B'-Y')/1.8814; Cr=(R'-Y')/1.4746"
+            }
+        }
+    }
+}
+
+/// 10-bit luma code for a normalized target signal. Limited range is
+/// `64 + 876*signal` (H.273 10-bit video range); full range is `1023*signal`.
+pub fn quantize_luma(signal: f64, range: PreviewRange) -> u16 {
+    let value = signal.clamp(0.0, 1.0);
+    let code = match range {
+        PreviewRange::Tv => 64.0 + 876.0 * value,
+        PreviewRange::Pc => 1023.0 * value,
+    };
+    code.round().clamp(0.0, f64::from(SIGNAL_MAX)) as u16
+}
+
+/// 10-bit chroma code for a non-constant-luminance Cb/Cr value in [-0.5, 0.5].
+/// Limited range is `512 + 896*value` (64..960); full range centres on the
+/// 10-bit midpoint.
+pub fn quantize_chroma(value: f64, range: PreviewRange) -> u16 {
+    // Snap numerical noise on the neutral axis so a mathematically neutral
+    // pixel always codes as 512, not 511/512 depending on the sign of a
+    // sub-code matrix residual. 1e-7 is four orders below one 10-bit code.
+    let value = if value.abs() < 1e-7 {
+        0.0
+    } else {
+        value.clamp(-0.5, 0.5)
+    };
+    let code = match range {
+        PreviewRange::Tv => 512.0 + 896.0 * value,
+        PreviewRange::Pc => 511.5 + 1023.0 * value,
+    };
+    code.round().clamp(0.0, f64::from(SIGNAL_MAX)) as u16
 }
 
 /// Accurate per-field H.273 code points; 2 means unspecified, not a fallback
@@ -572,7 +641,6 @@ pub struct ColorProfile {
     pub range_reason: &'static str,
     pub ycbcr_reason: &'static str,
     pub tag_policy: TagPolicy,
-    pub preview_filename: &'static str,
 }
 
 /// Writable backing for conversion. The pipeline supplies the unique Arc that
@@ -638,8 +706,10 @@ impl ColorProfile {
             _ => self.id,
         }
     }
-    /// Signed FP32 AP1 input, with native EV already applied. Reference scale
-    /// is applied once in target gamut, immediately before the Log curve.
+    /// Reference 8-bit quantization of signed FP32 AP1 input. Retained for the
+    /// historical golden/reference tests; the product encoder node uses
+    /// [`Self::convert_f32_frame_to_yuv10`] exclusively, so there is one
+    /// runtime quantization boundary.
     pub fn convert_f32_frame(
         &self,
         bytes: &[u8],
@@ -684,6 +754,108 @@ impl ColorProfile {
             dst.copy_from_slice(&self.encode_target_linear(target));
         }
         Ok(clipped)
+    }
+
+    /// The profile's YCbCr coding matrix. This is the delivery transform
+    /// declared by the same `ycbcr_matrix` token written into the container
+    /// tags; it never changes the vendor primaries or transfer curve.
+    pub fn ycbcr_coding(&self) -> Result<YcbcrCoding, String> {
+        YcbcrCoding::from_matrix(self.ycbcr_matrix).ok_or_else(|| {
+            format!(
+                "profile {} declares unregistered YCbCr matrix {:?}",
+                self.id, self.ycbcr_matrix
+            )
+        })
+    }
+
+    /// Signed FP32 AP1/D60 (native EV already applied) to the single encoder
+    /// handoff: planar `yuv444p10le` target signal (Y, Cb, Cr planes).
+    ///
+    /// This is the one quantization boundary for every preset. The transfer
+    /// curve, gamut matrix, reference scale and range convention all come from
+    /// this profile; the quantizer below is the only place 10-bit codes appear.
+    pub fn convert_f32_frame_to_yuv10(
+        &self,
+        bytes: &[u8],
+        width: usize,
+        height: usize,
+        reference_gain: f64,
+        range: PreviewRange,
+        out: &mut Vec<u16>,
+    ) -> Result<[usize; 2], String> {
+        if !reference_gain.is_finite()
+            || reference_gain <= 0.0
+            || (!self.is_rev_eng() && reference_gain != 1.0)
+        {
+            return Err("invalid FP32 profile/reference gain".into());
+        }
+        let pixels = width
+            .checked_mul(height)
+            .ok_or("FP32 geometry overflow")?;
+        let samples = pixels.checked_mul(3).ok_or("FP32 geometry overflow")?;
+        if samples.checked_mul(4) != Some(bytes.len()) {
+            return Err("FP32 length mismatch".into());
+        }
+        let coding = self.ycbcr_coding()?;
+        let (kr, kg, kb, div_cb, div_cr) = coding.coefficients();
+        let matrix = self.composed_matrix();
+        let (low, high) = self.transfer.domain();
+        let scale = reference_gain * self.scene_to_reflection_scale();
+        out.resize(samples, 0);
+        let mut clipped = [0usize; 2];
+        for (index, src) in bytes.chunks_exact(12).enumerate() {
+            let mut ap1 = [0.0; 3];
+            for channel in 0..3 {
+                ap1[channel] =
+                    f32::from_le_bytes(src[channel * 4..channel * 4 + 4].try_into().unwrap())
+                        as f64;
+                if !ap1[channel].is_finite() {
+                    return Err("nonfinite FP32 sample".into());
+                }
+            }
+            let target =
+                preview::mat3_vec(&matrix, ap1).map(|value| value * scale);
+            if target.iter().any(|value| !value.is_finite()) {
+                return Err("nonfinite target color".into());
+            }
+            for value in target {
+                clipped[0] += usize::from(value < low);
+                clipped[1] += usize::from(value > high);
+            }
+            let signal = [
+                self.transfer.forward(target[0].clamp(low, high)),
+                self.transfer.forward(target[1].clamp(low, high)),
+                self.transfer.forward(target[2].clamp(low, high)),
+            ];
+            if signal.iter().any(|value| !value.is_finite()) {
+                return Err("nonfinite target signal".into());
+            }
+            let luma = kr * signal[0] + kg * signal[1] + kb * signal[2];
+            let cb = (signal[2] - luma) / div_cb;
+            let cr = (signal[0] - luma) / div_cr;
+            out[index] = quantize_luma(luma, range);
+            out[pixels + index] = quantize_chroma(cb, range);
+            out[2 * pixels + index] = quantize_chroma(cr, range);
+        }
+        Ok(clipped)
+    }
+
+    /// Quantize one already-encoded target signal triple into the 10-bit
+    /// handoff. Exposed so reference-code tests do not re-implement the
+    /// production quantizer.
+    pub fn encode_signal_yuv10(
+        &self,
+        signal: [f64; 3],
+        range: PreviewRange,
+    ) -> Result<[u16; 3], String> {
+        let coding = self.ycbcr_coding()?;
+        let (kr, kg, kb, div_cb, div_cr) = coding.coefficients();
+        let luma = kr * signal[0] + kg * signal[1] + kb * signal[2];
+        Ok([
+            quantize_luma(luma, range),
+            quantize_chroma((signal[2] - luma) / div_cb, range),
+            quantize_chroma((signal[0] - luma) / div_cr, range),
+        ])
     }
 
     /// Composed AP1/D60 scene-linear -> target linear matrix. The order of the
@@ -898,25 +1070,30 @@ impl ColorProfile {
             (
                 "quantization",
                 Json::obj(vec![
-                    ("bits", Json::Int(8)),
+                    ("bits", Json::Int(f64::from(SIGNAL_BITS) as i64)),
+                    (
+                        "handoff",
+                        Json::Str("planar yuv444p10le target signal; the single quantization boundary before FFmpeg".to_string()),
+                    ),
                     (
                         "rounding",
-                        Json::Str("round-half-away-from-zero on signal*255; no dither".to_string()),
+                        Json::Str("round-half-away-from-zero on the coded signal (luma 64..940 or 0..1023; chroma centred at 512); no dither".to_string()),
                     ),
                     ("dither", Json::Bool(false)),
                     (
                         "tradeoff",
                         Json::Str(
-                            "8-bit Log output can show banding; no dither is applied by owner \
-                             decision, and richer output formats remain a future direction."
+                            "The 10-bit handoff is the delivery precision; lossy codec error is \
+                             measured separately from this quantization. Lower-bit-depth codecs \
+                             start from the same 10-bit buffer."
                                 .to_string(),
                         ),
                     ),
                     (
                         "reference_convention",
                         Json::Str(
-                            "official 10-bit codes are compared as code8 = round(code10*255/1023) \
-                             with a +/-1 dual-rounding tolerance"
+                            "official 10-bit codes are compared directly; lossy encoder error is \
+                             reported separately"
                                 .to_string(),
                         ),
                     ),
@@ -925,15 +1102,18 @@ impl ColorProfile {
             (
                 "encoding",
                 Json::obj(vec![
-                    ("codec", Json::Str("h264".to_string())),
                     (
-                        "encoder",
-                        Json::Str("h264_videotoolbox, 8-bit 4:2:0 (unchanged)".to_string()),
+                        "signal_pix_fmt",
+                        Json::Str("yuv444p10le".to_string()),
                     ),
-                    ("pix_fmt", Json::Str("yuv420p".to_string())),
                     ("range", Json::Str(self.range.as_str().to_string())),
                     ("range_reason", Json::Str(self.range_reason.to_string())),
                     ("ycbcr_matrix", Json::Str(self.ycbcr_matrix.to_string())),
+                    ("ycbcr_formula", Json::Str(
+                        self.ycbcr_coding()
+                            .map(|coding| coding.formula().to_string())
+                            .unwrap_or_else(|_| "unregistered".to_string())
+                    )),
                     ("ycbcr_reason", Json::Str(self.ycbcr_reason.to_string())),
                     ("delivery_background", self.delivery_background_json()),
                     (
@@ -944,40 +1124,39 @@ impl ColorProfile {
                 ]),
             ),
             (
-                "future_output",
+                "output_contract",
                 Json::Str(
-                    "8-bit SDR delivery only; 10-bit, HEVC/ProRes and HLG/PQ outputs are a \
-                     recorded future direction, not implemented"
+                    "One configured video per run: the encoder node's container receives this \
+                     profile's target signal. ProRes is delivered limited-range because MOV colr \
+                     is nclc (no range field); other containers carry the range they can express."
                         .to_string(),
                 ),
             ),
         ])
     }
 
-    pub fn emitted_tags_json(&self) -> Json {
-        let fields = || {
-            Json::obj(vec![
-                (
-                    "colour_primaries",
-                    Json::Int(self.tag_policy.primaries as i64),
-                ),
-                (
-                    "transfer_characteristics",
-                    Json::Int(self.tag_policy.transfer as i64),
-                ),
-                (
-                    "matrix_coefficients",
-                    Json::Int(self.tag_policy.matrix as i64),
-                ),
-                (
-                    "video_full_range_flag",
-                    Json::Int(if self.range == PreviewRange::Pc { 1 } else { 0 }),
-                ),
-            ])
-        };
+    /// Container colour code points for the range actually delivered. The range
+    /// field can only be carried by MP4/Matroska `nclx`; MOV `nclc` has no
+    /// range field, so the numbers here are a declaration, not a claim that
+    /// every container writes them.
+    pub fn emitted_tags_json(&self, range: PreviewRange) -> Json {
         Json::obj(vec![
-            ("h264_sps_vui", fields()),
-            ("mp4_colr_nclx", fields()),
+            (
+                "colour_primaries",
+                Json::Int(self.tag_policy.primaries as i64),
+            ),
+            (
+                "transfer_characteristics",
+                Json::Int(self.tag_policy.transfer as i64),
+            ),
+            (
+                "matrix_coefficients",
+                Json::Int(self.tag_policy.matrix as i64),
+            ),
+            (
+                "video_full_range_flag",
+                Json::Int(if range == PreviewRange::Pc { 1 } else { 0 }),
+            ),
         ])
     }
 
@@ -997,7 +1176,7 @@ impl ColorProfile {
                 Json::Str(self.tag_policy.matrix_token().to_string()),
             ),
             ("range", Json::Str(self.range.as_str().to_string())),
-            ("emitted_tags", self.emitted_tags_json()),
+            ("profile_code_points", self.emitted_tags_json(self.range)),
             (
                 "reason",
                 Json::Str(
@@ -1072,7 +1251,6 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: "existing display-referred sRGB review delivery uses limited (tv) range",
         ycbcr_reason: "existing sRGB preview conversion uses the BT.709 matrix",
         tag_policy: TagPolicy::SRGB,
-        preview_filename: "preview-h264-srgb-bt709.mp4",
     },
     ColorProfile {
         id: "sony-slog3-sgamut3",
@@ -1083,7 +1261,6 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
-        preview_filename: "preview-h264-slog3-sgamut3.mp4",
     },
     ColorProfile {
         id: "sony-slog3-sgamut3-cine",
@@ -1094,7 +1271,6 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
-        preview_filename: "preview-h264-slog3-sgamut3cine.mp4",
     },
     ColorProfile {
         id: "canon-log2-cinema-gamut",
@@ -1105,7 +1281,6 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
-        preview_filename: "preview-h264-clog2-cgamut.mp4",
     },
     ColorProfile {
         id: "nikon-nlog-bt2020",
@@ -1116,7 +1291,6 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::NIKON_LOG,
-        preview_filename: "preview-h264-nlog-bt2020.mp4",
     },
     ColorProfile {
         id: "dji-dlog-dgamut",
@@ -1127,7 +1301,6 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
-        preview_filename: "preview-h264-dlog-dgamut.mp4",
     },
     ColorProfile {
         id: "canon-log2-cinema-gamut-rev-eng-crm-dev",
@@ -1138,7 +1311,6 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
-        preview_filename: "preview-h264-clog2-rev-eng-crm-dev.mp4",
     },
     ColorProfile {
         id: "canon-log3-cinema-gamut-rev-eng-crm-dev",
@@ -1149,7 +1321,6 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
-        preview_filename: "preview-h264-clog3-rev-eng-crm-dev.mp4",
     },
 ];
 
@@ -1294,23 +1465,6 @@ mod tests {
         assert!(lookup("dlog-dgamut").is_none());
         assert!(lookup("").is_none());
         assert!(lookup("srgb-preview ").is_none());
-    }
-
-    #[test]
-    fn preview_filenames_follow_the_transfer_gamut_contract() {
-        for (id, filename) in [
-            ("srgb-preview", "preview-h264-srgb-bt709.mp4"),
-            ("dji-dlog-dgamut", "preview-h264-dlog-dgamut.mp4"),
-            ("canon-log2-cinema-gamut", "preview-h264-clog2-cgamut.mp4"),
-            ("sony-slog3-sgamut3", "preview-h264-slog3-sgamut3.mp4"),
-            (
-                "sony-slog3-sgamut3-cine",
-                "preview-h264-slog3-sgamut3cine.mp4",
-            ),
-            ("nikon-nlog-bt2020", "preview-h264-nlog-bt2020.mp4"),
-        ] {
-            assert_eq!(lookup(id).expect(id).preview_filename, filename);
-        }
     }
 
     #[test]
@@ -1464,6 +1618,140 @@ mod tests {
     }
 
     #[test]
+    fn ten_bit_handoff_carries_precision_that_eight_bit_quantization_loses() {
+        // One 10-bit luma step is invisible after 8-bit quantization but must
+        // survive the production handoff; this is the property that rejects a
+        // "quantize to RGB8, then wrap in a 10-bit codec" implementation.
+        let low = 0.5;
+        let high = low + 1.0 / 876.0;
+        assert_eq!(quantize_luma(low, PreviewRange::Tv) + 1, quantize_luma(high, PreviewRange::Tv));
+        assert_eq!(quantize_signal(low), quantize_signal(high));
+        assert_eq!(quantize_luma(0.0, PreviewRange::Tv), 64);
+        assert_eq!(quantize_luma(1.0, PreviewRange::Tv), 940);
+        assert_eq!(quantize_luma(0.0, PreviewRange::Pc), 0);
+        assert_eq!(quantize_luma(1.0, PreviewRange::Pc), 1023);
+        assert_eq!(quantize_chroma(-0.5, PreviewRange::Tv), 64);
+        assert_eq!(quantize_chroma(0.0, PreviewRange::Tv), 512);
+        assert_eq!(quantize_chroma(0.5, PreviewRange::Tv), 960);
+        assert_eq!(quantize_chroma(0.0, PreviewRange::Pc), 512);
+        assert_eq!(quantize_chroma(-0.5, PreviewRange::Pc), 0);
+        assert_eq!(quantize_chroma(0.5, PreviewRange::Pc), 1023);
+    }
+
+    #[test]
+    fn every_profile_maps_neutral_grey_to_neutral_chroma_and_reference_luma() {
+        for profile in &PROFILES {
+            let bytes: Vec<_> = [0.18f32; 3]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            let mut out = Vec::new();
+            let clipped = profile
+                .convert_f32_frame_to_yuv10(&bytes, 1, 1, 1.0, profile.range, &mut out)
+                .unwrap();
+            assert_eq!(clipped, [0, 0], "{}", profile.id);
+            assert_eq!(out.len(), 3);
+            assert_eq!((out[1], out[2]), (512, 512), "{} neutral chroma", profile.id);
+            let signal = profile.transfer.forward(
+                preview::mat3_vec(&profile.composed_matrix(), [0.18; 3])[0]
+                    * profile.scene_to_reflection_scale(),
+            );
+            // The frame adapter and the reference signal encoder agree.
+            let expected = profile.encode_signal_yuv10([signal; 3], profile.range).unwrap();
+            assert_eq!(&out[..], &expected, "{}", profile.id);
+        }
+    }
+
+    #[test]
+    fn ten_bit_frame_conversion_matches_the_documented_ycbcr_equations() {
+        // Independent BT.709/BT.2020 NCL evaluation for one non-neutral AP1
+        // triple; the production path must agree exactly.
+        for profile in &PROFILES {
+            let ap1 = [0.4f64, 0.18, 0.09];
+            let target = preview::mat3_vec(&profile.composed_matrix(), ap1)
+                .map(|value| value * profile.scene_to_reflection_scale());
+            let (low, high) = profile.transfer.domain();
+            let signal = target.map(|value| profile.transfer.forward(value.clamp(low, high)));
+            let (kr, kg, kb, div_cb, div_cr) = profile.ycbcr_coding().unwrap().coefficients();
+            let luma = kr * signal[0] + kg * signal[1] + kb * signal[2];
+            let bytes: Vec<_> = ap1
+                .into_iter()
+                .map(|value| value as f32)
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            let mut out = Vec::new();
+            profile
+                .convert_f32_frame_to_yuv10(&bytes, 1, 1, 1.0, profile.range, &mut out)
+                .unwrap();
+            assert_eq!(out[0], quantize_luma(luma, profile.range), "{}", profile.id);
+            assert_eq!(
+                out[1],
+                quantize_chroma((signal[2] - luma) / div_cb, profile.range),
+                "{}",
+                profile.id
+            );
+            assert_eq!(
+                out[2],
+                quantize_chroma((signal[0] - luma) / div_cr, profile.range),
+                "{}",
+                profile.id
+            );
+            // Non-neutral input must actually produce non-neutral chroma.
+            assert!(out[1] != 512 || out[2] != 512, "{}", profile.id);
+        }
+    }
+
+    #[test]
+    fn ten_bit_conversion_counts_both_domain_boundaries_and_rejects_bad_input() {
+        let profile = lookup("canon-log3-cinema-gamut-rev-eng-crm-dev").unwrap();
+        let mut out = Vec::new();
+        let negative: Vec<_> = [-1000f32; 3]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let counts = profile
+            .convert_f32_frame_to_yuv10(&negative, 1, 1, 1.0, profile.range, &mut out)
+            .unwrap();
+        assert!(counts[0] > 0 && counts[1] == 0);
+        assert_eq!(
+            out,
+            vec![quantize_luma(0.0, profile.range), 512, 512],
+            "{}",
+            profile.id
+        );
+        let highlight: Vec<_> = [1_000_000f32; 3]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let counts = profile
+            .convert_f32_frame_to_yuv10(&highlight, 1, 1, 1.0, profile.range, &mut out)
+            .unwrap();
+        assert!(counts[1] > 0 && counts[0] == 0);
+        assert_eq!(
+            out,
+            vec![quantize_luma(1.0, profile.range), 512, 512],
+            "{}",
+            profile.id
+        );
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let bytes: Vec<_> = [bad; 3].into_iter().flat_map(f32::to_le_bytes).collect();
+            assert!(profile
+                .convert_f32_frame_to_yuv10(&bytes, 1, 1, 1.0, profile.range, &mut out)
+                .is_err());
+        }
+        assert!(profile
+            .convert_f32_frame_to_yuv10(&negative[..11], 1, 1, 1.0, profile.range, &mut out)
+            .is_err());
+        assert!(profile
+            .convert_f32_frame_to_yuv10(&negative, 1, 1, 0.0, profile.range, &mut out)
+            .is_err());
+        assert!(lookup("srgb-preview")
+            .unwrap()
+            .convert_f32_frame_to_yuv10(&negative, 1, 1, 2.0, PreviewRange::Tv, &mut out)
+            .is_err());
+    }
+
+    #[test]
     fn quantization_rounds_half_away_from_zero() {
         assert_eq!(quantize_signal(0.0), 0);
         assert_eq!(quantize_signal(1.0), 255);
@@ -1540,11 +1828,19 @@ mod tests {
                 quantization.get("dither"),
                 Some(Json::Bool(false))
             ));
+            assert_eq!(
+                quantization.get("bits").and_then(Json::as_u64),
+                Some(u64::from(SIGNAL_BITS))
+            );
+            assert_eq!(
+                quantization.get("handoff").and_then(Json::as_str),
+                Some("planar yuv444p10le target signal; the single quantization boundary before FFmpeg")
+            );
             let tradeoff = quantization
                 .get("tradeoff")
                 .and_then(Json::as_str)
                 .expect("tradeoff");
-            for required in ["banding", "no dither", "owner", "future direction"] {
+            for required in ["10-bit", "handoff", "lossy", "same 10-bit buffer"] {
                 assert!(tradeoff.contains(required), "{}: {tradeoff}", profile.id);
             }
             let encoding = contract.get("encoding").expect("encoding");
@@ -1557,6 +1853,12 @@ mod tests {
                     .get("ycbcr_matrix")
                     .and_then(|value| value.as_str()),
                 Some(profile.ycbcr_matrix)
+            );
+            assert_eq!(
+                encoding
+                    .get("signal_pix_fmt")
+                    .and_then(|value| value.as_str()),
+                Some("yuv444p10le")
             );
             let tags = encoding.get("tag_policy").expect("tags");
             assert_eq!(tags.get("mode").and_then(Json::as_str), Some("per-field"));
@@ -1601,5 +1903,50 @@ mod tests {
                 3
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod delivered_range_tests {
+    use super::*;
+
+    #[test]
+    fn sony_green_reference_patch_survives_limited_delivery() {
+        // The profile convention is full range, but the ProRes encoder node
+        // delivers limited range. The handoff codes must follow the delivered
+        // range so a video-range decoder recovers the independent reference.
+        let profile = lookup("sony-slog3-sgamut3").unwrap();
+        let bytes: Vec<_> = [0f32, 1.0, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let target = preview::mat3_vec(&profile.composed_matrix(), [0.0, 1.0, 0.0]);
+        let (low, high) = profile.transfer.domain();
+        let signal = target.map(|value| profile.transfer.forward(value.clamp(low, high)));
+        assert_eq!(
+            (signal.map(|value| (value * 255.0).round())),
+            [59.0, 147.0, 20.0]
+        );
+        let mut limited = Vec::new();
+        profile
+            .convert_f32_frame_to_yuv10(&bytes, 1, 1, 1.0, PreviewRange::Tv, &mut limited)
+            .unwrap();
+        let mut full = Vec::new();
+        profile
+            .convert_f32_frame_to_yuv10(&bytes, 1, 1, 1.0, PreviewRange::Pc, &mut full)
+            .unwrap();
+        // Y=64+876*Y', Cb/Cr=512+896*Cb/Cr for the delivered (limited) range.
+        let y = 0.2627 * signal[0] + 0.6780 * signal[1] + 0.0593 * signal[2];
+        assert_eq!(
+            limited,
+            vec![
+                (64.0 + 876.0 * y).round() as u16,
+                (512.0 + 896.0 * (signal[2] - y) / 1.8814).round() as u16,
+                (512.0 + 896.0 * (signal[0] - y) / 1.4746).round() as u16,
+            ]
+        );
+        assert_eq!(limited, vec![464, 332, 374]);
+        assert_eq!(full, vec![467, 306, 354]);
+        assert_ne!(limited, full);
     }
 }

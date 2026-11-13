@@ -2,6 +2,7 @@
 
 use crate::color_profile;
 use crate::deflicker::ExposureStep;
+use crate::encoder::{self, Container, Patch, RateControl};
 use crate::error::{Error, Result, EXIT_USAGE};
 use std::path::PathBuf;
 
@@ -17,8 +18,8 @@ unreliable frames fall back to the global-reference curve; the temporal \
 audit records but never blocks (temporal_quality=report)";
 
 pub const USAGE: &str = "\
-rawtl-linear-video — DNG frame sequence -> streaming H.264 output.mp4
-(default: V4 deflicker enabled with legacy default parameters)
+rawtl-linear-video — DNG frame sequence -> one configured video file
+(default: V4 deflicker enabled, ProRes 4444 at the source geometry)
 
 USAGE:
     rawtl-linear-video --input <DIR> --output <DIR> [OPTIONS]
@@ -29,7 +30,7 @@ REQUIRED:
     --output <DIR>             Run directory; must be absent or empty
 
 OPTIONS:
-    --graph <FILE>            Built-in typed graph JSON (default: prepared-frame graph)
+    --graph <FILE>            Typed graph JSON (default: prepared-frame graph)
     --fps <N[/D]>              Frame rate as an integer or rational (default: 30)
     --white-balance <MODE>     first-frame | per-frame (default: first-frame)
                                first-frame freezes frame 1's as-shot neutral for the sequence;
@@ -37,7 +38,7 @@ OPTIONS:
     --dng-linear-frame <PATH>  Native single-frame producer (default: native/build/dng-linear-frame)
     --ffmpeg <PATH>            ffmpeg executable (default: /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg)
     --ffprobe <PATH>           ffprobe executable (default: /opt/homebrew/opt/ffmpeg-full/bin/ffprobe)
-    --preview-profile <ID>     Preview colour/Log profile (default: srgb-preview)
+    --preview-profile <ID>     Output colour/Log profile (default: srgb-preview)
                                one of: srgb-preview, dji-dlog-dgamut,
                                canon-log2-cinema-gamut, sony-slog3-sgamut3,
                                sony-slog3-sgamut3-cine, nikon-nlog-bt2020,
@@ -45,7 +46,17 @@ OPTIONS:
                                canon-log3-cinema-gamut-rev-eng-crm-dev
                                Canon names: clog2(white paper), clog2(rev-eng crm-dev),
                                clog3 (rev-eng crm-dev)
-    --log-reference-gain <N>   Positive reference scale, rev-eng Canon profiles only (default: 1, extra gain after fixed Canon calibration)
+    --log-reference-gain <N>   Positive reference scale, rev-eng Canon profiles only (default: 1)
+    --encoder <NAME>           prores_ks | libx264 | ffv1 (default: prores_ks)
+    --pix-fmt <FMT>            Encoder pixel format (default: yuv444p10le; libx264: yuv420p)
+    --container <NAME>         mov | mp4 | matroska (default: mov; libx264: mp4; ffv1: matroska)
+    --codec-profile <VALUE>    Encoder profile (ProRes 0-5/4444; H.264 baseline..high444)
+    --crf <N>                  Quality for libx264, 0-63 (conflicts with --qscale/--bitrate)
+    --qscale <N>               Fixed quantizer, 0-63 (conflicts with --crf/--bitrate)
+    --bitrate <BPS>            Target bitrate in bits/s (conflicts with --crf/--qscale)
+    --output-option <K=V>      Repeatable bounded encoder option, e.g. -preset=medium
+                               allowed: -preset -tune -vendor -threads -g -bf -level
+    --resize <WxH>             Explicit scene-linear resize; omit to keep source geometry
     --converter <PATH>         Adobe DNG Converter override passed to the native tool
     --converter-timeout <SEC>  Converter timeout override (1-3600 seconds)
     --strength <0..1>          Correction strength (default: 1.0; 0 disables deflicker)
@@ -60,13 +71,19 @@ OPTIONS:
     -h, --help                 Print this help
     --version                  Print version
 
+CONFIGURATION PRIORITY:
+    built-in default < graph encode-node configuration < explicit CLI flags
+    Unsupported encoders/pixel formats/options and conflicting geometry or
+    colour parameters are rejected before RAW preparation; no encoder or
+    pixel format is silently substituted.
+
 OUTPUT LAYOUT:
     <output>/logs/                        per-frame, encoder and audit transcripts
     <output>/exposure_report.json         per-frame exposure decisions and run status
     <output>/exposure-curve.csv           legacy write_curve fields, one row per frame
     <output>/temporal_audit.json          independent encoded-video audit (when enabled)
     <output>/pairs.csv, frames.csv        audit pair/frame evidence
-    <output>/output.mp4                  H.264 video in the selected colour/Log profile
+    <output>/output.<ext>                 the single configured video (default output.mov)
     <output>/manifest.json                run provenance and validation record
 ";
 
@@ -294,6 +311,10 @@ pub struct Options {
     pub converter: Option<String>,
     pub converter_timeout: Option<u64>,
     pub deflicker: DeflickerConfig,
+    /// Explicit CLI encoder layer; empty when no encoder flag was given.
+    pub encoder: Patch,
+    /// Explicit CLI resize; `None` keeps the graph's geometry (source by default).
+    pub resize: Option<(u32, u32)>,
 }
 
 #[derive(Debug)]
@@ -318,6 +339,13 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut converter: Option<String> = None;
     let mut converter_timeout: Option<u64> = None;
     let mut deflicker = DeflickerConfig::default();
+    let mut encoder = Patch::default();
+    let mut output_options: Vec<String> = Vec::new();
+    let mut rate: Option<RateControl> = None;
+    let mut rate_flag: Option<&'static str> = None;
+    let mut resize: Option<(u32, u32)> = None;
+    let mut seen_input = false;
+    let mut seen_output = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -334,6 +362,10 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         };
         match flag {
             "--input" => {
+                if seen_input {
+                    return Err(Error::new(EXIT_USAGE, "--input may be given only once"));
+                }
+                seen_input = true;
                 input = Some(PathBuf::from(take_value(
                     args,
                     &mut index,
@@ -342,6 +374,10 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 )?))
             }
             "--output" => {
+                if seen_output {
+                    return Err(Error::new(EXIT_USAGE, "--output may be given only once"));
+                }
+                seen_output = true;
                 output = Some(PathBuf::from(take_value(
                     args,
                     &mut index,
@@ -468,6 +504,67 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 deflicker.temporal_quality =
                     TemporalQuality::parse(&take_value(args, &mut index, flag, inline_value)?)?
             }
+            "--encoder" => {
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                if !encoder::SUPPORTED_ENCODERS.contains(&value.as_str()) {
+                    return Err(Error::new(
+                        EXIT_USAGE,
+                        format!(
+                            "invalid --encoder {value:?}: expected one of {}",
+                            encoder::SUPPORTED_ENCODERS.join(", ")
+                        ),
+                    ));
+                }
+                encoder.encoder = Some(value);
+            }
+            "--pix-fmt" => {
+                encoder.pix_fmt = Some(take_value(args, &mut index, flag, inline_value)?)
+            }
+            "--container" => {
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                encoder.container = Some(Container::parse(&value).ok_or_else(|| {
+                    Error::new(
+                        EXIT_USAGE,
+                        format!(
+                            "invalid --container {value:?}: expected one of {}",
+                            encoder::CONTAINERS.join(", ")
+                        ),
+                    )
+                })?);
+            }
+            "--codec-profile" => {
+                encoder.profile = Some(take_value(args, &mut index, flag, inline_value)?)
+            }
+            "--crf" => {
+                let value = parse_rate(&take_value(args, &mut index, flag, inline_value)?, 0, 63)?;
+                set_rate(&mut rate, &mut rate_flag, RateControl::Crf(value as u32), "--crf")?;
+            }
+            "--qscale" => {
+                let value = parse_rate(&take_value(args, &mut index, flag, inline_value)?, 0, 63)?;
+                set_rate(
+                    &mut rate,
+                    &mut rate_flag,
+                    RateControl::QScale(value as u32),
+                    "--qscale",
+                )?;
+            }
+            "--bitrate" => {
+                let value =
+                    parse_rate(&take_value(args, &mut index, flag, inline_value)?, 1, 1_000_000_000)?;
+                set_rate(
+                    &mut rate,
+                    &mut rate_flag,
+                    RateControl::Bitrate(value),
+                    "--bitrate",
+                )?;
+            }
+            "--output-option" => {
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                output_options.push(value);
+            }
+            "--resize" => {
+                resize = Some(parse_resize(&take_value(args, &mut index, flag, inline_value)?)?)
+            }
             other => {
                 return Err(Error::new(
                     EXIT_USAGE,
@@ -487,6 +584,13 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
             "--log-reference-gain requires a rev-eng Canon profile (canon-log2-cinema-gamut-rev-eng-crm-dev or canon-log3-cinema-gamut-rev-eng-crm-dev)",
         ));
     }
+    encoder.rate = rate;
+    if !output_options.is_empty() {
+        encoder.options = Some(
+            encoder::parse_output_options(&output_options)
+                .map_err(|message| Error::new(EXIT_USAGE, message))?,
+        );
+    }
     Ok(Parsed::Run(Options {
         graph,
         input,
@@ -502,7 +606,73 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         converter,
         converter_timeout,
         deflicker,
+        encoder,
+        resize,
     }))
+}
+
+fn parse_rate(value: &str, min: u64, max: u64) -> Result<u64> {
+    let number: u64 = value.parse().map_err(|_| {
+        Error::new(
+            EXIT_USAGE,
+            format!("invalid encoder rate value {value:?}: expected an integer {min}..={max}"),
+        )
+    })?;
+    if !(min..=max).contains(&number) {
+        return Err(Error::new(
+            EXIT_USAGE,
+            format!("invalid encoder rate value {value:?}: expected an integer {min}..={max}"),
+        ));
+    }
+    Ok(number)
+}
+
+fn set_rate(
+    slot: &mut Option<RateControl>,
+    flag_slot: &mut Option<&'static str>,
+    value: RateControl,
+    flag: &'static str,
+) -> Result<()> {
+    if let Some(previous) = flag_slot {
+        return Err(Error::new(
+            EXIT_USAGE,
+            format!("{flag} conflicts with {previous}; choose one rate control"),
+        ));
+    }
+    *slot = Some(value);
+    *flag_slot = Some(flag);
+    Ok(())
+}
+
+fn parse_resize(value: &str) -> Result<(u32, u32)> {
+    let (width, height) = value
+        .split_once('x')
+        .or_else(|| value.split_once('X'))
+        .ok_or_else(|| {
+            Error::new(
+                EXIT_USAGE,
+                format!("invalid --resize {value:?}: expected WxH, e.g. 4096x2734"),
+            )
+        })?;
+    let width: u32 = width.trim().parse().map_err(|_| {
+        Error::new(
+            EXIT_USAGE,
+            format!("invalid --resize {value:?}: width must be a positive integer"),
+        )
+    })?;
+    let height: u32 = height.trim().parse().map_err(|_| {
+        Error::new(
+            EXIT_USAGE,
+            format!("invalid --resize {value:?}: height must be a positive integer"),
+        )
+    })?;
+    if width == 0 || height == 0 {
+        return Err(Error::new(
+            EXIT_USAGE,
+            format!("invalid --resize {value:?}: dimensions must be positive"),
+        ));
+    }
+    Ok((width, height))
 }
 
 fn take_value(
@@ -927,6 +1097,92 @@ mod tests {
         let error = parse_run(&["--input", "in", "--output", "out", "--preview-profile="])
             .expect_err("empty inline value");
         assert_eq!(error.code, EXIT_USAGE);
+    }
+
+    #[test]
+    fn encoder_flags_form_the_explicit_cli_layer() {
+        let options = parse_run(&[
+            "--input",
+            "in",
+            "--output",
+            "out",
+            "--encoder",
+            "libx264",
+            "--pix-fmt",
+            "yuv420p",
+            "--container",
+            "mp4",
+            "--codec-profile",
+            "high",
+            "--crf",
+            "20",
+            "--output-option=-preset=medium",
+            "--output-option=-g=12",
+            "--resize",
+            "4096x2734",
+        ])
+        .expect("parse");
+        assert_eq!(options.encoder.encoder.as_deref(), Some("libx264"));
+        assert_eq!(options.encoder.pix_fmt.as_deref(), Some("yuv420p"));
+        assert_eq!(options.encoder.container, Some(Container::Mp4));
+        assert_eq!(options.encoder.profile.as_deref(), Some("high"));
+        assert_eq!(options.encoder.rate, Some(RateControl::Crf(20)));
+        assert_eq!(
+            options.encoder.options,
+            Some(vec![
+                ("-preset".into(), "medium".into()),
+                ("-g".into(), "12".into())
+            ])
+        );
+        assert_eq!(options.resize, Some((4096, 2734)));
+        assert!(USAGE.contains("--encoder"));
+        assert!(USAGE.contains("--resize"));
+        assert!(USAGE.contains("output.<ext>"));
+    }
+
+    #[test]
+    fn defaults_leave_the_cli_layer_empty_for_graph_inheritance() {
+        let options = parse_run(&["--input", "in", "--output", "out"]).expect("parse");
+        assert!(options.encoder.is_empty());
+        assert_eq!(options.resize, None);
+    }
+
+    #[test]
+    fn rejects_conflicting_or_invalid_encoder_flags() {
+        let base = ["--input", "in", "--output", "out"];
+        for extra in [
+            vec!["--encoder", "h264_videotoolbox"],
+            vec!["--container", "avi"],
+            vec!["--crf", "18", "--bitrate", "1000"],
+            vec!["--crf", "-1"],
+            vec!["--qscale", "64"],
+            vec!["--bitrate", "0"],
+            vec!["--output-option=-i=in.mov"],
+            vec!["--output-option=-vf=scale=2:2"],
+            vec!["--output-option=output.mov"],
+            vec!["--output-option=-preset"],
+            vec!["--resize", "0x10"],
+            vec!["--resize", "4096"],
+            vec!["--resize", "4096x"],
+        ] {
+            let mut args: Vec<&str> = base.to_vec();
+            args.extend(extra.iter());
+            let error = parse_run(&args).expect_err("must reject");
+            assert_eq!(error.code, EXIT_USAGE, "{extra:?}: {}", error.message);
+        }
+        let error = parse_run(&["--input", "in", "--output", "out", "--crf", "18", "--qscale", "2"])
+            .expect_err("conflict");
+        assert!(error.message.contains("conflicts"), "{}", error.message);
+    }
+
+    #[test]
+    fn duplicate_input_or_output_is_rejected() {
+        let error = parse_run(&["--input", "a", "--input", "b", "--output", "out"])
+            .expect_err("duplicate input");
+        assert!(error.message.contains("--input"));
+        let error = parse_run(&["--input", "in", "--output", "a", "--output", "b"])
+            .expect_err("duplicate output");
+        assert!(error.message.contains("--output"));
     }
 
     #[test]

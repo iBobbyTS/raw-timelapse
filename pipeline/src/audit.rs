@@ -894,7 +894,9 @@ mod tests {
     fn probe(profile: &ColorProfile, count: usize) -> ProbeInfo {
         ProbeInfo {
             codec_name: "h264".into(),
+            profile: "High".into(),
             pix_fmt: "yuv420p".into(),
+            bits_per_raw_sample: Some(8),
             width: 192,
             height: 144,
             frames: count as u64,

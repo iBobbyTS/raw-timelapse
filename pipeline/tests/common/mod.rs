@@ -56,7 +56,7 @@ pub fn ffprobe(path: &Path) -> String {
             "v:0",
             "-count_frames",
             "-show_entries",
-            "stream=codec_name,pix_fmt,width,height,nb_read_frames,avg_frame_rate",
+            "stream=codec_name,profile,pix_fmt,width,height,nb_read_frames,avg_frame_rate",
             "-of",
             "default=noprint_wrappers=1",
         ])
@@ -83,7 +83,7 @@ pub fn ffprobe_color(path: &Path) -> String {
             "-count_frames",
             "-show_entries",
             "stream=codec_name,pix_fmt,width,height,nb_read_frames,avg_frame_rate,\
-             color_space,color_primaries,color_transfer,color_range",
+             profile,bits_per_raw_sample,color_space,color_primaries,color_transfer,color_range",
             "-of",
             "default=noprint_wrappers=1",
         ])
@@ -650,7 +650,10 @@ pub fn fake_native_sequence_sidecar_defect(
 
 pub fn fake_failing_encoder(dir: &Path) -> PathBuf {
     let path = dir.join("fake-ffmpeg-encoder-failure");
-    let script = "#!/bin/sh\nfor last in \"$@\"; do :; done\nprintf 'partial video bytes' > \"$last\"\necho 'synthetic encoder failure after write' >&2\nexit 1\n";
+    // The early capability preflight uses a synthetic lavfi frame; pass it so
+    // the failure remains a genuine mid-write encoder failure, not a rejected
+    // configuration.
+    let script = "#!/bin/sh\ncase \" $* \" in *\" lavfi \"*) exit 0;; esac\nfor last in \"$@\"; do :; done\nprintf 'partial video bytes' > \"$last\"\necho 'synthetic encoder failure after write' >&2\nexit 1\n";
     write_executable(&path, script);
     path
 }

@@ -52,6 +52,7 @@ for mode in ['interrupt','terminate','operation-error','operation-error-with-enc
     (root/'in-flight').mkdir(exist_ok=True)
     encoder=executable(root/'encoder',f'''
         import json,os,signal,socket,sys
+        if 'lavfi' in sys.argv: sys.exit(0)
         s=socket.socket(socket.AF_UNIX);s.connect({sock_path!r});s.sendall((json.dumps({{'kind':'encoder','encoder':os.getpid()}})+'\\n').encode());s.close()
         sys.stdin.buffer.read()
         signal.pause()
@@ -76,7 +77,7 @@ for mode in ['interrupt','terminate','operation-error','operation-error-with-enc
         (root/'stdout.txt').write_bytes(stdout);(root/'stderr.txt').write_bytes(stderr)
         assert proc.returncode!=0,(args,stdout,stderr)
         assert all(absent(pid) for pid in owned.values()),owned
-        assert not (output/'output.mp4').exists()
+        assert not (output/'output.mov').exists()
         trace=(output/'logs/graph.log').read_text()
         if late:
             assert 'node=apply-ev frame=Some(1)' not in trace,trace

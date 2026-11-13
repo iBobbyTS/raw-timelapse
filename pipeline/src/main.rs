@@ -1,4 +1,4 @@
-//! rawtl-linear-video: DNG frame sequence -> streaming H.264 output.mp4.
+//! rawtl-linear-video: DNG frame sequence -> one configured video file.
 //!
 //! The deflicker node (legacy V4 semantics) is enabled by default; every pass,
 //! failure path, report and publication rule lives in the modules below.
@@ -15,6 +15,7 @@ mod guard;
 mod manifest;
 mod order;
 mod proc;
+mod resample;
 mod video;
 
 // The binary and the library compile the same source files. Re-exporting the
@@ -22,11 +23,12 @@ mod video;
 // across the engine and the process orchestration.
 pub use rawtl_linear_video::color_profile;
 pub use rawtl_linear_video::deflicker;
+pub use rawtl_linear_video::encoder;
 pub use rawtl_linear_video::json;
 pub use rawtl_linear_video::transport;
 
 use cli::{Options, Parsed};
-use error::{Error, Result, EXIT_PREVIEW, EXIT_TOOL, EXIT_VALIDATION};
+use error::{Result, EXIT_TOOL};
 use order::SourceFrame;
 use std::collections::BTreeMap;
 use std::fs;
@@ -93,63 +95,11 @@ pub struct EncodedStage {
     pub bytes: u64,
     pub timings: BTreeMap<String, Duration>,
     pub video_artifact: DataEnvelope,
+    pub encoder: encoder::ResolvedConfig,
+    pub resize: Option<video::ResizeRecord>,
 }
 
-pub fn encode_and_validate(
-    context: &RunContext<'_>,
-    evs: &[f64],
-) -> Result<(frame::FrameSequence, EncodedStage)> {
-    let options = context.options;
-    let output = context.partial_dir.join("output.mp4");
-    let mut timings = BTreeMap::new();
-    let phase = Instant::now();
-    let sequence = video::encode_stream(context, evs, &output)?;
-    timings.insert("encode".into(), phase.elapsed());
-    let phase = Instant::now();
-    let probe = video::validate_preview(
-        &options.ffprobe,
-        &options.ffmpeg,
-        &output,
-        sequence.width,
-        sequence.height,
-        sequence.frames.len(),
-        options.fps,
-        options.preview_profile,
-    )?;
-    timings.insert("validate_video".into(), phase.elapsed());
-    audit::write_inventory(
-        context.output,
-        &sequence
-            .frames
-            .iter()
-            .map(|f| f.source_name.clone())
-            .collect::<Vec<_>>(),
-    )?;
-    let bytes = video::file_size(&output)
-        .ok_or_else(|| Error::new(EXIT_PREVIEW, "validated video disappeared"))?;
-    let video_artifact = video::video_envelope_with_gain(
-        &output,
-        video::PREVIEW_MEDIA_TYPE,
-        &probe.codec_name,
-        probe.frames,
-        "ffmpeg h264 streaming encoder",
-        options.preview_profile,
-        options.log_reference_gain,
-    )
-    .map_err(|e| Error::new(EXIT_VALIDATION, e.to_string()))?;
-    Ok((
-        sequence,
-        EncodedStage {
-            retain_partial: false,
-            probe,
-            bytes,
-            timings,
-            video_artifact,
-        },
-    ))
-}
-
-/// Build and write the manifest, then publish the validated output.mp4.
+/// Build and write the manifest, then publish the validated configured video.
 pub fn publish_run(
     context: &RunContext<'_>,
     sequence: &frame::FrameSequence,
@@ -173,11 +123,13 @@ pub fn publish_run(
         ffprobe_version: tool_version(&options.ffprobe).unwrap_or_else(|| "UNKNOWN".to_string()),
         timings: &stage.timings,
         deflicker,
+        encoder: &stage.encoder,
+        resize: stage.resize,
     });
     manifest::write(&output.join("manifest.json"), &manifest_json)?;
 
     proc::check_stop()?;
-    let final_video = output.join(video::FINAL_NAME);
+    let final_video = output.join(stage.encoder.output_name());
     video::publish(&stage.video_artifact, &final_video)?;
 
     if stage.retain_partial {
