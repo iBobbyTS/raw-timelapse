@@ -19,3 +19,4 @@ __pycache__/
 
 # Local agent scratch work; durable evidence belongs in docs/
 .agent-work/
+.codegraph
