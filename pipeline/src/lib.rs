@@ -4,3 +4,5 @@ pub mod deflicker;
 pub mod json;
 pub mod preview;
 pub mod transport;
+
+pub mod graph;

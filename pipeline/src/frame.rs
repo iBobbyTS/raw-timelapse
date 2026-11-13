@@ -552,6 +552,7 @@ impl Drop for NativeStream {
 
 struct NativeRun<'a> {
     method: crate::color_profile::CameraColorMethod,
+    log_path: Option<&'a Path>,
     logs_dir: &'a Path,
     log_relative_dir: &'a str,
     converter: Option<&'a str>,
@@ -563,6 +564,7 @@ impl<'a> NativeRun<'a> {
     fn from_produce(config: &'a ProduceConfig<'a>) -> Self {
         Self {
             method: config.camera_color_method,
+            log_path: None,
             logs_dir: config.logs_dir,
             log_relative_dir: config.log_relative_dir,
             converter: config.converter,
@@ -821,6 +823,7 @@ pub fn prepare(
     }
     let captured = proc::run_capture(tool, &args, EXIT_FRAME)?;
     write_prepare_log(settings.log, tool, &args, &captured)?;
+    proc::check_stop()?;
     if !captured.status.success() {
         return Err(Error::new(
             EXIT_FRAME,
@@ -880,6 +883,7 @@ fn prepared_native_run<'a>(
 ) -> NativeRun<'a> {
     NativeRun {
         method: settings.camera_color_method,
+        log_path: None,
         logs_dir: settings.logs_dir,
         log_relative_dir: settings.log_relative_dir,
         converter: None,
@@ -956,6 +960,62 @@ pub fn develop_prepared(
         consume,
     )
     .map_err(|error| prepared_consumer_error(error, &log))
+}
+
+/// Scheduler entry points own the frame ID and transcript path.
+pub fn analyze_prepared_at(
+    tool: &Path,
+    prepared: &PreparedFrame,
+    wb: Option<[f64; 3]>,
+    roi: [f64; 4],
+    settings: &PreparedSettings<'_>,
+    id: usize,
+    total: usize,
+    log: &Path,
+) -> Result<FrameInfo> {
+    let mut run = prepared_native_run(settings, Some(roi));
+    run.log_path = Some(log);
+    run_frame(
+        tool,
+        FrameInput::Prepared(prepared),
+        id + 1,
+        total,
+        wb,
+        Some(0.),
+        &run,
+        false,
+        Default::default(),
+        &mut |_, _| Ok(()),
+    )
+    .map_err(|e| prepared_consumer_error(e, log))
+}
+pub fn develop_prepared_at(
+    tool: &Path,
+    prepared: &PreparedFrame,
+    wb: Option<[f64; 3]>,
+    ev: f64,
+    settings: &PreparedSettings<'_>,
+    id: usize,
+    total: usize,
+    log: &Path,
+    active: ActiveNative,
+    consume: &mut impl FnMut(&FrameInfo, &mut NativeStream) -> Result<()>,
+) -> Result<FrameInfo> {
+    let mut run = prepared_native_run(settings, None);
+    run.log_path = Some(log);
+    run_frame(
+        tool,
+        FrameInput::Prepared(prepared),
+        id + 1,
+        total,
+        wb,
+        Some(ev),
+        &run,
+        true,
+        active,
+        consume,
+    )
+    .map_err(|e| prepared_consumer_error(e, log))
 }
 
 fn run_frame(
@@ -1037,7 +1097,7 @@ fn run_frame(
     let mut stream = NativeStream::open(
         tool,
         &args,
-        &run.logs_dir.join(format!("frame_{index:06}.log")),
+        run.log_path.unwrap_or(&run.logs_dir.join(format!("frame_{index:06}.log"))),
         active,
     )?;
     let bytes = stream.json(1)?;

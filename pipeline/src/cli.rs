@@ -29,6 +29,7 @@ REQUIRED:
     --output <DIR>             Run directory; must be absent or empty
 
 OPTIONS:
+    --graph <FILE>            Built-in typed graph JSON (default: prepared-frame graph)
     --fps <N[/D]>              Frame rate as an integer or rational (default: 30)
     --white-balance <MODE>     first-frame | per-frame (default: first-frame)
                                first-frame freezes frame 1's as-shot neutral for the sequence;
@@ -279,6 +280,7 @@ impl DeflickerConfig {
 
 #[derive(Debug, Clone)]
 pub struct Options {
+    pub graph: Option<PathBuf>,
     pub input: PathBuf,
     pub output: PathBuf,
     pub fps: Fps,
@@ -302,6 +304,7 @@ pub enum Parsed {
 }
 
 pub fn parse(args: &[String]) -> Result<Parsed> {
+    let mut graph = None;
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut fps = Fps::DEFAULT;
@@ -390,6 +393,14 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 }
                 log_reference_gain = Some(gain);
             }
+            "--graph" => {
+                graph = Some(PathBuf::from(take_value(
+                    args,
+                    &mut index,
+                    flag,
+                    inline_value,
+                )?))
+            }
             "--converter" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
                 if !value.starts_with('/') {
@@ -477,6 +488,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         ));
     }
     Ok(Parsed::Run(Options {
+        graph,
         input,
         output,
         fps,

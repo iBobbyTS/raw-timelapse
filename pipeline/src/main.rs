@@ -10,6 +10,7 @@ mod digest;
 mod error;
 mod fallback;
 mod frame;
+mod graph_run;
 mod guard;
 mod manifest;
 mod order;
@@ -34,6 +35,7 @@ use std::time::{Duration, Instant};
 use transport::DataEnvelope;
 
 fn main() {
+    proc::install_stop_handlers();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let parsed = match cli::parse(&args) {
         Ok(parsed) => parsed,
@@ -86,6 +88,7 @@ fn run(options: &Options) -> Result<()> {
 }
 
 pub struct EncodedStage {
+    pub retain_partial: bool,
     pub probe: video::ProbeInfo,
     pub bytes: u64,
     pub timings: BTreeMap<String, Duration>,
@@ -137,6 +140,7 @@ pub fn encode_and_validate(
     Ok((
         sequence,
         EncodedStage {
+            retain_partial: false,
             probe,
             bytes,
             timings,
@@ -172,17 +176,24 @@ pub fn publish_run(
     });
     manifest::write(&output.join("manifest.json"), &manifest_json)?;
 
+    proc::check_stop()?;
     let final_video = output.join(video::FINAL_NAME);
     video::publish(&stage.video_artifact, &final_video)?;
 
-    match fs::remove_dir_all(&context.partial_dir) {
-        Ok(()) => {}
-        Err(err) => eprintln!(
-            "warning: could not remove partial directory {}: {err}",
-            context.partial_dir.display()
-        ),
+    if stage.retain_partial {
+        println!(
+            "retained graph cache: {}",
+            context.partial_dir.join("cache").display()
+        );
+    } else {
+        match fs::remove_dir_all(&context.partial_dir) {
+            Ok(()) => {}
+            Err(err) => eprintln!(
+                "warning: could not remove partial directory {}: {err}",
+                context.partial_dir.display()
+            ),
+        }
     }
-
     println!(
         "\nrun complete in {:.2}s",
         context.started.elapsed().as_secs_f64()

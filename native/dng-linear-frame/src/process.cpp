@@ -17,6 +17,18 @@
 extern char **environ;
 namespace frame {
 namespace {
+volatile std::sig_atomic_t cancelled = 0;
+void stop_handler(int) { cancelled = 1; }
+}
+void install_stop_handlers() {
+  std::signal(SIGINT, stop_handler);
+  std::signal(SIGTERM, stop_handler);
+}
+void check_cancelled() {
+  if (cancelled) throw Error(130, "caller cancelled native operation");
+}
+
+namespace {
 std::string read_text(const fs::path &p) {
   std::ifstream f(p);
   return {std::istreambuf_iterator<char>(f), {}};
@@ -80,6 +92,7 @@ Conversion convert_input(const fs::path &input, const fs::path &linear_dir,
 }
 ProcessResult run_process(const std::vector<std::string> &args,
                           const fs::path &log, int timeout) {
+  check_cancelled();
   std::vector<char *> argv;
   for (auto &a : args)
     argv.push_back(const_cast<char *>(a.c_str()));
@@ -108,6 +121,22 @@ ProcessResult run_process(const std::vector<std::string> &args,
       break;
     if (r < 0 && errno != EINTR)
       throw Error(24, "waitpid failed");
+    if (cancelled) {
+      // Converter is in a group created by this invocation, never Rust's or
+      // the user's group. Give cooperative termination a bounded interval,
+      // then terminate remaining group members even if the leader exits early.
+      kill(-pid, SIGTERM);
+      auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+      bool reaped = false;
+      while (std::chrono::steady_clock::now() < deadline) {
+        if (!reaped && waitpid(pid, &status, WNOHANG) == pid) reaped = true;
+        if (kill(-pid, 0) < 0 && errno == ESRCH) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      kill(-pid, SIGKILL);
+      if (!reaped) while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+      throw Error(130, "caller cancelled Converter; owned process group terminated and leader reaped");
+    }
     if (std::chrono::steady_clock::now() - start >
         std::chrono::seconds(timeout)) {
       expired = true;
