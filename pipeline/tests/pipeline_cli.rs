@@ -1949,7 +1949,7 @@ fn protocol_and_child_failures_reap_live_counterparts_and_never_publish() {
         write_executable(
             &encoder,
             &format!(
-                "#!/bin/sh\necho $$ >> \"$FAKE_NATIVE_PIDS\"\ncase \" $* \" in *\" lavfi \"*) exit 0;; esac\n{body}\n"
+                "#!/bin/sh\necho $$ >> \"$FAKE_NATIVE_PIDS\"\ncase \" $* \" in *\" lavfi \"*|*\" -h \"*) exit 0;; esac\n{body}\n"
             ),
         );
         let output = root.join("run");

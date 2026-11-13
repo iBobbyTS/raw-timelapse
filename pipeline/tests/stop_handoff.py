@@ -52,7 +52,7 @@ for mode in ['interrupt','terminate','operation-error','operation-error-with-enc
     (root/'in-flight').mkdir(exist_ok=True)
     encoder=executable(root/'encoder',f'''
         import json,os,signal,socket,sys
-        if 'lavfi' in sys.argv: sys.exit(0)
+        if 'lavfi' in sys.argv or '-h' in sys.argv: sys.exit(0)
         s=socket.socket(socket.AF_UNIX);s.connect({sock_path!r});s.sendall((json.dumps({{'kind':'encoder','encoder':os.getpid()}})+'\\n').encode());s.close()
         sys.stdin.buffer.read()
         signal.pause()

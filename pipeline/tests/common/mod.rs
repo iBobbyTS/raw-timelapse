@@ -653,7 +653,7 @@ pub fn fake_failing_encoder(dir: &Path) -> PathBuf {
     // The early capability preflight uses a synthetic lavfi frame; pass it so
     // the failure remains a genuine mid-write encoder failure, not a rejected
     // configuration.
-    let script = "#!/bin/sh\ncase \" $* \" in *\" lavfi \"*) exit 0;; esac\nfor last in \"$@\"; do :; done\nprintf 'partial video bytes' > \"$last\"\necho 'synthetic encoder failure after write' >&2\nexit 1\n";
+    let script = "#!/bin/sh\ncase \" $* \" in *\" lavfi \"*|*\" -h \"*) exit 0;; esac\nfor last in \"$@\"; do :; done\nprintf 'partial video bytes' > \"$last\"\necho 'synthetic encoder failure after write' >&2\nexit 1\n";
     write_executable(&path, script);
     path
 }
