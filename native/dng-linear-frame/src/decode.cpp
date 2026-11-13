@@ -1,9 +1,13 @@
 #include "dng_auto_ptr.h"
+#include "dng_1d_table.h"
+#include "dng_bottlenecks.h"
 #include "dng_camera_profile.h"
 #include "dng_color_spec.h"
+#include "dng_color_space.h"
 #include "dng_exceptions.h"
 #include "dng_file_stream.h"
 #include "dng_host.h"
+#include "dng_hue_sat_map.h"
 #include "dng_ifd.h"
 #include "dng_image.h"
 #include "dng_info.h"
@@ -60,6 +64,92 @@ public:
 };
 Json vec(const Vec &v) { return std::vector<Json>{v[0], v[1], v[2]}; }
 Json optional_matrix(const dng_matrix &m);
+Mat mat(const dng_matrix &m);
+
+// Camera-profile correction belongs between CameraToPCS and scene exposure.
+// Use the SDK's interpolated table and HSV kernel in its linear ProPhoto domain,
+// without invoking dng_render (which also adds exposure, look and tone).
+Json calibrate_profile(Decoded &d, const dng_camera_profile &profile,
+                       const dng_xy_coord &white, dng_host &host) {
+  AutoPtr<dng_hue_sat_map> map(profile.HueSatMapForWhite(white));
+  if (!map.Get() || !map->IsValid())
+    throw Error(40, "profile advertises an invalid HueSatMap");
+  uint32 nh, ns, nv;
+  map->GetDivisions(nh, ns, nv);
+  AutoPtr<dng_1d_table> encode, decode;
+  if (profile.HueSatMapEncoding() != 0)
+    BuildHueSatMapEncodingTable(host.Allocator(), profile.HueSatMapEncoding(),
+                               encode, decode, false);
+  // A single-value linear map depends only on hue/saturation. Normalize and
+  // restore the pixel's scale to avoid the SDK HSV kernel's [0,1] value clamp.
+  // This extends that calibration homogeneously to HDR without losing >1 data.
+  const bool homogeneous = nv == 1 && profile.HueSatMapEncoding() == 0;
+  double max_value_scale = 1;
+  for (uint32 v = 0; v < nv; ++v)
+    for (uint32 h = 0; h < nh; ++h)
+      for (uint32 s = 0; s < ns; ++s) {
+        dng_hue_sat_map::HSBModify delta;
+        map->GetDelta(h, s, v, delta);
+        if (!std::isfinite(delta.fHueShift) || !std::isfinite(delta.fSatScale) ||
+            !std::isfinite(delta.fValScale) || delta.fSatScale < 0 ||
+            delta.fValScale < 0)
+          throw Error(40, "invalid profile HueSatMap entry");
+        max_value_scale = std::max(max_value_scale, double(delta.fValScale));
+      }
+  const Mat to_rgb = multiply(mat(dng_space_ProPhoto::Get().MatrixFromPCS()),
+                             d.camera_to_d50);
+  const Mat to_ap1 = multiply(d50_to_ap1(),
+                             mat(dng_space_ProPhoto::Get().MatrixToPCS()));
+  constexpr size_t chunk = 4096;
+  std::array<float, chunk> r{}, g{}, b{};
+  std::array<double, chunk> scale{};
+  std::array<bool, chunk> bypass{};
+  size_t bypassed = 0;
+  d.calibrated_scene.resize(d.camera.size());
+  for (size_t start = 0; start < d.camera.size() / 3; start += chunk) {
+    size_t count = std::min(chunk, d.camera.size() / 3 - start);
+    for (size_t j = 0; j < count; ++j) {
+      size_t i = (start + j) * 3;
+      Vec camera{d.camera[i], d.camera[i + 1], d.camera[i + 2]};
+      Vec rgb = multiply(to_rgb, camera);
+      // HSV calibration is undefined for negative ProPhoto components. Keep
+      // the signed matrix result for those pixels instead of clipping them.
+      bypass[j] = *std::min_element(rgb.begin(), rgb.end()) < 0;
+      bypassed += bypass[j];
+      scale[j] = homogeneous
+                     ? std::max(1., *std::max_element(rgb.begin(), rgb.end()) *
+                                        max_value_scale * 1.000001)
+                     : 1.;
+      r[j] = bypass[j] ? 0 : float(rgb[0] / scale[j]);
+      g[j] = bypass[j] ? 0 : float(rgb[1] / scale[j]);
+      b[j] = bypass[j] ? 0 : float(rgb[2] / scale[j]);
+    }
+    DoBaselineHueSatMap(r.data(), g.data(), b.data(), r.data(), g.data(),
+                        b.data(), uint32(count), *map.Get(), encode.Get(),
+                        decode.Get(), true);
+    for (size_t j = 0; j < count; ++j) {
+      size_t i = (start + j) * 3;
+      Vec scene = bypass[j]
+                      ? multiply(d.camera_to_ap1,
+                                 Vec{d.camera[i], d.camera[i + 1], d.camera[i + 2]})
+                      : multiply(to_ap1, Vec{r[j] * scale[j], g[j] * scale[j],
+                                             b[j] * scale[j]});
+      for (int c = 0; c < 3; ++c) {
+        if (!std::isfinite(scene[c]))
+          throw Error(40, "nonfinite profile correction result");
+        d.calibrated_scene[i + c] = float(scene[c]);
+      }
+    }
+  }
+  return Json{{"space", "linear ProPhoto RGB / D50"},
+              {"dimensions", std::vector<Json>{int(nh), int(ns), int(nv)}},
+              {"encoding", int(profile.HueSatMapEncoding())},
+              {"hdr_policy", homogeneous ? "homogeneous scale normalization; no value clipping"
+                                          : "SDK supportOverrange"},
+              {"negative_policy", "negative ProPhoto pixels bypass HSV; signed matrix result preserved"},
+              {"negative_bypass_pixels", double(bypassed)},
+              {"position", "before user EV and reference gain; no look/tone/baseline exposure"}};
+}
 Json matrix(const Mat &m) {
   return std::vector<Json>{vec(m[0]), vec(m[1]), vec(m[2])};
 }
@@ -119,7 +209,7 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMe
     auto white = spec.NeutralToXY(neutral);
     spec.SetWhiteXY(white);
     // Both SDK paths include the selected neutral and PCS white adaptation.
-    // Legacy deliberately ignores FM; the new matrix-only strategy uses
+    // Legacy deliberately ignores FM; the calibrated strategy uses
     // CameraToPCS, including SDK's no-FM fallback. Do not add another WB/CAT.
     const bool pcs = method == CameraColorMethod::dng_camera_to_pcs;
     const bool fm = profile.ForwardMatrix1().NotEmpty() ||
@@ -129,49 +219,6 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMe
                           : inverse(mat(spec.PCStoCamera()));
     if (pcs) (void)inverse(d.camera_to_d50); // Reject singular profile transforms.
     d.camera_to_ap1 = multiply(d50_to_ap1(), d.camera_to_d50);
-    d.color = Json{
-        {"method", pcs ? "DNG SDK CameraToPCS; matrix only" : "DNG Ch6 no-ForwardMatrix; inverse(SDK normalized AB*CC*CM*MapWhiteMatrix(D50,selectedWhite))"},
-        {"selected_white_xy", std::vector<Json>{white.x, white.y}},
-        {"profile_index", 0},
-        {"profile_name", profile.Name().Get()},
-        {"profile_fingerprint", profile.Fingerprint().ToUtf8HexString().Get()},
-        {"algorithm_revision", 1},
-        {"calibration_illuminants",
-         std::vector<Json>{int(profile.CalibrationIlluminant1()),
-                           int(profile.CalibrationIlluminant2()),
-                           int(profile.CalibrationIlluminant3())}},
-        {"color_matrix1", matrix(mat(profile.ColorMatrix1()))},
-        {"color_matrix2", optional_matrix(profile.ColorMatrix2())},
-        {"color_matrix3", optional_matrix(profile.ColorMatrix3())},
-        {"analog_balance", vec(Vec{n->AnalogBalance(0), n->AnalogBalance(1),
-                                   n->AnalogBalance(2)})},
-        {"camera_calibration1", optional_matrix(n->CameraCalibration1())},
-        {"camera_calibration2", optional_matrix(n->CameraCalibration2())},
-        {"camera_calibration3", optional_matrix(n->CameraCalibration3())},
-        {"camera_calibration_signature", n->CameraCalibrationSignature().Get()},
-        {"profile_calibration_signature",
-         profile.ProfileCalibrationSignature().Get()},
-        {"sdk_normalized_pcs_to_camera", matrix(mat(spec.PCStoCamera()))},
-        {"camera_to_xyz_d50", matrix(d.camera_to_d50)},
-        {"xyz_d50_to_acescg", matrix(d50_to_ap1())},
-        {"camera_to_acescg", matrix(d.camera_to_ap1)},
-        {"cat", "linear Bradford D50->D60; AP1 inverse primaries matrix"},
-        {"white_balance_normalization",
-         "max camera-neutral component=1; SDK PCS-to-camera white "
-         "saturation normalization"},
-        {"method_requested", pcs ? "dng-camera-to-pcs" : "legacy-inverse-cm"},
-        {"method_effective", pcs ? (fm ? "dng-camera-to-pcs-forward-matrix" : "dng-camera-to-pcs-inverse-fallback") : "legacy-inverse-cm"},
-        {"camera_model", n->ModelName().Get()},
-        {"forward_matrix_present", fm},
-        {"forward_matrix1", optional_matrix(profile.ForwardMatrix1())},
-        {"forward_matrix2", optional_matrix(profile.ForwardMatrix2())},
-        {"forward_matrix3", optional_matrix(profile.ForwardMatrix3())},
-        {"hue_sat_map_present", profile.HasHueSatDeltas()},
-        {"look_table_present", profile.HasLookTable()},
-        {"tone_curve_present", profile.ToneCurve().IsValid()},
-        {"hue_sat_map_applied", false}, {"look_table_applied", false},
-        {"tone_curve_applied", false}, {"baseline_exposure_applied", false},
-        {"forward_matrix_used", pcs && fm}};
     std::vector<Json> black, white_levels;
     for (uint32_t r = 0; r < ifd.fBlackLevelRepeatRows; ++r) {
       std::vector<Json> row;
@@ -210,6 +257,54 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMe
     buf.fPixelSize = 4;
     buf.fData = d.camera.data();
     image->Get(buf);
+    Json correction;
+    if (pcs && profile.HasHueSatDeltas())
+      correction = calibrate_profile(d, profile, white, host);
+    d.color = Json{
+        {"method", pcs ? "DNG SDK CameraToPCS plus profile HueSatMap" : "DNG Ch6 no-ForwardMatrix; inverse(SDK normalized AB*CC*CM*MapWhiteMatrix(D50,selectedWhite))"},
+        {"selected_white_xy", std::vector<Json>{white.x, white.y}},
+        {"profile_index", 0},
+        {"profile_name", profile.Name().Get()},
+        {"profile_fingerprint", profile.Fingerprint().ToUtf8HexString().Get()},
+        {"algorithm_revision", pcs ? 2 : 1},
+        {"calibration_illuminants",
+         std::vector<Json>{int(profile.CalibrationIlluminant1()),
+                           int(profile.CalibrationIlluminant2()),
+                           int(profile.CalibrationIlluminant3())}},
+        {"color_matrix1", matrix(mat(profile.ColorMatrix1()))},
+        {"color_matrix2", optional_matrix(profile.ColorMatrix2())},
+        {"color_matrix3", optional_matrix(profile.ColorMatrix3())},
+        {"analog_balance", vec(Vec{n->AnalogBalance(0), n->AnalogBalance(1),
+                                   n->AnalogBalance(2)})},
+        {"camera_calibration1", optional_matrix(n->CameraCalibration1())},
+        {"camera_calibration2", optional_matrix(n->CameraCalibration2())},
+        {"camera_calibration3", optional_matrix(n->CameraCalibration3())},
+        {"camera_calibration_signature", n->CameraCalibrationSignature().Get()},
+        {"profile_calibration_signature",
+         profile.ProfileCalibrationSignature().Get()},
+        {"sdk_normalized_pcs_to_camera", matrix(mat(spec.PCStoCamera()))},
+        {"camera_to_xyz_d50", matrix(d.camera_to_d50)},
+        {"xyz_d50_to_acescg", matrix(d50_to_ap1())},
+        {"camera_to_acescg", matrix(d.camera_to_ap1)},
+        {"cat", "linear Bradford D50->D60; AP1 inverse primaries matrix"},
+        {"white_balance_normalization",
+         "max camera-neutral component=1; SDK PCS-to-camera white "
+         "saturation normalization"},
+        {"method_requested", pcs ? "dng-camera-to-pcs" : "legacy-inverse-cm"},
+        {"method_effective", pcs ? (fm ? "dng-camera-to-pcs-forward-matrix" : "dng-camera-to-pcs-inverse-fallback") : "legacy-inverse-cm"},
+        {"camera_model", n->ModelName().Get()},
+        {"forward_matrix_present", fm},
+        {"forward_matrix1", optional_matrix(profile.ForwardMatrix1())},
+        {"forward_matrix2", optional_matrix(profile.ForwardMatrix2())},
+        {"forward_matrix3", optional_matrix(profile.ForwardMatrix3())},
+        {"hue_sat_map_present", profile.HasHueSatDeltas()},
+        {"look_table_present", profile.HasLookTable()},
+        {"tone_curve_present", profile.ToneCurve().IsValid()},
+        {"hue_sat_map_applied", pcs && profile.HasHueSatDeltas()}, {"look_table_applied", false},
+        {"tone_curve_applied", false}, {"baseline_exposure_applied", false},
+        {"forward_matrix_used", pcs && fm},
+        {"matrix_scope", "camera_to_* matrices describe the pre-HueSatMap transform"},
+        {"profile_correction", correction}};
     auto range = std::minmax_element(d.camera.begin(), d.camera.end());
     d.semantics = Json{
         {"adapter", "SDK Stage1 -> SDK Linearize(FP32 destination) -> Stage2 "

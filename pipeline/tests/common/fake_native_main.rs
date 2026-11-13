@@ -213,7 +213,17 @@ fn run() -> Result<(), (i32, String)> {
         } else if options.camera_method == "dng-camera-to-pcs" {
             "dng-camera-to-pcs-forward-matrix"
         } else { "legacy-inverse-cm" };
-        let contract = format!("\"color_contract_version\":1,\"color\":{{\"profile_fingerprint\":\"controlled-test-profile\",\"camera_to_xyz_d50\":[[1,0,0],[0,1,0],[0,0,1]],\"camera_to_acescg\":[[1,0,0],[0,1,0],[0,0,1]],\"method_requested\":\"{method}\",\"method_effective\":\"{effective}\",\"camera_model\":\"{model}\"}},");
+        let contract = format!("\"color_contract_version\":1,\"color\":{{\"profile_fingerprint\":\"controlled-test-profile\",\"algorithm_revision\":2,\"hue_sat_map_present\":false,\"hue_sat_map_applied\":false,\"camera_to_xyz_d50\":[[1,0,0],[0,1,0],[0,0,1]],\"camera_to_acescg\":[[1,0,0],[0,1,0],[0,0,1]],\"method_requested\":\"{method}\",\"method_effective\":\"{effective}\",\"camera_model\":\"{model}\"}},");
+        let contract = if defect == Some("old-calibration") {
+            contract.replace("\"algorithm_revision\":2", "\"algorithm_revision\":1")
+        } else if defect == Some("skipped-hsm") {
+            contract.replace(
+                "\"hue_sat_map_present\":false",
+                "\"hue_sat_map_present\":true",
+            )
+        } else {
+            contract
+        };
         if defect != Some("missing-contract") {
             metadata.insert_str(1, &contract);
         }

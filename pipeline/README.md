@@ -79,17 +79,19 @@ contain each other in either direction. The input directory is only read.
 
 - `canon-log2-cinema-gamut` — **clog2(white paper)**, historical matrix and white-paper curve; shared FP32 handoff.
 - `canon-log2-cinema-gamut-rev-eng-crm-dev` — **clog2(rev-eng crm-dev)**,
-  Canon CR3 only, SDK CameraToPCS; all profiles share signed FP32 AP1/D60 handoff.
+  Canon CR3 only, SDK CameraToPCS plus its profile HueSatMap; all profiles share signed FP32 AP1/D60 handoff.
 - `canon-log3-cinema-gamut-rev-eng-crm-dev` — **clog3 (rev-eng crm-dev)**,
   the independently recovered three-segment Canon Log3 curve, using the same
-  CameraToPCS and FP32 color path as rev-eng Log2. See
+  CameraToPCS/profile-calibration and FP32 color path as rev-eng Log2. See
   [algorithm, reproduction and evidence](../docs/canon-log3-rev-eng.md).
 
 The two rev-eng Canon options accept `--log-reference-gain N` (positive finite; default 1,
 recorded unverified). This flag is rejected for the other profiles. It applies
 once after the Cinema Gamut transform; native user/deflicker EV is already
-applied. Every analysis/probe/application/encode pass uses the selected matrix
-strategy. The actual video audit divides the reference gain once after inverse
+applied. Every analysis/probe/application/encode pass uses the same camera calibration.
+The rev-eng routes apply the interpolated profile HueSatMap in linear ProPhoto
+before EV, without LookTable/tone/baseline exposure. Rebuild matched native/Rust
+tools; camera algorithm revision2 is required. See [calibration evidence](../docs/canon-profile-calibration.md). The actual video audit divides the reference gain once after inverse
 transfer. All Canon options still deliver the existing 8-bit H.264 `output.mp4`.
 
 See [complete algorithm, protocol and evidence](../docs/canon-log2-rev-eng.md)

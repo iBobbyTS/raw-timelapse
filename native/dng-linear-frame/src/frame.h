@@ -41,6 +41,9 @@ uint16_t quantize(float);
 struct Decoded {
   uint32_t width = 0, height = 0;
   std::vector<float> camera;
+  // Calibrated, unexposed AP1 samples when a profile HueSatMap is present.
+  // Keep camera separately for the sensor-domain saturation mask.
+  std::vector<float> calibrated_scene;
   Vec as_shot{}, applied{};
   Mat camera_to_d50{}, camera_to_ap1{};
   Json color, semantics;

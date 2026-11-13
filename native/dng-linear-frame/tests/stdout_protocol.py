@@ -4,7 +4,7 @@ Checks record framing, the two stdout modes, byte-level equivalence with the
 positional-mode metadata/analysis files, mode/option rejection and closed-pipe
 failure. Python is test infrastructure only.
 """
-import hashlib,json,os,pathlib,shlex,struct,subprocess,sys
+import hashlib,json,math,os,pathlib,shlex,struct,subprocess,sys
 from dng_fixture import make_dng
 
 exe,work=map(pathlib.Path,sys.argv[1:])
@@ -252,3 +252,82 @@ print('Signed FP32 / CameraToPCS conformance passed',flush=True)
 f=make_dng(work,'singular-fm',forward=[1,1,1]*3)
 r=subprocess.run([str(exe),'--stdout-frame-f32',str(f),'--camera-color-method','dng-camera-to-pcs'],capture_output=True)
 assert r.returncode!=0 and r.stdout==b'',(r.returncode,r.stderr)
+
+# Non-identity profile calibration: the FM and HueSatMap form one camera
+# characterization. A matrix-only producer fails this independent HSV oracle.
+from reference_color import inv,mm,matrix as dm,D50
+pp=dm([[.7977,.1352,.0313],[.2880,.7119,.0001],[0,0,.8249]])
+pp=[[v*D50[i]/sum(row) for v in row] for i,row in enumerate(pp)]
+pp_inv=inv(pp)
+hsm=([2,2,1],[0,1.2,1]*4)
+fwd=[.7977,.1352,.0313,.2880,.7119,.0001,0,0,.8249]
+def calibrated_stream(f,method='dng-camera-to-pcs',ev='0'):
+    r=stream([exe,'--stdout-frame-f32',f,'--camera-color-method',method,'--exposure-ev',ev])
+    rr=records(b'RAWTLST1'+r.stdout[8:]);return json.loads(rr[0][1]),struct.unpack('<3f',rr[2][1][:12])
+def transform(m,v):return [sum(float(x)*float(y) for x,y in zip(row,v)) for row in m]
+for camera in ([121,400,289],[605,1000,482]):
+    f=make_dng(work,'hsm-nonidentity-'+str(camera[0]),w=64,h=64,pixels=camera*4096,forward=fwd,hue_sat=hsm)
+    meta,pixel=calibrated_stream(f)
+    c=meta['color'];assert c['hue_sat_map_applied'] and c['algorithm_revision']==2
+    assert not c['look_table_applied'] and not c['tone_curve_applied'] and not c['baseline_exposure_applied']
+    assert c['profile_correction']['dimensions']==[2,2,1]
+    # Independent HSV saturation multiplication: preserve max (V), move each
+    # component away from V by 1.2; these vectors do not hit the S=1 boundary.
+    camera_float=[struct.unpack('<f',struct.pack('<f',x/1000))[0] for x in camera]
+    rgb=transform(pp_inv,transform(c['camera_to_xyz_d50'],camera_float));v=max(rgb)
+    assert min(rgb)>0
+    adjusted=[v-(v-x)*1.2 for x in rgb]
+    expected=transform(c['xyz_d50_to_acescg'],transform(pp,adjusted))
+    for a,b in zip(pixel,expected):assert abs(a-b)<2e-6,(pixel,expected)
+    # EV is after calibration, once. HDR values must survive the HSV kernel.
+    _,gained=calibrated_stream(f,ev='4.25')
+    for a,b in zip(gained,expected):assert abs(a-b*2**4.25)<4e-6,(gained,expected)
+    assert max(gained)>4
+    # Legacy profiles deliberately keep their historical matrix-only path.
+    plain=make_dng(work,'hsm-control-'+str(camera[0]),w=64,h=64,pixels=camera*4096,forward=fwd)
+    _,legacy_hsm=calibrated_stream(f,method='legacy-inverse-cm')
+    _,legacy_plain=calibrated_stream(plain,method='legacy-inverse-cm')
+    assert legacy_hsm==legacy_plain
+
+# Applying the same 2.5D profile to 2x-brighter camera data remains homogeneous,
+# including values above 1 in ProPhoto (the bare SDK HSV kernel would clip V).
+# Integer Linearize clips input at WhiteLevel, so compare a lower camera vector
+# instead of pretending that this stage can recover sensor-saturated samples.
+f=make_dng(work,'hsm-linear-scale',w=64,h=64,pixels=[121,400,289]*4096,white=500,forward=fwd,hue_sat=hsm)
+_,twice=calibrated_stream(f)
+f=make_dng(work,'hsm-linear-scale-control',w=64,h=64,pixels=[121,400,289]*4096,white=1000,forward=fwd,hue_sat=hsm)
+_,once=calibrated_stream(f)
+for a,b in zip(twice,once):assert abs(a-2*b)<2e-6,(twice,once)
+
+# The HSV domain cannot represent negative ProPhoto. Explicitly bypass those
+# pixels with the signed matrix result; never silently clip them to zero.
+fwd2=[.7,.1,.1643,.2,.7,.1,.01,.1,.7151]
+f=make_dng(work,'hsm-negative',w=64,h=64,pixels=[0,1000,0]*4096,forward=fwd2,hue_sat=hsm)
+meta,pixel=calibrated_stream(f)
+assert meta['color']['profile_correction']['negative_bypass_pixels']==4096
+expected=[row[1] for row in meta['color']['camera_to_acescg']]
+for a,b in zip(pixel,expected):assert abs(a-b)<2e-6
+print('PASS: profile HueSatMap calibration, HDR/exposure, legacy and signed bypass',flush=True)
+
+# ValueScale can exceed 1 even when the matrix RGB is below 1. An HDR extension
+# that accounts only for input V would still lose this profile correction.
+hsm_value=([2,2,1],[0,1.2,1,0,1.2,1.3]*2)
+f=make_dng(work,'hsm-value-hdr',w=64,h=64,pixels=[121,400,289]*4096,white=500,forward=fwd,hue_sat=hsm_value)
+meta,pixel=calibrated_stream(f)
+c=meta['color'];camera=[struct.unpack('<f',struct.pack('<f',x/500))[0] for x in [121,400,289]]
+rgb=transform(pp_inv,transform(c['camera_to_xyz_d50'],camera));v=max(rgb);s=(v-min(rgb))/v
+expected=transform(c['xyz_d50_to_acescg'],transform(pp,[(v-(v-x)*1.2)*(1+.3*s) for x in rgb]))
+for a,b in zip(pixel,expected):assert abs(a-b)<3e-6,(pixel,expected)
+assert max(pixel)>1
+print('PASS: HueSatMap ValueScale >1 retains calibrated HDR values',flush=True)
+
+# Deflicker photometry must observe the same calibrated scene as the final
+# frame, while retaining the uncalibrated camera-domain saturation mask.
+a=stream([exe,'--stdout-analysis',f,'--camera-color-method','dng-camera-to-pcs','--exposure-ev','0.5'])
+rr=records(a.stdout);am=json.loads(rr[0][1]);analysis=json.loads(rr[1][1])
+assert am['color']==meta['color']
+weights=analysis['analysis']['luma_weights']
+expected_log=math.log2(sum(w*x for w,x in zip(weights,pixel)))+.5
+assert all(t['valid'] and t['saturation_fraction']==0 for t in analysis['tiles'])
+for t in analysis['tiles']:assert abs(t['log_luminance']-expected_log)<2e-6
+print('PASS: calibrated analysis/pixel equivalence and camera saturation mask',flush=True)

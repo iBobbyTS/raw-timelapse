@@ -139,7 +139,12 @@ descriptor. Pixels are written after scene*2^EV and before legacy quantize;
 negative values and values above 4 remain intact. `--camera-color-method`
 also applies to stdout analysis (`RAWTLST1`, no full-frame pixels).
 The default method is `legacy-inverse-cm`; `dng-camera-to-pcs` explicitly
-selects SDK CameraToPCS, with its no-FM fallback and no extra WB/CAT.
+selects SDK CameraToPCS plus the interpolated profile HueSatMap in linear
+ProPhoto/D50, with its no-FM fallback and no extra WB/CAT. Calibration runs
+before EV in both analysis and pixel modes. LookTable, tone and baseline
+exposure remain disabled. Camera algorithm revision2 records the HSM dimensions,
+encoding, HDR policy and signed-pixel bypass count; matrix metadata describes
+the pre-HSM transform. See [calibration details](../../docs/canon-profile-calibration.md).
 See [Canon dual-profile contract](../../docs/canon-log2-rev-eng.md).
 
 The two original modes remain protocol v1. Each call starts with the 8-byte ASCII magic `RAWTLST1` followed by records:
@@ -272,7 +277,7 @@ not silently relabeled as uncropped RAW range. Converter clipping/other baking
 is `UNKNOWN`; float-source range behavior is not tested. Each frame records
 camera min/max and residual Stage3 black (a nonzero residual is rejected).
 
-Color uses the DNG Chapter 6 no-ForwardMatrix construction, even if a file also
+The default `legacy-inverse-cm` uses the DNG Chapter 6 no-ForwardMatrix construction, even if a file also
 contains ForwardMatrix. SDK `dng_color_spec` selects/interpolates ColorMatrix
 and calibration per illuminants/signatures and computes selected white from
 the applied neutral. We invert its normalized

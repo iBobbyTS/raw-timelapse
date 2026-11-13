@@ -1,0 +1,1488 @@
+{
+  "date": "2026-11-12",
+  "baseline_commit": "6df57ff85c89e4f5275e01ebf6ad3f81800a8591",
+  "scope": "Canon rev-eng profiles; complete CameraToPCS + HueSatMap camera calibration, without look/tone/baseline exposure",
+  "input_identity": [
+    {
+      "path": "/Users/ibobby/Temp/tl/pair/test/R7_L2220.CR3",
+      "bytes": 34835802,
+      "sha256": "98aa5f224a65c676066b36e1ed58b36d6e2182ee64f41a917778b54a71cb481c"
+    },
+    {
+      "path": "/Users/ibobby/Temp/tl/pair/test/R7_L2219.CR3",
+      "bytes": 43128666,
+      "sha256": "26c4447b73d85c0f03ba6511bd8c5ea3dcb9b6685a9ef7a526864100847ae868"
+    },
+    {
+      "path": "/Users/ibobby/Temp/tl/pair/davinci-reference/clog3_2219.tif",
+      "bytes": 193768182,
+      "sha256": "d611eea5694bb983419d997e5369b854b16dce61a18248f2a10d165844fd6035"
+    },
+    {
+      "path": "/Users/ibobby/Temp/tl/pair/davinci-reference/clog2_2219.tif",
+      "bytes": 193768182,
+      "sha256": "b0135d609f5a5ff0d40a18b2fdb9d6bd52ebfeca39eb1db9f3840b021a4f151c"
+    },
+    {
+      "path": "/Users/ibobby/Temp/tl/pair/davinci-reference/clog3_2220.tif",
+      "bytes": 193768182,
+      "sha256": "c98b7174dfb2f2242ae30674a382b05609aabe528f29529226ce63b6228c0a06"
+    },
+    {
+      "path": "/Users/ibobby/Temp/tl/pair/davinci-reference/clog2_2220.tif",
+      "bytes": 193768182,
+      "sha256": "8156b75bb7fbbd3574387ca8ae4d844b6d49f1f8d31f7aa906633d0cba37d8a7"
+    },
+    {
+      "path": "/Users/ibobby/Temp/tl/pair/ref video/R7__2218(2219).MP4",
+      "bytes": 37180852,
+      "sha256": "472928da65322d67f7fc689677bdf1cb2830bd2c384f28e9b82714a30a12a8be"
+    },
+    {
+      "path": "/Users/ibobby/Temp/tl/pair/ref video/R7__2221(2220).MP4",
+      "bytes": 41556080,
+      "sha256": "8e1f20d26af053513d0cc8fc05c2254b947c72bd21c91461592f56c64063be69"
+    }
+  ],
+  "before_after_comparison": {
+    "2219": {
+      "mask_pixels": 353657,
+      "before": {
+        "gain": 2.106048634665795,
+        "ev": 1.0745387526888894,
+        "linear_rmse": 0.020049894032625016,
+        "chroma_rmse": 0.11864860656895834,
+        "saturation_ratio_median": 0.6276024380906688
+      },
+      "after": {
+        "chroma_rmse": 0.03568667290550881,
+        "saturation_ratio_median": 1.0907778817164404,
+        "linear_rmse_after_scalar_alignment": 0.007286905860157761,
+        "diagnostic_alignment_gain_not_applied": 2.0996618605640966
+      },
+      "native_calibration": {
+        "space": "linear ProPhoto RGB / D50",
+        "dimensions": [
+          90,
+          30,
+          1
+        ],
+        "encoding": 0,
+        "hdr_policy": "homogeneous scale normalization; no value clipping",
+        "negative_policy": "negative ProPhoto pixels bypass HSV; signed matrix result preserved",
+        "negative_bypass_pixels": 0,
+        "position": "before user EV and reference gain; no look/tone/baseline exposure"
+      },
+      "applied_white_balance": [
+        0.793184,
+        1,
+        0.407157
+      ]
+    },
+    "2220": {
+      "mask_pixels": 402754,
+      "before": {
+        "gain": 3.7175341786868543,
+        "ev": 1.8943460063517639,
+        "linear_rmse": 0.019047848242548127,
+        "chroma_rmse": 0.13962865820655165,
+        "saturation_ratio_median": 0.5625130818345399
+      },
+      "after": {
+        "chroma_rmse": 0.027766976053002823,
+        "saturation_ratio_median": 1.0426114533553241,
+        "linear_rmse_after_scalar_alignment": 0.0039353214998355205,
+        "diagnostic_alignment_gain_not_applied": 3.6963713217888685
+      },
+      "native_calibration": {
+        "space": "linear ProPhoto RGB / D50",
+        "dimensions": [
+          90,
+          30,
+          1
+        ],
+        "encoding": 0,
+        "hdr_policy": "homogeneous scale normalization; no value clipping",
+        "negative_policy": "negative ProPhoto pixels bypass HSV; signed matrix result preserved",
+        "negative_bypass_pixels": 0,
+        "position": "before user EV and reference gain; no look/tone/baseline exposure"
+      },
+      "applied_white_balance": [
+        0.61244,
+        1,
+        0.583144
+      ]
+    }
+  },
+  "sdk_only_video_cross_check": {
+    "2219": {
+      "homography_video_to_photo": [
+        [
+          0.8971093074832273,
+          -0.00019456343194035707,
+          3.0429659016097284
+        ],
+        [
+          0.0005147021404019211,
+          0.8939016426572105,
+          49.74584595340532
+        ],
+        [
+          1.8905375091714492e-06,
+          -3.1632866818612213e-06,
+          1.0
+        ]
+      ],
+      "matches": 1346,
+      "inliers": 1318,
+      "pixels": 213899,
+      "metrics": {
+        "matrix_only": {
+          "gain": 17.989645329549834,
+          "ev": 4.169094838656105,
+          "chroma_rmse": 0.1433013664260331,
+          "sat_ratio": 0.5545595010506992
+        },
+        "hsm": {
+          "gain": 17.848999467905067,
+          "ev": 4.1577713006180534,
+          "chroma_rmse": 0.04549404695266259,
+          "sat_ratio": 0.9737246593463811
+        },
+        "legacy": {
+          "gain": 17.90784761338758,
+          "ev": 4.16252004169771,
+          "chroma_rmse": 0.05291704773533006,
+          "sat_ratio": 0.9846031106438267
+        },
+        "resolve": {
+          "gain": 8.49769090015242,
+          "ev": 3.087070867194677,
+          "chroma_rmse": 0.05156511024689316,
+          "sat_ratio": 0.895442978508094
+        }
+      }
+    },
+    "2220": {
+      "homography_video_to_photo": [
+        [
+          0.8954399778449602,
+          0.0018489672200032027,
+          3.9439451909591616
+        ],
+        [
+          -0.001245929895115308,
+          0.8965326610173706,
+          47.93974835737624
+        ],
+        [
+          -2.856609858688382e-06,
+          4.175945794531518e-06,
+          1.0
+        ]
+      ],
+      "matches": 1697,
+      "inliers": 1668,
+      "pixels": 299582,
+      "metrics": {
+        "matrix_only": {
+          "gain": 19.889424401499138,
+          "ev": 4.313929620173214,
+          "chroma_rmse": 0.13731405635568777,
+          "sat_ratio": 0.6085015933815836
+        },
+        "hsm": {
+          "gain": 19.77498117728847,
+          "ev": 4.305604416364418,
+          "chroma_rmse": 0.05356865407949582,
+          "sat_ratio": 1.1263697754548576
+        },
+        "legacy": {
+          "gain": 19.806329016196162,
+          "ev": 4.307889605054201,
+          "chroma_rmse": 0.06063018367821367,
+          "sat_ratio": 1.1398184412355383
+        },
+        "resolve": {
+          "gain": 5.347472535573282,
+          "ev": 2.418857167779478,
+          "chroma_rmse": 0.051632683815030306,
+          "sat_ratio": 1.084134228244983
+        }
+      }
+    }
+  },
+  "white_level_checks": {
+    "2219": {
+      "raw": {
+        "width": 6984,
+        "height": 4660,
+        "raw_width": 7128,
+        "raw_height": 4732,
+        "left": 144,
+        "top": 72,
+        "raw_bps": 14,
+        "maximum": 16383,
+        "black": 2047,
+        "cblack": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "libraw": "0.21.4-Release"
+      },
+      "dng": {
+        "stage1": {
+          "width": 6984,
+          "height": 4660,
+          "planes": 3,
+          "pixel_type": 3,
+          "storage_bits": 16,
+          "white": 65535,
+          "black": 8188,
+          "baseline_exposure": 0.35
+        },
+        "sdk_camera": {
+          "adapter": "SDK Stage1 -> SDK Linearize(FP32 destination) -> Stage2 -> Stage3; no dng_render",
+          "evidence": "tests/integration.py controlled LinearRaw probes; docs/migration-log.md S01",
+          "linearization_table": {
+            "entries": 0,
+            "status": "absent"
+          },
+          "black_level": {
+            "values": [
+              [
+                [
+                  8188,
+                  8188,
+                  8188
+                ]
+              ]
+            ],
+            "delta_h_count": 0,
+            "delta_v_count": 0,
+            "status": "applied by SDK Linearize; controlled 2x2 nonzero-black probe"
+          },
+          "white_level": {
+            "values": [
+              65535,
+              65535,
+              65535
+            ],
+            "status": "applied by SDK Linearize"
+          },
+          "opcodes": [
+            {
+              "stage": 1,
+              "count": 0,
+              "opcodes": [],
+              "status": "absent"
+            },
+            {
+              "stage": 2,
+              "count": 0,
+              "opcodes": [],
+              "status": "absent"
+            },
+            {
+              "stage": 3,
+              "count": 0,
+              "opcodes": [],
+              "status": "absent"
+            }
+          ],
+          "baseline_exposure": {
+            "ev": 0.35,
+            "applied": false,
+            "evidence": "controlled 0 vs 1.9 EV probe produces equal camera samples/PNG; decode bypasses dng_render"
+          },
+          "storage_bits_per_sample": 16,
+          "storage_sample_format": 1,
+          "camera_min": 0,
+          "camera_max": 1,
+          "residual_stage3_black": 0,
+          "upstream_clipping": "SDK integer Linearize clamps below black and above white to [0,1]; probed. Converter demosaic clipping UNKNOWN. Scene FP32 color transform is unclipped."
+        },
+        "manual_normalization_max_error": 2.979972402172848e-08,
+        "manual_normalization_mean_error": 2.237779669149688e-09
+      }
+    },
+    "2220": {
+      "raw": {
+        "width": 6984,
+        "height": 4660,
+        "raw_width": 7128,
+        "raw_height": 4732,
+        "left": 144,
+        "top": 72,
+        "raw_bps": 14,
+        "maximum": 16383,
+        "black": 511,
+        "cblack": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "libraw": "0.21.4-Release"
+      },
+      "dng": {
+        "stage1": {
+          "width": 6984,
+          "height": 4660,
+          "planes": 3,
+          "pixel_type": 3,
+          "storage_bits": 16,
+          "white": 65535,
+          "black": 2048,
+          "baseline_exposure": 0.41
+        },
+        "sdk_camera": {
+          "adapter": "SDK Stage1 -> SDK Linearize(FP32 destination) -> Stage2 -> Stage3; no dng_render",
+          "evidence": "tests/integration.py controlled LinearRaw probes; docs/migration-log.md S01",
+          "linearization_table": {
+            "entries": 0,
+            "status": "absent"
+          },
+          "black_level": {
+            "values": [
+              [
+                [
+                  2048,
+                  2048,
+                  2048
+                ]
+              ]
+            ],
+            "delta_h_count": 0,
+            "delta_v_count": 0,
+            "status": "applied by SDK Linearize; controlled 2x2 nonzero-black probe"
+          },
+          "white_level": {
+            "values": [
+              65535,
+              65535,
+              65535
+            ],
+            "status": "applied by SDK Linearize"
+          },
+          "opcodes": [
+            {
+              "stage": 1,
+              "count": 0,
+              "opcodes": [],
+              "status": "absent"
+            },
+            {
+              "stage": 2,
+              "count": 0,
+              "opcodes": [],
+              "status": "absent"
+            },
+            {
+              "stage": 3,
+              "count": 0,
+              "opcodes": [],
+              "status": "absent"
+            }
+          ],
+          "baseline_exposure": {
+            "ev": 0.41,
+            "applied": false,
+            "evidence": "controlled 0 vs 1.9 EV probe produces equal camera samples/PNG; decode bypasses dng_render"
+          },
+          "storage_bits_per_sample": 16,
+          "storage_sample_format": 1,
+          "camera_min": 0,
+          "camera_max": 1,
+          "residual_stage3_black": 0,
+          "upstream_clipping": "SDK integer Linearize clamps below black and above white to [0,1]; probed. Converter demosaic clipping UNKNOWN. Scene FP32 color transform is unclipped."
+        },
+        "manual_normalization_max_error": 2.975678825567485e-08,
+        "manual_normalization_mean_error": 1.1430948934373996e-09
+      }
+    }
+  },
+  "runs": [
+    {
+      "output": "/Users/ibobby/Temp/tl/pair/test-clog3-profile-corrected",
+      "profile": "canon-log3-cinema-gamut-rev-eng-crm-dev",
+      "pipeline_revision": 3,
+      "white_balance": {
+        "strategy": "per-frame",
+        "reference_frame": null,
+        "reference_source": null,
+        "reference": null,
+        "propagation": "every numerically ordered frame decoded with its own as-shot neutral; no --white-balance override is passed to the native producer in any pass",
+        "all_applied_equal": false,
+        "per_frame_as_shot_neutral": "each frame is decoded with its own source as_shot_neutral; its sidecar must report applied_white_balance equal to that neutral"
+      },
+      "full_decode": "pass",
+      "video_sha256": "3bc7c179fb00df24b92df9482b8a73f83b3da09db027d5d50ae0895f08433353",
+      "video_bytes": 225774,
+      "frames": [
+        {
+          "source": "/Users/ibobby/Temp/tl/pair/test/R7_L2219.CR3",
+          "source_sha256": "26c4447b73d85c0f03ba6511bd8c5ea3dcb9b6685a9ef7a526864100847ae868",
+          "exposure_ev": 0,
+          "gain": 1,
+          "white_balance_source": "as-shot",
+          "as_shot_neutral": [
+            0.793184,
+            1,
+            0.407157
+          ],
+          "applied_white_balance": [
+            0.793184,
+            1,
+            0.407157
+          ],
+          "color": {
+            "method": "DNG SDK CameraToPCS plus profile HueSatMap",
+            "selected_white_xy": [
+              0.42401035356798306,
+              0.40868183758148896
+            ],
+            "profile_index": 0,
+            "profile_name": "Adobe Standard",
+            "profile_fingerprint": "0C2FA6EA1F25BFF1C21E2C32CB3CF945",
+            "algorithm_revision": 2,
+            "calibration_illuminants": [
+              17,
+              21,
+              0
+            ],
+            "color_matrix1": [
+              [
+                1.2649000000000001,
+                -0.646,
+                -0.0013000000000000002
+              ],
+              [
+                -0.3506,
+                1.0855000000000001,
+                0.30610000000000004
+              ],
+              [
+                -0.01,
+                0.0741,
+                0.7311000000000001
+              ]
+            ],
+            "color_matrix2": [
+              [
+                1.0424,
+                -0.3138,
+                -0.13
+              ],
+              [
+                -0.42210000000000003,
+                1.1938,
+                0.2584
+              ],
+              [
+                -0.054700000000000006,
+                0.1658,
+                0.6183000000000001
+              ]
+            ],
+            "color_matrix3": null,
+            "analog_balance": [
+              1,
+              1,
+              1
+            ],
+            "camera_calibration1": [
+              [
+                0.9967,
+                0,
+                0
+              ],
+              [
+                0,
+                1,
+                0
+              ],
+              [
+                0,
+                0,
+                0.9542
+              ]
+            ],
+            "camera_calibration2": [
+              [
+                0.9967,
+                0,
+                0
+              ],
+              [
+                0,
+                1,
+                0
+              ],
+              [
+                0,
+                0,
+                0.9542
+              ]
+            ],
+            "camera_calibration3": null,
+            "camera_calibration_signature": "com.adobe",
+            "profile_calibration_signature": "com.adobe",
+            "sdk_normalized_pcs_to_camera": [
+              [
+                1.525256904062356,
+                -0.558995840828011,
+                -0.1437621405985778
+              ],
+              [
+                -0.3827651171115871,
+                1.2328436772199116,
+                0.16513672313095765
+              ],
+              [
+                -0.031306253835659784,
+                0.1235167071676825,
+                0.3803502953647197
+              ]
+            ],
+            "camera_to_xyz_d50": [
+              [
+                0.567422955426878,
+                0.34679138235543816,
+                0.4112258609829244
+              ],
+              [
+                0.2729187073511678,
+                0.7301785322925359,
+                0.13102247387757213
+              ],
+              [
+                0.10532524254182844,
+                0.0019590829836380495,
+                1.8165062146353772
+              ]
+            ],
+            "xyz_d50_to_acescg": [
+              [
+                1.59261603754023,
+                -0.35185123222912396,
+                -0.22288268229721614
+              ],
+              [
+                -0.675958396892256,
+                1.6393565015022566,
+                0.015109912160560601
+              ],
+              [
+                0.019953524116932287,
+                -0.02254715081984889,
+                1.2159743755297239
+              ]
+            ],
+            "camera_to_acescg": [
+              [
+                0.7841849428301055,
+                0.2949546552153987,
+                0.20395670484166706
+              ],
+              [
+                0.06544820113060693,
+                0.9626359788699108,
+                -0.03573178001429484
+              ],
+              [
+                0.13324134439672278,
+                -0.007161540574002002,
+                2.214076231642437
+              ]
+            ],
+            "cat": "linear Bradford D50->D60; AP1 inverse primaries matrix",
+            "white_balance_normalization": "max camera-neutral component=1; SDK PCS-to-camera white saturation normalization",
+            "method_requested": "dng-camera-to-pcs",
+            "method_effective": "dng-camera-to-pcs-forward-matrix",
+            "camera_model": "Canon EOS R7",
+            "forward_matrix_present": true,
+            "forward_matrix1": [
+              [
+                0.4475,
+                0.3644,
+                0.1524
+              ],
+              [
+                0.20270000000000002,
+                0.7486,
+                0.048600000000000004
+              ],
+              [
+                0.07250000000000001,
+                0.0014,
+                0.7513000000000001
+              ]
+            ],
+            "forward_matrix2": [
+              [
+                0.459,
+                0.2857,
+                0.21960000000000002
+              ],
+              [
+                0.2642,
+                0.666,
+                0.0698
+              ],
+              [
+                0.12190000000000001,
+                0.0039000000000000003,
+                0.6994
+              ]
+            ],
+            "forward_matrix3": null,
+            "hue_sat_map_present": true,
+            "look_table_present": true,
+            "tone_curve_present": false,
+            "hue_sat_map_applied": true,
+            "look_table_applied": false,
+            "tone_curve_applied": false,
+            "baseline_exposure_applied": false,
+            "forward_matrix_used": true,
+            "matrix_scope": "camera_to_* matrices describe the pre-HueSatMap transform",
+            "profile_correction": {
+              "space": "linear ProPhoto RGB / D50",
+              "dimensions": [
+                90,
+                30,
+                1
+              ],
+              "encoding": 0,
+              "hdr_policy": "homogeneous scale normalization; no value clipping",
+              "negative_policy": "negative ProPhoto pixels bypass HSV; signed matrix result preserved",
+              "negative_bypass_pixels": 0,
+              "position": "before user EV and reference gain; no look/tone/baseline exposure"
+            }
+          },
+          "quantization": {
+            "dtype": "f32",
+            "pixel_format": "rgbf32le",
+            "negative_policy": "preserve",
+            "upper_policy": "preserve",
+            "negative_samples": 1101,
+            "above_legacy_upper_samples": 0,
+            "transfer": "linear; no OETF"
+          },
+          "pixels_sha256": "d682ea9ebd07d2512d4a18114ab4ca6b5bed31d4a912e3a002ded72654d706dc"
+        },
+        {
+          "source": "/Users/ibobby/Temp/tl/pair/test/R7_L2220.CR3",
+          "source_sha256": "98aa5f224a65c676066b36e1ed58b36d6e2182ee64f41a917778b54a71cb481c",
+          "exposure_ev": 0,
+          "gain": 1,
+          "white_balance_source": "as-shot",
+          "as_shot_neutral": [
+            0.61244,
+            1,
+            0.583144
+          ],
+          "applied_white_balance": [
+            0.61244,
+            1,
+            0.583144
+          ],
+          "color": {
+            "method": "DNG SDK CameraToPCS plus profile HueSatMap",
+            "selected_white_xy": [
+              0.35641960811360557,
+              0.36441837771078783
+            ],
+            "profile_index": 0,
+            "profile_name": "Adobe Standard",
+            "profile_fingerprint": "0C2FA6EA1F25BFF1C21E2C32CB3CF945",
+            "algorithm_revision": 2,
+            "calibration_illuminants": [
+              17,
+              21,
+              0
+            ],
+            "color_matrix1": [
+              [
+                1.2649000000000001,
+                -0.646,
+                -0.0013000000000000002
+              ],
+              [
+                -0.3506,
+                1.0855000000000001,
+                0.30610000000000004
+              ],
+              [
+                -0.01,
+                0.0741,
+                0.7311000000000001
+              ]
+            ],
+            "color_matrix2": [
+              [
+                1.0424,
+                -0.3138,
+                -0.13
+              ],
+              [
+                -0.42210000000000003,
+                1.1938,
+                0.2584
+              ],
+              [
+                -0.054700000000000006,
+                0.1658,
+                0.6183000000000001
+              ]
+            ],
+            "color_matrix3": null,
+            "analog_balance": [
+              1,
+              1,
+              1
+            ],
+            "camera_calibration1": [
+              [
+                0.9967,
+                0,
+                0
+              ],
+              [
+                0,
+                1,
+                0
+              ],
+              [
+                0,
+                0,
+                0.9542
+              ]
+            ],
+            "camera_calibration2": [
+              [
+                0.9967,
+                0,
+                0
+              ],
+              [
+                0,
+                1,
+                0
+              ],
+              [
+                0,
+                0,
+                0.9542
+              ]
+            ],
+            "camera_calibration3": null,
+            "camera_calibration_signature": "com.adobe",
+            "profile_calibration_signature": "com.adobe",
+            "sdk_normalized_pcs_to_camera": [
+              [
+                1.147003566197717,
+                -0.4109240830213522,
+                -0.10021335152598974
+              ],
+              [
+                -0.4010779562138951,
+                1.1733725941101112,
+                0.25861587043498513
+              ],
+              [
+                -0.04037743336542847,
+                0.13497388211791425,
+                0.590356547547156
+              ]
+            ],
+            "camera_to_xyz_d50": [
+              [
+                0.7436185992236722,
+                0.31017214524810965,
+                0.3407421771735907
+              ],
+              [
+                0.4001722543924239,
+                0.691709610443215,
+                0.10839328567912851
+              ],
+              [
+                0.17393645446181774,
+                0.0031222077580570235,
+                1.226895500992913
+              ]
+            ],
+            "xyz_d50_to_acescg": [
+              [
+                1.59261603754023,
+                -0.35185123222912396,
+                -0.22288268229721614
+              ],
+              [
+                -0.675958396892256,
+                1.6393565015022566,
+                0.015109912160560601
+              ],
+              [
+                0.019953524116932287,
+                -0.02254715081984889,
+                1.2159743755297239
+              ]
+            ],
+            "camera_to_acescg": [
+              [
+                1.004730382605223,
+                0.24991036810141964,
+                0.2310793847417829
+              ],
+              [
+                0.15599791527697401,
+                0.9243423572541049,
+                -0.034094014988376754
+              ],
+              [
+                0.2173173390757671,
+                -0.005610528900715862,
+                1.496228538149908
+              ]
+            ],
+            "cat": "linear Bradford D50->D60; AP1 inverse primaries matrix",
+            "white_balance_normalization": "max camera-neutral component=1; SDK PCS-to-camera white saturation normalization",
+            "method_requested": "dng-camera-to-pcs",
+            "method_effective": "dng-camera-to-pcs-forward-matrix",
+            "camera_model": "Canon EOS R7",
+            "forward_matrix_present": true,
+            "forward_matrix1": [
+              [
+                0.4475,
+                0.3644,
+                0.1524
+              ],
+              [
+                0.20270000000000002,
+                0.7486,
+                0.048600000000000004
+              ],
+              [
+                0.07250000000000001,
+                0.0014,
+                0.7513000000000001
+              ]
+            ],
+            "forward_matrix2": [
+              [
+                0.459,
+                0.2857,
+                0.21960000000000002
+              ],
+              [
+                0.2642,
+                0.666,
+                0.0698
+              ],
+              [
+                0.12190000000000001,
+                0.0039000000000000003,
+                0.6994
+              ]
+            ],
+            "forward_matrix3": null,
+            "hue_sat_map_present": true,
+            "look_table_present": true,
+            "tone_curve_present": false,
+            "hue_sat_map_applied": true,
+            "look_table_applied": false,
+            "tone_curve_applied": false,
+            "baseline_exposure_applied": false,
+            "forward_matrix_used": true,
+            "matrix_scope": "camera_to_* matrices describe the pre-HueSatMap transform",
+            "profile_correction": {
+              "space": "linear ProPhoto RGB / D50",
+              "dimensions": [
+                90,
+                30,
+                1
+              ],
+              "encoding": 0,
+              "hdr_policy": "homogeneous scale normalization; no value clipping",
+              "negative_policy": "negative ProPhoto pixels bypass HSV; signed matrix result preserved",
+              "negative_bypass_pixels": 0,
+              "position": "before user EV and reference gain; no look/tone/baseline exposure"
+            }
+          },
+          "quantization": {
+            "dtype": "f32",
+            "pixel_format": "rgbf32le",
+            "negative_policy": "preserve",
+            "upper_policy": "preserve",
+            "negative_samples": 76,
+            "above_legacy_upper_samples": 0,
+            "transfer": "linear; no OETF"
+          },
+          "pixels_sha256": "3016e9b5a3d3c633dd4eff91534761bd98a4cbf4405b0839bb1409ec5a9953d9"
+        }
+      ]
+    },
+    {
+      "output": "/private/tmp/rawtl-hsm-log2-control",
+      "profile": "canon-log2-cinema-gamut-rev-eng-crm-dev",
+      "pipeline_revision": 3,
+      "white_balance": {
+        "strategy": "per-frame",
+        "reference_frame": null,
+        "reference_source": null,
+        "reference": null,
+        "propagation": "every numerically ordered frame decoded with its own as-shot neutral; no --white-balance override is passed to the native producer in any pass",
+        "all_applied_equal": false,
+        "per_frame_as_shot_neutral": "each frame is decoded with its own source as_shot_neutral; its sidecar must report applied_white_balance equal to that neutral"
+      },
+      "full_decode": "pass",
+      "video_sha256": "1993e678e6b6b6fe45f5ba697da81afa19266589e221f30cfa48f045479ad5e6",
+      "video_bytes": 245029,
+      "frames": [
+        {
+          "source": "/Users/ibobby/Temp/tl/pair/test/R7_L2219.CR3",
+          "source_sha256": "26c4447b73d85c0f03ba6511bd8c5ea3dcb9b6685a9ef7a526864100847ae868",
+          "exposure_ev": 0,
+          "gain": 1,
+          "white_balance_source": "as-shot",
+          "as_shot_neutral": [
+            0.793184,
+            1,
+            0.407157
+          ],
+          "applied_white_balance": [
+            0.793184,
+            1,
+            0.407157
+          ],
+          "color": {
+            "method": "DNG SDK CameraToPCS plus profile HueSatMap",
+            "selected_white_xy": [
+              0.42401035356798306,
+              0.40868183758148896
+            ],
+            "profile_index": 0,
+            "profile_name": "Adobe Standard",
+            "profile_fingerprint": "0C2FA6EA1F25BFF1C21E2C32CB3CF945",
+            "algorithm_revision": 2,
+            "calibration_illuminants": [
+              17,
+              21,
+              0
+            ],
+            "color_matrix1": [
+              [
+                1.2649000000000001,
+                -0.646,
+                -0.0013000000000000002
+              ],
+              [
+                -0.3506,
+                1.0855000000000001,
+                0.30610000000000004
+              ],
+              [
+                -0.01,
+                0.0741,
+                0.7311000000000001
+              ]
+            ],
+            "color_matrix2": [
+              [
+                1.0424,
+                -0.3138,
+                -0.13
+              ],
+              [
+                -0.42210000000000003,
+                1.1938,
+                0.2584
+              ],
+              [
+                -0.054700000000000006,
+                0.1658,
+                0.6183000000000001
+              ]
+            ],
+            "color_matrix3": null,
+            "analog_balance": [
+              1,
+              1,
+              1
+            ],
+            "camera_calibration1": [
+              [
+                0.9967,
+                0,
+                0
+              ],
+              [
+                0,
+                1,
+                0
+              ],
+              [
+                0,
+                0,
+                0.9542
+              ]
+            ],
+            "camera_calibration2": [
+              [
+                0.9967,
+                0,
+                0
+              ],
+              [
+                0,
+                1,
+                0
+              ],
+              [
+                0,
+                0,
+                0.9542
+              ]
+            ],
+            "camera_calibration3": null,
+            "camera_calibration_signature": "com.adobe",
+            "profile_calibration_signature": "com.adobe",
+            "sdk_normalized_pcs_to_camera": [
+              [
+                1.525256904062356,
+                -0.558995840828011,
+                -0.1437621405985778
+              ],
+              [
+                -0.3827651171115871,
+                1.2328436772199116,
+                0.16513672313095765
+              ],
+              [
+                -0.031306253835659784,
+                0.1235167071676825,
+                0.3803502953647197
+              ]
+            ],
+            "camera_to_xyz_d50": [
+              [
+                0.567422955426878,
+                0.34679138235543816,
+                0.4112258609829244
+              ],
+              [
+                0.2729187073511678,
+                0.7301785322925359,
+                0.13102247387757213
+              ],
+              [
+                0.10532524254182844,
+                0.0019590829836380495,
+                1.8165062146353772
+              ]
+            ],
+            "xyz_d50_to_acescg": [
+              [
+                1.59261603754023,
+                -0.35185123222912396,
+                -0.22288268229721614
+              ],
+              [
+                -0.675958396892256,
+                1.6393565015022566,
+                0.015109912160560601
+              ],
+              [
+                0.019953524116932287,
+                -0.02254715081984889,
+                1.2159743755297239
+              ]
+            ],
+            "camera_to_acescg": [
+              [
+                0.7841849428301055,
+                0.2949546552153987,
+                0.20395670484166706
+              ],
+              [
+                0.06544820113060693,
+                0.9626359788699108,
+                -0.03573178001429484
+              ],
+              [
+                0.13324134439672278,
+                -0.007161540574002002,
+                2.214076231642437
+              ]
+            ],
+            "cat": "linear Bradford D50->D60; AP1 inverse primaries matrix",
+            "white_balance_normalization": "max camera-neutral component=1; SDK PCS-to-camera white saturation normalization",
+            "method_requested": "dng-camera-to-pcs",
+            "method_effective": "dng-camera-to-pcs-forward-matrix",
+            "camera_model": "Canon EOS R7",
+            "forward_matrix_present": true,
+            "forward_matrix1": [
+              [
+                0.4475,
+                0.3644,
+                0.1524
+              ],
+              [
+                0.20270000000000002,
+                0.7486,
+                0.048600000000000004
+              ],
+              [
+                0.07250000000000001,
+                0.0014,
+                0.7513000000000001
+              ]
+            ],
+            "forward_matrix2": [
+              [
+                0.459,
+                0.2857,
+                0.21960000000000002
+              ],
+              [
+                0.2642,
+                0.666,
+                0.0698
+              ],
+              [
+                0.12190000000000001,
+                0.0039000000000000003,
+                0.6994
+              ]
+            ],
+            "forward_matrix3": null,
+            "hue_sat_map_present": true,
+            "look_table_present": true,
+            "tone_curve_present": false,
+            "hue_sat_map_applied": true,
+            "look_table_applied": false,
+            "tone_curve_applied": false,
+            "baseline_exposure_applied": false,
+            "forward_matrix_used": true,
+            "matrix_scope": "camera_to_* matrices describe the pre-HueSatMap transform",
+            "profile_correction": {
+              "space": "linear ProPhoto RGB / D50",
+              "dimensions": [
+                90,
+                30,
+                1
+              ],
+              "encoding": 0,
+              "hdr_policy": "homogeneous scale normalization; no value clipping",
+              "negative_policy": "negative ProPhoto pixels bypass HSV; signed matrix result preserved",
+              "negative_bypass_pixels": 0,
+              "position": "before user EV and reference gain; no look/tone/baseline exposure"
+            }
+          },
+          "quantization": {
+            "dtype": "f32",
+            "pixel_format": "rgbf32le",
+            "negative_policy": "preserve",
+            "upper_policy": "preserve",
+            "negative_samples": 1101,
+            "above_legacy_upper_samples": 0,
+            "transfer": "linear; no OETF"
+          },
+          "pixels_sha256": "d682ea9ebd07d2512d4a18114ab4ca6b5bed31d4a912e3a002ded72654d706dc"
+        },
+        {
+          "source": "/Users/ibobby/Temp/tl/pair/test/R7_L2220.CR3",
+          "source_sha256": "98aa5f224a65c676066b36e1ed58b36d6e2182ee64f41a917778b54a71cb481c",
+          "exposure_ev": 0,
+          "gain": 1,
+          "white_balance_source": "as-shot",
+          "as_shot_neutral": [
+            0.61244,
+            1,
+            0.583144
+          ],
+          "applied_white_balance": [
+            0.61244,
+            1,
+            0.583144
+          ],
+          "color": {
+            "method": "DNG SDK CameraToPCS plus profile HueSatMap",
+            "selected_white_xy": [
+              0.35641960811360557,
+              0.36441837771078783
+            ],
+            "profile_index": 0,
+            "profile_name": "Adobe Standard",
+            "profile_fingerprint": "0C2FA6EA1F25BFF1C21E2C32CB3CF945",
+            "algorithm_revision": 2,
+            "calibration_illuminants": [
+              17,
+              21,
+              0
+            ],
+            "color_matrix1": [
+              [
+                1.2649000000000001,
+                -0.646,
+                -0.0013000000000000002
+              ],
+              [
+                -0.3506,
+                1.0855000000000001,
+                0.30610000000000004
+              ],
+              [
+                -0.01,
+                0.0741,
+                0.7311000000000001
+              ]
+            ],
+            "color_matrix2": [
+              [
+                1.0424,
+                -0.3138,
+                -0.13
+              ],
+              [
+                -0.42210000000000003,
+                1.1938,
+                0.2584
+              ],
+              [
+                -0.054700000000000006,
+                0.1658,
+                0.6183000000000001
+              ]
+            ],
+            "color_matrix3": null,
+            "analog_balance": [
+              1,
+              1,
+              1
+            ],
+            "camera_calibration1": [
+              [
+                0.9967,
+                0,
+                0
+              ],
+              [
+                0,
+                1,
+                0
+              ],
+              [
+                0,
+                0,
+                0.9542
+              ]
+            ],
+            "camera_calibration2": [
+              [
+                0.9967,
+                0,
+                0
+              ],
+              [
+                0,
+                1,
+                0
+              ],
+              [
+                0,
+                0,
+                0.9542
+              ]
+            ],
+            "camera_calibration3": null,
+            "camera_calibration_signature": "com.adobe",
+            "profile_calibration_signature": "com.adobe",
+            "sdk_normalized_pcs_to_camera": [
+              [
+                1.147003566197717,
+                -0.4109240830213522,
+                -0.10021335152598974
+              ],
+              [
+                -0.4010779562138951,
+                1.1733725941101112,
+                0.25861587043498513
+              ],
+              [
+                -0.04037743336542847,
+                0.13497388211791425,
+                0.590356547547156
+              ]
+            ],
+            "camera_to_xyz_d50": [
+              [
+                0.7436185992236722,
+                0.31017214524810965,
+                0.3407421771735907
+              ],
+              [
+                0.4001722543924239,
+                0.691709610443215,
+                0.10839328567912851
+              ],
+              [
+                0.17393645446181774,
+                0.0031222077580570235,
+                1.226895500992913
+              ]
+            ],
+            "xyz_d50_to_acescg": [
+              [
+                1.59261603754023,
+                -0.35185123222912396,
+                -0.22288268229721614
+              ],
+              [
+                -0.675958396892256,
+                1.6393565015022566,
+                0.015109912160560601
+              ],
+              [
+                0.019953524116932287,
+                -0.02254715081984889,
+                1.2159743755297239
+              ]
+            ],
+            "camera_to_acescg": [
+              [
+                1.004730382605223,
+                0.24991036810141964,
+                0.2310793847417829
+              ],
+              [
+                0.15599791527697401,
+                0.9243423572541049,
+                -0.034094014988376754
+              ],
+              [
+                0.2173173390757671,
+                -0.005610528900715862,
+                1.496228538149908
+              ]
+            ],
+            "cat": "linear Bradford D50->D60; AP1 inverse primaries matrix",
+            "white_balance_normalization": "max camera-neutral component=1; SDK PCS-to-camera white saturation normalization",
+            "method_requested": "dng-camera-to-pcs",
+            "method_effective": "dng-camera-to-pcs-forward-matrix",
+            "camera_model": "Canon EOS R7",
+            "forward_matrix_present": true,
+            "forward_matrix1": [
+              [
+                0.4475,
+                0.3644,
+                0.1524
+              ],
+              [
+                0.20270000000000002,
+                0.7486,
+                0.048600000000000004
+              ],
+              [
+                0.07250000000000001,
+                0.0014,
+                0.7513000000000001
+              ]
+            ],
+            "forward_matrix2": [
+              [
+                0.459,
+                0.2857,
+                0.21960000000000002
+              ],
+              [
+                0.2642,
+                0.666,
+                0.0698
+              ],
+              [
+                0.12190000000000001,
+                0.0039000000000000003,
+                0.6994
+              ]
+            ],
+            "forward_matrix3": null,
+            "hue_sat_map_present": true,
+            "look_table_present": true,
+            "tone_curve_present": false,
+            "hue_sat_map_applied": true,
+            "look_table_applied": false,
+            "tone_curve_applied": false,
+            "baseline_exposure_applied": false,
+            "forward_matrix_used": true,
+            "matrix_scope": "camera_to_* matrices describe the pre-HueSatMap transform",
+            "profile_correction": {
+              "space": "linear ProPhoto RGB / D50",
+              "dimensions": [
+                90,
+                30,
+                1
+              ],
+              "encoding": 0,
+              "hdr_policy": "homogeneous scale normalization; no value clipping",
+              "negative_policy": "negative ProPhoto pixels bypass HSV; signed matrix result preserved",
+              "negative_bypass_pixels": 0,
+              "position": "before user EV and reference gain; no look/tone/baseline exposure"
+            }
+          },
+          "quantization": {
+            "dtype": "f32",
+            "pixel_format": "rgbf32le",
+            "negative_policy": "preserve",
+            "upper_policy": "preserve",
+            "negative_samples": 76,
+            "above_legacy_upper_samples": 0,
+            "transfer": "linear; no OETF"
+          },
+          "pixels_sha256": "3016e9b5a3d3c633dd4eff91534761bd98a4cbf4405b0839bb1409ec5a9953d9"
+        }
+      ]
+    }
+  ],
+  "canon_log2_log3_same_fp32_pixels": true,
+  "final_binary_identity": {
+    "native/build/dng-linear-frame": "2bb745a8b52640f1cf52fd54605d710e5aea5bbdffe9c4a4009352cd34c3345b",
+    "pipeline/target/release/rawtl-linear-video": "1f07ba56ee92823bed5e7b497ba1260ef2f9d10866cad1ebfa876b95ba1873c5"
+  },
+  "validation": {
+    "rust_test_functions_passed": 251,
+    "rust_groups": [
+      143,
+      64,
+      3,
+      38,
+      3
+    ],
+    "rust_log": "/private/tmp/rawtl-hsm-tests.log",
+    "native_groups_passed": 4,
+    "native_log": "/private/tmp/rawtl-hsm-final-native-tests.log",
+    "additional_value_scale_hdr_test": "/private/tmp/rawtl-hsm-value-hdr-test.log",
+    "contract_fault_cases": 104,
+    "native_release_build": "/private/tmp/rawtl-hsm-final-native-build.log",
+    "rust_release_build": "/private/tmp/rawtl-hsm-final-release.log",
+    "additional_native_assertions": [
+      "ValueScale >1 HDR retention",
+      "calibrated analysis vs FP32 pixel agreement",
+      "uncalibrated camera-domain saturation mask retained"
+    ]
+  },
+  "export_build_note": "CLog3 review export preceded only a descriptive transfer.document wording update (matrix-only CR3 adaptation -> camera-profile calibrated CR3 adaptation); same numerical calibration/transfer logic. CLog2 control uses the final release. Actual export metadata is preserved in its manifest.",
+  "limits": [
+    "No color-chart DeltaE or absolute physical camera calibration.",
+    "Residual Resolve chroma-amplitude ratio difference about 4-9% on this pair, not a pixel match.",
+    "Reference ICC Rec.709 tags ignored when interpreting the user-confirmed Log signal samples.",
+    "Camera movie registration differs in WB/exposure/capture/readout; diagnostic cross-check only.",
+    "Camera gamma/gamut transfer recovered exactly does not imply official Canon CR3 upstream pipeline.",
+    "No extra 3EV compensation, no deflicker, no unified WB.",
+    "Final video is 8bit H264 4:2:0."
+  ]
+}
