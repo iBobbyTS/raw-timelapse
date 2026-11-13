@@ -87,12 +87,14 @@ RESOLUTION:
 
 SCRATCH AND FAILURE:
     A run-specific scratch directory (<video dir>/.rawtl-<name>-<pid>-<nonce>) holds
-    the converted LinearRaw DNG cache and child-process transcripts. It is removed
-    after a successful publication; on failure or stop it is retained and named in
-    the log together with any partial output. Converting and caching a long
-    full-resolution sequence needs disk space for the cache peak. A failed run must
-    be re-run from the source: there is no checkpoint, resume or automatic
-    recovery, and an earlier cache is never picked up again.
+    the converted LinearRaw DNG cache and child-process transcripts. The graph owns
+    deletion: the scratch is removed after a successful publication when its delete
+    nodes consumed every generated cache file; a custom graph that leaves generated
+    DNGs keeps the scratch and the log names the retained cache. On failure or stop
+    the scratch is retained and named in the log together with any partial output.
+    Converting and caching a long full-resolution sequence needs disk space for the
+    cache peak. A failed run must be re-run from the source: there is no checkpoint,
+    resume or automatic recovery, and an earlier cache is never picked up again.
 
 MIGRATION:
     --output used to name a run directory. Pass the video file instead; the log is

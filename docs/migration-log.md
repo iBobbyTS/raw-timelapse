@@ -575,3 +575,24 @@ native 新增回归覆盖：非 TIFF 输入与 TIFF 无 DNGVersion（CR2/NEF/ARW
   对照属于 Main 的最终候选验收，本条目未运行；Windows/Linux、其它 FFmpeg 版本、
   磁盘写满/断电故障注入未测。本条目记录本地实现与检查证据，不代表独立评审或
   Feature 验收；提交由 Main 负责。
+### 修复（blind review B1-01 / B1-02，2026-11-13）
+
+- B1-01（悬空符号链接被覆盖）：`guard.rs` 与 `video.rs` 的占用判断改用
+  `symlink_metadata`；任何已存在的目录项（含指向缺失目标的链接）都被视为已占用，
+  其他元数据错误显式报错。预检拒绝退出 12，发布拒绝仍为 70，链接与其目标原样
+  保留，且在创建日志/scratch/RAW 工作之前拒绝。回归：guard 单测、publish 单测、
+  CLI 悬空视频链接用例（先在修复前代码上确认失败：exit 0 并替换链接；修复后
+  exit 12 且 `is_symlink=true` 不变）。
+- B1-02（自定义图删除权）：恢复 S03 合同——成功路径仅在图的 delete 节点消费了全部
+  run 生成缓存时删除 scratch；`graph_run` 重新跟踪生成的 prepared 路径并在
+  `EncodedStage.retained_cache` 返回仍存在的文件，`main` 据此保留 scratch/cache
+  并写 `kind=retained-cache count=… path=…`（stdout 同步提示）。默认图仍完全清理；
+  自定义无 delete 图保留生成缓存且原始源不受影响。回归：graph_configuration 的
+  no-delete 用例恢复“生成缓存存活”断言（修复前失败），默认图清理断言保持不变。
+- 文档：`--help`、`pipeline/README.md`、`docs/node-graph-workflow.md` 更新为
+  “graph 拥有删除权”的成功清理语义。
+- 检查（修复后）：`cargo test --manifest-path pipeline/Cargo.toml` 退出码 0（见
+  `.agent-work/tmp/node-graph-product/cli-surface/repair-full-suite.*`）；
+  `cargo build --release` 退出码 0（`repair-release-build.*`）。修复前失败日志见
+  `prerepair-dangling-integration.*`、`prerepair-dangling-units.*`、
+  `prerepair-custom-cache.*`。未覆盖项与上条相同。

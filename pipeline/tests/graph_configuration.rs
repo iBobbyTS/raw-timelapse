@@ -63,6 +63,30 @@ fn cr3_material(root: &Path, fixtures: &Path) -> (PathBuf, PathBuf) {
     (input, fake_native_tool(fixtures, &frames, None, false))
 }
 
+/// Generated cache payloads: every regular file under the cache except the
+/// prepared-context sidecars. The native producer keeps the source file name
+/// (and its extension) for a converted LinearRaw payload, so filtering by a
+/// `.dng` suffix would miss vendor RAW sources.
+fn cache_payloads(directory: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    fn walk(directory: &Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, files);
+            } else if path.file_name().and_then(|name| name.to_str()) != Some("prepared.context") {
+                files.push(path);
+            }
+        }
+    }
+    walk(directory, &mut files);
+    files.sort();
+    files
+}
+
 #[test]
 fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
     let root = test_dir("graph-config");
@@ -129,14 +153,37 @@ fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
             > base_pixel.iter().map(|v| *v as u32).sum::<u32>() + 60
     );
 
-    // Without a delete node no cache deletion is dispatched; original sources
-    // are never a deletion target and the run scratch still disappears.
+    // Without a delete node no cache deletion is dispatched: the graph owns
+    // deletion, so the generated cache survives the successful run, the log
+    // names the retained location, and the original sources stay untouched.
     let mut retained = graph();
     nodes(&mut retained).pop();
     let retained = run(&root, "retained", &input, &tool, &retained);
     let retained_log = read_log(&retained);
     assert!(log_kind(&retained_log, "delete").is_empty(), "{retained_log}");
-    assert!(!scratch_from_log(&retained_log).exists());
+    let retained_scratch = scratch_from_log(&retained_log);
+    assert!(
+        retained_scratch.is_dir(),
+        "a custom graph without delete must retain its generated cache"
+    );
+    let generated = cache_payloads(&retained_scratch.join("cache"));
+    assert_eq!(generated.len(), 3, "generated cache payloads: {generated:?}");
+    for path in &generated {
+        assert!(path.is_file(), "{}", path.display());
+    }
+    let retained_lines = log_kind(&retained_log, "retained-cache");
+    assert_eq!(retained_lines.len(), 1, "{retained_log}");
+    assert_eq!(
+        log_field(retained_lines[0], "count"),
+        Some("3"),
+        "{retained_log}"
+    );
+    assert_eq!(
+        log_field(retained_lines[0], "path").map(PathBuf::from),
+        Some(retained_scratch.join("cache")),
+        "{retained_log}"
+    );
+    assert!(retained.join(VIDEO_NAME).is_file());
     for id in 1..=3 {
         assert!(input.join(format!("IMG_{id}.CR3")).is_file());
     }

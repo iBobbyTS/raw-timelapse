@@ -46,6 +46,7 @@ struct Runner<'a, 'b> {
     source_geometry: Option<(u32, u32)>,
     resize_target: Option<(u32, u32)>,
     resize: Option<ResizeRecord>,
+    generated_paths: Vec<std::path::PathBuf>,
     encoder: video::GraphEncoder,
     failure: Option<Error>,
 }
@@ -134,6 +135,9 @@ impl Backend for Runner<'_, '_> {
             self.reference_wb = Some(prepared.as_shot_neutral);
         }
         self.capture_times.push(prepared.capture_time.clone());
+        if prepared.generated {
+            self.generated_paths.push(prepared.dng.clone());
+        }
         let written = self.log.line(&format!(
             "kind=prepare frame={} source={} route={} generated={} cache={} duration={:.3}",
             id + 1,
@@ -539,6 +543,7 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         source_geometry: None,
         resize_target: explicit_resize,
         resize: None,
+        generated_paths: vec![],
         encoder: video::GraphEncoder::new(config.clone(), context.sources.len(), &output_name),
         failure: None,
     };
@@ -608,6 +613,17 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         context.options.log_reference_gain,
     )
     .map_err(|e| Error::new(EXIT_VALIDATION, e.to_string()))?;
+    // The graph owns cache deletion. Files that a custom graph did not delete
+    // are retained (and named by the success log); the default graph deletes
+    // every generated cache DNG, leaving this list empty.
+    let mut retained_cache: Vec<std::path::PathBuf> = runner
+        .generated_paths
+        .iter()
+        .filter(|path| fs::symlink_metadata(path).is_ok())
+        .cloned()
+        .collect();
+    retained_cache.sort();
+    retained_cache.dedup();
     Ok(Output {
         sequence,
         stage: EncodedStage {
@@ -616,6 +632,7 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
             timings,
             video_artifact: artifact,
             resize: runner.resize,
+            retained_cache,
         },
     })
 }

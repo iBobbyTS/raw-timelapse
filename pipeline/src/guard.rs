@@ -96,16 +96,39 @@ pub fn canonical_artifact(path: &Path) -> Result<PathBuf> {
         })?,
     };
     let resolved = canonical_directory(&parent)?.join(file_name);
-    if resolved.exists() && !resolved.is_file() {
-        return Err(Error::new(
-            EXIT_OUTPUT_GUARD,
-            format!(
-                "output path exists and is not a regular file: {}",
-                resolved.display()
-            ),
-        ));
+    if let Some(metadata) = existing_entry(&resolved)? {
+        let file_type = metadata.file_type();
+        // Symlinks (including dangling ones) are left for `ensure_absent` to
+        // refuse as occupied entries; only non-file entries that cannot be a
+        // deliverable are rejected here.
+        if !file_type.is_file() && !file_type.is_symlink() {
+            return Err(Error::new(
+                EXIT_OUTPUT_GUARD,
+                format!(
+                    "output path exists and is not a regular file: {}",
+                    resolved.display()
+                ),
+            ));
+        }
     }
     Ok(resolved)
+}
+
+/// Inspect one deliverable path without following a final symlink.
+///
+/// `Path::exists()` follows links and reports a dangling symlink as absent,
+/// which would let publication replace the user's directory entry. Any
+/// `symlink_metadata` result means the entry is occupied; other metadata
+/// errors are reported instead of being mistaken for absence.
+fn existing_entry(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(Error::new(
+            EXIT_OUTPUT_GUARD,
+            format!("cannot inspect output path {}: {err}", path.display()),
+        )),
+    }
 }
 
 /// Create the missing parent directories of one deliverable file.
@@ -127,7 +150,7 @@ pub fn prepare_parent(path: &Path) -> Result<()> {
 /// Refuse to overwrite an existing deliverable (video or log).
 pub fn ensure_absent(artifacts: &[&Path]) -> Result<()> {
     for artifact in artifacts {
-        if artifact.exists() {
+        if existing_entry(artifact)?.is_some() {
             return Err(Error::new(
                 EXIT_OUTPUT_NOT_EMPTY,
                 format!(
@@ -254,6 +277,24 @@ mod tests {
         let log = root.join("timelapse.log");
         assert!(ensure_absent(&[&video, &log]).is_err());
         assert!(ensure_absent(&[&log]).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symbolic_link_counts_as_an_occupied_output_entry() {
+        let root = temp_root("dangling-link");
+        let link = root.join("output.mov");
+        std::os::unix::fs::symlink("missing-target.mov", &link).expect("dangling link");
+        assert!(!link.exists(), "the fixture link must dangle");
+        let error = ensure_absent(&[&link]).expect_err("dangling link must be occupied");
+        assert_eq!(error.code, EXIT_OUTPUT_NOT_EMPTY);
+        assert!(error.message.contains("refusing to overwrite"), "{error:?}");
+        let metadata = fs::symlink_metadata(&link).expect("link metadata");
+        assert!(metadata.file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(&link).expect("link target"),
+            PathBuf::from("missing-target.mov")
+        );
     }
 
     #[test]
