@@ -1,60 +1,89 @@
-# Pure V4 deflicker engine
+# Pure exposure engine
 
-This library ports the pure algorithms from `main-legacy @f6d3ae7`. It uses
-`f64`, the standard library only, and no I/O or child processes. Public numerical
-operations return `Result` for malformed shapes/configuration. Missing legacy
-observations remain NaN internally; report serializers write them as JSON null.
+This standard-library-only library retains the V4 smooth/uniform, strength,
+period, ROI, confirmed-step and EV-limit semantics. Numerical operations use
+`f64`, validate shapes/configuration and return errors for malformed inputs.
+Missing observations remain NaN internally; serializers use JSON null.
 
-`measurement::AnalysisSidecar::parse` consumes S01 schema 1 (top-level tiles,
-actual grid dimensions, ragged structure samples). Match source identity using
-`measurement.source_sha256`. Camera saturation gates and delivered output clip
-occupancy are independent arrays. Exclusion boxes are `[x0,y0,x1,y1]`; sidecar
-analysis ROI is `[x,y,width,height]`.
+`measurement::AnalysisSidecar::parse` consumes schema 2 measurements in signed
+scene-linear AP1/D60. Source hashes are retained. Camera saturation and gained
+analysis highlight occupancy have separate meanings. Exclusion boxes are
+`[x0,y0,x1,y1]`; the native analysis ROI is `[x,y,width,height]`.
 
-`estimate_exposure(&measurements, &ExposureConfig)` returns frames, original
-tiles, consensus, trusted indices, frozen targets, scene-cut metadata and graph
-summary. Defaults are smooth / pairwise / period 60 / strength 1 / unbounded EV.
-Scene cuts and time gaps do not split estimation. Confirmed steps preserve
-smooth intent; uniform intent flattens all measured evolution. Legacy estimator
-selection retains the older tile-trend and per-frame uniform behavior.
+`estimate_exposure(&measurements, &ExposureConfig)` returns an ordered, complete
+finite estimate for every input frame. Defaults are smooth / pairwise /
+period 60 / strength 1 / unbounded EV. Smooth retains low-frequency evolution
+and confirmed steps; uniform flattens measured evolution. Legacy selection
+retains the tile-trend estimator; missing legacy gains now use conservative
+neighbour interpolation/hold, or zero when nothing was observed. Missing
+support never authorizes a large absolute-level correction.
 
-The graph solver eliminates the first node of each component as its gauge and
-uses deterministic Jacobi-preconditioned conjugate gradients on sparse weighted
-incidence normal equations. Weights are normalized by their global median. Each
-CG solve targets relative L2 residual 1e-12 with `4*free_nodes+64` iterations;
-the recomputed true residual must be <=1e-10 and all values finite. Every inner
-solve records component, IRLS round, iterations, residual and convergence. A
-failure sets graph `converged=false`; it is never silently marked converged.
-Huber IRLS uses delta 0.02, at most eight rounds, and successive-solution change
-<1e-10. Lone nodes retain NaN. This is a solver substitution, not a claim of
-SciPy bit identity.
+The primary pair graph retains its structure, chroma, saturation, support and
+spatial gates. Its sparse solver eliminates one gauge per component and uses
+Jacobi-preconditioned conjugate gradients and bounded Huber IRLS. A graph with
+no edges still contains each frame as a singleton, with unknown brightness.
 
-`trends::solve_weighted` uses bandwidth-two Cholesky for `W + lambda D2' D2`.
-Missing values are zeroed before forming the RHS. Huber-Whittaker retains delta
-0.1, at most 100 iterations, change <=1e-5, at least eight valid observations,
-and `lambda = 1/(16*sin(pi/P)^4)`. Solves use O(N) storage.
+Component placement is a second, small offset-only solve. Every actual adjacent
+frame transition between primary components contributes a constraint. Coherent
+shared-tile luminance differences constrain offsets without requiring a tile
+that persists throughout the sequence. This preserves primary within-component
+differences and handles interleaved components, arbitrary gauge constants,
+component numbering and singleton frames. Persistent background is computed
+only after placement. A zero-persistent sequence remains untrusted even when
+local observations support a useful correction.
 
-`validation::evaluate_render` compares consensus tile levels to the frozen desired
-levels through one shared median offset. `feedback_update` changes only applied
-EVs. S03 owns the render loop, best-state preservation and the limit of
-`MAX_FEEDBACK_UPDATES=2`; the pure update function itself follows legacy and has
-no orchestration counter. All-unobservable validation has no statistics and
-`passed=false`. The service must distinguish that case from partial evidence.
+`pairwise::local_common_change` measures shared valid, adequately lit,
+unsaturated in-ROI tile differences. It requires at least max(24, grid/4)
+tiles, 60% agreement within 0.06 EV, scaled MAD <=0.06 EV and three quadrants.
+It measures common luminance change, not its physical cause. It deliberately
+does not assert fine-structure/chroma constancy or persistent background.
+Without this evidence, low-weight fallback constraints preserve correction
+continuity for smooth, or use the declared whole-frame level intent for
+uniform when both frames have enough measurements. Unsupported frames remain
+unverified. A sequence without measurements gets zero correction.
 
-`photometry` accepts decoded arrays. `linear16` means raw integer code divided by
-16384; sRGB/bt709 inverse-transfer inputs are normalized code/65535. It includes
-Gaussian mirror blur, trimmed tiles, matched-pair gates, temporal metrics,
-audit geometry, ROI metrics and pure feature aggregation with boundaries.
-`audit_features` flags common-jump candidates without assigning a physical cause.
-S03 supplies source boundaries and owns decoding/encoding/publication.
+Smooth trends are fitted within groups joined by primary edges or observable
+local transitions, retaining real frame spacing rather than compressing
+non-contiguous members into consecutive samples. Unrelated spatial scene
+baselines do not get smoothed into an exposure ramp. Confirmed steps are
+removed before trend fitting and retained in the desired signal. There is
+one correction gauge for the sequence, not an independent re-anchor per
+component. Huber-Whittaker keeps period-derived lambda and the fixed 100-iterate
+budget. If that tolerance is not reached, one weighted Whittaker solve supplies
+a finite conservative trend, with `TREND_REFERENCE_NONCONVERGED` and no trust;
+there is no extra RAW pass or unbounded retry.
 
-`report::ExposureReport` stores the required JSON fields with caller-supplied
-metadata and process results. Build it from the final exposure state (after
-feedback) or refresh its cloned frames before serialization. Its initial run
-status is PENDING, not success. It performs no writing. S03 owns CSV and file
-publication.
+`estimation::ExposurePlan::from_result` freezes the estimates into a read-only
+ordered slice of `{frame_id, source_sha256, ev}`. It rejects count, identity,
+order, missing-gain and nonfinite/unrepresentable-gain errors. Missing or
+misordered entries are protocol errors, never silently rendered at zero.
+The current run entry uses this handoff before final rendering.
 
-Run `cargo clean` then `cargo test --lib` from `pipeline/`. Engine tests embed all
-input fixtures; they do not depend on Python, `.agent-work`, ffmpeg or network.
-`fixtures/generate.py` documents one-time NumPy fixture generation from the
-frozen legacy synthetic inputs and S01 sample copies. Runtime tests never run it.
+`validation::evaluate_plan` runs before estimation returns and again before
+the current final render handoff. It projects local input changes through the
+actual gains and checks remaining common discontinuities against the intended
+uniform signal or smooth trend/confirmed steps, including intentional partial
+strength and EV limits. Its internal `PlanQuality` records potential pairs,
+evaluated/skipped pairs and residuals above 0.05 EV. It neither raises a user
+quality gate nor triggers another RAW traversal. It does not use the frozen
+per-frame target obtained by adding our own gains; correct gain execution
+alone cannot establish continuity. Render targets include the requested strength,
+so bounded legacy feedback does not turn a partial correction into full strength.
+
+`validation::evaluate_render` retains the old render-target feedback helper.
+Its internal coverage counts every frame, including empty consensus masks,
+missing targets, limited and unobservable frames. All-unobservable validation
+has no error statistics and `passed=false`. This execution check is distinct
+from local plan continuity. The current service owns its bounded feedback
+loop, report compatibility and immutable final snapshot; the pure numerical
+library performs no rendering, encoding or process I/O.
+
+`photometry` supplies decoded-pixel measurement, transfer handling, matched
+pairs and temporal features. The independent encoded-output oracle remains a
+composition check; saved-measurement replay is not encoded-output acceptance.
+
+Tests embed numerical inputs, including the compact
+[exposure-seam fixture](fixtures/exposure-seam.md). They require no photos,
+external disks, Python, ffmpeg or network for the library checks. Run from the
+repository root with `cargo test --manifest-path pipeline/Cargo.toml` after the
+repository-required initial clean.

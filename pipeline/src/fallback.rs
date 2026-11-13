@@ -35,6 +35,7 @@ pub struct FallbackConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FallbackSummary {
+    pub reference_method: &'static str,
     pub filled: usize,
     pub rendered_at_zero_ev: usize,
     pub hole_ranges: Vec<(usize, usize)>,
@@ -45,6 +46,7 @@ pub struct FallbackSummary {
 impl FallbackSummary {
     fn empty() -> Self {
         FallbackSummary {
+            reference_method: "whole-frame valid-tile median log2 level -> Huber-Whittaker trend (uniform intent: segment median) per continuity segment, confirmed steps removed before smoothing, offset-aligned to verified neighbours",
             filled: 0,
             rendered_at_zero_ev: 0,
             hole_ranges: vec![],
@@ -55,22 +57,15 @@ impl FallbackSummary {
 
     pub fn to_json(&self) -> Json {
         Json::obj(vec![
-            (
-                "method",
-                Json::Str(
-                    "whole-frame valid-tile median log2 level -> Huber-Whittaker trend \
-                     (uniform intent: segment median) per continuity segment, confirmed \
-                     steps removed before smoothing, offset-aligned to verified neighbours"
-                        .into(),
-                ),
-            ),
+            ("method", Json::Str(self.reference_method.into())),
             (
                 "provenance",
                 Json::Str(
-                    "concept borrowed from the reverse-engineered LRTimelapse Visual \
-                     Deflicker; all measurement, smoothing and application machinery is \
-                     this system's own"
-                        .into(),
+                    if self.reference_method.starts_with("finite conservative") {
+                        "local component reference and neighbouring finite-gain fallback from the exposure engine".into()
+                    } else {
+                        "concept borrowed from the reverse-engineered LRTimelapse Visual Deflicker; all measurement, smoothing and application machinery is this system's own".into()
+                    },
                 ),
             ),
             ("frames_filled", Json::Int(self.filled as i64)),
@@ -102,6 +97,36 @@ impl FallbackSummary {
             ),
         ])
     }
+}
+
+/// Adapt the legacy report shell to plans that already contain finite
+/// low-support gains. Report their provenance without reopening or changing
+/// the completed mathematical plan.
+pub fn describe_completed_holds(
+    measurements: &[FrameMeasurement],
+    exposure: &mut ExposureResult,
+) -> Result<FallbackSummary, String> {
+    if measurements.len() != exposure.frames.len() {
+        return Err("fallback measurement count mismatch".into());
+    }
+    let mut summary = FallbackSummary::empty();
+    summary.reference_method = "finite conservative gains selected before exposure-plan publication; local reference or neighbouring gain hold, not independently verified";
+    for (t, frame) in exposure.frames.iter_mut().enumerate() {
+        if frame.status != STATUS {
+            continue;
+        }
+        summary.filled += 1;
+        if !measurements[t].valid.iter().any(|v| *v) && frame.applied_ev == Some(0.) {
+            summary.rendered_at_zero_ev += 1;
+        }
+        if let Some(last) = summary.hole_ranges.last_mut().filter(|r| r.1 + 1 == t) {
+            last.1 = t;
+        } else {
+            summary.hole_ranges.push((t, t));
+        }
+        frame.warnings.push("GLOBAL_REFERENCE_FALLBACK: finite conservative gain selected from local reference before plan publication; not verified".into());
+    }
+    Ok(summary)
 }
 
 /// Median with NumPy linear-interpolation percentile semantics (matches the
@@ -161,7 +186,11 @@ pub fn fill_holes(
         }
     }
     let mut summary = FallbackSummary::empty();
-    if !exposure.frames.iter().any(|frame| frame.applied_ev.is_none()) {
+    if !exposure
+        .frames
+        .iter()
+        .any(|frame| frame.applied_ev.is_none())
+    {
         return Ok(summary);
     }
     let steps = step_vector(n, &config.steps)?;
@@ -246,7 +275,9 @@ pub fn fill_holes(
         let valid: Vec<bool> = adjusted.iter().map(|v| v.is_finite()).collect();
         let trend: Option<Vec<f64>> = if config.brightness == "uniform" {
             let target = median(&adjusted);
-            target.is_finite().then(|| vec![target; seg_end - seg_start])
+            target
+                .is_finite()
+                .then(|| vec![target; seg_end - seg_start])
         } else {
             let fit = huber_whittaker(&adjusted, &valid, config.period)?;
             if fit.converged {
@@ -295,7 +326,9 @@ pub fn fill_holes(
             let correction = config.strength * (trend[t - seg_start] - adjusted[t - seg_start]);
             let unaligned_post = level[t - seg_start] + correction;
             let verified_post = frame.measured_level_ev? + frame.applied_ev?;
-            (verified_post - unaligned_post).is_finite().then_some(verified_post - unaligned_post)
+            (verified_post - unaligned_post)
+                .is_finite()
+                .then_some(verified_post - unaligned_post)
         };
         for &anchor in &anchors {
             if !summary.anchor_frames.contains(&anchor) {
@@ -359,8 +392,7 @@ pub fn fill_holes(
                     summary.rendered_at_zero_ev += 1;
                     continue;
                 }
-                let correction =
-                    config.strength * (curve - adjusted[frame_index - seg_start]);
+                let correction = config.strength * (curve - adjusted[frame_index - seg_start]);
                 let delta = deltas[frame_index - run_start];
                 let requested = correction + delta;
                 let applied = match config.ev_limits {
@@ -431,7 +463,12 @@ mod tests {
     fn estimate(index: usize, applied: Option<f64>, measured: Option<f64>) -> FrameEstimate {
         FrameEstimate {
             index,
-            status: if applied.is_some() { "OK".into() } else { "REVIEW_REQUIRED".into() },
+            source_sha256: String::new(),
+            status: if applied.is_some() {
+                "OK".into()
+            } else {
+                "REVIEW_REQUIRED".into()
+            },
             common_residual_ev: None,
             requested_ev: applied,
             applied_ev: applied,
@@ -464,6 +501,7 @@ mod tests {
             scene_cuts: vec![],
             time_gaps: vec![],
             pairwise_summary: Json::Null,
+            plan_quality: Default::default(),
         }
     }
 
@@ -488,8 +526,7 @@ mod tests {
             .collect();
         let mut exposure = result(frames, 96);
         let measurements: Vec<_> = (0..10).map(|_| flat_measurement(-2.0)).collect();
-        let summary =
-            fill_holes(&measurements, &mut exposure, &[], &config()).expect("fill");
+        let summary = fill_holes(&measurements, &mut exposure, &[], &config()).expect("fill");
         assert_eq!(summary, FallbackSummary::empty());
         assert!(exposure.frames.iter().all(|f| f.status == "OK"));
     }
@@ -504,8 +541,7 @@ mod tests {
         let measurements: Vec<_> = levels.iter().map(|v| flat_measurement(*v)).collect();
         let frames: Vec<_> = (0..n).map(|t| estimate(t, None, None)).collect();
         let mut exposure = result(frames, 96);
-        let summary = fill_holes(&measurements, &mut exposure, &[], &config())
-            .expect("fill");
+        let summary = fill_holes(&measurements, &mut exposure, &[], &config()).expect("fill");
         assert_eq!(summary.filled, n);
         assert_eq!(summary.rendered_at_zero_ev, 0);
         assert!(summary.anchor_frames.is_empty());
@@ -526,10 +562,10 @@ mod tests {
             "flicker not removed: before {spread_before:.4} after {spread_after:.4}"
         );
         assert!(exposure.frames.iter().all(|f| f.status == STATUS));
-        assert!(exposure
-            .frames
+        assert!(exposure.frames.iter().all(|f| f
+            .warnings
             .iter()
-            .all(|f| f.warnings.iter().any(|w| w.starts_with("GLOBAL_REFERENCE_FALLBACK"))));
+            .any(|w| w.starts_with("GLOBAL_REFERENCE_FALLBACK"))));
         assert!(exposure
             .frames
             .iter()
@@ -554,8 +590,7 @@ mod tests {
             })
             .collect();
         let mut exposure = result(frames, 96);
-        let summary = fill_holes(&measurements, &mut exposure, &[], &config())
-            .expect("fill");
+        let summary = fill_holes(&measurements, &mut exposure, &[], &config()).expect("fill");
         assert_eq!(summary.filled, 10);
         assert_eq!(summary.anchor_frames.len() >= 2, true);
         for t in 10..20 {
@@ -569,7 +604,8 @@ mod tests {
         }
         // Seam continuity of post-correction levels.
         let post = |t: usize| {
-            exposure.frames[t].measured_level_ev.expect("m") + exposure.frames[t].applied_ev.expect("a")
+            exposure.frames[t].measured_level_ev.expect("m")
+                + exposure.frames[t].applied_ev.expect("a")
         };
         for seam in [9usize, 10usize, 18usize, 19usize] {
             assert!(
@@ -592,11 +628,16 @@ mod tests {
             frame.valid = vec![false; 96];
         }
         let frames: Vec<_> = (0..n)
-            .map(|t| if (8..16).contains(&t) { estimate(t, None, None) } else { estimate(t, Some(0.0), Some(-2.0)) })
+            .map(|t| {
+                if (8..16).contains(&t) {
+                    estimate(t, None, None)
+                } else {
+                    estimate(t, Some(0.0), Some(-2.0))
+                }
+            })
             .collect();
         let mut exposure = result(frames, 96);
-        let summary = fill_holes(&measurements, &mut exposure, &[], &config())
-            .expect("fill");
+        let summary = fill_holes(&measurements, &mut exposure, &[], &config()).expect("fill");
         assert_eq!(summary.filled, 8);
         assert_eq!(summary.rendered_at_zero_ev, 0);
         for t in 8..16 {
@@ -615,16 +656,15 @@ mod tests {
         }
         let frames: Vec<_> = (0..n).map(|t| estimate(t, None, None)).collect();
         let mut exposure = result(frames, 96);
-        let summary = fill_holes(&measurements, &mut exposure, &[], &config())
-            .expect("fill");
+        let summary = fill_holes(&measurements, &mut exposure, &[], &config()).expect("fill");
         assert_eq!(summary.filled, n);
         assert_eq!(summary.rendered_at_zero_ev, n);
         assert!(exposure.frames.iter().all(|f| f.applied_ev == Some(0.0)));
         assert!(exposure.frames.iter().all(|f| f.status == STATUS));
-        assert!(exposure
-            .frames
+        assert!(exposure.frames.iter().all(|f| f
+            .warnings
             .iter()
-            .all(|f| f.warnings.iter().any(|w| w.starts_with("GLOBAL_REFERENCE_UNMEASURED"))));
+            .any(|w| w.starts_with("GLOBAL_REFERENCE_UNMEASURED"))));
     }
 
     #[test]
@@ -636,11 +676,13 @@ mod tests {
         let measurements: Vec<_> = levels.iter().map(|v| flat_measurement(*v)).collect();
         let frames: Vec<_> = (0..n).map(|t| estimate(t, None, None)).collect();
         let mut exposure = result(frames, 96);
-        let summary =
-            fill_holes(&measurements, &mut exposure, &[18], &config()).expect("fill");
+        let summary = fill_holes(&measurements, &mut exposure, &[18], &config()).expect("fill");
         assert_eq!(summary.filled, n);
         assert!(summary.linear_reference_segments >= 1);
-        assert!(exposure.frames.iter().all(|f| f.applied_ev.is_some_and(|v| v.is_finite())));
+        assert!(exposure
+            .frames
+            .iter()
+            .all(|f| f.applied_ev.is_some_and(|v| v.is_finite())));
     }
 
     #[test]
@@ -655,7 +697,10 @@ mod tests {
         let frames: Vec<_> = (0..n).map(|t| estimate(t, None, None)).collect();
         let mut exposure = result(frames, 96);
         let config = FallbackConfig {
-            steps: vec![ExposureStep { start_frame: 10, delta_ev: 1.0 }],
+            steps: vec![ExposureStep {
+                start_frame: 10,
+                delta_ev: 1.0,
+            }],
             ..config()
         };
         fill_holes(&measurements, &mut exposure, &[], &config).expect("fill");
@@ -674,7 +719,13 @@ mod tests {
         let levels: Vec<f64> = (0..n).map(|t| -2.0 + 0.1 * t as f64).collect();
         let measurements: Vec<_> = levels.iter().map(|v| flat_measurement(*v)).collect();
         let frames: Vec<_> = (0..n)
-            .map(|t| if t == 0 { estimate(0, Some(0.0), Some(levels[0])) } else { estimate(t, None, None) })
+            .map(|t| {
+                if t == 0 {
+                    estimate(0, Some(0.0), Some(levels[0]))
+                } else {
+                    estimate(t, None, None)
+                }
+            })
             .collect();
         let mut exposure = result(frames, 96);
         let config = FallbackConfig {

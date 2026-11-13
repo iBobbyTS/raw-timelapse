@@ -79,9 +79,6 @@ pub fn solve_graph_with(
         iterations: 0,
         linear_solves: vec![],
     };
-    if edges.is_empty() {
-        return Ok(r);
-    }
     let mut adj = vec![vec![]; n];
     for e in edges {
         adj[e.i].push(e.j);
