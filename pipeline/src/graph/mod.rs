@@ -443,8 +443,7 @@ impl Graph {
         while done.len() < self.nodes.len() {
             let next = (0..self.nodes.len()).find(|i| {
                 !done.contains(i)
-                    && self.nodes[*i].inputs.values().all(|v| done.contains(v))
-                    && self.nodes[*i].waits.iter().all(|w| done.contains(&w.node))
+                    && self.completion_dependencies(*i).all(|v| done.contains(&v))
             });
             if let Some(i) = next {
                 done.insert(i);
@@ -472,6 +471,25 @@ impl Graph {
         }
         Ok(())
     }
+    /// Include the reader prerequisites enforced by Delete's runtime gate.
+    /// A frame needs those readers finished; sequence completion needs them
+    /// finished for every frame, including when JSON only waits on prepare.
+    fn completion_dependencies(&self, index: usize) -> impl Iterator<Item = usize> + '_ {
+        let node = &self.nodes[index];
+        let readers = self.nodes.iter().enumerate().filter_map(|(i, reader)| {
+            matches!(reader.kind, Kind::Solve | Kind::Develop).then_some(i)
+        });
+        node.inputs
+            .values()
+            .copied()
+            .chain(node.waits.iter().map(|wait| wait.node))
+            .chain(
+                (node.kind == Kind::Delete)
+                    .then_some(readers)
+                    .into_iter()
+                    .flatten(),
+            )
+    }
     fn completion_image_ancestor(
         &self,
         consumer: usize,
@@ -486,11 +504,8 @@ impl Graph {
         }
         // Even a frame-scoped prerequisite must cover the complete inventory
         // before its dependent node can publish sequence completion.
-        self.nodes[target]
-            .inputs
-            .values()
-            .chain(self.nodes[target].waits.iter().map(|wait| &wait.node))
-            .find_map(|producer| self.completion_image_ancestor(consumer, *producer, visited))
+        self.completion_dependencies(target)
+            .find_map(|producer| self.completion_image_ancestor(consumer, producer, visited))
     }
     fn image_ancestor(&self, i: usize, wanted: usize) -> bool {
         self.nodes[i].inputs.values().any(|p| {

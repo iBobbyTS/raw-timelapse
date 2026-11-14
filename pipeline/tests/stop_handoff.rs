@@ -9,12 +9,16 @@ fn caller_cancel_reaps_real_native_converter_group_and_encoder() {
         native.is_file(),
         "build native producer before process-boundary tests"
     );
-    let work = common::test_dir("stop-handoff");
+    let work = common::test_dir("stop-handoff").canonicalize().unwrap();
     let result = std::process::Command::new("/usr/bin/python3")
         .arg(repo.join("pipeline/tests/stop_handoff.py"))
         .arg(env!("CARGO_BIN_EXE_rawtl-linear-video"))
         .arg(native)
-        .arg(work)
+        .arg(&work)
+        // Fixture/tool arguments stay absolute; socket names stay short even
+        // when the assigned work directory exceeds macOS sockaddr_un limits.
+        .current_dir(&work)
+        .env("RAWTL_TEST_WORK", ".")
         .output()
         .unwrap();
     assert!(
