@@ -1028,14 +1028,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                 let mut frame_done = false;
                 let mut close = false;
                 match node.kind {
-                    Kind::Source => {
-                        if id < count {
-                            states[i].next += 1;
-                            frame_done = true;
-                        } else {
-                            close = true;
-                        }
-                    }
+                    Kind::Source => unreachable!("source events are owned by the source drain"),
                     Kind::Prepare => {
                         let p = input("source");
                         if let Some(stage) = batches[i].as_mut() {
