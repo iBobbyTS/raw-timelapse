@@ -20,6 +20,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
+#[cfg(test)]
+#[path = "graph_run_stage_summary_tests.rs"]
+mod stage_summary_tests;
+
 pub struct Output {
     pub sequence: FrameSequence,
     pub stage: EncodedStage,
@@ -700,7 +704,12 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
     let graph_started = Instant::now();
     let result = graph::execute(&graph, context.sources.len(), &mut runner);
     for (node, stats) in &runner.stage_stats {
-        runner.log.line(&format!("kind=stage node={} concurrency={} accepted={} committed={} delivered={} peak_in_flight={}",node,stats.capacity,stats.accepted,stats.committed,stats.delivered,stats.peak))?;
+        let written = runner.log.line(&format!("kind=stage node={} concurrency={} accepted={} committed={} delivered={} peak_in_flight={}",node,stats.capacity,stats.accepted,stats.committed,stats.delivered,stats.peak));
+        // Diagnostics must not replace the graph's selected error or STOP.
+        // With a successful graph, a summary append failure remains fatal.
+        if result.is_ok() {
+            written?;
+        }
     }
     if let Err(message) = result {
         let _ = runner.log.line(&format!(
