@@ -535,7 +535,6 @@ fn validate_conversion(
     }
     require_fields(fields, &allowed)
 }
-#[allow(dead_code)] // S02 will connect the graph scheduler to this adapter.
 fn percent_encode(text: &str) -> String {
     let mut out = String::new();
     for c in text.chars() {
@@ -1000,7 +999,6 @@ pub fn prepare_active(
 }
 
 /// One explicit source identity in an ordered batch (1..64 entries).
-#[allow(dead_code)] // S02 will connect the graph scheduler to this adapter.
 pub struct PrepareBatchItem<'a> {
     pub frame_id: usize,
     pub source: &'a SourceFrame,
@@ -1008,13 +1006,11 @@ pub struct PrepareBatchItem<'a> {
 /// A private, empty batch scratch directory. This adapter owns prepare.request,
 /// prepare.result, batch-native.log and frame_{id}.context in that directory.
 /// The transcript is the batch's unique ActiveNative registration key.
-#[allow(dead_code)] // S02 will connect the graph scheduler to this adapter.
 pub struct PrepareBatchSettings<'a> {
     pub scratch_dir: &'a Path,
     pub converter: Option<&'a str>,
     pub converter_timeout: Option<u64>,
 }
-#[allow(dead_code)] // S02 will connect the graph scheduler to this adapter.
 fn batch_check_stop(active: &ActiveNative) -> Result<()> {
     proc::check_stop()?;
     if active.lock().unwrap().cancelled {
@@ -1024,7 +1020,6 @@ fn batch_check_stop(active: &ActiveNative) -> Result<()> {
 }
 /// Returns the complete validated batch in request order, or no frames. No
 /// caller may load individual contexts as a substitute for this success path.
-#[allow(dead_code)] // S02 will connect the graph scheduler to this adapter.
 pub fn prepare_batch_active(
     tool: &Path,
     items: &[PrepareBatchItem<'_>],
@@ -1101,7 +1096,6 @@ pub fn prepare_batch_active(
     batch_check_stop(&active)?; // Late success cannot revive cancelled work.
     Ok(prepared)
 }
-#[allow(dead_code)] // S02 will connect the graph scheduler to this adapter.
 fn load_batch_result(
     result: &Path,
     expected: &[(usize, PathBuf, PathBuf)],

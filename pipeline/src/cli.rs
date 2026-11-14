@@ -27,12 +27,12 @@ REQUIRED:
                                overwritten; choose a new name or remove the old run first.
 
 OPTIONS:
-    --graph <FILE>            Typed graph JSON (default: prepared-frame graph)
+    --graph <FILE>            Typed graph JSON (default: prepare P1/B32, solve 8, develop 4)
     --fps <N[/D]>              Frame rate as an integer or rational (default: 30)
     --white-balance <MODE>     first-frame | per-frame (default: first-frame)
                                first-frame freezes frame 1's as-shot neutral for the sequence;
                                per-frame decodes every frame with its own RAW as-shot neutral
-    --dng-linear-frame <PATH>  Native single-frame producer (default: native/build/dng-linear-frame)
+    --dng-linear-frame <PATH>  Native frame producer (default: native/build/dng-linear-frame)
     --ffmpeg <PATH>            ffmpeg executable (default: /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg)
     --ffprobe <PATH>           ffprobe executable (default: /opt/homebrew/opt/ffmpeg-full/bin/ffprobe)
     --preview-profile <ID>     Output colour/Log profile (default: srgb-preview)
@@ -55,7 +55,7 @@ OPTIONS:
                                allowed: -preset -tune -vendor -threads -g -bf -level
     --resize <WxH>             Explicit scene-linear resize; omit to keep source geometry
     --converter <PATH>         Adobe DNG Converter override passed to the native tool
-    --converter-timeout <SEC>  Converter timeout override (1-3600 seconds)
+    --converter-timeout <SEC>  Total timeout per ADC call, including batches (1-3600 seconds)
     --verify-output           Verify the encoded output in full after encoding: frame-count
                                decode plus a complete decode (default: container metadata only)
     --strength <0..1>          Correction strength (default: 1.0; 0 disables deflicker)

@@ -1,4 +1,6 @@
 use super::*;
+#[path = "prepare_batch_tests.rs"]
+mod prepare_batch_tests;
 #[derive(Default)]
 struct Fake {
     frame_count: usize,
@@ -10,6 +12,14 @@ struct Fake {
     resizes: Vec<(u32, u32)>,
     zero: bool,
     bad_plan: bool,
+    batches: Vec<Vec<usize>>,
+    prepare_commits: Vec<usize>,
+    batch_defect: Option<&'static str>,
+    batch_stats: Vec<ordered_frames::StageStats>,
+    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
+    trace: Option<std::sync::mpsc::Sender<String>>,
+    batch_completion: Option<std::sync::mpsc::Receiver<usize>>,
+    slow_measure: Option<std::sync::mpsc::Receiver<()>>,
     plan_defect: Option<&'static str>,
 }
 impl Backend for Fake {
@@ -17,6 +27,13 @@ impl Backend for Fake {
     type Measurement = usize;
     type Image = Vec<f32>;
     fn check(&mut self) -> Result<()> {
+        if self
+            .cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Err("controlled run cancelled".into());
+        }
         Ok(())
     }
     fn source_identity(&self, id: usize) -> String {
@@ -26,14 +43,95 @@ impl Backend for Fake {
         self.order.push(format!("prepare {id}"));
         Ok(Box::new(move || Ok(format!("hash{id}"))))
     }
-    fn commit_prepare(&mut self, _: usize, _: &String, _: Duration) -> Result<()> {
+    fn prepare_batch_task(&mut self, ids: &[usize]) -> Result<FrameTask<PreparedBatch<String>>> {
+        self.batches.push(ids.to_vec());
+        self.order
+            .extend(ids.iter().map(|id| format!("prepare {id}")));
+        let ids = ids.to_vec();
+        let trace = self.trace.clone();
+        let completion = self.batch_completion.take();
+        let defect = self.batch_defect;
+        let cancelled = self.cancelled.clone();
+        Ok(Box::new(move || {
+            if let Some(trace) = &trace {
+                trace.send(format!("batch-start {ids:?}")).unwrap();
+            }
+            let order = if let Some(completion) = completion {
+                let mut order = vec![];
+                for _ in &ids {
+                    let id = completion
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(|e| e.to_string())?;
+                    order.push(id);
+                    if let Some(trace) = &trace {
+                        trace.send(format!("adc-complete {id}")).unwrap();
+                    }
+                }
+                order
+            } else {
+                ids.iter().rev().copied().collect()
+            };
+            let mut frames: Vec<_> = order
+                .into_iter()
+                .map(|id| PreparedReference {
+                    frame_id: id,
+                    source: format!("source{id}"),
+                    value: format!("hash{id}"),
+                    elapsed: Duration::ZERO,
+                })
+                .collect();
+            match defect {
+                Some("missing") => {
+                    frames.pop();
+                }
+                Some("duplicate") => {
+                    frames.last_mut().unwrap().frame_id = frames[0].frame_id;
+                }
+                Some("extra") => {
+                    frames.last_mut().unwrap().frame_id = usize::MAX;
+                }
+                Some("source") => {
+                    frames.last_mut().unwrap().source = "wrong-source".into();
+                }
+                Some("last-context") => return Err("last context write failed".into()),
+                Some("late-cancel") => cancelled
+                    .unwrap()
+                    .store(true, std::sync::atomic::Ordering::SeqCst),
+                _ => (),
+            }
+            Ok(PreparedBatch {
+                frames,
+                diagnostics: String::new(),
+            })
+        }))
+    }
+    fn commit_prepare(&mut self, id: usize, _: &String, _: Duration) -> Result<()> {
+        self.prepare_commits.push(id);
+        if let Some(trace) = &self.trace {
+            trace.send(format!("prepare-commit {id}")).unwrap();
+        }
         Ok(())
     }
     fn hash<'a>(&self, r: &'a String) -> &'a str {
         r
     }
     fn measure_task(&mut self, id: usize, _: &String) -> Result<FrameTask<usize>> {
-        Ok(Box::new(move || Ok(id)))
+        let gate = if id == 0 {
+            self.slow_measure.take()
+        } else {
+            None
+        };
+        let trace = self.trace.clone();
+        Ok(Box::new(move || {
+            if let Some(trace) = &trace {
+                trace.send(format!("measure-start {id}")).unwrap();
+            }
+            if let Some(gate) = gate {
+                gate.recv_timeout(Duration::from_secs(10))
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(id)
+        }))
     }
     fn commit_measure(
         &mut self,
@@ -138,6 +236,12 @@ impl Backend for Fake {
     fn delete(&mut self, id: usize, _: &String) -> Result<()> {
         self.order.push(format!("delete {id}"));
         self.deleted.push(id);
+        Ok(())
+    }
+    fn activity(&mut self, node: &str, stats: ordered_frames::StageStats) -> Result<()> {
+        if node == "convert-cache" {
+            self.batch_stats.push(stats);
+        }
         Ok(())
     }
     fn event(&mut self, e: &Event) -> Result<()> {
@@ -434,6 +538,15 @@ fn last_measurement_and_unread_sink_are_controlled_by_events() {
         fn prepare_task(&mut self, id: usize) -> Result<FrameTask<String>> {
             std::fs::write(self.root.join(format!("{id}.dng")), b"generated").unwrap();
             self.fake.prepare_task(id)
+        }
+        fn prepare_batch_task(
+            &mut self,
+            ids: &[usize],
+        ) -> Result<FrameTask<PreparedBatch<String>>> {
+            for id in ids {
+                std::fs::write(self.root.join(format!("{id}.dng")), b"generated").unwrap();
+            }
+            self.fake.prepare_batch_task(ids)
         }
         fn commit_prepare(&mut self, _: usize, _: &String, _: Duration) -> Result<()> {
             Ok(())

@@ -101,6 +101,8 @@ fn main() {
 }
 
 fn run() -> Result<(), (i32, String)> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().is_some_and(|s| s == "--prepare-batch") { return run_prepare_batch(&args); }
     let options = parse_args()?;
     let config_path = env::var("FAKE_NATIVE_CONFIG")
         .map_err(|_| (2, "FAKE_NATIVE_CONFIG is not set".to_string()))?;
@@ -638,6 +640,37 @@ fn run_prepare(
     }
     fs::write(&prepare.emit, text)
         .map_err(|error| (26, format!("cannot write prepared context: {error}")))?;
+    Ok(())
+}
+
+/// Test fixture adapter for the exact accepted request/result protocol. The
+/// native CTest/graph handshake tests exercise real ADC batching separately.
+fn run_prepare_batch(args: &[String]) -> Result<(), (i32, String)> {
+    let request = fs::read_to_string(&args[1]).map_err(|e| (26, e.to_string()))?;
+    let fields: std::collections::BTreeMap<_, _> = request.lines().skip(1).map(|line| {
+        let (key, value) = line.split_once('=').unwrap();
+        Ok((key.to_string(), percent_decode(value)?))
+    }).collect::<Result<_, (i32, String)>>()?;
+    let scratch = PathBuf::from(&args[3]);
+    let result = PathBuf::from(&args[5]);
+    let count: usize = fields["count"].parse().unwrap();
+    let mut text = format!("rawtl-prepare-result/1\ncount={count}\n");
+    for i in 0..count {
+        let source = &fields[&format!("item{i}_source")];
+        let context = &fields[&format!("item{i}_context")];
+        let id = &fields[&format!("item{i}_id")];
+        let child = scratch.join(format!("fixture-{id}"));
+        fs::create_dir(&child).map_err(|e| (26, e.to_string()))?;
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args(["--prepare", source, "--scratch", child.to_str().unwrap(), "--emit-prepared", context]).output().map_err(|e| (26,e.to_string()))?;
+        if !output.status.success() { return Err((output.status.code().unwrap_or(26), String::from_utf8_lossy(&output.stderr).into())); }
+        let sha = digest::sha256(&read_file(Path::new(source))?);
+        for (key,value) in [("id",id.as_str()),("source",source.as_str()),("source_sha256",sha.as_str()),("context",context.as_str())] {
+            text.push_str(&format!("item{i}_{key}={}\n",percent_encode(value)));
+        }
+    }
+    fs::write(result,text).map_err(|e|(26,e.to_string()))?;
+    eprintln!("prepare batch count={count} adc_calls=0 conversion_and_output_verification_s=0 metadata_verification_s=0 total_s=0");
     Ok(())
 }
 

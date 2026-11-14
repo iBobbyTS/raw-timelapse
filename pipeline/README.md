@@ -90,7 +90,9 @@ The log is line-oriented; every entry carries `wall=<epoch seconds>` and
 
 - `run.start`, `settings`, `inventory`, `graph`, `encoder`, `colour`
 - `prepare`, `measure`, `develop` (frame, EV, applied/own white balance,
-  pixel count and digest, per-call duration)
+  pixel count and digest, duration; prepare timing depends on its mode)
+- `prepare.batch` (batch ID, first/last frame, count, actual ADC calls, conversion,
+  verification and total wall time)
 - `node` completion events for every declared node and frame
 - `delete` events naming each deleted cache DNG
 - `exposure` events for an explicit exposure node
@@ -135,8 +137,9 @@ source -> convert-cache --prepared references--> measure-solve -> apply-ev
                        delete-cache (waits apply-ev frame completion) -----+
 ```
 
-- `prepare` (`convert-cache`) runs once per source (`dng-linear-frame --prepare`) and keeps only a
-  cache reference table; it is never blocked by the EV branch.
+- `prepare` (`convert-cache`) defaults to one bounded native batch of up to 32 sources
+  (`dng-linear-frame --prepare-batch`). Each successful batch publishes source-ordered
+  references; it can overlap the next batch with measurements of earlier frames.
 - `measure-solve` measures independent frames concurrently, then seals the full
   frame inventory and publishes one EV table. `--strength 0` replaces it with a zero plan.
 - `develop` applies the plan EV exactly once and returns owned FP32 pixels; the
@@ -155,10 +158,21 @@ Set concurrency per node in the graph JSON:
 `prepare`, `develop`, `identity`, `exposure`, `resize`, `color`, and the
 measurement phase of `solve` accept integer `concurrency` values from 1 to 64;
 omission means 1. Source, references, barrier, zero, encode and delete only
-accept 1. The built-in graph explicitly uses Prepare=4, Solve measurement=8,
-Develop=4, and 1 for all other nodes. The final Solve operation still runs once.
+accept 1. Prepare also accepts `batch_size`, an integer in 1..64, omitted=1.
+Null, booleans, strings, fractions, overflow, duplicates and declarations on other
+node kinds are rejected. With `batch_size=1`, concurrency retains its per-frame
+meaning, including old `concurrency=4` graphs. With `batch_size>1`, concurrency
+must be 1; conflicting fields fail before RAW work or output creation.
 
-These fixed defaults were selected from repeated 1/4/8 real-CR3 comparisons,
+```json
+{"id":"convert-cache","kind":"prepare","concurrency":1,"batch_size":32,"inputs":{"source":"source"}}
+```
+
+The built-in graph uses Prepare=1/batch_size=32, Solve measurement=8, Develop=4,
+and 1 elsewhere. 32 is an engineering initial value, not a measured optimum.
+The final Solve operation still runs once.
+
+The previous per-frame 4/8/4 defaults were selected from repeated 1/4/8 real-CR3 comparisons,
 isolated-stage controls and a direct 4/4/4 versus 4/8/4 comparison. Develop=8
 added memory for little extra benefit; measurement=8 helped in the actual 4/N/4
 pipeline. Prepare's result depended on the downstream settings, so the choice
@@ -182,7 +196,7 @@ concurrency 1. CLI resize overrides preserve the existing node's concurrency;
 a newly inserted resize uses 1. There is no global threads option or concurrency
 environment variable.
 
-All frame stages use the same standard-library ordered executor. For each stage,
+Per-frame stages use the standard-library ordered executor. For each stage,
 `accepted_not_delivered = running_or_queued + completed_waiting <= concurrency`.
 Completion does not release capacity: ordered commit validates identity and
 emits the frame event; downstream acceptance releases the slot. A committed
@@ -190,12 +204,39 @@ frame may still occupy its producer while a frame-dependent Delete runs. A ready
 lightweight reference directory, so it does not wait for every consumer. The
 reference directory, features, EV plan and on-disk cache can grow with sequence
 length; the concurrency bound is a frame bound, not a byte or disk limit.
+Prepare batch mode has one task slot holding at most B input/result references.
+It selects the continuous available prefix from the next unreceived frame,
+checking each source and every frame/sequence wait. It drains currently emittable
+source events first, dispatches a short prefix immediately, and flushes tails
+without waiting to fill B. Empty prefixes wait only for real work. The complete
+result set passes identity validation before any frame commit; frame 0 commits
+first. The slot releases after all references are materialized, without waiting
+for measure/develop/delete consumption. Exact frame coverage and no outstanding
+batch are required for EOF. Other stages retain their frame capacities.
+
 Heavy frames across the chain are bounded by the sum of stage capacities, plus
 native worksets and each transformation's temporary buffers.
 Frame 0's white balance is frozen at ordered prepare commit. Solve runs once,
 after every measurement and matching EOF is sealed. Per-node logs commit in
 source order; different nodes can interleave. Durations measure computation,
-not time waiting in ordered slots, and their sum is not wall time.
+not time waiting in ordered slots, and their sum is not wall time. In batch mode,
+`kind=prepare duration` measures independent reference materialization/publication
+preparation only, excluding shared native conversion, context loading and verification.
+`kind=prepare.batch` records those shared costs separately: actual ADC calls,
+conversion process wall, output+metadata verification wall and total adapter wall.
+Total includes routing, hashes, context/result publication and Rust loading; it
+need not equal conversion+verification. Custom tools without native diagnostics
+log unknown metrics. Single mode keeps the old per-frame wall-time interpretation.
+`mode`, `duration_scope` and stage `capacity_unit=frames|batch_tasks` distinguish
+these meanings; never sum per-frame batch durations as conversion cost.
+
+`--converter-timeout` remains a total timeout per actual ADC sub-call (default
+120 seconds, 1..3600), including a multi-file invocation. It is not multiplied by
+frame count. Filename collisions and argv limits may split a logical batch into
+serial calls; cancellation stops later calls. Each batch has a unique private
+`cache/batch_NNNNNN` with request/result/contexts, shared records and
+`batch-native.log`. Shared records survive per-frame Delete until run scratch
+cleanup. Materials remain read-only.
 
 All prepare, measure, develop and FFmpeg processes share the run's multi-task
 process owner. Encode runs as a capacity-1 task with one writer to one FFmpeg

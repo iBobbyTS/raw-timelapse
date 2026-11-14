@@ -492,10 +492,11 @@ fn stops_at_the_first_failing_frame_without_video() {
     let scratch = scratch_from_log(&log);
     assert!(scratch.is_dir(), "failure keeps the scratch for diagnosis");
     assert!(scratch.join("cache").is_dir());
-    let transcripts = scratch.join("transcripts/prepare");
+    // The built-in prepare adapter owns one unique transcript per batch.
+    let transcript = scratch.join("cache/batch_000001/batch-native.log");
     assert!(
-        fs::read_dir(&transcripts).unwrap().next().is_some(),
-        "converter transcripts are retained in scratch"
+        fs::read_to_string(&transcript).unwrap().contains("--prepare-batch"),
+        "batch converter transcript is retained in scratch"
     );
     // No later frame was committed; concurrent computation may have started.
     assert!(!log.contains("kind=develop frame=3"), "{log}");

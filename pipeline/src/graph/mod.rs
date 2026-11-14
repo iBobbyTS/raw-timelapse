@@ -12,6 +12,8 @@ mod image_chain_tests;
 #[cfg(test)]
 mod node_concurrency_tests;
 pub mod ordered_frames;
+mod prepare_batches;
+use prepare_batches::PrepareBatches;
 #[cfg(test)]
 mod ordered_frames_tests;
 
@@ -101,6 +103,8 @@ pub struct Node {
     pub waits: Vec<Wait>,
     pub encoder: Option<EncoderPatch>,
     pub concurrency: usize,
+    /// Prepare-only frame limit; 1 preserves per-frame concurrency.
+    pub batch_size: usize,
 }
 #[derive(Clone, Debug)]
 pub struct Graph {
@@ -185,8 +189,12 @@ impl Graph {
                     "height",
                     "encoder",
                     "concurrency",
+                    "batch_size",
                 ],
             )?;
+            if n.get("batch_size").is_some() && string(n, "kind")? != "prepare" {
+                return Err("graph: batch_size only belongs to prepare".into());
+            }
             let kind = match string(n, "kind")? {
                 "source" => Kind::Source,
                 "prepare" => Kind::Prepare,
@@ -217,6 +225,14 @@ impl Graph {
                 Some(Json::Int(n)) if (1..=64).contains(n) => *n as usize,
                 _ => return Err("graph: concurrency must be an integer in 1..64".into()),
             };
+            let batch_size = match n.get("batch_size") {
+                None => 1,
+                Some(Json::Int(n)) if (1..=64).contains(n) => *n as usize,
+                _ => return Err("graph: batch_size must be an integer in 1..64".into()),
+            };
+            if batch_size > 1 && concurrency != 1 {
+                return Err("graph: prepare batch_size>1 conflicts with concurrency; set concurrency=1 or batch_size=1".into());
+            }
             if concurrency > 1
                 && !matches!(
                     kind,
@@ -284,6 +300,7 @@ impl Graph {
                 waits,
                 encoder,
                 concurrency,
+                batch_size,
             });
         }
         let mut graph = Self {
@@ -317,6 +334,22 @@ impl Graph {
             .iter()
             .map(|n| (n.id.as_str(), n.concurrency))
             .collect()
+    }
+
+    pub fn prepare_node_id(&self) -> &str {
+        &self
+            .nodes
+            .iter()
+            .find(|n| n.kind == Kind::Prepare)
+            .unwrap()
+            .id
+    }
+    pub fn prepare_batch_size(&self) -> usize {
+        self.nodes
+            .iter()
+            .find(|n| n.kind == Kind::Prepare)
+            .unwrap()
+            .batch_size
     }
 
     /// The single explicit resize geometry, when the graph declares one.
@@ -371,6 +404,7 @@ impl Graph {
                 waits: vec![],
                 encoder: None,
                 concurrency: 1,
+                batch_size: 1,
             });
             self.nodes[color].inputs.insert("image".into(), index);
         }
@@ -581,6 +615,19 @@ pub struct Event {
     pub frame_id: Option<usize>,
     pub scope: Scope,
 }
+/// A complete batch, whose identities are checked together before any commit.
+pub struct PreparedReference<R> {
+    pub frame_id: usize,
+    pub source: String,
+    pub value: R,
+    /// Independent reference materialization only; excludes shared native time.
+    pub elapsed: Duration,
+}
+pub struct PreparedBatch<R> {
+    pub frames: Vec<PreparedReference<R>>,
+    /// Backend-specific diagnostic timings, never copied into per-frame duration.
+    pub diagnostics: String,
+}
 /// Backends own actual I/O; scheduler owns invocation order and event emission.
 pub trait Backend {
     type Reference: Clone + Send + 'static;
@@ -589,6 +636,21 @@ pub trait Backend {
     fn check(&mut self) -> Result<()>;
     fn source_identity(&self, id: usize) -> String;
     fn prepare_task(&mut self, id: usize) -> Result<FrameTask<Self::Reference>>;
+    fn prepare_batch_task(
+        &mut self,
+        _ids: &[usize],
+    ) -> Result<FrameTask<PreparedBatch<Self::Reference>>> {
+        Err("graph: backend does not support prepare batches".into())
+    }
+    fn commit_prepare_batch(
+        &mut self,
+        _batch_id: usize,
+        _ids: &[usize],
+        _elapsed: Duration,
+        _diagnostics: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn commit_prepare(&mut self, id: usize, r: &Self::Reference, elapsed: Duration) -> Result<()>;
     fn cancel(&mut self) {}
     fn hash<'a>(&self, r: &'a Self::Reference) -> &'a str;
@@ -663,6 +725,47 @@ fn ready<R, I>(node: &Node, states: &[State<R, I>], id: Option<usize>) -> bool {
         }),
     })
 }
+fn available_prepare_prefix<R, I>(
+    node: &Node,
+    states: &[State<R, I>],
+    start: usize,
+    count: usize,
+) -> Vec<usize> {
+    (start..count)
+        .take(node.batch_size)
+        .take_while(|id| {
+            states[node.inputs["source"]].frames.contains(id) && ready(node, states, Some(*id))
+        })
+        .collect()
+}
+/// One prepare admission decision. Keeping selection and dispatch together also
+/// lets controlled backends exercise unavailable source/wait prefixes directly.
+fn admit_prepare_batch<B: Backend>(
+    node: &Node,
+    states: &[State<B::Reference, B::Image>],
+    count: usize,
+    stage: &mut PrepareBatches<B::Reference>,
+    b: &mut B,
+) -> Result<bool> {
+    if !stage.has_capacity() {
+        return Ok(false);
+    }
+    let ids = available_prepare_prefix(node, states, stage.accepted(), count);
+    if ids.is_empty() {
+        return Ok(false);
+    }
+    let keys = ids
+        .iter()
+        .map(|id| ordered_frames::TaskKey {
+            node: node.id.clone(),
+            frame_id: *id,
+            source: b.source_identity(*id),
+        })
+        .collect();
+    let task = b.prepare_batch_task(&ids)?;
+    stage.submit(keys, task)?;
+    Ok(true)
+}
 fn emit<B: Backend>(
     b: &mut B,
     node: &Node,
@@ -713,8 +816,16 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
         .nodes
         .iter()
         .map(|n| {
-            (n.kind == Kind::Prepare)
+            (n.kind == Kind::Prepare && n.batch_size == 1)
                 .then(|| OrderedStage::<B::Reference>::new(n.concurrency, wake.clone()))
+        })
+        .collect();
+    let mut batches: Vec<_> = graph
+        .nodes
+        .iter()
+        .map(|n| {
+            (n.kind == Kind::Prepare && n.batch_size > 1)
+                .then(|| PrepareBatches::<B::Reference>::new(n.batch_size, wake.clone()))
         })
         .collect();
     let mut measurements: Vec<_> = graph
@@ -763,6 +874,9 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
             for stage in preparations.iter_mut().flatten() {
                 stage.poll()?;
             }
+            for stage in batches.iter_mut().flatten() {
+                stage.poll()?;
+            }
             for stage in measurements.iter_mut().flatten() {
                 stage.poll()?;
             }
@@ -790,6 +904,51 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                         stage.delivered(id)?;
                         progress = true;
                     }
+                }
+            }
+            for (i, stage) in batches.iter_mut().enumerate() {
+                if let Some(stage) = stage {
+                    if let Some(output) = stage.commit_next()? {
+                        b.check()?;
+                        // Entire result set has passed the adapter gate before the
+                        // first commit. A cancellation is rechecked at every commit.
+                        b.commit_prepare_batch(
+                            output.batch_id,
+                            &output.ids,
+                            output.elapsed,
+                            &output.diagnostics,
+                        )?;
+                        for frame in output.frames {
+                            b.check()?;
+                            if frame.frame_id != states[i].next {
+                                return Err("graph: batch commit order mismatch".into());
+                            }
+                            b.commit_prepare(frame.frame_id, &frame.value, frame.elapsed)?;
+                            states[i].refs.push(frame.value);
+                            states[i].next += 1;
+                            emit(b, &graph.nodes[i], &mut states[i], Some(frame.frame_id))?;
+                        }
+                        stage.delivered()?;
+                        progress = true;
+                    }
+                }
+            }
+            // Source descriptors are lightweight. Drain every currently ready
+            // consecutive event before selection, checking each event's waits.
+            for &i in &graph.order {
+                let node = &graph.nodes[i];
+                if node.kind != Kind::Source || states[i].closed {
+                    continue;
+                }
+                while states[i].next < count && ready(node, &states, Some(states[i].next)) {
+                    let id = states[i].next;
+                    states[i].next += 1;
+                    emit(b, node, &mut states[i], Some(id))?;
+                    progress = true;
+                }
+                if states[i].next == count && ready(node, &states, None) {
+                    emit(b, node, &mut states[i], None)?;
+                    progress = true;
                 }
             }
             for (i, stage) in measurements.iter_mut().enumerate() {
@@ -850,6 +1009,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                 let id = preparations[i]
                     .as_ref()
                     .map(|s| s.accepted())
+                    .or_else(|| batches[i].as_ref().map(|s| s.accepted()))
                     .or_else(|| measurements[i].as_ref().map(|s| s.accepted()))
                     .or_else(|| images[i].as_ref().map(|s| s.accepted()))
                     .unwrap_or(states[i].next);
@@ -878,23 +1038,37 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                     }
                     Kind::Prepare => {
                         let p = input("source");
-                        let stage = preparations[i].as_mut().unwrap();
-                        if id < count && states[p].frames.contains(&id) && stage.has_capacity() {
-                            let task = b.prepare_task(id)?;
-                            stage.submit(
-                                ordered_frames::TaskKey {
-                                    node: node.id.clone(),
-                                    frame_id: id,
-                                    source: b.source_identity(id),
-                                },
-                                task,
-                            )?;
-                            progress = true;
-                        } else if states[p].closed
-                            && states[i].next == count
-                            && stage.outstanding() == 0
-                        {
-                            close = true;
+                        if let Some(stage) = batches[i].as_mut() {
+                            progress |= admit_prepare_batch(node, &states, count, stage, b)?;
+                            if states[p].closed
+                                && states[i].next == count
+                                && stage.outstanding() == 0
+                            {
+                                if stage.accepted() != count || states[i].refs.len() != count {
+                                    return Err("graph: prepare batch EOF coverage mismatch".into());
+                                }
+                                close = true;
+                            }
+                        } else {
+                            let stage = preparations[i].as_mut().unwrap();
+                            if id < count && states[p].frames.contains(&id) && stage.has_capacity()
+                            {
+                                let task = b.prepare_task(id)?;
+                                stage.submit(
+                                    ordered_frames::TaskKey {
+                                        node: node.id.clone(),
+                                        frame_id: id,
+                                        source: b.source_identity(id),
+                                    },
+                                    task,
+                                )?;
+                                progress = true;
+                            } else if states[p].closed
+                                && states[i].next == count
+                                && stage.outstanding() == 0
+                            {
+                                close = true;
+                            }
                         }
                     }
                     Kind::References | Kind::Barrier => {
@@ -1086,6 +1260,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                 let stats = preparations[i]
                     .as_ref()
                     .map(|s| s.stats())
+                    .or_else(|| batches[i].as_ref().map(|s| s.stats()))
                     .or_else(|| measurements[i].as_ref().map(|s| s.stats()))
                     .or_else(|| images[i].as_ref().map(|s| s.stats()));
                 if let Some(stats) = stats {
@@ -1096,7 +1271,8 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                 }
             }
             if !progress {
-                let active = preparations.iter().flatten().any(|s| s.outstanding() > 0)
+                let active = batches.iter().flatten().any(|s| s.outstanding() > 0)
+                    || preparations.iter().flatten().any(|s| s.outstanding() > 0)
                     || measurements.iter().flatten().any(|s| s.outstanding() > 0)
                     || images.iter().flatten().any(|s| s.outstanding() > 0);
                 if active {
@@ -1114,6 +1290,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
     }
     // Cancel precedes joining/dropping every stage, so blocked native reads
     // cannot strand the coordinator on the first failing worker.
+    drop(batches);
     drop(preparations);
     drop(measurements);
     drop(images);

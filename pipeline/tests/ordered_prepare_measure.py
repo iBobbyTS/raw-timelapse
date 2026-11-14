@@ -19,6 +19,7 @@ wrapper.chmod(0o755)
 graph=json.loads((pathlib.Path(__file__).parent/'../src/graph/default.json').resolve().read_text())
 for n in graph['nodes']:
     n['concurrency']=4 if n['kind'] in ['prepare','solve','develop'] else 1
+    if n['kind']=='prepare':n['batch_size']=1
 graph_path=root/'graph.json';graph_path.write_text(json.dumps(graph))
 args=[str(cli),'--input',str(root/'input'),'--output',str(root/'output/timelapse.mov'),'--dng-linear-frame',str(wrapper),'--graph',str(graph_path)]
 proc=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
@@ -41,5 +42,10 @@ try:
     (root/'trace.json').write_text(json.dumps({'command':args,'exit':proc.returncode,'releases':trace},indent=2))
     assert proc.returncode==0,(stdout,stderr)
 finally:
-    if proc.poll() is None: proc.kill();proc.wait()
+    killed=proc.poll() is None
+    if killed:proc.kill()
+    stdout,stderr=proc.communicate(timeout=10)
+    if not (root/'cli.stdout').exists():(root/'cli.stdout').write_bytes(stdout)
+    if not (root/'cli.stderr').exists():(root/'cli.stderr').write_bytes(stderr)
+    (root/'process-exit.json').write_text(json.dumps({'command':args,'exit':proc.returncode,'harness_killed':killed},indent=2))
     server.close();sock.unlink()

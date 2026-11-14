@@ -132,13 +132,15 @@ for stage in ['prepare','measure']:
         import os,pathlib,sys
         args=sys.argv[1:]
         if args[0]=='--stdout-analysis':
-            task=pathlib.Path(args[2]).parent.name
+            task=pathlib.Path(args[2]).parent.name+'-'+pathlib.Path(args[2]).stem
             scratch=pathlib.Path({str(root)!r})/task;scratch.mkdir(exist_ok=True)
             args=['--prepare',{str(mosaic)!r},'--scratch',str(scratch),'--emit-prepared',str(scratch/'context'),'--converter',{str(converter)!r}]
         os.execv({str(native)!r},[{str(native)!r},*args])
     ''')
     graph=json.loads((repo/'pipeline/src/graph/default.json').read_text())
-    for node in graph['nodes']: node['concurrency']=4 if node['kind'] in ['prepare','solve'] else 1
+    for node in graph['nodes']:
+        node['concurrency']=4 if node['kind'] in ['prepare','solve'] else 1
+        if node['kind']=='prepare':node['batch_size']=1
     config=root/'graph.json';config.write_text(json.dumps(graph))
     video=root/'output/timelapse.mov'
     args=[str(cli),'--input',str(incoming),'--output',str(video),'--graph',str(config),'--dng-linear-frame',str(wrapper if stage=='measure' else native),'--converter',str(converter),'--strength','1' if stage=='measure' else '0']
@@ -202,7 +204,7 @@ for trigger in ['interrupt','terminate','error']:
         import os,pathlib,sys
         args=sys.argv[1:]
         if args[0]=='--stdout-frame-f32' and 'frame_0.dng' not in pathlib.Path(args[2]).read_text():
-            task=pathlib.Path(args[2]).parent.name
+            task=pathlib.Path(args[2]).parent.name+'-'+pathlib.Path(args[2]).stem
             scratch=pathlib.Path({str(root)!r})/('active-'+task);scratch.mkdir()
             args=['--prepare',{str(mosaic)!r},'--scratch',str(scratch),'--emit-prepared',str(scratch/'context'),'--converter',{str(converter)!r}]
         os.execv({str(native)!r},[{str(native)!r},*args])

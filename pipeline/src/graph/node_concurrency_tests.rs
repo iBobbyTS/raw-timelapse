@@ -2,6 +2,7 @@ use super::*;
 
 fn configured(kind: &str, value: &str) -> String {
     include_str!("default.json")
+        .replace(", \"batch_size\":32", "")
         .replace(", \"concurrency\":1", "")
         .replace(", \"concurrency\":4", "")
         .replace(", \"concurrency\":8", "")

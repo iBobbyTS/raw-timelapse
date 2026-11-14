@@ -131,6 +131,7 @@ fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
             Some("prepare" | "develop" | "identity" | "color")
         ) {
             set(node, "concurrency", Json::Int(4));
+            if node.get("kind").and_then(Json::as_str) == Some("prepare") { set(node, "batch_size", Json::Int(1)); }
         }
     }
     let kept = run(&root, "identity", &input, &tool, &identity);
@@ -174,6 +175,7 @@ fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
             Some("prepare" | "develop" | "color")
         ) {
             set(node, "concurrency", Json::Int(4));
+            if node.get("kind").and_then(Json::as_str) == Some("prepare") { set(node, "batch_size", Json::Int(1)); }
         }
     }
     let retained = run(&root, "retained", &input, &tool, &retained);
@@ -349,6 +351,7 @@ fn strength_zero_normalizes_parallel_solve_and_logs_effective_configuration() {
     let (input, tool) = cr3_material(&root, &root.join("fixtures"));
     let mut config = graph();
     set(&mut nodes(&mut config)[1], "concurrency", Json::Int(4));
+    set(&mut nodes(&mut config)[1], "batch_size", Json::Int(1));
     set(&mut nodes(&mut config)[2], "concurrency", Json::Int(8));
     let output = run(&root, "output", &input, &tool, &config);
     let trace = read_log(&output);
@@ -357,6 +360,10 @@ fn strength_zero_normalizes_parallel_solve_and_logs_effective_configuration() {
         "{trace}"
     );
     assert!(log_kind(&trace, "measure").is_empty());
+    let prepares = log_kind(&trace, "prepare");
+    assert_eq!(prepares.len(), 3);
+    assert!(prepares.iter().all(|line| line.contains("mode=single duration_scope=single_frame_wall")));
+    assert!(log_kind(&trace, "prepare.batch").is_empty());
     assert!(ffprobe(&output.join(VIDEO_NAME)).contains("nb_read_frames=3"));
 }
 
@@ -417,5 +424,30 @@ fn delete_reader_dependencies_reject_before_output_or_native_work() {
             !directory.exists(),
             "invalid graph created output/log/scratch"
         );
+    }
+}
+
+#[test]
+fn invalid_batch_configuration_never_creates_output_or_starts_native() {
+    let root = test_dir("batch-config-reject");
+    let input = root.join("input");
+    make_input(&input, &["IMG_1.DNG"]);
+    let native = root.join("native-marker");
+    let marker = root.join("native-started");
+    write_executable(&native, "#!/bin/sh\ntouch \"$(dirname \"$0\")/native-started\"\nexit 99\n");
+    let text = include_str!("../src/graph/default.json");
+    let mut cases: Vec<String> = ["null", "true", "false", "\"32\"", "0", "-1", "1.0", "1e0", "65", "18446744073709551616", "2,\"batch_size\":3"]
+        .into_iter().map(|value| text.replace("\"batch_size\":32", &format!("\"batch_size\":{value}"))).collect();
+    cases.push(text.replace("\"kind\":\"prepare\", \"concurrency\":1", "\"kind\":\"prepare\", \"concurrency\":4"));
+    cases.push(text.replace("\"kind\":\"source\",", "\"kind\":\"source\",\"batch_size\":1,"));
+    for (case, config) in cases.iter().enumerate() {
+        let path = root.join(format!("case-{case}.json"));
+        fs::write(&path, config).unwrap();
+        let directory = root.join(format!("output-{case}"));
+        let video = directory.join(VIDEO_NAME);
+        let result = run_cli(&["--input", input.to_str().unwrap(), "--output", video.to_str().unwrap(), "--graph", path.to_str().unwrap(), "--dng-linear-frame", native.to_str().unwrap()]);
+        assert_eq!(result.status.code(), Some(50), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(!directory.exists());
+        assert!(!marker.exists());
     }
 }
