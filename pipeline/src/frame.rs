@@ -443,20 +443,10 @@ pub struct NativeStream {
     pixel_bytes: usize,
     f32: bool,
     expected_digest: Option<String>,
-    active: ActiveNative,
 }
 impl NativeStream {
     fn open(tool: &Path, args: &[String], log: &Path, active: ActiveNative) -> Result<Self> {
-        let mut registration = active.lock().unwrap();
-        if registration.cancelled {
-            return Err(Error::new(
-                crate::error::EXIT_PREVIEW,
-                "encoder failed; native frame dispatch cancelled",
-            ));
-        }
-        let process = OwnedProcess::spawn(tool, args, log, EXIT_FRAME, false)?;
-        registration.child = Some(process.child.clone());
-        drop(registration);
+        let process = OwnedProcess::spawn_active(tool, args, log, EXIT_FRAME, false, active)?;
         let stdout = process.child.lock().unwrap().stdout.take().unwrap();
         let mut stream = Self {
             process,
@@ -464,7 +454,6 @@ impl NativeStream {
             pixel_bytes: 0,
             expected_digest: None,
             f32: args.first().is_some_and(|a| a == "--stdout-frame-f32"),
-            active,
         };
         stream.protocol = Some(Protocol::with_version(stdout, stream.f32)?);
         Ok(stream)
@@ -524,7 +513,6 @@ impl NativeStream {
         self.protocol.as_mut().unwrap().end()?;
         self.protocol.take();
         let status = self.process.finish(false)?;
-        self.active.lock().unwrap().child = None;
         if !status.success() {
             return Err(failure(format!(
                 "native frame failed: {}",
@@ -540,7 +528,6 @@ impl Drop for NativeStream {
         // Reap before unregistering, including protocol/conversion/write failures.
         // OwnedProcess records the real exit status on drop.
         self.process.abort_if_running();
-        self.active.lock().unwrap().child = None;
     }
 }
 
@@ -760,10 +747,19 @@ pub struct PreparedSettings {
 /// Run the native prepare operation once for one source and load the resulting
 /// context. The returned frame carries the original identity; the prepared DNG
 /// stays in the caller's scratch until the caller deletes it.
+#[cfg(test)]
 pub fn prepare(
     tool: &Path,
     source: &SourceFrame,
     settings: &PrepareSettings<'_>,
+) -> Result<PreparedFrame> {
+    prepare_active(tool, source, settings, Default::default())
+}
+pub fn prepare_active(
+    tool: &Path,
+    source: &SourceFrame,
+    settings: &PrepareSettings<'_>,
+    active: ActiveNative,
 ) -> Result<PreparedFrame> {
     let mut args = vec![
         "--prepare".to_string(),
@@ -779,7 +775,7 @@ pub fn prepare(
     if let Some(seconds) = settings.converter_timeout {
         args.extend(["--converter-timeout".into(), seconds.to_string()]);
     }
-    let captured = proc::run_capture(tool, &args, EXIT_FRAME)?;
+    let captured = proc::run_capture_active(tool, &args, EXIT_FRAME, settings.log, active)?;
     write_prepare_log(settings.log, tool, &args, &captured)?;
     proc::check_stop()?;
     if !captured.status.success() {
@@ -928,6 +924,7 @@ pub fn analyze_prepared_at(
     id: usize,
     total: usize,
     log: &Path,
+    active: ActiveNative,
 ) -> Result<FrameInfo> {
     let run = prepared_native_run(settings, Some(roi), log);
     run_frame(
@@ -939,7 +936,7 @@ pub fn analyze_prepared_at(
         Some(0.),
         &run,
         false,
-        Default::default(),
+        active,
         &mut |_, _| Ok(()),
     )
     .map_err(|e| prepared_consumer_error(e, log))

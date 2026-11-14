@@ -14,18 +14,35 @@ struct Fake {
 }
 impl Backend for Fake {
     type Reference = String;
+    type Measurement = usize;
     type Image = Vec<f32>;
     fn check(&mut self) -> Result<()> {
         Ok(())
     }
-    fn prepare(&mut self, id: usize) -> Result<String> {
+    fn source_identity(&self, id: usize) -> String {
+        format!("source{id}")
+    }
+    fn prepare_task(&mut self, id: usize) -> Result<FrameTask<String>> {
         self.order.push(format!("prepare {id}"));
-        Ok(format!("hash{id}"))
+        Ok(Box::new(move || Ok(format!("hash{id}"))))
+    }
+    fn commit_prepare(&mut self, _: usize, _: &String, _: Duration) -> Result<()> {
+        Ok(())
     }
     fn hash<'a>(&self, r: &'a String) -> &'a str {
         r
     }
-    fn measure(&mut self, id: usize, _: &String) -> Result<()> {
+    fn measure_task(&mut self, id: usize, _: &String) -> Result<FrameTask<usize>> {
+        Ok(Box::new(move || Ok(id)))
+    }
+    fn commit_measure(
+        &mut self,
+        id: usize,
+        _: &String,
+        measurement: usize,
+        _: Duration,
+    ) -> Result<()> {
+        assert_eq!(measurement, id);
         self.measured.push(id);
         assert!(!self.events.iter().any(|e| e.node == "apply-ev"));
         Ok(())
@@ -120,7 +137,7 @@ impl Backend for Fake {
 #[test]
 fn explicit_resize_node_stays_between_develop_and_colour() {
     let text = include_str!("default.json").replace(
-        "{\"id\":\"color\", \"kind\":\"color\", \"inputs\":{\"image\":\"apply-ev\"}}",
+        "{\"id\":\"color\", \"kind\":\"color\", \"concurrency\":1, \"inputs\":{\"image\":\"apply-ev\"}}",
         "{\"id\":\"resize\",\"kind\":\"resize\",\"width\":16,\"height\":12,\"inputs\":{\"image\":\"apply-ev\"}},{\"id\":\"color\",\"kind\":\"color\",\"inputs\":{\"image\":\"resize\"}}",
     );
     let graph = Graph::parse(&text).unwrap();
@@ -143,7 +160,7 @@ fn explicit_resize_node_stays_between_develop_and_colour() {
     }
     // Resize is scene-linear: it cannot sit after the colour node.
     let after_color = include_str!("default.json").replace(
-        "{\"id\":\"encode\", \"kind\":\"encode\", \"inputs\":{\"image\":\"color\"}}",
+        "{\"id\":\"encode\", \"kind\":\"encode\", \"concurrency\":1, \"inputs\":{\"image\":\"color\"}}",
         "{\"id\":\"resize\",\"kind\":\"resize\",\"width\":16,\"height\":12,\"inputs\":{\"image\":\"color\"}},{\"id\":\"encode\",\"kind\":\"encode\",\"inputs\":{\"image\":\"resize\"}}",
     );
     let error = Graph::parse(&after_color).unwrap_err();
@@ -167,7 +184,7 @@ fn cli_resize_inserts_or_overrides_the_single_explicit_node() {
     assert_eq!(fake.resizes, vec![(8, 6); 3]);
 
     let duplicated = include_str!("default.json").replace(
-        "{\"id\":\"color\", \"kind\":\"color\", \"inputs\":{\"image\":\"apply-ev\"}}",
+        "{\"id\":\"color\", \"kind\":\"color\", \"concurrency\":1, \"inputs\":{\"image\":\"apply-ev\"}}",
         "{\"id\":\"resize-one\",\"kind\":\"resize\",\"width\":16,\"height\":12,\"inputs\":{\"image\":\"apply-ev\"}},{\"id\":\"resize-two\",\"kind\":\"resize\",\"width\":8,\"height\":6,\"inputs\":{\"image\":\"resize-one\"}},{\"id\":\"color\",\"kind\":\"color\",\"inputs\":{\"image\":\"resize-two\"}}",
     );
     assert!(Graph::parse(&duplicated)
@@ -197,10 +214,8 @@ fn encode_node_owns_the_bounded_encoder_configuration() {
             "only belongs to encode",
         ),
         (
-            include_str!("default.json").replace(
-                "\"kind\":\"color\",",
-                "\"kind\":\"color\",\"width\":10,",
-            ),
+            include_str!("default.json")
+                .replace("\"kind\":\"color\",", "\"kind\":\"color\",\"width\":10,"),
             "only belong to resize",
         ),
         (
@@ -222,7 +237,7 @@ fn encode_node_owns_the_bounded_encoder_configuration() {
         assert!(error.contains(marker), "{error}");
     }
     let missing = include_str!("default.json").replace(
-        "{\"id\":\"color\", \"kind\":\"color\", \"inputs\":{\"image\":\"apply-ev\"}}",
+        "{\"id\":\"color\", \"kind\":\"color\", \"concurrency\":1, \"inputs\":{\"image\":\"apply-ev\"}}",
         "{\"id\":\"resize\",\"kind\":\"resize\",\"width\":16,\"inputs\":{\"image\":\"apply-ev\"}},{\"id\":\"color\",\"kind\":\"color\",\"inputs\":{\"image\":\"resize\"}}",
     );
     assert!(Graph::parse(&missing)
@@ -390,31 +405,50 @@ fn last_measurement_and_unread_sink_are_controlled_by_events() {
         root: std::path::PathBuf,
         events: Arc<Mutex<Vec<Event>>>,
         measurement_ready: mpsc::SyncSender<()>,
-        measurement_continue: mpsc::Receiver<()>,
+        measurement_continue: Option<mpsc::Receiver<()>>,
         sink_ready: mpsc::SyncSender<usize>,
         sink_continue: mpsc::Receiver<()>,
     }
     impl Backend for Gated {
         type Reference = String;
+        type Measurement = usize;
         type Image = Vec<f32>;
         fn check(&mut self) -> Result<()> {
             Ok(())
         }
-        fn prepare(&mut self, id: usize) -> Result<String> {
+        fn source_identity(&self, id: usize) -> String {
+            self.fake.source_identity(id)
+        }
+        fn prepare_task(&mut self, id: usize) -> Result<FrameTask<String>> {
             std::fs::write(self.root.join(format!("{id}.dng")), b"generated").unwrap();
-            self.fake.prepare(id)
+            self.fake.prepare_task(id)
+        }
+        fn commit_prepare(&mut self, _: usize, _: &String, _: Duration) -> Result<()> {
+            Ok(())
         }
         fn hash<'a>(&self, r: &'a String) -> &'a str {
             r
         }
-        fn measure(&mut self, id: usize, r: &String) -> Result<()> {
+        fn measure_task(&mut self, id: usize, _: &String) -> Result<FrameTask<usize>> {
             if id == 2 {
-                self.measurement_ready.send(()).unwrap();
-                self.measurement_continue
-                    .recv_timeout(Duration::from_secs(10))
-                    .unwrap();
+                let ready = self.measurement_ready.clone();
+                let proceed = self.measurement_continue.take().unwrap();
+                return Ok(Box::new(move || {
+                    ready.send(()).unwrap();
+                    proceed.recv_timeout(Duration::from_secs(10)).unwrap();
+                    Ok(id)
+                }));
             }
-            self.fake.measure(id, r)
+            Ok(Box::new(move || Ok(id)))
+        }
+        fn commit_measure(
+            &mut self,
+            id: usize,
+            r: &String,
+            value: usize,
+            elapsed: Duration,
+        ) -> Result<()> {
+            self.fake.commit_measure(id, r, value, elapsed)
         }
         fn solve(&mut self) -> Result<Vec<Gain>> {
             self.fake.solve()
@@ -464,7 +498,7 @@ fn last_measurement_and_unread_sink_are_controlled_by_events() {
         root: root.clone(),
         events: events.clone(),
         measurement_ready: ready,
-        measurement_continue: wait_permit,
+        measurement_continue: Some(wait_permit),
         sink_ready: sink,
         sink_continue: wait_consume,
     };

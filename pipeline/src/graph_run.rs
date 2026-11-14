@@ -3,19 +3,21 @@
 //! the run-log events and the encoder/validation handoff.
 use crate::encoder::ResolvedConfig;
 use crate::error::{Error, Result, EXIT_FRAME, EXIT_PREVIEW, EXIT_USAGE, EXIT_VALIDATION};
-use crate::frame::{self, FrameInfo, FrameSequence, PrepareSettings, PreparedFrame, PreparedSettings};
+use crate::frame::{
+    self, FrameInfo, FrameSequence, PrepareSettings, PreparedFrame, PreparedSettings,
+};
 use crate::run_log::{quote, RunLog};
 use crate::video::{self, ResizeRecord};
 use crate::{proc, EncodedStage, RunContext};
 use rawtl_linear_video::deflicker::estimation::ExposurePlan;
 use rawtl_linear_video::deflicker::measurement::AnalysisSidecar;
-use rawtl_linear_video::deflicker::{
-    estimate_exposure, ExposureConfig, FrameMeasurement,
-};
+use rawtl_linear_video::deflicker::{estimate_exposure, ExposureConfig, FrameMeasurement};
+use rawtl_linear_video::graph::ordered_frames::FrameTask;
 use rawtl_linear_video::graph::{self, Backend, Event, Gain, Graph, Scope};
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 pub struct Output {
@@ -95,6 +97,7 @@ impl Runner<'_, '_> {
 }
 impl Backend for Runner<'_, '_> {
     type Reference = PreparedFrame;
+    type Measurement = FrameMeasurement;
     type Image = Image;
     fn check(&mut self) -> graph::Result<()> {
         self.result(proc::check_stop())?;
@@ -106,31 +109,51 @@ impl Backend for Runner<'_, '_> {
         }
         Ok(())
     }
-    fn prepare(&mut self, id: usize) -> graph::Result<PreparedFrame> {
-        let ctx = self.context;
-        let opts = ctx.options;
-        let scratch = ctx
+    fn source_identity(&self, id: usize) -> String {
+        self.context.sources[id].path.display().to_string()
+    }
+    fn cancel(&mut self) {
+        proc::cancel(&self.encoder.active);
+    }
+    fn prepare_task(&mut self, id: usize) -> graph::Result<FrameTask<PreparedFrame>> {
+        let scratch = self
+            .context
             .scratch
             .join("cache")
             .join(format!("frame_{:06}", id + 1));
         let context = scratch.join("prepared.context");
         let log = self.transcript("prepare", id);
-        self.result(
-            fs::create_dir_all(&scratch).map_err(|e| Error::new(EXIT_FRAME, e.to_string())),
-        )?;
-        let started = Instant::now();
-        let result = frame::prepare(
-            &opts.native_tool,
-            &ctx.sources[id],
-            &PrepareSettings {
-                scratch_dir: &scratch,
-                context_path: &context,
-                log: &log,
-                converter: opts.converter.as_deref(),
-                converter_timeout: opts.converter_timeout,
-            },
-        );
-        let prepared = self.result(result)?;
+        let source = self.context.sources[id].clone();
+        let tool = self.context.options.native_tool.clone();
+        let converter = self.context.options.converter.clone();
+        let converter_timeout = self.context.options.converter_timeout;
+        let active = self.encoder.active.clone();
+        Ok(Box::new(move || {
+            fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+            frame::prepare_active(
+                &tool,
+                &source,
+                &PrepareSettings {
+                    scratch_dir: &scratch,
+                    context_path: &context,
+                    log: &log,
+                    converter: converter.as_deref(),
+                    converter_timeout,
+                },
+                active,
+            )
+            .map_err(|e| e.message)
+        }))
+    }
+    fn commit_prepare(
+        &mut self,
+        id: usize,
+        prepared: &PreparedFrame,
+        elapsed: Duration,
+    ) -> graph::Result<()> {
+        if id != self.capture_times.len() {
+            return Err("graph: prepare commit order mismatch".into());
+        }
         if id == 0 {
             self.reference_wb = Some(prepared.as_shot_neutral);
         }
@@ -145,43 +168,69 @@ impl Backend for Runner<'_, '_> {
             prepared.route.token(),
             prepared.generated,
             quote(&prepared.dng.display().to_string()),
-            started.elapsed().as_secs_f64()
+            elapsed.as_secs_f64()
         ));
-        self.result(written)?;
-        Ok(prepared)
+        self.result(written)
     }
     fn hash<'a>(&self, r: &'a PreparedFrame) -> &'a str {
         &r.source_sha256
     }
-    fn measure(&mut self, id: usize, r: &PreparedFrame) -> graph::Result<()> {
+    fn measure_task(
+        &mut self,
+        id: usize,
+        r: &PreparedFrame,
+    ) -> graph::Result<FrameTask<FrameMeasurement>> {
         let log = self.transcript("measure", id);
-        let started = Instant::now();
-        let result = frame::analyze_prepared_at(
-            &self.context.options.native_tool,
-            r,
-            self.wb(id),
-            self.context.options.deflicker.roi,
-            &self.settings(),
-            id,
-            self.context.sources.len(),
-            &log,
-        );
-        let info = self.frame_result(id, result)?;
-        let bytes = frame::analysis_bytes(&info).ok_or("graph: missing measurement")?;
-        let sidecar =
-            AnalysisSidecar::parse(std::str::from_utf8(bytes).map_err(|e| e.to_string())?)?;
-        if sidecar.measurement.source_sha256 != r.source_sha256 {
-            return Err("graph: measurement identity mismatch".into());
+        let tool = self.context.options.native_tool.clone();
+        let prepared = r.clone();
+        let wb = self.wb(id);
+        if id > 0 && self.context.options.white_balance.freezes_reference() && wb.is_none() {
+            return Err("graph: reference WB is not committed".into());
         }
-        self.measurements.push(sidecar.measurement);
+        let roi = self.context.options.deflicker.roi;
+        let settings = self.settings();
+        let total = self.context.sources.len();
+        let active = self.encoder.active.clone();
+        Ok(Box::new(move || {
+            let info = frame::analyze_prepared_at(
+                &tool, &prepared, wb, roi, &settings, id, total, &log, active,
+            )
+            .map_err(|e| {
+                format!(
+                    "frame {}/{} ({}) failed: {}; no video was produced",
+                    id + 1,
+                    total,
+                    prepared.source_name,
+                    e.message
+                )
+            })?;
+            let bytes = frame::analysis_bytes(&info).ok_or("graph: missing measurement")?;
+            let sidecar =
+                AnalysisSidecar::parse(std::str::from_utf8(bytes).map_err(|e| e.to_string())?)?;
+            if sidecar.measurement.source_sha256 != prepared.source_sha256 {
+                return Err("graph: measurement identity mismatch".into());
+            }
+            Ok(sidecar.measurement)
+        }))
+    }
+    fn commit_measure(
+        &mut self,
+        id: usize,
+        r: &PreparedFrame,
+        measurement: FrameMeasurement,
+        elapsed: Duration,
+    ) -> graph::Result<()> {
+        if id != self.measurements.len() || measurement.source_sha256 != r.source_sha256 {
+            return Err("graph: measurement commit identity/order mismatch".into());
+        }
+        self.measurements.push(measurement);
         let written = self.log.line(&format!(
             "kind=measure frame={} source={} duration={:.3}",
             id + 1,
             quote(&r.source_name),
-            started.elapsed().as_secs_f64()
+            elapsed.as_secs_f64()
         ));
-        self.result(written)?;
-        Ok(())
+        self.result(written)
     }
     fn solve(&mut self) -> graph::Result<Vec<Gain>> {
         let cfg = &self.context.options.deflicker;
@@ -485,12 +534,18 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
     let explicit_resize = graph.resize_geometry();
     let range = config.effective_range(context.options.preview_profile);
     log.line(&format!(
-        "kind=graph source={} nodes={}",
+        "kind=graph source={} nodes={} concurrency={}",
         match &context.options.graph {
             Some(path) => quote(&path.display().to_string()),
             None => quote("built-in"),
         },
-        graph.node_ids().join(",")
+        graph.node_ids().join(","),
+        graph
+            .concurrency_config()
+            .iter()
+            .map(|(id, n)| format!("{id}:{n}"))
+            .collect::<Vec<_>>()
+            .join(",")
     ))?;
     log.line(&format!(
         "kind=encoder encoder={} container={} pix_fmt={} profile={} range={} geometry={}",
@@ -555,7 +610,8 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
             quote(&message),
             quote(&context.scratch.join("cache").display().to_string())
         ));
-        if runner.encoder.active.lock().unwrap().cancelled {
+        proc::check_stop()?;
+        if runner.encoder.failed() {
             return Err(Error::new(
                 EXIT_PREVIEW,
                 format!(

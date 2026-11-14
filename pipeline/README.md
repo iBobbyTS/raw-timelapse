@@ -19,6 +19,7 @@ argv vectors (no shell).
 ```sh
 cargo clean --manifest-path pipeline/Cargo.toml
 cargo build --release --manifest-path pipeline/Cargo.toml
+cargo clean --manifest-path pipeline/Cargo.toml
 cargo test --manifest-path pipeline/Cargo.toml
 ```
 
@@ -133,14 +134,49 @@ source -> convert-cache --prepared references--> measure-solve -> apply-ev
 
 - `convert` runs once per source (`dng-linear-frame --prepare`) and keeps only a
   cache reference table; it is never blocked by the EV branch.
-- The sequential `measure-solve` node seals its full frame inventory and
-  publishes one EV table. `--strength 0` replaces it with a zero plan.
+- `measure-solve` measures independent frames concurrently, then seals the full
+  frame inventory and publishes one EV table. `--strength 0` replaces it with a zero plan.
 - `develop` applies the plan EV exactly once and returns owned FP32 pixels; the
   source read is complete before the completion event is emitted.
 - `color` performs the single 10-bit 4:4:4 quantization handoff; `encode` is the
   streaming FFmpeg sink.
 - `delete` waits for the per-frame develop completion and removes only the
   run-generated cache DNG. Original RAW/DNG sources are never deletion targets.
+
+Set concurrency per node in the graph JSON:
+
+```json
+{"id":"convert-cache","kind":"prepare","concurrency":4,"inputs":{"source":"source"}}
+```
+
+`prepare` and the measurement phase of `solve` accept integer `concurrency`
+values from 1 to 64; omission means 1. All built-in nodes currently declare 1.
+These conservative defaults have not been tuned for throughput. The image chain
+(develop, identity, exposure, resize, color) remains serial, as does encode;
+values above 1 on those or other sequential/control nodes are rejected.
+Null, strings, booleans, fractions, out-of-range values and duplicate fields are
+configuration errors. `--strength 0` normalizes a valid solve to zero with
+concurrency 1. CLI resize overrides preserve the existing node's concurrency;
+a newly inserted resize uses 1. There is no global threads option or concurrency
+environment variable.
+
+Prepare and measure use one standard-library frame executor. For each stage,
+`accepted_not_delivered = running_or_queued + completed_waiting <= concurrency`.
+Completion does not release capacity: ordered commit validates identity and
+publishes state; downstream receipt releases the slot. A ready frame 0 can be
+committed while later frames are still running. Prepare delivers into a
+lightweight reference directory, so it does not wait for every consumer. The
+reference directory, features, EV plan and on-disk cache can grow with sequence
+length; the concurrency bound is a frame bound, not a byte or disk limit.
+Frame 0's white balance is frozen at ordered prepare commit. Solve runs once,
+after every measurement and matching EOF is sealed. Per-node logs commit in
+source order; different nodes can interleave. Durations measure computation,
+not time waiting in ordered slots, and their sum is not wall time.
+
+All prepare, measure and develop processes share the run's multi-task process
+owner. Errors or stop signals cancel and reap active tasks; late successes are
+not committed. FFmpeg failure cancels every registered producer. Each task has
+its own transcript in retained scratch on failure.
 
 Events are framework-generated per frame and per sequence and are recorded in
 the run log. A custom graph may insert identity/exposure/resize nodes, chain
