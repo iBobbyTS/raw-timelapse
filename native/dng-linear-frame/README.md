@@ -346,7 +346,7 @@ BigTIFF (magic 43) is rejected explicitly rather than guessed. Only
 three-channel LinearRaw decode is supported.
 
 - Main RAW `34892`: direct Adobe SDK decode (`route: linearraw-sdk`).
-- Main RAW `32803`: Adobe Converter `-c -l -d <run-temp-directory> <input>`;
+- Main RAW `32803`: Adobe Converter `-c -l -d <run-temp-directory> -mp <input>`;
   require exactly one output and independently verify main RAW `34892`, then
   SDK (`route: cfa-converter-linearraw-sdk`).
 - A malformed recognized DNG (missing/ambiguous main RAW IFD, other
@@ -365,9 +365,10 @@ Default Converter: `/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe D
 The timeout defaults to 120 seconds; allowed override 1–3600 seconds. Execution
 uses an argv vector and a process group, with no shell. Failures and timeout are
 explicit errors; the run-owned temporary directory is removed on success and
-exception, with cleanup logged to stderr. Successful sidecars include the
-Converter command, version (bundle metadata, otherwise `UNKNOWN`), exit code,
-transcript, output hash/name, verified routing value, and cleanup location.
+retained on failure for diagnostics, with cleanup or retention logged to stderr.
+Successful sidecars include the Converter command, version (bundle metadata,
+otherwise `UNKNOWN`), exit code, transcript, output hash/name, verified routing
+value, and cleanup location.
 
 WB values are **camera neutral values in AsShotNeutral's domain**, rather than
 reciprocal RGB gains. Defaults preserve the original file tag's rational
