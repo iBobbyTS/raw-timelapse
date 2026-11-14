@@ -56,6 +56,8 @@ OPTIONS:
     --resize <WxH>             Explicit scene-linear resize; omit to keep source geometry
     --converter <PATH>         Adobe DNG Converter override passed to the native tool
     --converter-timeout <SEC>  Converter timeout override (1-3600 seconds)
+    --verify-output           Verify the encoded output in full after encoding: frame-count
+                               decode plus a complete decode (default: container metadata only)
     --strength <0..1>          Correction strength (default: 1.0; 0 disables deflicker)
     --period <N>               Smooth-trend period in frames, >= 6 (default: 60)
     --brightness <MODE>        smooth | uniform (default: smooth)
@@ -74,7 +76,9 @@ CONFIGURATION PRIORITY:
     pixel format is silently substituted.
 
 OUTPUT SURFACE:
-    <VIDEO_FILE>               validated deliverable, published by a single rename
+    <VIDEO_FILE>               deliverable, published by a single rename; checked against
+                               container metadata by default (--verify-output adds frame
+                               counting and a complete decode)
     <name>.log                 one run log: wall-clock + monotonic elapsed, node/frame
                                events, per-frame timings, cache-deletion events and
                                bounded error summaries (Converter/FFmpeg stderr tails)
@@ -308,6 +312,9 @@ pub struct Options {
     pub encoder: Patch,
     /// Explicit CLI resize; `None` keeps the graph's geometry (source by default).
     pub resize: Option<(u32, u32)>,
+    /// Opt in to the full output verification pass (frame-count decode plus a
+    /// complete decode of the deliverable). Default: container metadata only.
+    pub verify_output: bool,
 }
 
 #[derive(Debug)]
@@ -337,6 +344,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut rate: Option<RateControl> = None;
     let mut rate_flag: Option<&'static str> = None;
     let mut resize: Option<(u32, u32)> = None;
+    let mut verify_output = false;
     let mut seen_input = false;
     let mut seen_output = false;
 
@@ -600,6 +608,21 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
             "--resize" => {
                 resize = Some(parse_resize(&take_value(args, &mut index, flag, inline_value)?)?)
             }
+            "--verify-output" => {
+                if inline_value.is_some() {
+                    return Err(Error::new(
+                        EXIT_USAGE,
+                        "--verify-output takes no value",
+                    ));
+                }
+                if verify_output {
+                    return Err(Error::new(
+                        EXIT_USAGE,
+                        "--verify-output may be given only once",
+                    ));
+                }
+                verify_output = true;
+            }
             other => {
                 return Err(Error::new(
                     EXIT_USAGE,
@@ -645,6 +668,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         deflicker,
         encoder,
         resize,
+        verify_output,
     }))
 }
 
@@ -1274,6 +1298,31 @@ mod tests {
         assert!(USAGE.contains("--encoder"));
         assert!(USAGE.contains("--resize"));
         assert!(USAGE.contains("--output <VIDEO_FILE>"));
+    }
+
+    #[test]
+    fn full_output_verification_is_opt_in_and_single() {
+        let options = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");
+        assert!(!options.verify_output);
+        let options =
+            parse_run(&["--input", "in", "--output", "out.mov", "--verify-output"])
+                .expect("parse");
+        assert!(options.verify_output);
+        assert!(USAGE.contains("--verify-output"));
+        assert!(
+            parse_run(&[
+                "--input",
+                "in",
+                "--output",
+                "out.mov",
+                "--verify-output",
+                "--verify-output"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_run(&["--input", "in", "--output", "out.mov", "--verify-output=1"]).is_err()
+        );
     }
 
     #[test]

@@ -770,6 +770,11 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
             frames: sequence.frames.len(),
             fps: context.options.fps,
         },
+        if context.options.verify_output {
+            video::OutputVerify::Full
+        } else {
+            video::OutputVerify::Metadata
+        },
     )?;
     timings.insert("validate_video".into(), validation_started.elapsed());
     let bytes = video::file_size(&output)
@@ -778,7 +783,7 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         &output,
         config.media_type(),
         &probe.codec_name,
-        probe.frames,
+        probe.frames.unwrap_or(sequence.frames.len() as u64),
         "graph streaming encoder",
         profile,
         context.options.log_reference_gain,
@@ -803,6 +808,11 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
             timings,
             video_artifact: artifact,
             resize: runner.resize,
+            verify: if context.options.verify_output {
+                "full"
+            } else {
+                "metadata"
+            },
             retained_cache,
         },
     })

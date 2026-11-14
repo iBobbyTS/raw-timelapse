@@ -3,8 +3,9 @@
 Rust driver for the RAW time-lapse product: enumerate a directory of RAW/DNG
 frames, convert each source once into a run-local LinearRaw cache, measure and
 solve a best-effort exposure plan in one sequential node, stream each developed
-frame through scene-linear colour conversion into FFmpeg, validate the encoded
-file, and publish **one video file and one run log**.
+frame through scene-linear colour conversion into FFmpeg, check the encoded
+file against container metadata (full verification is opt-in via
+`--verify-output`), and publish **one video file and one run log**.
 
 The deflicker node is enabled by default. There is no report directory, manifest,
 CSV, audit JSON or per-frame log in the product output: the log beside the video
@@ -75,7 +76,9 @@ Defaults:
 ## Output
 
 ```
-<video file>     the validated deliverable, published by one rename
+<video file>     the deliverable, published by one rename after a container
+                 metadata check (--verify-output adds frame counting by decode
+                 and a complete decode)
 <stem>.log       the single run log
 ```
 
@@ -92,8 +95,8 @@ The log is line-oriented; every entry carries `wall=<epoch seconds>` and
 - `delete` events naming each deleted cache DNG
 - `exposure` events for an explicit exposure node
 - `encoder.command` with the exact FFmpeg argv once
-- `timing`, `video`, `publish`, `retained-cache` (custom graph left generated
-  cache behind), `run.complete`
+- `timing`, `video` (including `verify=metadata|full`), `publish`,
+  `retained-cache` (custom graph left generated cache behind), `run.complete`
 - on failure: `node.error` / `run.error` with the error family, a bounded
   Converter/FFmpeg stderr tail and the retained scratch path
 
@@ -255,10 +258,13 @@ are rejected. Unsupported encoder/pixel-format/container combinations and
 configuration conflicts are rejected before any RAW preparation; no encoder or
 pixel format is silently substituted.
 
-Publication is one rename after validation (nonempty file, ffprobe
-codec/profile/pixel format/geometry/frame count/rate, per-field colour tags,
-range where the container can express it, and a full decode). Validation failure
-leaves only the scratch partial and a non-zero exit.
+Publication is one rename after the output check. By default the check reads
+ffprobe container metadata only: codec/profile/pixel format/geometry/rate,
+per-field colour tags, range where the container can express it, and the frame
+count when the container declares one (MOV/ProRes declares none, so the logged
+count is then the encoder's own). `--verify-output` additionally counts frames
+by decoding and decodes the entire deliverable to prove it is playable. Check
+failure leaves only the scratch partial and a non-zero exit.
 
 ## Colour/Log profiles
 

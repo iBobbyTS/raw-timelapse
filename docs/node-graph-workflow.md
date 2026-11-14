@@ -141,7 +141,7 @@ wall=<epoch 秒.毫秒> elapsed=<单调秒.毫秒> kind=<事件> <有界字段..
 | `exposure` | 显式 exposure 节点的 EV 与累计 EV |
 | `encoder.command` | 实际 FFmpeg argv（一次） |
 | `timing` / `timing.publish` | preflight / graph / validate / publish / total |
-| `video` | 最终视频路径、字节、codec/profile/几何/帧数/像素格式/range/resize |
+| `video` | 最终视频路径、字节、codec/profile/几何/帧数/像素格式/range/resize、verify=metadata|full |
 | `publish` / `run.complete` | 发布与正常结束 |
 | `retained-cache` | 自定义图未删除生成缓存时的保留位置与数量 |
 | `node.error` / `run.error` | 错误家族、有界 Converter/FFmpeg stderr 片段、scratch 保留路径 |

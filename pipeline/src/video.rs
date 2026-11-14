@@ -178,7 +178,9 @@ pub struct ProbeInfo {
     pub bits_per_raw_sample: Option<u32>,
     pub width: u32,
     pub height: u32,
-    pub frames: u64,
+    /// Decoded/counted frame total. `None` when the probe did not decode (no
+    /// `-count_frames`) and the container declares no `nb_frames`.
+    pub frames: Option<u64>,
     pub avg_frame_rate: String,
     pub color_space: String,
     pub color_primaries: String,
@@ -203,7 +205,12 @@ impl ProbeInfo {
             ),
             ("width", crate::json::Json::Int(self.width as i64)),
             ("height", crate::json::Json::Int(self.height as i64)),
-            ("nb_read_frames", crate::json::Json::Int(self.frames as i64)),
+            (
+                "nb_read_frames",
+                self.frames
+                    .map(|frames| crate::json::Json::Int(frames as i64))
+                    .unwrap_or(crate::json::Json::Null),
+            ),
             (
                 "avg_frame_rate",
                 crate::json::Json::Str(self.avg_frame_rate.clone()),
@@ -228,19 +235,25 @@ impl ProbeInfo {
     }
 }
 
-pub fn probe_stream(ffprobe: &Path, file: &Path) -> Result<ProbeInfo> {
-    let args = vec![
+pub fn probe_stream(ffprobe: &Path, file: &Path, count_frames: bool) -> Result<ProbeInfo> {
+    // `-count_frames` makes ffprobe decode the entire stream just to count it.
+    // Without it only the container-declared count (if any) is available.
+    let mut args = vec![
         "-v".to_string(),
         "error".to_string(),
         "-select_streams".to_string(),
         "v:0".to_string(),
-        "-count_frames".to_string(),
+    ];
+    if count_frames {
+        args.push("-count_frames".to_string());
+    }
+    args.extend([
         "-show_entries".to_string(),
         "stream=codec_name,profile,pix_fmt,bits_per_raw_sample,width,height,nb_read_frames,avg_frame_rate,color_space,color_primaries,color_transfer,color_range".to_string(),
         "-of".to_string(),
         "default=noprint_wrappers=1".to_string(),
         file.display().to_string(),
-    ];
+    ]);
     let captured = proc::run_capture(ffprobe, &args, EXIT_VALIDATION)?;
     if !captured.status.success() {
         return Err(Error::new(
@@ -289,29 +302,11 @@ pub fn probe_stream(ffprobe: &Path, file: &Path) -> Result<ProbeInfo> {
             ),
         )
     })?;
-    let frames_text = fields
+    // Whether a missing count is acceptable is the caller's verify-depth choice.
+    let frames = fields
         .get("nb_read_frames")
         .or_else(|| fields.get("nb_frames"))
-        .cloned()
-        .ok_or_else(|| {
-            Error::new(
-                EXIT_VALIDATION,
-                format!(
-                    "ffprobe output for {} has no frame count field; output: {}",
-                    file.display(),
-                    proc::tail(&captured.stdout, 600)
-                ),
-            )
-        })?;
-    let frames: u64 = frames_text.parse().map_err(|_| {
-        Error::new(
-            EXIT_VALIDATION,
-            format!(
-                "ffprobe returned a non-integer frame count {frames_text:?} for {}",
-                file.display()
-            ),
-        )
-    })?;
+        .and_then(|text| text.parse::<u64>().ok());
     let color = |key: &str| {
         fields
             .get(key)
@@ -349,14 +344,26 @@ pub struct OutputContract<'a> {
     pub fps: Fps,
 }
 
+/// Depth of the post-encode output check. `Metadata` compares ffprobe
+/// container metadata against the configured contract without decoding;
+/// `Full` additionally counts frames by decoding and decodes the whole
+/// deliverable to prove it is playable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputVerify {
+    Metadata,
+    Full,
+}
+
 /// Validate the encoded file generically: codec/profile/pixel format/geometry/
-/// frame count/rate, the profile's per-field colour tags, the range the
-/// container can express, and a complete decode.
+/// frame count/rate and the profile's per-field colour tags against ffprobe
+/// metadata; `OutputVerify::Full` also counts frames by decoding and runs a
+/// complete decode of the deliverable.
 pub fn validate_output(
     ffprobe: &Path,
     ffmpeg: &Path,
     file: &Path,
     contract: &OutputContract<'_>,
+    verify: OutputVerify,
 ) -> Result<ProbeInfo> {
     let config = contract.config;
     let profile = contract.profile;
@@ -364,7 +371,7 @@ pub fn validate_output(
     if let Err(message) = config.validate_geometry(contract.width, contract.height) {
         return Err(Error::new(EXIT_PREVIEW, message));
     }
-    let probe = probe_stream(ffprobe, file)?;
+    let probe = probe_stream(ffprobe, file, verify == OutputVerify::Full)?;
     if probe.codec_name != config.codec_name() {
         return Err(Error::new(
             EXIT_PREVIEW,
@@ -414,14 +421,24 @@ pub fn validate_output(
             ),
         ));
     }
-    if probe.frames != contract.frames as u64 {
-        return Err(Error::new(
-            EXIT_PREVIEW,
-            format!(
-                "output has {} frames, expected {}",
-                probe.frames, contract.frames
-            ),
-        ));
+    match (verify, probe.frames) {
+        (_, Some(observed)) if observed != contract.frames as u64 => {
+            return Err(Error::new(
+                EXIT_PREVIEW,
+                format!(
+                    "output has {observed} frames, expected {}",
+                    contract.frames
+                ),
+            ));
+        }
+        // A count is only observable by decoding in this container.
+        (OutputVerify::Full, None) => {
+            return Err(Error::new(
+                EXIT_PREVIEW,
+                "full output verification could not count frames",
+            ));
+        }
+        _ => {}
     }
     if !rate_matches(&probe.avg_frame_rate, contract.fps) {
         return Err(Error::new(
@@ -477,28 +494,30 @@ pub fn validate_output(
         ));
     }
 
-    // Full decode proves the file is actually playable, not merely indexable.
-    let args = vec![
-        "-hide_banner".to_string(),
-        "-nostdin".to_string(),
-        "-v".to_string(),
-        "error".to_string(),
-        "-i".to_string(),
-        file.display().to_string(),
-        "-f".to_string(),
-        "null".to_string(),
-        "-".to_string(),
-    ];
-    let captured = proc::run_capture(ffmpeg, &args, EXIT_PREVIEW)?;
-    if !captured.status.success() {
-        return Err(Error::new(
-            EXIT_PREVIEW,
-            format!(
-                "output failed a full decode: {}; stderr: {}",
-                proc::exit_description(&captured.status),
-                proc::tail(&captured.stderr, 1200)
-            ),
-        ));
+    if verify == OutputVerify::Full {
+        // Full decode proves the file is actually playable, not merely indexable.
+        let args = vec![
+            "-hide_banner".to_string(),
+            "-nostdin".to_string(),
+            "-v".to_string(),
+            "error".to_string(),
+            "-i".to_string(),
+            file.display().to_string(),
+            "-f".to_string(),
+            "null".to_string(),
+            "-".to_string(),
+        ];
+        let captured = proc::run_capture(ffmpeg, &args, EXIT_PREVIEW)?;
+        if !captured.status.success() {
+            return Err(Error::new(
+                EXIT_PREVIEW,
+                format!(
+                    "output failed a full decode: {}; stderr: {}",
+                    proc::exit_description(&captured.status),
+                    proc::tail(&captured.stderr, 1200)
+                ),
+            ));
+        }
     }
     Ok(probe)
 }
@@ -981,6 +1000,218 @@ mod tests {
                 assert_eq!(actual, expected - 2);
             }
             other => panic!("unexpected constructor outcome: {other:?}"),
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod output_verify_tests {
+    use super::*;
+    use crate::encoder::Patch;
+
+    struct Harness {
+        root: std::path::PathBuf,
+    }
+
+    impl Harness {
+        fn new(name: &str) -> Self {
+            let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target/test-tmp")
+                .join(format!("verify-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+
+        fn script(&self, name: &str, lines: &[String]) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.root.join(name);
+            fs::write(&path, format!("#!/bin/sh\n{}\n", lines.join("\n"))).unwrap();
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).unwrap();
+            path
+        }
+
+        /// Fake ffprobe: records argv and reports exactly the fields the
+        /// configured contract expects, so the metadata checks pass by
+        /// construction and only the verify depth changes behaviour.
+        fn ffprobe(
+            &self,
+            config: &ResolvedConfig,
+            profile: &ColorProfile,
+            frames: Option<u64>,
+        ) -> std::path::PathBuf {
+            let mut lines = vec![format!(
+                "printf '%s\\n' \"$@\" > {}",
+                self.root.join("ffprobe.argv").display()
+            )];
+            lines.push(format!("echo codec_name={}", config.codec_name()));
+            lines.push(format!("echo pix_fmt={}", config.pix_fmt));
+            if let Some(name) = config.probe_profile() {
+                lines.push(format!("echo profile={name}"));
+            }
+            lines.push("echo width=64".to_string());
+            lines.push("echo height=48".to_string());
+            if let Some(count) = frames {
+                lines.push(format!("echo nb_read_frames={count}"));
+            }
+            lines.push("echo avg_frame_rate=30/1".to_string());
+            lines.push(format!(
+                "echo color_space={}",
+                profile.tag_policy.matrix_token()
+            ));
+            lines.push(format!(
+                "echo color_primaries={}",
+                profile.tag_policy.primaries_token()
+            ));
+            lines.push(format!(
+                "echo color_transfer={}",
+                profile.tag_policy.transfer_token()
+            ));
+            lines.push(format!(
+                "echo color_range={}",
+                config.effective_range(profile).as_str()
+            ));
+            self.script("ffprobe", &lines)
+        }
+
+        fn ffmpeg(&self) -> std::path::PathBuf {
+            let lines = vec![format!(
+                "printf '%s\\n' \"$@\" > {}",
+                self.root.join("ffmpeg.argv").display()
+            )];
+            self.script("ffmpeg", &lines)
+        }
+
+        fn argv(&self, name: &str) -> Vec<String> {
+            fs::read_to_string(self.root.join(name))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn contract<'a>(
+        config: &'a ResolvedConfig,
+        profile: &'a ColorProfile,
+        frames: usize,
+    ) -> OutputContract<'a> {
+        OutputContract {
+            config,
+            profile,
+            width: 64,
+            height: 48,
+            frames,
+            fps: Fps::DEFAULT,
+        }
+    }
+
+    fn scene(name: &str, frames: Option<u64>) -> (Harness, ResolvedConfig, &'static ColorProfile) {
+        let harness = Harness::new(name);
+        let config = ResolvedConfig::resolve(None, &Patch::default()).unwrap();
+        let profile = crate::color_profile::default_profile();
+        let _ = frames;
+        (harness, config, profile)
+    }
+
+    #[test]
+    fn metadata_mode_skips_frame_counting_and_the_full_decode() {
+        let (harness, config, profile) = scene("metadata", Some(3));
+        let ffprobe = harness.ffprobe(&config, profile, Some(3));
+        let ffmpeg = harness.ffmpeg();
+        let output = harness.root.join("video.mov");
+        fs::write(&output, b"encoded").unwrap();
+        let probe = validate_output(
+            &ffprobe,
+            &ffmpeg,
+            &output,
+            &contract(&config, profile, 3),
+            OutputVerify::Metadata,
+        )
+        .unwrap();
+        assert_eq!(probe.frames, Some(3));
+        assert!(!harness
+            .argv("ffprobe.argv")
+            .contains(&"-count_frames".to_string()));
+        assert!(!harness.root.join("ffmpeg.argv").exists());
+    }
+
+    #[test]
+    fn full_mode_counts_frames_and_decodes_the_deliverable() {
+        let (harness, config, profile) = scene("full", Some(3));
+        let ffprobe = harness.ffprobe(&config, profile, Some(3));
+        let ffmpeg = harness.ffmpeg();
+        let output = harness.root.join("video.mov");
+        fs::write(&output, b"encoded").unwrap();
+        validate_output(
+            &ffprobe,
+            &ffmpeg,
+            &output,
+            &contract(&config, profile, 3),
+            OutputVerify::Full,
+        )
+        .unwrap();
+        assert!(harness
+            .argv("ffprobe.argv")
+            .contains(&"-count_frames".to_string()));
+        let ffmpeg_argv = harness.argv("ffmpeg.argv");
+        assert!(ffmpeg_argv.contains(&"-f".to_string()));
+        assert!(ffmpeg_argv.contains(&"null".to_string()));
+    }
+
+    #[test]
+    fn a_container_without_a_count_passes_metadata_and_fails_full() {
+        let (harness, config, profile) = scene("missing-count", None);
+        let ffprobe = harness.ffprobe(&config, profile, None);
+        let ffmpeg = harness.ffmpeg();
+        let output = harness.root.join("video.mov");
+        fs::write(&output, b"encoded").unwrap();
+        validate_output(
+            &ffprobe,
+            &ffmpeg,
+            &output,
+            &contract(&config, profile, 3),
+            OutputVerify::Metadata,
+        )
+        .unwrap();
+        let error = validate_output(
+            &ffprobe,
+            &ffmpeg,
+            &output,
+            &contract(&config, profile, 3),
+            OutputVerify::Full,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, EXIT_PREVIEW);
+        assert!(error.message.contains("could not count frames"));
+    }
+
+    #[test]
+    fn a_declared_count_mismatch_is_rejected_in_both_modes() {
+        let (harness, config, profile) = scene("mismatch", Some(5));
+        let ffprobe = harness.ffprobe(&config, profile, Some(5));
+        let ffmpeg = harness.ffmpeg();
+        let output = harness.root.join("video.mov");
+        fs::write(&output, b"encoded").unwrap();
+        for verify in [OutputVerify::Metadata, OutputVerify::Full] {
+            let error = validate_output(
+                &ffprobe,
+                &ffmpeg,
+                &output,
+                &contract(&config, profile, 3),
+                verify,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, EXIT_PREVIEW);
+            assert!(error.message.contains("output has 5 frames, expected 3"));
         }
     }
 }

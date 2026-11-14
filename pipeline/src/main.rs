@@ -73,6 +73,8 @@ pub struct EncodedStage {
     pub timings: BTreeMap<String, Duration>,
     pub video_artifact: DataEnvelope,
     pub resize: Option<video::ResizeRecord>,
+    /// Depth of the completed output check: "metadata" or "full".
+    pub verify: &'static str,
     /// Run-generated cache DNGs that the graph did not delete.
     pub retained_cache: Vec<std::path::PathBuf>,
 }
@@ -223,20 +225,24 @@ fn execute(
     let stage = &result.stage;
     log.line(&format!(
         "kind=video path={} bytes={} codec={} profile={} width={} height={} frames={} \
-         pix_fmt={} range={} resize={}",
+         pix_fmt={} range={} resize={} verify={}",
         quote(&video.display().to_string()),
         stage.bytes,
         stage.probe.codec_name,
         stage.probe.profile,
         stage.probe.width,
         stage.probe.height,
-        stage.probe.frames,
+        stage
+            .probe
+            .frames
+            .unwrap_or(result.sequence.frames.len() as u64),
         stage.probe.pix_fmt,
         stage.probe.color_range,
         match stage.resize {
             Some(record) => format!("{}x{}", record.width, record.height),
             None => "none".to_string(),
-        }
+        },
+        stage.verify
     ))?;
     log.line(&format!(
         "kind=timing preflight={:.3} graph={:.3} validate={:.3}",
