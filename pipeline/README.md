@@ -132,7 +132,7 @@ source -> convert-cache --prepared references--> measure-solve -> apply-ev
                        delete-cache (waits apply-ev frame completion) -----+
 ```
 
-- `convert` runs once per source (`dng-linear-frame --prepare`) and keeps only a
+- `prepare` (`convert-cache`) runs once per source (`dng-linear-frame --prepare`) and keeps only a
   cache reference table; it is never blocked by the EV branch.
 - `measure-solve` measures independent frames concurrently, then seals the full
   frame inventory and publishes one EV table. `--strength 0` replaces it with a zero plan.
@@ -149,38 +149,65 @@ Set concurrency per node in the graph JSON:
 {"id":"convert-cache","kind":"prepare","concurrency":4,"inputs":{"source":"source"}}
 ```
 
-`prepare` and the measurement phase of `solve` accept integer `concurrency`
-values from 1 to 64; omission means 1. All built-in nodes currently declare 1.
-These conservative defaults have not been tuned for throughput. The image chain
-(develop, identity, exposure, resize, color) remains serial, as does encode;
-values above 1 on those or other sequential/control nodes are rejected.
+`prepare`, `develop`, `identity`, `exposure`, `resize`, `color`, and the
+measurement phase of `solve` accept integer `concurrency` values from 1 to 64;
+omission means 1. Source, references, barrier, zero, encode and delete only
+accept 1. The built-in graph explicitly uses Prepare=4, Solve measurement=8,
+Develop=4, and 1 for all other nodes. The final Solve operation still runs once.
+
+These fixed defaults were selected from repeated 1/4/8 real-CR3 comparisons,
+isolated-stage controls and a direct 4/4/4 versus 4/8/4 comparison. Develop=8
+added memory for little extra benefit; measurement=8 helped in the actual 4/N/4
+pipeline. Prepare's result depended on the downstream settings, so the choice
+uses the combined pipeline rather than an isolated-stage ranking.
+
+On the tested macOS host (36 GiB RAM, 14 logical CPUs), a full 476-frame R7
+sequence at 6984x4660, sRGB/ProRes 4444, without resize, took 2239.07 s with all
+capacities 1 and 1484.13 s with 4/8/4. Sampled process-tree RSS peaks were
+4.37 GiB and 7.77 GiB respectively. Both published and fully decoded all frames,
+with identical source/EV/WB/developed-pixel and decoded-frame results. Outputs
+and scratch used the same local APFS volume. The smaller 29-file set was split
+into 19 R7 and 10 R6 II frames, resized to 696x464 and 600x400; two rounds used
+opposite 1/4/8 orders. Source fingerprinting pre-read the files; caches were not
+purged and background load varied. These are observed workloads, not an optimal
+setting or a fixed speedup guarantee. Colour remains 1 in the measured default;
+custom graphs can set its concurrency independently.
+
 Null, strings, booleans, fractions, out-of-range values and duplicate fields are
 configuration errors. `--strength 0` normalizes a valid solve to zero with
 concurrency 1. CLI resize overrides preserve the existing node's concurrency;
 a newly inserted resize uses 1. There is no global threads option or concurrency
 environment variable.
 
-Prepare and measure use one standard-library frame executor. For each stage,
+All frame stages use the same standard-library ordered executor. For each stage,
 `accepted_not_delivered = running_or_queued + completed_waiting <= concurrency`.
 Completion does not release capacity: ordered commit validates identity and
-publishes state; downstream receipt releases the slot. A ready frame 0 can be
-committed while later frames are still running. Prepare delivers into a
+emits the frame event; downstream acceptance releases the slot. A committed
+frame may still occupy its producer while a frame-dependent Delete runs. A ready frame 0 can be committed while later frames are still running. Prepare delivers into a
 lightweight reference directory, so it does not wait for every consumer. The
 reference directory, features, EV plan and on-disk cache can grow with sequence
 length; the concurrency bound is a frame bound, not a byte or disk limit.
+Heavy frames across the chain are bounded by the sum of stage capacities, plus
+native worksets and each transformation's temporary buffers.
 Frame 0's white balance is frozen at ordered prepare commit. Solve runs once,
 after every measurement and matching EOF is sealed. Per-node logs commit in
 source order; different nodes can interleave. Durations measure computation,
 not time waiting in ordered slots, and their sum is not wall time.
 
-All prepare, measure and develop processes share the run's multi-task process
-owner. Errors or stop signals cancel and reap active tasks; late successes are
+All prepare, measure, develop and FFmpeg processes share the run's multi-task
+process owner. Encode runs as a capacity-1 task with one writer to one FFmpeg
+stream, so a blocked stdin write leaves the coordinator able to cancel and
+collect other completions. Sequence completion requires sealed input, all tasks
+finished, ordered commits and all output delivery. Errors or stop signals cancel and reap active tasks; late successes are
 not committed. FFmpeg failure cancels every registered producer. Each task has
-its own transcript in retained scratch on failure.
+its own transcript in retained scratch on failure. The existing run log records
+`kind=stage` summaries (capacity, accepted/committed/delivered counts and peak
+in-flight frames) and `kind=image`/`kind=encode` compute durations. Stage duration
+sums include overlapping tasks and must not be interpreted as pipeline wall time.
 
 Events are framework-generated per frame and per sequence and are recorded in
 the run log. A custom graph may insert identity/exposure/resize nodes, chain
-another sequential node, or add waits; an invalid graph, type mismatch, cycle or
+another frame node, or add waits; an invalid graph, type mismatch, cycle or
 illegal event dependency is a configuration error before any RAW work.
 
 [`docs/node-graph-workflow.md`](../docs/node-graph-workflow.md) records the model, default graph, event scopes,
@@ -277,7 +304,7 @@ records.
    surfaced as a user-facing quality verdict.
 4. **Render** — each frame is decoded once more at its planned EV
    (`--stdout-frame-f32`), converted to the single 10-bit 4:4:4 handoff and
-   pushed to FFmpeg while only one full-resolution frame lives in the chain.
+   pushed in source order to one FFmpeg stream through a bounded image chain.
 5. **Delete** — the develop completion event releases that frame's cache DNG
    immediately; no encoder acknowledgement is awaited.
 

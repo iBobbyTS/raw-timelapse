@@ -18,6 +18,14 @@ pub struct Completion<T> {
     pub value: T,
     pub elapsed: Duration,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageStats {
+    pub capacity: usize,
+    pub accepted: usize,
+    pub committed: usize,
+    pub delivered: usize,
+    pub peak: usize,
+}
 struct Slot<T> {
     key: TaskKey,
     worker: Option<JoinHandle<()>>,
@@ -28,6 +36,7 @@ struct Slot<T> {
 /// There is no unbounded input queue or per-wave barrier.
 pub struct OrderedStage<T> {
     capacity: usize,
+    peak: usize,
     accepted: usize,
     committed: usize,
     delivered: usize,
@@ -42,6 +51,7 @@ impl<T: Send + 'static> OrderedStage<T> {
         let (send, receive) = mpsc::channel();
         Self {
             capacity,
+            peak: 0,
             accepted: 0,
             committed: 0,
             delivered: 0,
@@ -49,6 +59,15 @@ impl<T: Send + 'static> OrderedStage<T> {
             send,
             receive,
             wake,
+        }
+    }
+    pub fn stats(&self) -> StageStats {
+        StageStats {
+            capacity: self.capacity,
+            accepted: self.accepted,
+            committed: self.committed,
+            delivered: self.delivered,
+            peak: self.peak,
         }
     }
     pub fn outstanding(&self) -> usize {
@@ -87,6 +106,7 @@ impl<T: Send + 'static> OrderedStage<T> {
             },
         );
         self.accepted += 1;
+        self.peak = self.peak.max(self.outstanding());
         Ok(())
     }
     /// Observe every completion, including failures beyond a blocked head.
