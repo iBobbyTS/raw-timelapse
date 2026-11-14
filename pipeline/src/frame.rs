@@ -3053,12 +3053,21 @@ if mode.startswith('late:'):
         let settings = PreparedSettings {
             camera_color_method: crate::color_profile::CameraColorMethod::LegacyInverseCm,
         };
+        for name in ["context-nul.ctx", "record-nul.ctx"] {
+            let error = PreparedFrame::load(&root.join(name)).expect_err("forged NUL must be rejected");
+            assert!(
+                error.message.contains("prepared document contains NUL"),
+                "{}",
+                error.message
+            );
+        }
         for (i, name) in [
             "many/0.ctx",
             "noisy/0.ctx",
             "mapping/5.ctx",
             "all-direct/0.ctx",
             "mixed/2.ctx",
+            "nul/0.ctx",
         ]
         .iter()
         .enumerate()
@@ -3110,6 +3119,18 @@ if mode.startswith('late:'):
         .unwrap();
         let fields = parse_document_fields(&record, "rawtl-conversion/1", 1024 * 1024).unwrap();
         assert_eq!(field_value(&fields, "argc").unwrap(), "26");
+        let frame = PreparedFrame::load(&root.join("nul/0.ctx")).unwrap();
+        let fields = parse_context_fields(&fs::read(&frame.context).unwrap()).unwrap();
+        let record = read_document(
+            Path::new(field_value(&fields, "converter_record").unwrap()),
+            1024 * 1024,
+        )
+        .unwrap();
+        let fields = parse_document_fields(&record, "rawtl-conversion/1", 1024 * 1024).unwrap();
+        assert_eq!(
+            field_value(&fields, "transcript").unwrap(),
+            "warning before?after\n"
+        );
     }
 
 }

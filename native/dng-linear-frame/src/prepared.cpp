@@ -507,35 +507,29 @@ void write_prepared(const PreparedFrame &prepared,
                    "and prepared DNG");
   std::ostringstream out;
   out << kContextMagic << '\n';
-  auto field = [&](const char *key, const std::string &value) {
-    out << key << '=' << escape(value) << '\n';
-  };
-  auto integer = [&](const char *key, uint32_t value) {
-    out << key << '=' << value << '\n';
-  };
-  field("source", prepared.source.string());
-  field("source_sha256", prepared.source_hash);
-  field("route", route_name(prepared.kind));
-  field("prepared_dng", prepared.prepared_dng.string());
-  field("prepared_sha256", prepared.prepared_hash);
-  out << "generated=" << (prepared.generated ? 1 : 0) << '\n';
-  integer("main_ifd_width", prepared.main_ifd_width);
-  integer("main_ifd_height", prepared.main_ifd_height);
-  field("as_shot_neutral", number(prepared.own[0]) + "," +
+  field(out, "source", prepared.source.string());
+  field(out, "source_sha256", prepared.source_hash);
+  field(out, "route", route_name(prepared.kind));
+  field(out, "prepared_dng", prepared.prepared_dng.string());
+  field(out, "prepared_sha256", prepared.prepared_hash);
+  field(out, "generated", prepared.generated ? "1" : "0");
+  field(out, "main_ifd_width", std::to_string(prepared.main_ifd_width));
+  field(out, "main_ifd_height", std::to_string(prepared.main_ifd_height));
+  field(out, "as_shot_neutral", number(prepared.own[0]) + "," +
                                number(prepared.own[1]) + "," +
                                number(prepared.own[2]));
-  out << "has_capture_time=" << (prepared.capture_time ? 1 : 0) << '\n';
+  field(out, "has_capture_time", prepared.capture_time ? "1" : "0");
   if (prepared.capture_time)
-    field("capture_time", *prepared.capture_time);
+    field(out, "capture_time", *prepared.capture_time);
   const ConversionInfo &conversion = prepared.conversion;
-  out << "converter_used=" << (conversion.used ? 1 : 0) << '\n';
+  field(out, "converter_used", conversion.used ? "1" : "0");
   if (conversion.used) {
-    field("converter_record", conversion.record_path.string());
-    field("converter_record_sha256", conversion.record_hash);
-    field("converter_output_name", conversion.output_name);
-    field("converter_output_sha256", conversion.output_sha256);
-    integer("converter_photometric", conversion.photometric);
-    field("converter_cleanup", conversion.cleanup);
+    field(out, "converter_record", conversion.record_path.string());
+    field(out, "converter_record_sha256", conversion.record_hash);
+    field(out, "converter_output_name", conversion.output_name);
+    field(out, "converter_output_sha256", conversion.output_sha256);
+    field(out, "converter_photometric", std::to_string(conversion.photometric));
+    field(out, "converter_cleanup", conversion.cleanup);
   }
   atomic_document(context_path, out.str(), kContextLimit);
 }

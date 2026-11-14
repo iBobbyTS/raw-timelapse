@@ -49,6 +49,7 @@ import os,sys,pathlib,socket,shutil,signal,time
 args=sys.argv[1:]; out=pathlib.Path(args[args.index('-d')+1]); inputs=args[args.index('-mp')+1:]
 mode=os.environ.get('BATCH_MODE','ok')
 if mode=='noisy': print('é'*100000)
+if mode=='nul': os.write(2,b'warning before\\x00after\\n')
 if mode=='root-error':
  r,w=os.pipe()
  if os.fork():
@@ -231,3 +232,24 @@ for name,text in [('record-version',r.read_text().replace('rawtl-conversion/1','
     record_path=work/(name+'.record');record_path.write_text(text)
     ctx=work/(name+'.ctx');ctx.write_text(original.replace(str(r),str(record_path)).replace(f['converter_record_sha256'],hashlib.sha256(record_path.read_bytes()).hexdigest()))
     run([exe,'--stdout-analysis','--prepared',ctx],26)
+
+# A converter's raw log may contain NUL; published documents must not carry it.
+os.environ['BATCH_MODE']='nul'
+root=work/'nul';manifest(root,sources);run(args(root,fake))
+assert (root/'result').is_file()
+f=fields(root/'0.ctx');record_path=pathlib.Path(f['converter_record'])
+assert (root/'linear-converter.log').read_bytes()==b'warning before\x00after\n'
+# Keep the reader contract strict, including a hash-consistent forged record.
+context_nul=work/'context-nul.ctx'
+context_nul.write_text((root/'0.ctx').read_text().replace('converter_cleanup=','converter_cleanup=%00',1))
+record_nul=work/'record-nul.record'
+record_nul.write_text(record_path.read_text().replace('transcript=','transcript=%00',1))
+record_nul_context=work/'record-nul.ctx'
+record_nul_context.write_text((root/'0.ctx').read_text().replace(str(record_path),str(record_nul)).replace(f['converter_record_sha256'],hashlib.sha256(record_nul.read_bytes()).hexdigest()))
+for forged in [context_nul,record_nul_context]:
+    rejected=run([exe,'--stdout-analysis','--prepared',forged],26)
+    assert b'prepared document contains NUL' in rejected.stderr
+# Red-first: the unfixed writer publishes success, but this real consumer fails.
+run([exe,'--stdout-analysis','--prepared',root/'0.ctx'])
+assert fields(record_path)['transcript']=='warning before?after\n'
+assert '%00' not in record_path.read_text()

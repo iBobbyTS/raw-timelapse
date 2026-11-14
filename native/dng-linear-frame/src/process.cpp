@@ -37,6 +37,9 @@ std::string read_text(const fs::path &p) {
   std::string text(65536, '\0');
   f.read(text.data(), text.size());
   text.resize(size_t(f.gcount()));
+  // NUL is valid UTF-8 but forbidden in protocol values. Sanitize only the
+  // transported excerpt; the original converter log remains byte-for-byte.
+  std::replace(text.begin(), text.end(), '\0', '?');
   CFStringRef valid = CFStringCreateWithBytes(nullptr,
       reinterpret_cast<const UInt8 *>(text.data()), text.size(), kCFStringEncodingUTF8, false);
   if (valid) CFRelease(valid);
