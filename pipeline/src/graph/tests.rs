@@ -604,3 +604,84 @@ fn frame_wait_on_delete_completion_still_drains_images() {
     assert_eq!(backend.deleted, vec![0, 1, 2]);
     assert_eq!(backend.consumed.len(), 3);
 }
+
+fn assert_delete_reader_dependencies_reject_before_backend_work(
+    configured: &str,
+    diagnostic_parts: &[&str],
+) {
+    for (text, zero) in [
+        (configured.to_owned(), false),
+        (
+            configured.replace("\"kind\": \"solve\"", "\"kind\": \"zero\""),
+            true,
+        ),
+    ] {
+        for count in [3, 1] {
+            let mut backend = Fake {
+                frame_count: count,
+                zero,
+                ..Default::default()
+            };
+            let parsed = Graph::parse(&text);
+            if let Ok(graph) = &parsed {
+                let _ = execute(graph, count, &mut backend);
+            }
+            assert!(
+                backend.order.is_empty(),
+                "configuration reached backend operations: {:?}",
+                backend.order
+            );
+            assert!(backend.measured.is_empty());
+            assert!(backend.deleted.is_empty());
+            assert!(backend.consumed.is_empty());
+            assert!(backend.events.is_empty());
+            let diagnostic =
+                parsed.expect_err("reject implicit Delete reader conflict during parse");
+            for part in diagnostic_parts {
+                assert!(diagnostic.contains(part), "{diagnostic}");
+            }
+        }
+    }
+}
+
+#[test]
+fn delete_reader_dependencies_reject_develop_wait_before_backend_work() {
+    assert_delete_reader_dependencies_reject_before_backend_work(
+        include_str!("../../tests/fixtures/delete_reader_dependencies/develop_waits_delete.json"),
+        &["cycle"],
+    );
+}
+
+#[test]
+fn delete_reader_dependencies_reject_sequence_wait_before_backend_work() {
+    assert_delete_reader_dependencies_reject_before_backend_work(
+        include_str!(
+            "../../tests/fixtures/delete_reader_dependencies/color_waits_delete_sequence.json"
+        ),
+        &["sequence wait", "color", "delete-cache", "apply-ev"],
+    );
+}
+
+#[test]
+fn delete_reader_dependencies_allow_frame_scoped_color_wait() {
+    let text = include_str!(
+        "../../tests/fixtures/delete_reader_dependencies/color_waits_delete_sequence.json"
+    )
+    .replace("\"scope\": \"sequence\"", "\"scope\": \"frame\"");
+    let mut backend = Fake::default();
+    execute(&Graph::parse(&text).unwrap(), 3, &mut backend).unwrap();
+    assert_eq!(backend.deleted, vec![0, 1, 2]);
+    assert_eq!(backend.consumed.len(), 3);
+    for id in 0..3 {
+        let position = |name| {
+            backend
+                .events
+                .iter()
+                .position(|e| e.node == name && e.frame_id == Some(id))
+                .unwrap()
+        };
+        assert!(position("apply-ev") < position("delete-cache"));
+        assert!(position("delete-cache") < position("color"));
+        assert!(position("color") < position("encode"));
+    }
+}

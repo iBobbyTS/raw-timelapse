@@ -1,0 +1,70 @@
+{
+  "nodes": [
+    {
+      "id": "source",
+      "kind": "source",
+      "concurrency": 1
+    },
+    {
+      "id": "convert-cache",
+      "kind": "prepare",
+      "concurrency": 1,
+      "inputs": {
+        "source": "source"
+      }
+    },
+    {
+      "id": "measure-solve",
+      "kind": "solve",
+      "concurrency": 1,
+      "inputs": {
+        "frames": "convert-cache"
+      }
+    },
+    {
+      "id": "apply-ev",
+      "kind": "develop",
+      "concurrency": 1,
+      "inputs": {
+        "frames": "convert-cache",
+        "plan": "measure-solve"
+      },
+      "waits": [
+        {
+          "node": "delete-cache",
+          "scope": "frame"
+        }
+      ]
+    },
+    {
+      "id": "color",
+      "kind": "color",
+      "concurrency": 1,
+      "inputs": {
+        "image": "apply-ev"
+      }
+    },
+    {
+      "id": "encode",
+      "kind": "encode",
+      "concurrency": 1,
+      "inputs": {
+        "image": "color"
+      }
+    },
+    {
+      "id": "delete-cache",
+      "kind": "delete",
+      "concurrency": 1,
+      "inputs": {
+        "frames": "convert-cache"
+      },
+      "waits": [
+        {
+          "node": "convert-cache",
+          "scope": "frame"
+        }
+      ]
+    }
+  ]
+}

@@ -669,10 +669,6 @@ impl StreamingEncoder {
         if let Some(w) = self.watcher.take() { let _ = w.join(); }
         self.input.take();
         let status = self.process.finish(abort);
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(w) = self.watcher.take() {
-            let _ = w.join();
-        }
         self.process
             .note(&format!("pixel bytes (yuv444p10le): {}", self.bytes));
         status

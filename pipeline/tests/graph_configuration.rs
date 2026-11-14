@@ -335,3 +335,63 @@ fn strength_zero_normalizes_parallel_solve_and_logs_effective_configuration() {
     assert!(log_kind(&trace, "measure").is_empty());
     assert!(ffprobe(&output.join(VIDEO_NAME)).contains("nb_read_frames=3"));
 }
+
+#[test]
+fn delete_reader_dependencies_reject_before_output_or_native_work() {
+    let root = test_dir("delete-reader-dependencies");
+    let input = root.join("input");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG"]);
+    let native = root.join("native-marker");
+    let marker = root.join("native-started");
+    write_executable(
+        &native,
+        "#!/bin/sh\ntouch \"$(dirname \"$0\")/native-started\"\nexit 99\n",
+    );
+    for (label, text) in [
+        (
+            "develop-wait",
+            include_str!("fixtures/delete_reader_dependencies/develop_waits_delete.json"),
+        ),
+        (
+            "sequence-wait",
+            include_str!("fixtures/delete_reader_dependencies/color_waits_delete_sequence.json"),
+        ),
+    ] {
+        let config = root.join(format!("{label}.json"));
+        fs::write(&config, text).unwrap();
+        let directory = root.join(label);
+        let video = directory.join(VIDEO_NAME);
+        let result = run_cli(&[
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            video.to_str().unwrap(),
+            "--graph",
+            config.to_str().unwrap(),
+            "--strength",
+            "0",
+            "--resize",
+            "320x214",
+            "--dng-linear-frame",
+            native.to_str().unwrap(),
+        ]);
+        fs::write(root.join(format!("{label}.stdout")), &result.stdout).unwrap();
+        fs::write(root.join(format!("{label}.stderr")), &result.stderr).unwrap();
+        fs::write(
+            root.join(format!("{label}.status")),
+            format!("{}\nexit_code={:?}\n", result.status, result.status.code()),
+        )
+        .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(50),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!marker.exists(), "invalid graph invoked native work");
+        assert!(
+            !directory.exists(),
+            "invalid graph created output/log/scratch"
+        );
+    }
+}

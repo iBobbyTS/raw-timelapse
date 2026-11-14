@@ -52,6 +52,13 @@ struct Runner<'a, 'b> {
     encoder: video::GraphEncoder,
     failure: Option<Error>,
 }
+fn frame_failure(id: usize, total: usize, name: &str, message: &str) -> String {
+    format!(
+        "frame {}/{} ({}) failed: {}; no video was produced",
+        id + 1, total, name, message
+    )
+}
+
 impl Runner<'_, '_> {
     fn result<T>(&mut self, result: Result<T>) -> graph::Result<T> {
         result.map_err(|e| {
@@ -64,12 +71,11 @@ impl Runner<'_, '_> {
         let result = result.map_err(|e| {
             Error::new(
                 e.code,
-                format!(
-                    "frame {}/{} ({}) failed: {}; no video was produced",
-                    id + 1,
+                frame_failure(
+                    id,
                     self.context.sources.len(),
-                    self.context.sources[id].name,
-                    e.message
+                    &self.context.sources[id].name,
+                    &e.message,
                 ),
             )
         });
@@ -195,15 +201,7 @@ impl Backend for Runner<'_, '_> {
             let info = frame::analyze_prepared_at(
                 &tool, &prepared, wb, roi, &settings, id, total, &log, active,
             )
-            .map_err(|e| {
-                format!(
-                    "frame {}/{} ({}) failed: {}; no video was produced",
-                    id + 1,
-                    total,
-                    prepared.source_name,
-                    e.message
-                )
-            })?;
+            .map_err(|e| frame_failure(id, total, &prepared.source_name, &e.message))?;
             let bytes = frame::analysis_bytes(&info).ok_or("graph: missing measurement")?;
             let sidecar =
                 AnalysisSidecar::parse(std::str::from_utf8(bytes).map_err(|e| e.to_string())?)?;
