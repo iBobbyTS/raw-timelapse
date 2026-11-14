@@ -18,6 +18,39 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// Concurrent defects need not be observed at the lowest frame ID. Keep the
+/// zero-based task key, one-based frame context, total and filename aligned.
+fn assert_failed_input_frame(error: &str, frames: &[FakeFrame]) -> usize {
+    let line = error
+        .lines()
+        .find(|line| line.starts_with("error: "))
+        .unwrap_or(error);
+    let matches: Vec<_> = frames
+        .iter()
+        .enumerate()
+        .filter(|(id, frame)| {
+            line.contains(&format!(
+                "frame {}/{} ({}) failed:",
+                id + 1,
+                frames.len(),
+                frame.name
+            ))
+        })
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "failure must identify exactly one matching source frame: {error}"
+    );
+    let id = matches[0];
+    assert!(
+        line.contains(&format!(" frame {id} source ")),
+        "task key must match its frame context: {error}"
+    );
+    id
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -56,7 +89,10 @@ fn cr3_standard_frames(fixtures: &Path) -> Vec<FakeFrame> {
 fn append_config(fixtures: &Path, line: &str) {
     let config = fixtures.join(format!("fake-native-{}.config", std::process::id()));
     writeln!(
-        fs::OpenOptions::new().append(true).open(&config).expect("config"),
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&config)
+            .expect("config"),
         "{line}"
     )
     .expect("append config");
@@ -172,7 +208,10 @@ fn publishes_one_video_and_one_run_log_with_a_clean_scratch() {
         "temporal_audit.json",
         "logs",
     ] {
-        assert!(!directory.join(retired).exists(), "{retired} must not exist");
+        assert!(
+            !directory.join(retired).exists(),
+            "{retired} must not exist"
+        );
     }
 }
 
@@ -197,7 +236,11 @@ fn refuses_to_overwrite_an_existing_video_or_log() {
     // A retry with the same name never overwrites the published video or log.
     let second = run_cli(&base_args(&input, &video, &tool));
     assert_eq!(second.status.code(), Some(12), "{}", stderr(&second));
-    assert!(stderr(&second).contains("refusing to overwrite"), "{}", stderr(&second));
+    assert!(
+        stderr(&second).contains("refusing to overwrite"),
+        "{}",
+        stderr(&second)
+    );
     assert_eq!(fs::read(&video).expect("video"), video_bytes);
     assert_eq!(read_log(&directory), log_before);
 
@@ -205,7 +248,11 @@ fn refuses_to_overwrite_an_existing_video_or_log() {
     fs::remove_file(&video).expect("remove video");
     let third = run_cli(&base_args(&input, &video, &tool));
     assert_eq!(third.status.code(), Some(12), "{}", stderr(&third));
-    assert!(stderr(&third).contains("timelapse.log"), "{}", stderr(&third));
+    assert!(
+        stderr(&third).contains("timelapse.log"),
+        "{}",
+        stderr(&third)
+    );
 
     // A stale scratch from an earlier run is never picked up: a fresh name uses
     // a new, empty scratch directory and leaves the old one untouched.
@@ -269,7 +316,11 @@ fn refuses_a_preexisting_dangling_video_symlink_and_preserves_it() {
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
     entries.sort();
-    assert_eq!(entries, vec![VIDEO_NAME.to_string()], "only the user link remains");
+    assert_eq!(
+        entries,
+        vec![VIDEO_NAME.to_string()],
+        "only the user link remains"
+    );
     assert!(!log_in(&directory).exists());
     assert!(
         !fs::read_dir(&directory)
@@ -332,7 +383,10 @@ fn removed_quality_workflow_flags_are_rejected_explicitly() {
             stderr(&result)
         );
         assert!(!video.exists(), "{flag} must not create a video");
-        assert!(!root.join("run").exists(), "{flag} must not create the directory");
+        assert!(
+            !root.join("run").exists(),
+            "{flag} must not create the directory"
+        );
     }
 }
 
@@ -399,7 +453,10 @@ fn no_quality_verdict_or_audit_content_reaches_the_product() {
     // No per-frame metadata document, matrix or pixel payload.
     for line in log.lines() {
         assert!(line.len() <= 1400, "unbounded log line: {line}");
-        assert!(!line.contains("[[") && !line.contains("\"matrix\""), "{line}");
+        assert!(
+            !line.contains("[[") && !line.contains("\"matrix\""),
+            "{line}"
+        );
     }
 }
 
@@ -440,7 +497,7 @@ fn stops_at_the_first_failing_frame_without_video() {
         fs::read_dir(&transcripts).unwrap().next().is_some(),
         "converter transcripts are retained in scratch"
     );
-    // No later frame was developed.
+    // No later frame was committed; concurrent computation may have started.
     assert!(!log.contains("kind=develop frame=3"), "{log}");
 }
 
@@ -815,10 +872,7 @@ fn ev_limits_clamp_every_applied_ev() {
     let log = read_log(&directory);
     let evs = develop_evs(&log);
     assert_eq!(evs.len(), 12);
-    assert!(
-        evs.iter().all(|ev| (-0.25..=0.25).contains(ev)),
-        "{evs:?}"
-    );
+    assert!(evs.iter().all(|ev| (-0.25..=0.25).contains(ev)), "{evs:?}");
     assert!(evs.iter().any(|ev| *ev == 0.25 || *ev == -0.25), "{evs:?}");
     assert_only_video_and_log(&directory, VIDEO_NAME, &[]);
 }
@@ -872,7 +926,14 @@ fn fractional_ev_values_survive_the_sidecar_round_trip() {
     let (result, directory) = run_synthetic(
         &material,
         "run",
-        &["--estimator", "legacy", "--brightness", "uniform", "--strength", "0.7"],
+        &[
+            "--estimator",
+            "legacy",
+            "--brightness",
+            "uniform",
+            "--strength",
+            "0.7",
+        ],
     );
     assert!(
         result.status.success(),
@@ -915,7 +976,10 @@ fn strength_zero_is_the_single_pass_regression_path() {
     let second = run("run-b");
 
     let log = read_log(&first);
-    assert!(log_kind(&log, "measure").is_empty(), "no analysis at strength 0");
+    assert!(
+        log_kind(&log, "measure").is_empty(),
+        "no analysis at strength 0"
+    );
     let evs = develop_evs(&log);
     assert_eq!(evs, vec![0.0, 0.0, 0.0]);
     // Frame 1 decodes with its own as-shot neutral; later frames carry the
@@ -1078,9 +1142,9 @@ fn per_frame_deflicker_measures_and_renders_without_an_override() {
     assert_eq!(measured.len(), 30);
     let rendered = develop_wb(&log);
     assert_eq!(rendered.len(), 30);
-    assert!(rendered.iter().all(|(wb, own, source)| {
-        source == "as-shot" && wb == own
-    }));
+    assert!(rendered
+        .iter()
+        .all(|(wb, own, source)| { source == "as-shot" && wb == own }));
     assert!(video_in(&directory).is_file());
 }
 
@@ -1106,8 +1170,11 @@ fn per_frame_mode_rejects_a_producer_that_invents_an_override() {
     let result = run_cli(&args);
     assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
     let text = stderr(&result);
-    assert!(text.contains("should use its as-shot white balance"), "{text}");
-    assert!(text.contains("frame 1/3"), "{text}");
+    assert!(
+        text.contains("should use its as-shot white balance"),
+        "{text}"
+    );
+    assert_failed_input_frame(&text, &frames);
     assert!(!video_in(&directory).exists());
 }
 
@@ -1128,7 +1195,10 @@ fn rejects_a_producer_that_reports_as_shot_but_applies_another_neutral() {
     let result = run_cli(&args);
     assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
     let text = stderr(&result);
-    assert!(text.contains("reports as-shot white balance but applied"), "{text}");
+    assert!(
+        text.contains("reports as-shot white balance but applied"),
+        "{text}"
+    );
     assert!(text.contains("as_shot_neutral"), "{text}");
     assert!(!video_in(&directory).exists());
 }
@@ -1153,7 +1223,11 @@ fn rejects_invalid_white_balance_mode_values() {
             "must reject {extra:?}: {}",
             stderr(&result)
         );
-        assert!(stderr(&result).contains("--white-balance"), "{}", stderr(&result));
+        assert!(
+            stderr(&result).contains("--white-balance"),
+            "{}",
+            stderr(&result)
+        );
         assert!(!root.join("run").exists());
     }
 }
@@ -1198,10 +1272,7 @@ fn assert_final_source_hash_rejected(defect: &str) {
         stderr(&result)
     );
     let error = stderr(&result);
-    assert!(
-        error.contains("frame 1/3") && error.contains(&frames[0].name),
-        "{error}"
-    );
+    let failed_id = assert_failed_input_frame(&error, &frames);
     assert!(
         error.contains("metadata is missing or invalid field \"source_sha256\""),
         "{error}"
@@ -1210,10 +1281,21 @@ fn assert_final_source_hash_rejected(defect: &str) {
     let log = read_log(&directory);
     assert!(log.contains("kind=run.error code=30"), "{log}");
     let scratch = scratch_from_log(&log);
-    let transcript = fs::read_to_string(scratch.join("transcripts/develop/frame_000001.log"))
-        .expect("final-frame transcript");
+    let transcript = fs::read_to_string(scratch.join(format!(
+        "transcripts/develop/frame_{:06}.log",
+        failed_id + 1
+    )))
+    .expect("reported final-frame transcript");
     metadata_from_transcript(&transcript);
     assert!(!log.contains("kind=develop frame=3"), "{log}");
+    assert!(
+        log_kind(&log, "develop").is_empty(),
+        "all frame metadata is invalid: {log}"
+    );
+    assert!(
+        log_kind(&log, "encode").is_empty(),
+        "no invalid result may reach the sink: {log}"
+    );
 }
 
 #[test]
@@ -1261,7 +1343,7 @@ fn forged_metadata_source_hash_is_rejected_by_the_typed_boundary() {
     );
     assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
     let text = stderr(&result);
-    assert!(text.contains("frame 1/2"), "{text}");
+    assert_failed_input_frame(&text, &synthetic_sequence(&[0.0, 0.1]));
     assert!(
         text.contains("metadata is missing or invalid field \"source_sha256\""),
         "{text}"
@@ -1279,8 +1361,11 @@ fn forged_analysis_sidecar_without_kind_is_rejected() {
     );
     assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
     let text = stderr(&result);
-    assert!(text.contains("frame 1/2"), "{text}");
-    assert!(text.contains("analysis sidecar has an unsupported schema"), "{text}");
+    assert_failed_input_frame(&text, &synthetic_sequence(&[0.0, 0.1]));
+    assert!(
+        text.contains("analysis sidecar has an unsupported schema"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -1294,7 +1379,7 @@ fn forged_analysis_sidecar_hash_mismatch_is_rejected() {
     );
     assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
     let text = stderr(&result);
-    assert!(text.contains("frame 1/2"), "{text}");
+    assert_failed_input_frame(&text, &synthetic_sequence(&[0.0, 0.1]));
     assert!(
         text.contains("analysis sidecar source_sha256 does not match the frame metadata"),
         "{text}"
@@ -1368,8 +1453,20 @@ fn preview_profiles_emit_their_declared_colour_contract() {
     let cases: [(&str, &str, bool, &str, &str); 6] = [
         ("srgb-preview", "bt709", false, "bt709", "iec.ch"),
         ("sony-slog3-sgamut3", "bt2020nc", true, "unknown", "sony.jp"),
-        ("sony-slog3-sgamut3-cine", "bt2020nc", true, "unknown", "sony.jp"),
-        ("canon-log2-cinema-gamut", "bt2020nc", true, "unknown", "canon.com"),
+        (
+            "sony-slog3-sgamut3-cine",
+            "bt2020nc",
+            true,
+            "unknown",
+            "sony.jp",
+        ),
+        (
+            "canon-log2-cinema-gamut",
+            "bt2020nc",
+            true,
+            "unknown",
+            "canon.com",
+        ),
         ("nikon-nlog-bt2020", "bt2020nc", true, "bt2020", "nikon"),
         ("dji-dlog-dgamut", "bt2020nc", true, "unknown", "djicdn"),
     ];
@@ -1392,7 +1489,10 @@ fn preview_profiles_emit_their_declared_colour_contract() {
         assert_eq!(colour.len(), 1, "{log}");
         assert!(colour[0].contains(&format!("profile={id}")), "{log}");
         assert!(colour[0].contains(&format!("matrix={matrix}")), "{log}");
-        assert!(colour[0].contains("camera_color=legacy-inverse-cm"), "{log}");
+        assert!(
+            colour[0].contains("camera_color=legacy-inverse-cm"),
+            "{log}"
+        );
         let encoder_command = log_kind(&log, "encoder.command");
         assert_eq!(encoder_command.len(), 1, "{log}");
         assert!(
@@ -1546,11 +1646,8 @@ fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
 #[test]
 fn wrong_ycbcr_matrix_is_rejected_by_the_patch_check() {
     const CORRECT_TOLERANCE: i32 = 8;
-    let (root, input, tool) = profile_material_for_extension(
-        "profile-wrong-matrix",
-        [57344, 0, 0],
-        "DNG",
-    );
+    let (root, input, tool) =
+        profile_material_for_extension("profile-wrong-matrix", [57344, 0, 0], "DNG");
     let (result, directory) = run_profile(&root, &input, &tool, "nikon-nlog-bt2020");
     assert!(
         result.status.success(),
@@ -1565,7 +1662,10 @@ fn wrong_ycbcr_matrix_is_rejected_by_the_patch_check() {
         .map(|channel| (decoded[channel] as i32 - expected[channel] as i32).abs())
         .max()
         .unwrap_or(0);
-    assert!(difference <= CORRECT_TOLERANCE, "declared matrix: {decoded:?}");
+    assert!(
+        difference <= CORRECT_TOLERANCE,
+        "declared matrix: {decoded:?}"
+    );
     let wrong = decode_first_pixel(&video, "bt709", "tv");
     let wrong_difference = (0..3)
         .map(|channel| (wrong[channel] as i32 - expected[channel] as i32).abs())
@@ -1612,7 +1712,10 @@ fn vendor_previews_auto_decode_from_their_own_tags() {
         assert!(distance(auto, correct) <= 1, "{id} auto vs forced");
         assert!(distance(auto, wrong_matrix) >= 4, "{id} wrong matrix");
         assert!(distance(auto, wrong_range) > 3, "{id} wrong range");
-        assert!(distance(wrong_range, expected) > 3, "{id}: wrong range passes");
+        assert!(
+            distance(wrong_range, expected) > 3,
+            "{id}: wrong range passes"
+        );
     }
 }
 
@@ -1635,8 +1738,15 @@ fn rejects_unknown_or_empty_preview_profile_with_exit_usage() {
             stdout(&result),
             stderr(&result)
         );
-        assert!(stderr(&result).contains("--preview-profile"), "{}", stderr(&result));
-        assert!(!root.join("run").exists(), "usage rejection must not create output");
+        assert!(
+            stderr(&result).contains("--preview-profile"),
+            "{}",
+            stderr(&result)
+        );
+        assert!(
+            !root.join("run").exists(),
+            "usage rejection must not create output"
+        );
     }
 }
 
@@ -1732,8 +1842,14 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
                 "rev_defect=skipped-fixed",
                 "incomplete camera profile calibration",
             ),
-            ("rev_defect=auto-tone", "incomplete camera profile calibration"),
-            ("rev_defect=double-scale", "incomplete camera profile calibration"),
+            (
+                "rev_defect=auto-tone",
+                "incomplete camera profile calibration",
+            ),
+            (
+                "rev_defect=double-scale",
+                "incomplete camera profile calibration",
+            ),
             ("rev_defect=infinity", "nonfinite FP32"),
             ("short_pixels=1", "short record payload"),
             ("descriptor_geometry_mismatch=1", "descriptor geometry"),
@@ -1769,8 +1885,17 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
             let mut args = base_args(&input, &video, &tool);
             args.extend(["--strength", "0", "--preview-profile", profile.id]);
             let result = run_cli(&args);
-            assert_eq!(result.status.code(), Some(30), "{knob}: {}", stderr(&result));
-            assert!(stderr(&result).contains(expected), "{knob}: {}", stderr(&result));
+            assert_eq!(
+                result.status.code(),
+                Some(30),
+                "{knob}: {}",
+                stderr(&result)
+            );
+            assert!(
+                stderr(&result).contains(expected),
+                "{knob}: {}",
+                stderr(&result)
+            );
             assert!(!video_in(&directory).exists());
         }
     }
@@ -1840,10 +1965,7 @@ fn rational_fps_is_honoured_by_the_encoder_and_the_log() {
     let log = read_log(&directory);
     assert!(log.contains("kind=settings fps=30000/1001"), "{log}");
     let probe = ffprobe(&video_in(&directory));
-    assert!(
-        probe.contains("avg_frame_rate=30000/1001"),
-        "{probe}"
-    );
+    assert!(probe.contains("avg_frame_rate=30000/1001"), "{probe}");
 }
 
 // ---------------------------------------------------------------------------

@@ -77,8 +77,20 @@ fn premature_encoder_exit_cancels_every_registered_producer() {
             worker.join().unwrap();
         }
         assert!(encoder.failed.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(active.lock().unwrap().children.is_empty());
+        // The encoder now shares cancellation ownership; all producers have
+        // unregistered, while its own registration lasts until finish/reap.
+        assert_eq!(
+            active
+                .lock()
+                .unwrap()
+                .children
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![root.join("encoder.log")]
+        );
         assert_eq!(encoder.finish(false).unwrap().code(), Some(exit));
+        assert!(active.lock().unwrap().children.is_empty());
     }
 }
 

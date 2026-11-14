@@ -3,6 +3,8 @@ use super::*;
 fn configured(kind: &str, value: &str) -> String {
     include_str!("default.json")
         .replace(", \"concurrency\":1", "")
+        .replace(", \"concurrency\":4", "")
+        .replace(", \"concurrency\":8", "")
         .replace(
             &format!("\"kind\":\"{kind}\""),
             &format!("\"concurrency\":{value},\"kind\":\"{kind}\""),
@@ -11,7 +13,7 @@ fn configured(kind: &str, value: &str) -> String {
 #[test]
 fn concurrency_is_strict_and_capabilities_are_explicit() {
     for value in ["1", "4", "8", "64"] {
-        for kind in ["prepare", "solve"] {
+        for kind in ["prepare", "solve", "develop", "color"] {
             let graph = Graph::parse(&configured(kind, value)).unwrap();
             assert_eq!(
                 graph
@@ -19,7 +21,9 @@ fn concurrency_is_strict_and_capabilities_are_explicit() {
                     .iter()
                     .find(|n| match kind {
                         "prepare" => n.kind == Kind::Prepare,
-                        _ => n.kind == Kind::Solve,
+                        "solve" => n.kind == Kind::Solve,
+                        "develop" => n.kind == Kind::Develop,
+                        _ => n.kind == Kind::Color,
                     })
                     .unwrap()
                     .concurrency,
@@ -45,7 +49,7 @@ fn concurrency_is_strict_and_capabilities_are_explicit() {
         );
     }
     assert!(Graph::parse(&configured("prepare", "2,\"concurrency\":3")).is_err());
-    for kind in ["source", "zero", "develop", "color", "encode", "delete"] {
+    for kind in ["source", "zero", "encode", "delete"] {
         let mut text = configured(kind, "2");
         if kind == "zero" {
             text = text.replace("\"kind\":\"solve\"", "\"kind\":\"zero\",\"concurrency\":2");

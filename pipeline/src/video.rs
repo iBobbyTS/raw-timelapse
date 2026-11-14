@@ -14,11 +14,11 @@ use crate::json::Json;
 use crate::proc;
 #[cfg(test)]
 use crate::transport::RGB48_FRAME;
-#[cfg(test)]
-use crate::transport::{ArrayDescriptor, ArrayLayout, ByteOrder, DType};
 use crate::transport::{
     self, DataEnvelope, DiskArtifact, MetadataDoc, Payload, Provenance, VIDEO_ARTIFACT,
 };
+#[cfg(test)]
+use crate::transport::{ArrayDescriptor, ArrayLayout, ByteOrder, DType};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -466,10 +466,7 @@ pub fn validate_output(
     let expected_range = range.as_str();
     let range_matches = probe.color_range == expected_range
         || (!config.writes_range_tag()
-            && matches!(
-                probe.color_range.as_str(),
-                "" | "unknown" | "unspecified"
-            ));
+            && matches!(probe.color_range.as_str(), "" | "unknown" | "unspecified"));
     if !range_matches {
         return Err(Error::new(
             EXIT_PREVIEW,
@@ -520,7 +517,11 @@ fn supported_encoder_pixel_formats(ffmpeg: &Path, encoder: &str) -> Result<Optio
     let formats = text
         .lines()
         .find_map(|line| line.trim().strip_prefix("Supported pixel formats:"))
-        .map(|rest| rest.split_whitespace().map(str::to_string).collect::<Vec<_>>());
+        .map(|rest| {
+            rest.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        });
     if formats.is_none() && !captured.status.success() {
         return Err(Error::new(
             EXIT_USAGE_FOR_PREFLIGHT,
@@ -629,7 +630,14 @@ impl StreamingEncoder {
         active: proc::ActiveNative,
     ) -> Result<Self> {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let process = proc::OwnedProcess::spawn(program, args, log, EXIT_PREVIEW, true)?;
+        let process = proc::OwnedProcess::spawn_active(
+            program,
+            args,
+            log,
+            EXIT_PREVIEW,
+            true,
+            active.clone(),
+        )?;
         let input = process.child.lock().unwrap().stdin.take();
         let child = process.child.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -666,7 +674,9 @@ impl StreamingEncoder {
         // Stop observing before intentional EOF/cancellation. The observer
         // distinguishes premature exit from successful final input completion.
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(w) = self.watcher.take() { let _ = w.join(); }
+        if let Some(w) = self.watcher.take() {
+            let _ = w.join();
+        }
         self.input.take();
         let status = self.process.finish(abort);
         self.process
@@ -807,25 +817,18 @@ impl GraphEncoder {
         }
     }
 
-    pub fn config(&self) -> &ResolvedConfig {
-        &self.config
-    }
-
-    pub fn failed(&self) -> bool {
-        self.encoder.as_ref().is_some_and(|e| e.failed.load(std::sync::atomic::Ordering::SeqCst))
-    }
     pub fn begin(&mut self) -> Result<()> {
         proc::check_stop()
     }
 
     pub fn push(
         &mut self,
-        context: &crate::RunContext<'_>,
+        options: &crate::cli::Options,
+        scratch: &Path,
         info: &crate::frame::FrameInfo,
         signal: &[u16],
     ) -> Result<()> {
         proc::check_stop()?;
-        let options = context.options;
         let expected = info.width as usize * info.height as usize * 3;
         if signal.len() != expected {
             return Err(Error::new(
@@ -842,7 +845,7 @@ impl GraphEncoder {
             if let Err(message) = self.config.validate_geometry(info.width, info.height) {
                 return Err(Error::new(EXIT_USAGE_FOR_PREFLIGHT, message));
             }
-            let output = context.scratch.join(&self.output_name);
+            let output = scratch.join(&self.output_name);
             let args = self.config.encoder_args(
                 options.preview_profile,
                 info.width,
@@ -851,7 +854,7 @@ impl GraphEncoder {
                 &options.fps.arg(),
                 &output,
             );
-            let transcript = context.scratch.join("transcripts/encode.log");
+            let transcript = scratch.join("transcripts/encode.log");
             self.command = Some(proc::display_command(&options.ffmpeg, &args));
             self.output = Some(output);
             self.transcript = Some(transcript.clone());
@@ -863,10 +866,7 @@ impl GraphEncoder {
             )?);
         }
         let encoder = self.encoder.as_mut().unwrap();
-        if encoder
-            .failed
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if encoder.failed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(Error::new(
                 EXIT_PREVIEW,
                 "encoder failed while a graph image was active",
@@ -879,7 +879,9 @@ impl GraphEncoder {
         // write is still an error (broken pipe), and output validation remains
         // responsible for exact frame coverage after a successful final write.
         if info.index == self.frames {
-            encoder.final_input.store(true, std::sync::atomic::Ordering::SeqCst);
+            encoder
+                .final_input
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let bytes = signal_bytes(signal);
         encoder
@@ -898,9 +900,7 @@ impl GraphEncoder {
             .encoder
             .as_mut()
             .ok_or_else(|| Error::new(EXIT_PREVIEW, "empty encoder input"))?;
-        let failed = encoder
-            .failed
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let failed = encoder.failed.load(std::sync::atomic::Ordering::SeqCst);
         let status = encoder.finish(false)?;
         if failed || !status.success() {
             return Err(Error::new(
@@ -908,9 +908,10 @@ impl GraphEncoder {
                 format!(
                     "streaming encoder failed: {}; transcript {}: {}",
                     proc::exit_description(&status),
-                    self.transcript
-                        .as_ref()
-                        .map_or_else(|| "unavailable".to_string(), |path| path.display().to_string()),
+                    self.transcript.as_ref().map_or_else(
+                        || "unavailable".to_string(),
+                        |path| path.display().to_string()
+                    ),
                     self.transcript_tail()
                 ),
             ));
@@ -1056,7 +1057,10 @@ mod signal_byte_tests {
     fn ten_bit_samples_use_little_endian_words() {
         let samples = [64u16, 512, 940, 1023];
         let bytes = signal_bytes(&samples);
-        let expected: Vec<u8> = samples.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+        let expected: Vec<u8> = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
         assert_eq!(&bytes[..], &expected[..]);
         assert_eq!(bytes.len(), samples.len() * 2);
     }

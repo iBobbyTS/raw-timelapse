@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 #[test]
-fn real_cli_orders_prepare_and_measure_and_freezes_source_zero_white_balance() {
+fn real_cli_orders_concurrent_native_stages_and_freezes_source_zero_white_balance() {
     let root = test_dir("ordered-prepare-measure");
     let input = root.join("input");
     make_input(
@@ -52,6 +52,15 @@ fn real_cli_orders_prepare_and_measure_and_freezes_source_zero_white_balance() {
     for line in log_kind(&trace, "develop") {
         assert_eq!(log_field(line, "wb"), Some("0.4,1,0.7"));
     }
+    // Keep the comparison explicitly N=1 when measured built-in defaults change.
+    let serial_graph = root.join("serial-graph.json");
+    fs::write(
+        &serial_graph,
+        include_str!("../src/graph/default.json")
+            .replace("\"concurrency\":4", "\"concurrency\":1")
+            .replace("\"concurrency\":8", "\"concurrency\":1"),
+    )
+    .unwrap();
     let baseline = root.join("serial/timelapse.mov");
     let result = run_cli(&[
         "--input",
@@ -60,6 +69,8 @@ fn real_cli_orders_prepare_and_measure_and_freezes_source_zero_white_balance() {
         baseline.to_str().unwrap(),
         "--dng-linear-frame",
         tool.to_str().unwrap(),
+        "--graph",
+        serial_graph.to_str().unwrap(),
     ]);
     assert!(
         result.status.success(),

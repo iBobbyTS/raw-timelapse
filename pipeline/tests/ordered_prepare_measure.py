@@ -10,7 +10,7 @@ import json,os,pathlib,socket,subprocess,sys
 args=sys.argv[1:]
 result=subprocess.run([{str(tool)!r},*args])
 if result.returncode: sys.exit(result.returncode)
-if args[0] in ['--prepare','--stdout-analysis']:
+if args[0] in ['--prepare','--stdout-analysis','--stdout-frame-f32']:
     source=pathlib.Path(args[1]).stem if args[0]=='--prepare' else pathlib.Path(dict(line.split('=',1) for line in pathlib.Path(args[2]).read_text().splitlines()[1:])['source']).stem
     s=socket.socket(socket.AF_UNIX);s.connect({str(sock)!r});s.sendall((json.dumps({{'stage':args[0],'source':source,'args':args}})+'\\n').encode());s.recv(1);s.close()
 sys.exit(0)
@@ -18,13 +18,13 @@ sys.exit(0)
 wrapper.chmod(0o755)
 graph=json.loads((pathlib.Path(__file__).parent/'../src/graph/default.json').resolve().read_text())
 for n in graph['nodes']:
-    n['concurrency']=4 if n['kind'] in ['prepare','solve'] else 1
+    n['concurrency']=4 if n['kind'] in ['prepare','solve','develop'] else 1
 graph_path=root/'graph.json';graph_path.write_text(json.dumps(graph))
 args=[str(cli),'--input',str(root/'input'),'--output',str(root/'output/timelapse.mov'),'--dng-linear-frame',str(wrapper),'--graph',str(graph_path)]
 proc=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
 trace=[]
 try:
-    for stage in ['--prepare','--stdout-analysis']:
+    for stage in ['--prepare','--stdout-analysis','--stdout-frame-f32']:
         peers={}
         for _ in range(4):
             conn,_=server.accept(); conn.settimeout(20)

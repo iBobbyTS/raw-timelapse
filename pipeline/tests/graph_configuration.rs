@@ -123,6 +123,14 @@ fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
         "inputs",
         json::parse(r#"{"image":"keep-pixels"}"#).unwrap(),
     );
+    for node in nodes(&mut identity) {
+        if matches!(
+            node.get("kind").and_then(Json::as_str),
+            Some("prepare" | "develop" | "identity" | "color")
+        ) {
+            set(node, "concurrency", Json::Int(4));
+        }
+    }
     let kept = run(&root, "identity", &input, &tool, &identity);
     assert_eq!(
         base_pixel,
@@ -158,16 +166,31 @@ fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
     // names the retained location, and the original sources stay untouched.
     let mut retained = graph();
     nodes(&mut retained).pop();
+    for node in nodes(&mut retained) {
+        if matches!(
+            node.get("kind").and_then(Json::as_str),
+            Some("prepare" | "develop" | "color")
+        ) {
+            set(node, "concurrency", Json::Int(4));
+        }
+    }
     let retained = run(&root, "retained", &input, &tool, &retained);
     let retained_log = read_log(&retained);
-    assert!(log_kind(&retained_log, "delete").is_empty(), "{retained_log}");
+    assert!(
+        log_kind(&retained_log, "delete").is_empty(),
+        "{retained_log}"
+    );
     let retained_scratch = scratch_from_log(&retained_log);
     assert!(
         retained_scratch.is_dir(),
         "a custom graph without delete must retain its generated cache"
     );
     let generated = cache_payloads(&retained_scratch.join("cache"));
-    assert_eq!(generated.len(), 3, "generated cache payloads: {generated:?}");
+    assert_eq!(
+        generated.len(),
+        3,
+        "generated cache payloads: {generated:?}"
+    );
     for path in &generated {
         assert!(path.is_file(), "{}", path.display());
     }
@@ -329,7 +352,7 @@ fn strength_zero_normalizes_parallel_solve_and_logs_effective_configuration() {
     let output = run(&root, "output", &input, &tool, &config);
     let trace = read_log(&output);
     assert!(
-        trace.contains("convert-cache:4,measure-solve:1,apply-ev:1"),
+        trace.contains("convert-cache:4,measure-solve:1,apply-ev:4"),
         "{trace}"
     );
     assert!(log_kind(&trace, "measure").is_empty());

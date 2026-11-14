@@ -13,10 +13,10 @@ use rawtl_linear_video::deflicker::estimation::ExposurePlan;
 use rawtl_linear_video::deflicker::measurement::AnalysisSidecar;
 use rawtl_linear_video::deflicker::{estimate_exposure, ExposureConfig, FrameMeasurement};
 use rawtl_linear_video::graph::ordered_frames::FrameTask;
-use rawtl_linear_video::graph::{self, Backend, Event, Gain, Graph, Scope};
+use rawtl_linear_video::graph::{self, Backend, Event, Gain, Graph, Kind, Scope};
 use std::collections::BTreeMap;
 use std::fs;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -49,13 +49,21 @@ struct Runner<'a, 'b> {
     resize_target: Option<(u32, u32)>,
     resize: Option<ResizeRecord>,
     generated_paths: Vec<std::path::PathBuf>,
-    encoder: video::GraphEncoder,
+    encoder: Arc<Mutex<video::GraphEncoder>>,
+    active: proc::ActiveNative,
+    encoder_config: ResolvedConfig,
+    develop_reference: Option<FrameInfo>,
+    stage_stats: BTreeMap<String, graph::ordered_frames::StageStats>,
+    worker_failure: Arc<Mutex<Option<Error>>>,
     failure: Option<Error>,
 }
 fn frame_failure(id: usize, total: usize, name: &str, message: &str) -> String {
     format!(
         "frame {}/{} ({}) failed: {}; no video was produced",
-        id + 1, total, name, message
+        id + 1,
+        total,
+        name,
+        message
     )
 }
 
@@ -66,20 +74,6 @@ impl Runner<'_, '_> {
             self.failure = Some(e);
             message
         })
-    }
-    fn frame_result<T>(&mut self, id: usize, result: Result<T>) -> graph::Result<T> {
-        let result = result.map_err(|e| {
-            Error::new(
-                e.code,
-                frame_failure(
-                    id,
-                    self.context.sources.len(),
-                    &self.context.sources[id].name,
-                    &e.message,
-                ),
-            )
-        });
-        self.result(result)
     }
     fn wb(&self, id: usize) -> Option<[f64; 3]> {
         if id > 0 && self.context.options.white_balance.freezes_reference() {
@@ -107,7 +101,7 @@ impl Backend for Runner<'_, '_> {
     type Image = Image;
     fn check(&mut self) -> graph::Result<()> {
         self.result(proc::check_stop())?;
-        if self.encoder.active.lock().unwrap().cancelled {
+        if self.active.lock().unwrap().cancelled {
             return self.result(Err(Error::new(
                 EXIT_PREVIEW,
                 "streaming encoder failed; scheduling cancelled",
@@ -119,7 +113,7 @@ impl Backend for Runner<'_, '_> {
         self.context.sources[id].path.display().to_string()
     }
     fn cancel(&mut self) {
-        proc::cancel(&self.encoder.active);
+        proc::cancel(&self.active);
     }
     fn prepare_task(&mut self, id: usize) -> graph::Result<FrameTask<PreparedFrame>> {
         let scratch = self
@@ -133,7 +127,7 @@ impl Backend for Runner<'_, '_> {
         let tool = self.context.options.native_tool.clone();
         let converter = self.context.options.converter.clone();
         let converter_timeout = self.context.options.converter_timeout;
-        let active = self.encoder.active.clone();
+        let active = self.active.clone();
         Ok(Box::new(move || {
             fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
             frame::prepare_active(
@@ -196,7 +190,7 @@ impl Backend for Runner<'_, '_> {
         let roi = self.context.options.deflicker.roi;
         let settings = self.settings();
         let total = self.context.sources.len();
-        let active = self.encoder.active.clone();
+        let active = self.active.clone();
         Ok(Box::new(move || {
             let info = frame::analyze_prepared_at(
                 &tool, &prepared, wb, roi, &settings, id, total, &log, active,
@@ -280,169 +274,261 @@ impl Backend for Runner<'_, '_> {
         self.result(written)?;
         Ok(gains)
     }
-    fn develop(&mut self, id: usize, r: &PreparedFrame, ev: f64) -> graph::Result<Image> {
+    fn develop_task(
+        &mut self,
+        id: usize,
+        r: &PreparedFrame,
+        ev: f64,
+    ) -> graph::Result<FrameTask<Image>> {
         let log = self.transcript("develop", id);
-        let mut pixels = None;
-        let started = Instant::now();
-        let result = frame::develop_prepared_at(
-            &self.context.options.native_tool,
-            r,
-            self.wb(id),
-            ev,
-            &self.settings(),
-            id,
-            self.context.sources.len(),
-            &log,
-            self.encoder.active.clone(),
-            &mut |info, native| {
-                pixels = Some(native.pixels(info.width, info.height)?);
-                Ok(())
-            },
-        );
-        let info = self.frame_result(id, result)?;
-        if let Some((width, height)) = self.source_geometry {
-            if width != info.width || height != info.height {
-                return Err("graph: frame dimensions changed".into());
-            }
-        } else {
-            self.source_geometry = Some((info.width, info.height));
-            // An explicit resize replaces the default source geometry; only the
-            // geometry that actually reaches the codec is validated here.
-            let geometry = self.resize_target.unwrap_or((info.width, info.height));
-            if let Err(message) = self.encoder.config().validate_geometry(geometry.0, geometry.1) {
-                return Err(message);
-            }
+        let tool = self.context.options.native_tool.clone();
+        let prepared = r.clone();
+        let wb = self.wb(id);
+        let settings = self.settings();
+        let total = self.context.sources.len();
+        let active = self.active.clone();
+        if id > 0 && self.context.options.white_balance.freezes_reference() && wb.is_none() {
+            return Err("graph: reference WB is not committed".into());
         }
-        if self
-            .context
-            .options
-            .preview_profile
-            .camera_color_method()
-            .requires_canon_cr3()
-            && self.frames.first().is_some_and(|first_frame| {
-                first_frame
-                    .camera_color
-                    .as_ref()
-                    .and_then(|c| c.get("camera_model"))
-                    != info
+        Ok(Box::new(move || {
+            let mut pixels = None;
+            let info = frame::develop_prepared_at(
+                &tool,
+                &prepared,
+                wb,
+                ev,
+                &settings,
+                id,
+                total,
+                &log,
+                active,
+                &mut |info, native| {
+                    pixels = Some(native.pixels(info.width, info.height)?);
+                    Ok(())
+                },
+            )
+            .map_err(|e| frame_failure(id, total, &prepared.source_name, &e.message))?;
+            Ok(Image {
+                info,
+                pixels: Pixels::Linear(pixels.ok_or("graph: develop returned no owned pixels")?),
+            })
+        }))
+    }
+    fn image_task(
+        &mut self,
+        kind: Kind,
+        _: usize,
+        mut image: Image,
+    ) -> graph::Result<FrameTask<Image>> {
+        let profile = self.context.options.preview_profile;
+        let range = self.encoder_config.effective_range(profile);
+        let reference_gain = self.context.options.log_reference_gain;
+        Ok(Box::new(move || {
+            match kind {
+                Kind::Identity => (),
+                Kind::Exposure(ev) => {
+                    let Pixels::Linear(pixels) = &mut image.pixels else {
+                        return Err("graph: exposure requires scene-linear pixels".into());
+                    };
+                    let gain = ev.exp2();
+                    for p in Arc::make_mut(pixels).chunks_exact_mut(4) {
+                        let value =
+                            (f32::from_le_bytes(p.try_into().unwrap()) as f64 * gain) as f32;
+                        if !value.is_finite() {
+                            return Err("graph: exposure overflow".into());
+                        }
+                        p.copy_from_slice(&value.to_le_bytes());
+                    }
+                    image.info.pixels_sha256 = Some(crate::digest::sha256(pixels));
+                    image.info.exposure_ev += ev;
+                }
+                Kind::Resize { width, height } => {
+                    let Pixels::Linear(pixels) = &image.pixels else {
+                        return Err(
+                            "graph: resize requires scene-linear pixels before colour".into()
+                        );
+                    };
+                    let resized = crate::resample::resize_scene_linear(
+                        pixels,
+                        image.info.width,
+                        image.info.height,
+                        width,
+                        height,
+                    )
+                    .map_err(|e| format!("graph: resize: {e}"))?;
+                    image.info.pixels_sha256 = Some(crate::digest::sha256(&resized));
+                    image.pixels = Pixels::Linear(Arc::from(resized));
+                    image.info.width = width;
+                    image.info.height = height;
+                }
+                Kind::Color => {
+                    let Pixels::Linear(pixels) = &image.pixels else {
+                        return Err("graph: colour conversion requires scene-linear pixels".into());
+                    };
+                    let mut signal = Vec::new();
+                    profile
+                        .convert_f32_frame_to_yuv10(
+                            pixels,
+                            image.info.width as usize,
+                            image.info.height as usize,
+                            reference_gain,
+                            range,
+                            &mut signal,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    image.pixels = Pixels::Target(signal);
+                }
+                _ => return Err("graph: unsupported image task".into()),
+            }
+            Ok(image)
+        }))
+    }
+    fn commit_image(
+        &mut self,
+        kind: Kind,
+        id: usize,
+        image: &Image,
+        elapsed: Duration,
+    ) -> graph::Result<()> {
+        let info = &image.info;
+        if info.index != id + 1 || info.source_sha256.as_deref().is_none() {
+            return Err("graph: image identity mismatch".into());
+        }
+        if kind == Kind::Develop {
+            if let Some((width, height)) = self.source_geometry {
+                if width != info.width || height != info.height {
+                    return Err("graph: frame dimensions changed".into());
+                }
+            } else {
+                self.source_geometry = Some((info.width, info.height));
+                // An explicit resize replaces the default source geometry; only the
+                // geometry that actually reaches the codec is validated here.
+                let geometry = self.resize_target.unwrap_or((info.width, info.height));
+                if let Err(message) = self
+                    .encoder_config
+                    .validate_geometry(geometry.0, geometry.1)
+                {
+                    return Err(message);
+                }
+            }
+            if self
+                .context
+                .options
+                .preview_profile
+                .camera_color_method()
+                .requires_canon_cr3()
+                && self.develop_reference.as_ref().is_some_and(|first_frame| {
+                    first_frame
                         .camera_color
                         .as_ref()
                         .and_then(|c| c.get("camera_model"))
-            })
-        {
-            return Err("rev-eng Canon Log rejects mixed camera models".into());
-        }
-        // pixels() checks EOF/hash and reaps native before returning owned data.
-        self.check()?;
-        let written = self.log.line(&format!(
-            "kind=develop frame={} source={} ev={:.9} wb={} wb_source={} as_shot={} \
-             source_sha256={} pixels={} pixels_sha256={} duration={:.3}",
-            info.index,
-            quote(&info.source_name),
-            info.exposure_ev,
-            frame::format_wb(info.applied_wb),
-            info.wb_source,
-            frame::format_wb(info.as_shot_neutral),
-            info.source_sha256.as_deref().unwrap_or("unknown"),
-            pixels.as_ref().map_or(0, |pixels| pixels.len()),
-            info.pixels_sha256.as_deref().unwrap_or("unknown"),
-            started.elapsed().as_secs_f64()
-        ));
-        self.result(written)?;
-        Ok(Image {
-            info,
-            pixels: Pixels::Linear(pixels.ok_or("graph: develop returned no owned pixels")?),
-        })
-    }
-    fn exposure(&mut self, image: &mut Image, ev: f64) -> graph::Result<()> {
-        let Pixels::Linear(pixels) = &mut image.pixels else {
-            return Err("graph: exposure requires scene-linear pixels".into());
-        };
-        let gain = ev.exp2();
-        for p in Arc::make_mut(pixels).chunks_exact_mut(4) {
-            let value = (f32::from_le_bytes(p.try_into().unwrap()) as f64 * gain) as f32;
-            if !value.is_finite() {
-                return Err("graph: exposure overflow".into());
+                        != info
+                            .camera_color
+                            .as_ref()
+                            .and_then(|c| c.get("camera_model"))
+                })
+            {
+                return Err("rev-eng Canon Log rejects mixed camera models".into());
             }
-            p.copy_from_slice(&value.to_le_bytes());
+
+            if id == 0 {
+                self.develop_reference = Some(info.clone());
+            }
+            let written=self.log.line(&format!(
+                "kind=develop frame={} source={} ev={:.9} wb={} wb_source={} as_shot={} source_sha256={} pixels={} pixels_sha256={} duration={:.3}",
+                info.index,quote(&info.source_name),info.exposure_ev,frame::format_wb(info.applied_wb),info.wb_source,frame::format_wb(info.as_shot_neutral),info.source_sha256.as_deref().unwrap_or("unknown"),
+                match &image.pixels {Pixels::Linear(p)=>p.len(),_=>0},info.pixels_sha256.as_deref().unwrap_or("unknown"),elapsed.as_secs_f64()));
+            self.result(written)?;
+        } else {
+            if let Kind::Resize { width, height } = kind {
+                if self.resize.is_none() {
+                    let (sw, sh) = self
+                        .source_geometry
+                        .ok_or("graph: missing source geometry")?;
+                    self.resize = Some(ResizeRecord {
+                        source_width: sw,
+                        source_height: sh,
+                        width,
+                        height,
+                    });
+                }
+            }
+            if let Kind::Exposure(ev) = kind {
+                let written = self.log.line(&format!(
+                    "kind=exposure frame={} ev={:.9} total_ev={:.9}",
+                    info.index, ev, info.exposure_ev
+                ));
+                self.result(written)?;
+            }
+            let token = match kind {
+                Kind::Identity => "identity",
+                Kind::Exposure(_) => "exposure",
+                Kind::Resize { .. } => "resize",
+                Kind::Color => "color",
+                _ => unreachable!("only image transformations reach this commit"),
+            };
+            let written = self.log.line(&format!(
+                "kind=image node_kind={token} frame={} duration={:.3}",
+                info.index,
+                elapsed.as_secs_f64()
+            ));
+            self.result(written)?;
         }
-        image.info.pixels_sha256 = Some(crate::digest::sha256(pixels));
-        image.info.exposure_ev += ev;
-        let written = self.log.line(&format!(
-            "kind=exposure frame={} ev={:.9} total_ev={:.9}",
-            image.info.index, ev, image.info.exposure_ev
-        ));
-        self.result(written)
-    }
-    fn resize(&mut self, image: &mut Image, width: u32, height: u32) -> graph::Result<()> {
-        let Pixels::Linear(pixels) = &image.pixels else {
-            return Err("graph: resize requires scene-linear pixels before colour".into());
-        };
-        let source = (image.info.width, image.info.height);
-        let resized = crate::resample::resize_scene_linear(pixels, source.0, source.1, width, height)
-            .map_err(|e| format!("graph: resize: {e}"))?;
-        if self.resize.is_none() {
-            self.resize = Some(ResizeRecord {
-                source_width: source.0,
-                source_height: source.1,
-                width,
-                height,
-            });
-        }
-        let digest = crate::digest::sha256(&resized);
-        image.pixels = Pixels::Linear(Arc::from(resized));
-        image.info.width = width;
-        image.info.height = height;
-        image.info.pixels_sha256 = Some(digest);
         Ok(())
     }
-    fn color(&mut self, image: Image) -> graph::Result<Image> {
-        let Image { info, pixels } = image;
-        let Pixels::Linear(pixels) = pixels else {
-            return Err("graph: colour conversion requires scene-linear pixels".into());
-        };
-        let profile = self.context.options.preview_profile;
-        let range = self.encoder.config().effective_range(profile);
-        let mut signal = Vec::new();
-        profile
-            .convert_f32_frame_to_yuv10(
-                &pixels,
-                info.width as usize,
-                info.height as usize,
-                self.context.options.log_reference_gain,
-                range,
-                &mut signal,
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(Image {
-            info,
-            pixels: Pixels::Target(signal),
-        })
+    fn encode_task(&mut self, _: usize, image: Image) -> graph::Result<FrameTask<Image>> {
+        let encoder = self.encoder.clone();
+        let options = self.context.options.clone();
+        let scratch = self.context.scratch.to_path_buf();
+        let failure = self.worker_failure.clone();
+        Ok(Box::new(move || {
+            let Pixels::Target(signal) = &image.pixels else {
+                return Err("graph: encoder requires the 10-bit target signal".into());
+            };
+            let mut encoder = encoder.lock().map_err(|_| "encoder writer panicked")?;
+            let result = encoder
+                .begin()
+                .and_then(|_| encoder.push(&options, &scratch, &image.info, signal));
+            if let Err(e) = result {
+                let message = e.message.clone();
+                *failure.lock().unwrap() = Some(e);
+                return Err(message);
+            }
+            Ok(image)
+        }))
     }
-    fn begin(&mut self) -> graph::Result<()> {
-        self.check()?;
-        let result = self.encoder.begin();
-        self.result(result)
-    }
-    fn push(&mut self, id: usize, image: Image) -> graph::Result<()> {
-        let Pixels::Target(signal) = &image.pixels else {
-            return Err("graph: encoder requires the 10-bit target signal".into());
-        };
-        let result = self.encoder.push(self.context, &image.info, signal);
-        self.result(result)?;
+    fn commit_encode(&mut self, id: usize, image: Image, elapsed: Duration) -> graph::Result<()> {
+        if id != self.frames.len() {
+            return Err("graph: encode commit order mismatch".into());
+        }
         if id == 0 {
-            if let Some(command) = self.encoder.command() {
+            let command = self.encoder.lock().unwrap().command().map(str::to_owned);
+            if let Some(command) = command {
                 let written = self
                     .log
-                    .line(&format!("kind=encoder.command args={}", quote(command)));
+                    .line(&format!("kind=encoder.command args={}", quote(&command)));
                 self.result(written)?;
             }
         }
+        let written = self.log.line(&format!(
+            "kind=encode frame={} duration={:.3}",
+            id + 1,
+            elapsed.as_secs_f64()
+        ));
+        self.result(written)?;
         self.frames.push(image.info);
         Ok(())
     }
+    fn activity(
+        &mut self,
+        node: &str,
+        stats: graph::ordered_frames::StageStats,
+    ) -> graph::Result<()> {
+        self.stage_stats.insert(node.into(), stats);
+        Ok(())
+    }
     fn end(&mut self) -> graph::Result<()> {
-        let result = self.encoder.end();
+        let result = self.encoder.lock().unwrap().end();
         self.result(result)
     }
     fn delete(&mut self, id: usize, r: &PreparedFrame) -> graph::Result<()> {
@@ -504,14 +590,15 @@ fn check_output_extension(options: &crate::cli::Options, config: &ResolvedConfig
 /// location. Configuration errors are therefore rejected before the run log,
 /// the scratch directory or any RAW work exists.
 pub fn resolve_configuration(options: &crate::cli::Options) -> Result<(Graph, ResolvedConfig)> {
-    let mut graph = if let Some(path) = &options.graph {
-        Graph::parse(&fs::read_to_string(path).map_err(|e| {
-            Error::new(EXIT_VALIDATION, format!("graph {}: {e}", path.display()))
-        })?)
-    } else {
-        Ok(Graph::default_graph(options.deflicker.enabled()))
-    }
-    .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
+    let mut graph =
+        if let Some(path) = &options.graph {
+            Graph::parse(&fs::read_to_string(path).map_err(|e| {
+                Error::new(EXIT_VALIDATION, format!("graph {}: {e}", path.display()))
+            })?)
+        } else {
+            Ok(Graph::default_graph(options.deflicker.enabled()))
+        }
+        .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
     if !options.deflicker.enabled() {
         graph.disable_measurement();
     }
@@ -520,9 +607,8 @@ pub fn resolve_configuration(options: &crate::cli::Options) -> Result<(Graph, Re
             .apply_resize(width, height)
             .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
     }
-    let config =
-        ResolvedConfig::resolve(graph.encoder_patch(), &options.encoder)
-            .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
+    let config = ResolvedConfig::resolve(graph.encoder_patch(), &options.encoder)
+        .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
     check_output_extension(options, &config)?;
     Ok((graph, config))
 }
@@ -586,6 +672,7 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| Error::new(EXIT_USAGE, "--output has no usable file name"))?
         .to_string();
+    let active: proc::ActiveNative = Default::default();
     let mut runner = Runner {
         context,
         log,
@@ -597,11 +684,24 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         resize_target: explicit_resize,
         resize: None,
         generated_paths: vec![],
-        encoder: video::GraphEncoder::new(config.clone(), context.sources.len(), &output_name),
+        encoder: {
+            let mut encoder =
+                video::GraphEncoder::new(config.clone(), context.sources.len(), &output_name);
+            encoder.active = active.clone();
+            Arc::new(Mutex::new(encoder))
+        },
+        active,
+        encoder_config: config.clone(),
+        develop_reference: None,
+        stage_stats: BTreeMap::new(),
+        worker_failure: Default::default(),
         failure: None,
     };
     let graph_started = Instant::now();
     let result = graph::execute(&graph, context.sources.len(), &mut runner);
+    for (node, stats) in &runner.stage_stats {
+        runner.log.line(&format!("kind=stage node={} concurrency={} accepted={} committed={} delivered={} peak_in_flight={}",node,stats.capacity,stats.accepted,stats.committed,stats.delivered,stats.peak))?;
+    }
     if let Err(message) = result {
         let _ = runner.log.line(&format!(
             "kind=node.error message={} cache_root={}",
@@ -609,19 +709,27 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
             quote(&context.scratch.join("cache").display().to_string())
         ));
         proc::check_stop()?;
-        if runner.encoder.failed() {
-            return Err(Error::new(
-                EXIT_PREVIEW,
-                format!(
-                    "streaming encoder failed: {message}; encoder transcript: {}",
-                    runner.encoder.failure_detail()
-                ),
-            ));
-        }
-        return Err(runner
+        // Cancellation can make the encoder observer report failure during
+        // cleanup. Choose the already observed root before adding diagnostics.
+        let worker_failure = runner
+            .worker_failure
+            .lock()
+            .unwrap()
+            .take()
+            .filter(|e| message.ends_with(&e.message));
+        let mut error = runner
             .failure
             .take()
-            .unwrap_or_else(|| Error::new(EXIT_FRAME, message)));
+            .or(worker_failure)
+            .unwrap_or_else(|| Error::new(EXIT_FRAME, message));
+        if error.code == EXIT_PREVIEW {
+            error.message = format!(
+                "streaming encoder failed: {}; encoder transcript: {}",
+                error.message,
+                runner.encoder.lock().unwrap().failure_detail()
+            );
+        }
+        return Err(error);
     }
     proc::check_stop()?;
     let first = runner

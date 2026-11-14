@@ -213,15 +213,6 @@ impl OwnedProcess {
         process.registration = Some((active.clone(), log.to_path_buf()));
         Ok(process)
     }
-    pub fn spawn(
-        program: &Path,
-        args: &[String],
-        log: &Path,
-        code: i32,
-        pipe_input: bool,
-    ) -> Result<Self> {
-        Self::spawn_inner(program, args, log, code, pipe_input, None)
-    }
     fn spawn_inner(
         program: &Path,
         args: &[String],

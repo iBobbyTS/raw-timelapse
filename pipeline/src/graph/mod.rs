@@ -1,13 +1,14 @@
-//! A synchronous typed DAG. Lightweight references may accumulate through EOF;
-//! image outputs have one slot, with a single consumer and downstream-first
-//! draining. Events are distinct from data, and deletion runs before image
-//! consumers on each scheduling turn.
+//! A bounded ordered typed DAG. Lightweight references may accumulate through
+//! EOF; image stages charge running and completed results to their concurrency
+//! capacity. Events precede downstream acceptance; deletion has dispatch priority.
 use crate::encoder::Patch as EncoderPatch;
 use crate::json::{self, Json};
 use ordered_frames::{FrameTask, OrderedStage};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(test)]
+mod image_chain_tests;
 #[cfg(test)]
 mod node_concurrency_tests;
 pub mod ordered_frames;
@@ -216,7 +217,18 @@ impl Graph {
                 Some(Json::Int(n)) if (1..=64).contains(n) => *n as usize,
                 _ => return Err("graph: concurrency must be an integer in 1..64".into()),
             };
-            if concurrency > 1 && !matches!(kind, Kind::Prepare | Kind::Solve) {
+            if concurrency > 1
+                && !matches!(
+                    kind,
+                    Kind::Prepare
+                        | Kind::Solve
+                        | Kind::Develop
+                        | Kind::Identity
+                        | Kind::Exposure(_)
+                        | Kind::Resize { .. }
+                        | Kind::Color
+                )
+            {
                 return Err(format!(
                     "graph: {kind:?} only supports concurrency 1 in this runtime"
                 ));
@@ -442,8 +454,7 @@ impl Graph {
         let mut done = BTreeSet::new();
         while done.len() < self.nodes.len() {
             let next = (0..self.nodes.len()).find(|i| {
-                !done.contains(i)
-                    && self.completion_dependencies(*i).all(|v| done.contains(&v))
+                !done.contains(i) && self.completion_dependencies(*i).all(|v| done.contains(&v))
             });
             if let Some(i) = next {
                 done.insert(i);
@@ -476,9 +487,7 @@ impl Graph {
     /// finished for every frame, including when JSON only waits on prepare.
     fn completion_dependencies(&self, index: usize) -> impl Iterator<Item = usize> + '_ {
         let node = &self.nodes[index];
-        let readers = self.nodes.iter().enumerate().filter_map(|(i, reader)| {
-            matches!(reader.kind, Kind::Solve | Kind::Develop).then_some(i)
-        });
+        let readers = self.cache_readers();
         node.inputs
             .values()
             .copied()
@@ -489,6 +498,15 @@ impl Graph {
                     .into_iter()
                     .flatten(),
             )
+    }
+    /// All graph consumers that can open the materialized DNG. Reference and
+    /// barrier nodes only move lightweight descriptors. Share this set between
+    /// validation and the runtime so custom waits cannot hide future readers.
+    fn cache_readers(&self) -> impl Iterator<Item = usize> + '_ {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| matches!(n.kind, Kind::Solve | Kind::Develop).then_some(i))
     }
     fn completion_image_ancestor(
         &self,
@@ -567,7 +585,7 @@ pub struct Event {
 pub trait Backend {
     type Reference: Clone + Send + 'static;
     type Measurement: Send + 'static;
-    type Image;
+    type Image: Send + 'static;
     fn check(&mut self) -> Result<()>;
     fn source_identity(&self, id: usize) -> String;
     fn prepare_task(&mut self, id: usize) -> Result<FrameTask<Self::Reference>>;
@@ -587,17 +605,32 @@ pub trait Backend {
         elapsed: Duration,
     ) -> Result<()>;
     fn solve(&mut self) -> Result<Vec<Gain>>;
-    fn develop(&mut self, id: usize, r: &Self::Reference, ev: f64) -> Result<Self::Image>;
-    fn exposure(&mut self, image: &mut Self::Image, ev: f64) -> Result<()>;
-    /// Explicit scene-linear resample. Backends that carry linear pixels
-    /// implement this; others reject a resize configuration explicitly.
-    fn resize(&mut self, image: &mut Self::Image, width: u32, height: u32) -> Result<()> {
-        let _ = (image, width, height);
-        Err("graph: this backend cannot resize scene-linear images".into())
+    fn develop_task(
+        &mut self,
+        id: usize,
+        r: &Self::Reference,
+        ev: f64,
+    ) -> Result<FrameTask<Self::Image>>;
+    fn image_task(
+        &mut self,
+        kind: Kind,
+        id: usize,
+        image: Self::Image,
+    ) -> Result<FrameTask<Self::Image>>;
+    fn commit_image(
+        &mut self,
+        _kind: Kind,
+        _id: usize,
+        _image: &Self::Image,
+        _elapsed: Duration,
+    ) -> Result<()> {
+        Ok(())
     }
-    fn color(&mut self, image: Self::Image) -> Result<Self::Image>;
-    fn begin(&mut self) -> Result<()>;
-    fn push(&mut self, id: usize, image: Self::Image) -> Result<()>;
+    fn encode_task(&mut self, id: usize, image: Self::Image) -> Result<FrameTask<Self::Image>>;
+    fn commit_encode(&mut self, id: usize, image: Self::Image, elapsed: Duration) -> Result<()>;
+    fn activity(&mut self, _node: &str, _stats: ordered_frames::StageStats) -> Result<()> {
+        Ok(())
+    }
     fn end(&mut self) -> Result<()>;
     fn delete(&mut self, id: usize, r: &Self::Reference) -> Result<()>;
     fn event(&mut self, event: &Event) -> Result<()>;
@@ -605,22 +638,20 @@ pub trait Backend {
 struct State<R, I> {
     refs: Vec<R>,
     plan: Option<Arc<Vec<Gain>>>,
-    image: Option<(usize, I)>,
+    images: VecDeque<(ordered_frames::TaskKey, I)>,
     next: usize,
     frames: BTreeSet<usize>,
     closed: bool,
-    begun: bool,
 }
 impl<R, I> Default for State<R, I> {
     fn default() -> Self {
         Self {
             refs: vec![],
             plan: None,
-            image: None,
+            images: VecDeque::new(),
             next: 0,
             frames: BTreeSet::new(),
             closed: false,
-            begun: false,
         }
     }
 }
@@ -659,9 +690,8 @@ fn emit<B: Backend>(
         },
     })
 }
-/// Execute all nodes, retaining only O(N) references/features and one image per
-/// active chain slot. The downstream-first sweep prevents filling those slots;
-/// after develop, deletion is dispatched before any color/encoder operation.
+/// Execute with O(frame count) lightweight sequence state and at most the sum
+/// of stage capacities in heavy frames. Delete runs before image admissions.
 pub fn execute<B: Backend>(graph: &Graph, count: usize, b: &mut B) -> Result<()> {
     let mut inventory = Seal::new(count);
     for id in 0..count {
@@ -695,6 +725,16 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                 .then(|| OrderedStage::<B::Measurement>::new(n.concurrency, wake.clone()))
         })
         .collect();
+    let mut images: Vec<_> = graph
+        .nodes
+        .iter()
+        .map(|n| {
+            n.kind
+                .image_node()
+                .then(|| OrderedStage::<B::Image>::new(n.concurrency, wake.clone()))
+        })
+        .collect();
+    let mut previous_activity = BTreeMap::new();
     let mut measured_inventory = Seal::new(count);
     let mut states: Vec<State<B::Reference, B::Image>> =
         (0..graph.nodes.len()).map(|_| State::default()).collect();
@@ -724,6 +764,9 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                 stage.poll()?;
             }
             for stage in measurements.iter_mut().flatten() {
+                stage.poll()?;
+            }
+            for stage in images.iter_mut().flatten() {
                 stage.poll()?;
             }
             if states.iter().all(|s| s.closed) {
@@ -769,6 +812,35 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                     }
                 }
             }
+            // Business completion precedes delivery. Completed images remain
+            // charged to their producing stage until the consumer accepts them.
+            for (i, stage) in images.iter_mut().enumerate() {
+                if let Some(stage) = stage {
+                    while let Some(output) = stage.commit_next() {
+                        b.check()?;
+                        let id = output.key.frame_id;
+                        if id != states[i].next || output.key.node != graph.nodes[i].id {
+                            return Err("graph: image completion identity/order mismatch".into());
+                        }
+                        if graph.nodes[i].kind == Kind::Encode {
+                            b.commit_encode(id, output.value, output.elapsed)?;
+                            stage.delivered(id)?;
+                        } else {
+                            b.commit_image(graph.nodes[i].kind, id, &output.value, output.elapsed)
+                                .map_err(|e| {
+                                    format!(
+                                        "node {} frame {} source {} failed: {e}",
+                                        output.key.node, id, output.key.source
+                                    )
+                                })?;
+                            states[i].images.push_back((output.key, output.value));
+                        }
+                        states[i].next += 1;
+                        emit(b, &graph.nodes[i], &mut states[i], Some(id))?;
+                        progress = true;
+                    }
+                }
+            }
             for &i in &order {
                 let node = &graph.nodes[i];
                 if states[i].closed {
@@ -779,6 +851,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                     .as_ref()
                     .map(|s| s.accepted())
                     .or_else(|| measurements[i].as_ref().map(|s| s.accepted()))
+                    .or_else(|| images[i].as_ref().map(|s| s.accepted()))
                     .unwrap_or(states[i].next);
                 if !ready(
                     node,
@@ -906,22 +979,32 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                     Kind::Develop => {
                         let p = input("frames");
                         let plan = input("plan");
-                        // One full-resolution image in the complete final chain.
-                        let occupied = states.iter().any(|s| s.image.is_some());
-                        if !occupied && states[plan].closed && states[i].image.is_none() {
-                            if let Some(r) = states[p].refs.get(id).cloned() {
-                                let g =
+                        let stage = images[i].as_mut().unwrap();
+                        if stage.has_capacity() && states[plan].closed && id < count {
+                            if let Some(r) = states[p].refs.get(id) {
+                                let gain =
                                     &states[plan].plan.as_ref().ok_or("graph: missing plan")?[id];
-                                if g.source_sha256 != b.hash(&r) {
+                                if gain.source_sha256 != b.hash(r) {
                                     return Err("graph: EV join identity mismatch".into());
                                 }
-                                let image = b.develop(id, &r, g.ev)?;
-                                states[i].image = Some((id, image));
-                                states[i].next += 1;
-                                frame_done = true;
-                            } else if states[p].closed && id == count {
-                                close = true;
+                                let task = b.develop_task(id, r, gain.ev)?;
+                                stage.submit(
+                                    ordered_frames::TaskKey {
+                                        node: node.id.clone(),
+                                        frame_id: id,
+                                        source: b.hash(r).into(),
+                                    },
+                                    task,
+                                )?;
+                                progress = true;
                             }
+                        } else if states[p].closed
+                            && states[plan].closed
+                            && id == count
+                            && states[i].next == count
+                            && stage.outstanding() == 0
+                        {
+                            close = true;
                         }
                     }
                     Kind::Identity
@@ -930,35 +1013,35 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                     | Kind::Color
                     | Kind::Encode => {
                         let p = input("image");
-                        if states[i].image.is_none()
+                        if images[i].as_ref().unwrap().has_capacity()
                             && states[p]
-                                .image
-                                .as_ref()
-                                .is_some_and(|(frame, _)| *frame == id)
+                                .images
+                                .front()
+                                .is_some_and(|(key, _)| key.frame_id == id)
                         {
-                            if node.kind == Kind::Encode && !states[i].begun {
-                                b.begin()?;
-                                states[i].begun = true;
-                            }
-                            let (frame, mut image) = states[p].image.take().unwrap();
-                            match node.kind {
-                                Kind::Exposure(ev) => {
-                                    b.exposure(&mut image, ev)?;
-                                    states[i].image = Some((frame, image));
-                                }
-                                Kind::Resize { width, height } => {
-                                    b.resize(&mut image, width, height)?;
-                                    states[i].image = Some((frame, image));
-                                }
-                                Kind::Color => {
-                                    states[i].image = Some((frame, b.color(image)?));
-                                }
-                                Kind::Encode => b.push(frame, image)?,
-                                _ => states[i].image = Some((frame, image)),
-                            }
-                            states[i].next += 1;
-                            frame_done = true;
-                        } else if states[p].closed && states[p].image.is_none() && id == count {
+                            let (upstream, image) = states[p].images.pop_front().unwrap();
+                            let task = if node.kind == Kind::Encode {
+                                b.encode_task(id, image)?
+                            } else {
+                                b.image_task(node.kind, id, image)?
+                            };
+                            images[i].as_mut().unwrap().submit(
+                                ordered_frames::TaskKey {
+                                    node: node.id.clone(),
+                                    frame_id: id,
+                                    source: upstream.source,
+                                },
+                                task,
+                            )?;
+                            // Downstream owns its slot before upstream releases one.
+                            images[p].as_mut().unwrap().delivered(id)?;
+                            progress = true;
+                        } else if states[p].closed
+                            && states[p].images.is_empty()
+                            && id == count
+                            && states[i].next == count
+                            && images[i].as_ref().unwrap().outstanding() == 0
+                        {
                             if node.kind == Kind::Encode {
                                 b.end()?;
                             }
@@ -970,16 +1053,15 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                         if let Some(r) = states[p].refs.get(id).cloned() {
                             // A reference fork is lightweight, but every future
                             // native reader must finish this frame before deletion.
-                            let readers_done =
-                                graph
-                                    .nodes
-                                    .iter()
-                                    .enumerate()
-                                    .all(|(reader, n)| match n.kind {
-                                        Kind::Solve => states[reader].next > id,
-                                        Kind::Develop => states[reader].frames.contains(&id),
-                                        _ => true,
-                                    });
+                            let readers_done = graph.cache_readers().all(|reader| {
+                                match graph.nodes[reader].kind {
+                                    Kind::Solve => states[reader].next > id,
+                                    // Commit follows owned-pixel EOF/hash validation and
+                                    // native reaping, even while its image holds a slot.
+                                    Kind::Develop => states[reader].frames.contains(&id),
+                                    _ => unreachable!(),
+                                }
+                            });
                             if !readers_done {
                                 continue;
                             }
@@ -1000,9 +1082,23 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                     progress = true;
                 }
             }
+            for i in 0..graph.nodes.len() {
+                let stats = preparations[i]
+                    .as_ref()
+                    .map(|s| s.stats())
+                    .or_else(|| measurements[i].as_ref().map(|s| s.stats()))
+                    .or_else(|| images[i].as_ref().map(|s| s.stats()));
+                if let Some(stats) = stats {
+                    if previous_activity.get(&i) != Some(&stats) {
+                        b.activity(&graph.nodes[i].id, stats)?;
+                        previous_activity.insert(i, stats);
+                    }
+                }
+            }
             if !progress {
                 let active = preparations.iter().flatten().any(|s| s.outstanding() > 0)
-                    || measurements.iter().flatten().any(|s| s.outstanding() > 0);
+                    || measurements.iter().flatten().any(|s| s.outstanding() > 0)
+                    || images.iter().flatten().any(|s| s.outstanding() > 0);
                 if active {
                     // Timed wake only exists to observe async-signal-safe STOP;
                     // completions themselves wake this receiver immediately.
@@ -1020,6 +1116,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
     // cannot strand the coordinator on the first failing worker.
     drop(preparations);
     drop(measurements);
+    drop(images);
     result
 }
 #[cfg(test)]
