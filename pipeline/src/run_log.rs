@@ -17,6 +17,8 @@ pub struct RunLog {
     file: File,
     path: PathBuf,
     started: Instant,
+    #[cfg(test)]
+    before_line: Option<Box<dyn FnMut(&str, &mut File)>>,
 }
 
 impl RunLog {
@@ -36,6 +38,8 @@ impl RunLog {
             file,
             path: path.to_path_buf(),
             started: Instant::now(),
+            #[cfg(test)]
+            before_line: None,
         };
         writeln!(log.file, "rawtl-linear-video {version}").map_err(|err| log_write_error(path, err))?;
         Ok(log)
@@ -51,6 +55,10 @@ impl RunLog {
 
     /// Append one `wall=... elapsed=... <payload>` line.
     pub fn line(&mut self, payload: &str) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = &mut self.before_line {
+            hook(payload, &mut self.file);
+        }
         let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs_f64())
@@ -69,6 +77,12 @@ impl RunLog {
         if let Err(err) = self.line(payload) {
             eprintln!("warning: {}", err.message);
         }
+    }
+
+    /// Test-only boundary control; the actual append still uses `File` I/O.
+    #[cfg(test)]
+    pub(crate) fn before_line(&mut self, hook: impl FnMut(&str, &mut File) + 'static) {
+        self.before_line = Some(Box::new(hook));
     }
 }
 
