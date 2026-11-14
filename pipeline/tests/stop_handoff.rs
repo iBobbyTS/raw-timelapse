@@ -4,7 +4,8 @@ fn caller_cancel_reaps_real_native_converter_group_and_encoder() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap();
-    let native = repo.join("native/build/dng-linear-frame");
+    let native = std::env::var_os("RAWTL_NATIVE_TOOL").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| repo.join("native/build/dng-linear-frame"));
     assert!(
         native.is_file(),
         "build native producer before process-boundary tests"

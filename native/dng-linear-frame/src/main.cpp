@@ -7,6 +7,7 @@
 #include <csignal>
 #include <cstdio>
 #include <fstream>
+#include <exception>
 #include <iostream>
 #include <sstream>
 #include <unistd.h>
@@ -33,23 +34,34 @@ struct Temp {
     path = p;
   }
   void clear() {
-    std::error_code e;
-    fs::remove_all(path, e);
-    if (e)
-      throw Error(50, "cannot remove temporary directory: " + e.message());
+    std::vector<fs::path> entries;
+    for (const auto &entry : fs::recursive_directory_iterator(path)) {
+      check_cancelled();
+      entries.push_back(entry.path());
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b) {
+      return std::distance(a.begin(),a.end()) > std::distance(b.begin(),b.end());
+    });
+    entries.push_back(path);
+    for (const auto &entry : entries) {
+      check_cancelled();
+      std::error_code e;
+      fs::remove(entry,e);
+      if (e) throw Error(50, "cannot remove temporary artifact: " + entry.string() + ": " + e.message());
+    }
     removed = true;
     std::cerr << "temporary directory cleaned: " << path << '\n';
   }
   ~Temp() {
-    if (removed)
+    if (removed) return;
+    if (std::uncaught_exceptions()) {
+      std::cerr << "failed operation retained diagnostic temporary directory: " << path << '\n';
       return;
-    std::error_code e;
-    fs::remove_all(path, e);
-    if (e)
-      std::cerr << "temporary cleanup failed: " << path << ": " << e.message()
-                << '\n';
-    else
-      std::cerr << "temporary directory cleaned: " << path << '\n';
+    }
+    try { clear(); }
+    catch (const std::exception &e) {
+      std::cerr << "temporary cleanup stopped; retained " << path << ": " << e.what() << '\n';
+    }
   }
 };
 Vec parse_wb(std::string s) {
@@ -269,7 +281,8 @@ int main(int argc, char **argv) {
     // prepare mode, so the positional path slots stay paths even when a path
     // is spelled like a mode flag.
     const std::string mode = argc >= 2 ? std::string(argv[1]) : std::string();
-    const bool prepare_mode = mode == "--prepare";
+    const bool batch_mode = mode == "--prepare-batch";
+    const bool prepare_mode = mode == "--prepare" || batch_mode;
     const bool stdout_mode = mode == "--stdout-analysis" ||
                              mode == "--stdout-frame" ||
                              mode == "--stdout-frame-f32";
@@ -279,7 +292,7 @@ int main(int argc, char **argv) {
 
     if (prepare_mode) {
       if (argc < 3)
-        throw Error(2, "usage: dng-linear-frame --prepare <source> --scratch "
+        throw Error(2, "usage: dng-linear-frame --prepare <source> / --prepare-batch <request> --scratch "
                        "DIR --emit-prepared PATH [--converter PATH] "
                        "[--converter-timeout SECONDS]");
       fs::path input = argv[2];
@@ -295,7 +308,7 @@ int main(int argc, char **argv) {
         if (a == "--scratch") {
           scratch = value;
           scratch_set = true;
-        } else if (a == "--emit-prepared") {
+        } else if (a == (batch_mode ? "--emit-result" : "--emit-prepared")) {
           context = value;
           context_set = true;
         } else if (a == "--converter")
@@ -313,9 +326,13 @@ int main(int argc, char **argv) {
           throw Error(2, "unknown option: " + a);
       }
       if (!scratch_set)
-        throw Error(2, "--prepare requires --scratch");
+        throw Error(2, mode + " requires --scratch");
       if (!context_set)
-        throw Error(2, "--prepare requires --emit-prepared");
+        throw Error(2, mode + (batch_mode ? " requires --emit-result" : " requires --emit-prepared"));
+      if (batch_mode) {
+        prepare_batch(input, scratch, context, converter, timeout);
+        return 0;
+      }
       PreparedFrame prepared =
           prepare_frame(input, scratch, converter, timeout, false);
       check_cancelled();

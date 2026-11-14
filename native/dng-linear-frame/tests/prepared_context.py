@@ -66,9 +66,9 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def context_fields(path):
+def context_fields(path, magic="rawtl-prepared-frame/2"):
     lines = path.read_bytes().decode().split("\n")
-    assert lines[0] == "rawtl-prepared-frame/1", lines[0]
+    assert lines[0] == magic, lines[0]
     fields = {}
     for line in lines[1:]:
         if not line:
@@ -106,7 +106,7 @@ def converted_count(counter):
 
 
 def write_context(path, fields, order):
-    path.write_text("\n".join(["rawtl-prepared-frame/1"] +
+    path.write_text("\n".join(["rawtl-prepared-frame/2"] +
                               [f"{key}={fields[key]}" for key in order]) + "\n")
 
 
@@ -182,7 +182,7 @@ counter = work / "converter-count"
 converter = work / "converter-copy"
 converter.write_text(
     f"#!/bin/sh\necho call >> {counter}\n"
-    f"cp {base.resolve()} \"$4/converted.dng\"\n"
+    f"for source do :; done\ncp {base.resolve()} \"$4/$(basename \"${{source%.*}}\").dng\"\n"
 )
 converter.chmod(0o755)
 cfa = make_dng(work, "cfa", pi=32803, w=64, h=64, pixels=[250, 500, 750] * 4096)
@@ -198,7 +198,8 @@ assert prepared_dng != cfa
 assert prepared_dng.exists() and prepared_dng.parent == cfa_scratch / "linear"
 assert cfa_fields["prepared_sha256"] == sha(prepared_dng)
 assert cfa_fields["converter_used"] == "1"
-assert cfa_fields["converter_argc"] == "6"
+record_fields = context_fields(pathlib.Path(cfa_fields["converter_record"]), "rawtl-conversion/1")
+assert record_fields["argc"] == "7"
 assert cfa_fields["converter_output_name"] == prepared_dng.name
 assert "caller-owned" in cfa_fields["converter_cleanup"]
 
@@ -225,7 +226,7 @@ vendor_counter = work / "vendor-count"
 vendor_converter = work / "converter-vendor"
 vendor_converter.write_text(
     f"#!/bin/sh\necho call >> {vendor_counter}\n"
-    f"cp {vendor_output.resolve()} \"$4/converted.dng\"\n"
+    f"for source do :; done\ncp {vendor_output.resolve()} \"$4/$(basename \"${{source%.*}}\").dng\"\n"
 )
 vendor_converter.chmod(0o755)
 vendor = work / "vendor-cr3-like.CR3"
@@ -320,12 +321,12 @@ run([exe, "--stdout-analysis", "--prepared", work / "unknown.ctx"], 26)
     context.read_bytes() + b"source=" + str(base).encode() + b"\n")
 run([exe, "--stdout-analysis", "--prepared", work / "duplicate.ctx"], 26)
 (work / "escape.ctx").write_bytes(
-    context.read_bytes().replace(b"rawtl-prepared-frame/1",
-                                 b"rawtl-prepared-frame/1\nsource=%zz"))
+    context.read_bytes().replace(b"rawtl-prepared-frame/2",
+                                 b"rawtl-prepared-frame/2\nsource=%zz"))
 run([exe, "--stdout-analysis", "--prepared", work / "escape.ctx"], 26)
 (work / "header.ctx").write_bytes(
-    context.read_bytes().replace(b"rawtl-prepared-frame/1",
-                                 b"rawtl-prepared-frame/2", 1))
+    context.read_bytes().replace(b"rawtl-prepared-frame/2",
+                                 b"rawtl-prepared-frame/1", 1))
 run([exe, "--stdout-analysis", "--prepared", work / "header.ctx"], 26)
 print("PASS: tampered prepared contexts fail closed with explicit errors", flush=True)
 

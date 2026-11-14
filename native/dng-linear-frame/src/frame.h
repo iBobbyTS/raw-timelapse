@@ -68,13 +68,11 @@ struct ProcessResult {
 };
 ProcessResult run_process(const std::vector<std::string> &, const fs::path &log,
                           int timeout_seconds);
-// One Converter invocation and its verified LinearRaw output. `linear_dir` is
-// a caller-created, empty directory; the Converter writes exactly one DNG into
-// it. `temporary` only selects the cleanup wording recorded in the provenance
-// block: the caller owns deletion either way. The provenance stays typed so a
-// prepared context never has to embed or parse arbitrary JSON text.
+// One verified output plus a reference to its shared invocation record.
 struct ConversionInfo {
   bool used = false;
+  fs::path record_path;
+  std::string record_hash;
   std::string executable;
   std::string version;
   std::vector<std::string> command;
@@ -91,9 +89,14 @@ struct Conversion {
   fs::path output;
   ConversionInfo info;
 };
-Conversion convert_input(const fs::path &input, const fs::path &linear_dir,
+// Inputs have distinct normalized stem names. The caller owns the empty dir.
+std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
+                         const fs::path &linear_dir,
                          const std::string &converter, int timeout_seconds,
                          bool temporary);
+// Actual platform argv/environment budget, capped for bounded record transport.
+size_t converter_argv_budget();
+std::string output_collision_key(const fs::path &source);
 // A PreparedFrame is one source file resolved to the LinearRaw DNG the SDK may
 // decode, plus the original identity every later consumer must keep using.
 // The prepared path is a cache/scratch artifact and is never the source of
@@ -120,6 +123,13 @@ const char *route_name(Route);
 PreparedFrame prepare_frame(const fs::path &source, const fs::path &scratch,
                             const std::string &converter, int timeout_seconds,
                             bool temporary);
+// Batch and single-frame commands use this same routing/conversion core.
+std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
+                            const fs::path &scratch, const std::string &converter,
+                            int timeout_seconds, bool temporary);
+void prepare_batch(const fs::path &request, const fs::path &scratch,
+                   const fs::path &result, const std::string &converter,
+                   int timeout_seconds);
 // Deterministic versioned context document (not the metadata sidecar).
 void write_prepared(const PreparedFrame &, const fs::path &context_path);
 // Strictly parses the context and revalidates every original/prepared identity:

@@ -63,10 +63,8 @@ fn cr3_material(root: &Path, fixtures: &Path) -> (PathBuf, PathBuf) {
     (input, fake_native_tool(fixtures, &frames, None, false))
 }
 
-/// Generated cache payloads: every regular file under the cache except the
-/// prepared-context sidecars. The native producer keeps the source file name
-/// (and its extension) for a converted LinearRaw payload, so filtering by a
-/// `.dng` suffix would miss vendor RAW sources.
+/// Generated cache payloads exclude the context and its shared conversion record.
+/// Validate the exact record name/header rather than ignoring arbitrary sidecars.
 fn cache_payloads(directory: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     fn walk(directory: &Path, files: &mut Vec<PathBuf>) {
@@ -77,8 +75,12 @@ fn cache_payloads(directory: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 walk(&path, files);
-            } else if path.file_name().and_then(|name| name.to_str()) != Some("prepared.context") {
-                files.push(path);
+            } else {
+                match path.file_name().and_then(|name| name.to_str()) {
+                    Some("prepared.context") => {},
+                    Some("conversion-0.record") => assert!(fs::read_to_string(&path).unwrap().starts_with("rawtl-conversion/1\n")),
+                    _ => files.push(path),
+                }
             }
         }
     }
@@ -185,6 +187,9 @@ fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
         retained_scratch.is_dir(),
         "a custom graph without delete must retain its generated cache"
     );
+    for id in 1..=3 {
+        assert!(retained_scratch.join(format!("cache/frame_{id:06}/conversion-0.record")).is_file(), "provenance must survive with the retained DNG");
+    }
     let generated = cache_payloads(&retained_scratch.join("cache"));
     assert_eq!(
         generated.len(),
@@ -264,10 +269,8 @@ fn invalid_graph_is_rejected_before_prepare_and_writes_nothing() {
             .replace("\"image\":\"color\"", "\"image\":\"convert-cache\""),
     )
     .unwrap();
-    let native = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("native/build/dng-linear-frame");
+    let native = std::env::var_os("RAWTL_NATIVE_TOOL").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("native/build/dng-linear-frame"));
     let directory = root.join("run");
     let video = directory.join(VIDEO_NAME);
     let result = run_cli(&[
@@ -292,10 +295,8 @@ fn invalid_concurrency_is_rejected_before_any_output_or_native_work() {
     let root = test_dir("concurrency-reject");
     let input = root.join("input");
     make_input(&input, &["IMG_1.DNG"]);
-    let native = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("native/build/dng-linear-frame");
+    let native = std::env::var_os("RAWTL_NATIVE_TOOL").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("native/build/dng-linear-frame"));
     for (case, value) in [
         "null",
         "\"4\"",

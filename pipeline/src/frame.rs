@@ -62,7 +62,7 @@ pub struct ProduceConfig<'a> {
 /// written by `dng-linear-frame --prepare`; both processes parse the same
 /// bytes and the native consumer revalidates every hash before decoding.
 #[allow(dead_code)] // consumed by the graph scheduling integration
-pub const PREPARED_CONTEXT_MAGIC: &str = "rawtl-prepared-frame/1";
+pub const PREPARED_CONTEXT_MAGIC: &str = "rawtl-prepared-frame/2";
 
 /// Routing identity carried by a prepared context. `Direct` is a LinearRaw
 /// source used as-is; the other two routes have a Converter-produced DNG.
@@ -122,8 +122,7 @@ impl PreparedFrame {
     /// consistency and file existence so a mis-wired graph fails before a
     /// native process is started.
     pub fn load(context: &Path) -> Result<Self> {
-        let bytes = fs::read(context)
-            .map_err(|e| failure(format!("cannot read prepared context {}: {e}", context.display())))?;
+        let bytes = read_document(context, 65536)?;
         let fields = parse_context_fields(&bytes)?;
         let get = |key: &str| -> Result<&str> {
             fields
@@ -196,6 +195,7 @@ impl PreparedFrame {
                 "prepared context cannot use the original source as its converted DNG",
             ));
         }
+        validate_conversion(&fields, &source_raw, &source_sha256, &dng_raw, &dng_sha256, generated)?;
         let source_name = source
             .file_name()
             .and_then(|name| name.to_str())
@@ -220,20 +220,29 @@ impl PreparedFrame {
 
 #[allow(dead_code)] // consumed by the graph scheduling integration
 fn parse_context_fields(bytes: &[u8]) -> Result<Vec<(String, String)>> {
-    if bytes.len() > 4 * 1024 * 1024 {
+    parse_document_fields(bytes, PREPARED_CONTEXT_MAGIC, 65536)
+}
+
+fn parse_document_fields(bytes: &[u8], header: &str, limit: usize) -> Result<Vec<(String, String)>> {
+    if !bytes.ends_with(b"\n") {
+        return Err(failure("prepared document is truncated (missing final LF)"));
+    }
+    if bytes.len() > limit {
         return Err(failure("prepared context exceeds the size limit"));
     }
     let mut lines = bytes.split(|byte| *byte == b'\n');
     let magic = lines
         .next()
         .ok_or_else(|| failure("prepared context is empty"))?;
-    if magic != PREPARED_CONTEXT_MAGIC.as_bytes() {
+    if magic != header.as_bytes() {
         return Err(failure("prepared context has an unsupported header"));
     }
     let mut fields: Vec<(String, String)> = Vec::new();
-    for line in lines {
+    let mut lines = lines.peekable();
+    while let Some(line) = lines.next() {
         if line.is_empty() {
-            continue;
+            if lines.peek().is_none() { break; }
+            return Err(failure("prepared document contains an empty row"));
         }
         if line.ends_with(b"\r") {
             return Err(failure("prepared context must use LF line endings"));
@@ -300,6 +309,7 @@ fn percent_decode(value: &[u8], field: &str) -> Result<String> {
             index += 1;
         }
     }
+    if out.contains(&0) { return Err(failure("prepared document contains NUL")); }
     String::from_utf8(out)
         .map_err(|_| failure(format!("prepared context field {field} is not UTF-8")))
 }
@@ -355,6 +365,187 @@ fn parse_neutral(text: &str) -> Result<[f64; 3]> {
         out[index] = value;
     }
     Ok(out)
+}
+
+fn read_document(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let file = fs::File::open(path)
+        .map_err(|e| failure(format!("cannot read {}: {e}", path.display())))?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| failure(format!("cannot read {}: {e}", path.display())))?;
+    if bytes.len() > limit {
+        return Err(failure("prepared document exceeds size limit"));
+    }
+    Ok(bytes)
+}
+fn field_value<'a>(fields: &'a [(String, String)], key: &str) -> Result<&'a str> {
+    fields
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .ok_or_else(|| failure(format!("prepared document missing field {key}")))
+}
+fn require_fields(fields: &[(String, String)], allowed: &[String]) -> Result<()> {
+    if fields.len() != allowed.len() || fields.iter().any(|(k, _)| !allowed.contains(k)) {
+        return Err(failure("prepared document has missing or unknown fields"));
+    }
+    Ok(())
+}
+fn validate_conversion(
+    fields: &[(String, String)],
+    source: &Path,
+    source_hash: &str,
+    dng: &Path,
+    dng_hash: &str,
+    generated: bool,
+) -> Result<()> {
+    let get = |key: &str| field_value(fields, key);
+    let mut allowed: Vec<String> = [
+        "source",
+        "source_sha256",
+        "route",
+        "prepared_dng",
+        "prepared_sha256",
+        "generated",
+        "main_ifd_width",
+        "main_ifd_height",
+        "as_shot_neutral",
+        "has_capture_time",
+        "converter_used",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if get("has_capture_time")? == "1" {
+        allowed.push("capture_time".into());
+    }
+    if parse_flag(get("converter_used")?, "converter_used")? != generated {
+        return Err(failure(
+            "prepared context converter_used disagrees with generated",
+        ));
+    }
+    if generated {
+        allowed.extend(
+            [
+                "converter_record",
+                "converter_record_sha256",
+                "converter_output_name",
+                "converter_output_sha256",
+                "converter_photometric",
+                "converter_cleanup",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        let path = Path::new(get("converter_record")?);
+        if !path.is_absolute() {
+            return Err(failure("conversion record path must be absolute"));
+        }
+        let bytes = read_document(path, 1024 * 1024)?;
+        if crate::digest::sha256(&bytes)
+            != hex64(get("converter_record_sha256")?, "converter_record_sha256")?
+        {
+            return Err(failure("conversion record hash mismatch"));
+        }
+        let record = parse_document_fields(&bytes, "rawtl-conversion/1", 1024 * 1024)?;
+        let r = |key: &str| field_value(&record, key);
+        let count = parse_u32(r("count")?, "count")? as usize;
+        let argc = parse_u32(r("argc")?, "argc")? as usize;
+        if count == 0 || count > 64 || argc != count + 6 {
+            return Err(failure("conversion record count/argc out of range"));
+        }
+        let mut keys: Vec<String> = [
+            "executable",
+            "version",
+            "argc",
+            "exit_code",
+            "transcript",
+            "directory",
+            "count",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut args = Vec::new();
+        for i in 0..argc {
+            let key = format!("arg{i}");
+            args.push(r(&key)?);
+            keys.push(key);
+        }
+        if args
+            .iter()
+            .map(|s| s.len() + 1 + std::mem::size_of::<usize>())
+            .sum::<usize>()
+            > 65536
+            || args[..6] != [r("executable")?, "-c", "-l", "-d", r("directory")?, "-mp"]
+            || r("exit_code")? != "0"
+            || r("transcript")?.len() > 65792
+            || !Path::new(r("directory")?).is_absolute()
+        {
+            return Err(failure("conversion record invocation mismatch"));
+        }
+        let name = get("converter_output_name")?;
+        if get("converter_photometric")? != "34892"
+            || get("converter_output_sha256")? != dng_hash
+            || dng.file_name().and_then(|s| s.to_str()) != Some(name)
+            || Path::new(r("directory")?).join(name) != dng
+        {
+            return Err(failure("conversion record output mismatch"));
+        }
+        let mut matched = false;
+        let mut sources = std::collections::BTreeSet::new();
+        let mut names = std::collections::BTreeSet::new();
+        for i in 0..count {
+            for key in ["source", "source_sha256", "output_name", "output_sha256"] {
+                keys.push(format!("item{i}_{key}"));
+            }
+            let src = r(&format!("item{i}_source"))?;
+            let sh = hex64(r(&format!("item{i}_source_sha256"))?, "source_sha256")?;
+            let output = r(&format!("item{i}_output_name"))?;
+            let oh = hex64(r(&format!("item{i}_output_sha256"))?, "output_sha256")?;
+            if !Path::new(src).is_absolute()
+                || args[i + 6] != src
+                || Path::new(src)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| format!("{s}.dng"))
+                    .as_deref()
+                    != Some(output)
+                || !sources.insert(src)
+                || !names.insert(output)
+            {
+                return Err(failure("conversion record source/output identity mismatch"));
+            }
+            if Path::new(src) == source {
+                if sh != source_hash || output != name || oh != dng_hash {
+                    return Err(failure(
+                        "conversion record does not describe prepared source/output",
+                    ));
+                }
+                matched = true;
+            }
+        }
+        require_fields(&record, &keys)?;
+        if !matched {
+            return Err(failure(
+                "conversion record does not contain prepared source",
+            ));
+        }
+    }
+    require_fields(fields, &allowed)
+}
+#[allow(dead_code)] // S02 will connect the graph scheduler to this adapter.
+fn percent_encode(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if c == '%' || c.is_ascii_control() {
+            out.push_str(&format!("%{:02x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn failure(message: impl Into<String>) -> Error {
@@ -806,6 +997,162 @@ pub fn prepare_active(
         )));
     }
     Ok(prepared)
+}
+
+/// One explicit source identity in an ordered batch (1..64 entries).
+#[allow(dead_code)] // S02 will connect the graph scheduler to this adapter.
+pub struct PrepareBatchItem<'a> {
+    pub frame_id: usize,
+    pub source: &'a SourceFrame,
+}
+/// A private, empty batch scratch directory. This adapter owns prepare.request,
+/// prepare.result, batch-native.log and frame_{id}.context in that directory.
+/// The transcript is the batch's unique ActiveNative registration key.
+#[allow(dead_code)] // S02 will connect the graph scheduler to this adapter.
+pub struct PrepareBatchSettings<'a> {
+    pub scratch_dir: &'a Path,
+    pub converter: Option<&'a str>,
+    pub converter_timeout: Option<u64>,
+}
+#[allow(dead_code)] // S02 will connect the graph scheduler to this adapter.
+fn batch_check_stop(active: &ActiveNative) -> Result<()> {
+    proc::check_stop()?;
+    if active.lock().unwrap().cancelled {
+        return Err(failure("run cancelled before batch publication"));
+    }
+    Ok(())
+}
+/// Returns the complete validated batch in request order, or no frames. No
+/// caller may load individual contexts as a substitute for this success path.
+#[allow(dead_code)] // S02 will connect the graph scheduler to this adapter.
+pub fn prepare_batch_active(
+    tool: &Path,
+    items: &[PrepareBatchItem<'_>],
+    settings: &PrepareBatchSettings<'_>,
+    active: ActiveNative,
+) -> Result<Vec<(usize, PreparedFrame)>> {
+    batch_check_stop(&active)?;
+    if items.is_empty() || items.len() > 64 {
+        return Err(failure("batch count must be 1..64"));
+    }
+    let scratch = fs::canonicalize(settings.scratch_dir)
+        .map_err(|e| failure(format!("batch scratch: {e}")))?;
+    if fs::read_dir(&scratch)
+        .map_err(|e| failure(e.to_string()))?
+        .next()
+        .is_some()
+    {
+        return Err(failure(
+            "batch adapter requires an empty private scratch directory",
+        ));
+    }
+    let request = scratch.join("prepare.request");
+    let result = scratch.join("prepare.result");
+    let log = scratch.join("batch-native.log");
+    let mut expected = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
+    let mut text = format!("rawtl-prepare-request/1\ncount={}\n", items.len());
+    for (i, item) in items.iter().enumerate() {
+        if item.frame_id > u32::MAX as usize || !ids.insert(item.frame_id) {
+            return Err(failure("batch duplicate or out-of-range frame ID"));
+        }
+        let source = fs::canonicalize(&item.source.path)
+            .map_err(|e| failure(format!("batch source: {e}")))?;
+        let context = scratch.join(format!("frame_{}.context", item.frame_id));
+        for (key, value) in [
+            ("id", item.frame_id.to_string()),
+            ("source", source.display().to_string()),
+            ("context", context.display().to_string()),
+        ] {
+            text.push_str(&format!("item{i}_{key}={}\n", percent_encode(&value)));
+        }
+        expected.push((item.frame_id, source, context));
+    }
+    if text.len() > 1024 * 1024 {
+        return Err(failure("batch request exceeds size limit"));
+    }
+    fs::write(&request, text).map_err(|e| failure(format!("batch request write: {e}")))?;
+    let mut args = vec![
+        "--prepare-batch".into(),
+        request.display().to_string(),
+        "--scratch".into(),
+        scratch.display().to_string(),
+        "--emit-result".into(),
+        result.display().to_string(),
+    ];
+    if let Some(path) = settings.converter {
+        args.extend(["--converter".into(), path.into()]);
+    }
+    if let Some(seconds) = settings.converter_timeout {
+        args.extend(["--converter-timeout".into(), seconds.to_string()]);
+    }
+    let captured = proc::run_capture_active(tool, &args, EXIT_FRAME, &log, active.clone())?;
+    write_prepare_log(&log, tool, &args, &captured)?;
+    batch_check_stop(&active)?;
+    if !captured.status.success() {
+        return Err(failure(format!(
+            "prepared batch failed IDs {ids:?}: {}; transcript {}: {}",
+            proc::exit_description(&captured.status),
+            log.display(),
+            proc::tail(&captured.stderr, 1200)
+        )));
+    }
+    let prepared = load_batch_result(&result, &expected)?;
+    batch_check_stop(&active)?; // Late success cannot revive cancelled work.
+    Ok(prepared)
+}
+#[allow(dead_code)] // S02 will connect the graph scheduler to this adapter.
+fn load_batch_result(
+    result: &Path,
+    expected: &[(usize, PathBuf, PathBuf)],
+) -> Result<Vec<(usize, PreparedFrame)>> {
+    let fields = parse_document_fields(
+        &read_document(result, 1024 * 1024)?,
+        "rawtl-prepare-result/1",
+        1024 * 1024,
+    )?;
+    let get = |key: &str| field_value(&fields, key);
+    let count = parse_u32(get("count")?, "count")? as usize;
+    if count != expected.len() {
+        return Err(failure("batch result count differs from request"));
+    }
+    let mut keys = vec!["count".into()];
+    let mut found = std::collections::BTreeMap::new();
+    for i in 0..count {
+        for k in ["id", "source", "source_sha256", "context"] {
+            keys.push(format!("item{i}_{k}"));
+        }
+        let id = parse_u32(get(&format!("item{i}_id"))?, "id")? as usize;
+        let (_, source, context) = expected
+            .iter()
+            .find(|(n, _, _)| *n == id)
+            .ok_or_else(|| failure("batch result has extra frame ID"))?;
+        if Path::new(get(&format!("item{i}_source"))?) != source
+            || Path::new(get(&format!("item{i}_context"))?) != context
+        {
+            return Err(failure("batch result source/context differs from request"));
+        }
+        let frame = PreparedFrame::load(context)?;
+        if frame.source != *source
+            || frame.source_sha256
+                != hex64(get(&format!("item{i}_source_sha256"))?, "source_sha256")?
+        {
+            return Err(failure("batch result context identity mismatch"));
+        }
+        if found.insert(id, frame).is_some() {
+            return Err(failure("batch result repeats frame ID"));
+        }
+    }
+    require_fields(&fields, &keys)?;
+    expected
+        .iter()
+        .map(|(id, _, _)| {
+            found
+                .remove(id)
+                .map(|f| (*id, f))
+                .ok_or_else(|| failure("batch result missing frame ID"))
+        })
+        .collect()
 }
 
 fn write_prepare_log(
@@ -1687,9 +2034,8 @@ mod tests {
     #[test]
     fn canonical_source_comparison_resolves_symlinks() {
         use std::os::unix::fs::symlink;
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-tmp")
+        let dir = std::env::var_os("RAWTL_TEST_WORK").map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp"))
             .join(format!("frame-source-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create test dir");
@@ -1816,9 +2162,8 @@ mod prepared_tests {
     }
 
     fn work_dir(name: &str) -> PathBuf {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("test-tmp")
+        let dir = std::env::var_os("RAWTL_TEST_WORK").map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp"))
             .join(format!("prepared-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create test dir");
@@ -1974,7 +2319,7 @@ mod prepared_tests {
         assert!(prepared.dng.exists());
         assert_eq!(
             prepared.dng,
-            fs::canonicalize(dir.join("scratch-vendor/linear/IMG_2.CR3")).unwrap()
+            fs::canonicalize(dir.join("scratch-vendor/linear/IMG_2.dng")).unwrap()
         );
         assert_eq!(
             prepared.capture_time.as_deref(),
@@ -2095,7 +2440,7 @@ mod prepared_tests {
 
         // Structural grammar failures fail closed.
         for (name, text) in [
-            ("header", valid.replacen("rawtl-prepared-frame/1", "rawtl-prepared-frame/2", 1)),
+            ("header", valid.replacen("rawtl-prepared-frame/2", "rawtl-prepared-frame/1", 1)),
             ("missing", valid.replace("route=linearraw-sdk\n", "")),
             ("duplicate", format!("{valid}route=linearraw-sdk\n")),
             ("escape", valid.replace("source=", "source=%zz")),
@@ -2134,7 +2479,7 @@ mod prepared_tests {
         let sha = crate::digest::sha256(b"odd");
         let escaped = canonical.display().to_string().replace('%', "%25").replace(' ', "%20");
         let context_text = format!(
-            "rawtl-prepared-frame/1\nsource={escaped}\nsource_sha256={sha}\nroute=linearraw-sdk\nprepared_dng={escaped}\nprepared_sha256={sha}\ngenerated=0\nmain_ifd_width=8\nmain_ifd_height=6\nas_shot_neutral=0.5,1,0.8\nhas_capture_time=0\nconverter_used=0\n"
+            "rawtl-prepared-frame/2\nsource={escaped}\nsource_sha256={sha}\nroute=linearraw-sdk\nprepared_dng={escaped}\nprepared_sha256={sha}\ngenerated=0\nmain_ifd_width=8\nmain_ifd_height=6\nas_shot_neutral=0.5,1,0.8\nhas_capture_time=0\nconverter_used=0\n"
         );
         let path = dir.join("escaped.ctx");
         fs::write(&path, context_text).unwrap();
@@ -2351,4 +2696,420 @@ mod prepared_tests {
         assert!(error.message.contains("prepared"), "{}", error.message);
         assert_eq!(counter_lines(&prepared_counter), sources.len() + 1);
     }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    fn work(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rawtl-batch-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    fn fake(dir: &Path, mode: &str) -> PathBuf {
+        let tool = dir.join(format!("native-{mode}"));
+        let script=r#"#!/usr/bin/env python3
+import sys,pathlib,urllib.parse,hashlib,socket,signal
+mode=MODE
+request=pathlib.Path(sys.argv[2]); root=request.parent
+fields=dict((k,urllib.parse.unquote(v)) for k,v in (line.split('=',1) for line in request.read_text().splitlines()[1:]))
+def encode(x): return urllib.parse.quote(str(x),safe='/ :,._-')
+n=int(fields['count']); result='rawtl-prepare-result/1\ncount=%d\n'%n
+for i in range(n):
+ src=fields['item%d_source'%i]; ctx=pathlib.Path(fields['item%d_context'%i]); id=fields['item%d_id'%i]; h=hashlib.sha256(pathlib.Path(src).read_bytes()).hexdigest()
+ ctx.write_text('rawtl-prepared-frame/2\n'+''.join(k+'='+encode(v)+'\n' for k,v in [('source',src),('source_sha256',h),('route','linearraw-sdk'),('prepared_dng',src),('prepared_sha256',h),('generated',0),('main_ifd_width',64),('main_ifd_height',64),('as_shot_neutral','0.5,1,0.8'),('has_capture_time',0),('converter_used',0)]))
+ if mode=='missing' and i==n-1: continue
+ if mode=='extra' and i==n-1: id='999'
+ if mode=='duplicate': id='0'
+ if mode=='source' and i==n-1: src=fields['item0_source']
+ result+=''.join('item%d_%s=%s\n'%(i,k,encode(v)) for k,v in [('id',id),('source',src),('source_sha256',h),('context',ctx)])
+if mode.startswith('late:'):
+ signal.signal(signal.SIGTERM,signal.SIG_IGN)
+ s=socket.socket();s.connect(('127.0.0.1',int(mode.split(':')[1])));s.sendall(b'ready');s.recv(1)
+(root/'prepare.result').write_text(result)
+"#.replace("MODE",&format!("{mode:?}"));
+        fs::write(&tool, script).unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        tool
+    }
+    fn sources(dir: &Path) -> Vec<SourceFrame> {
+        (0..2)
+            .map(|i| {
+                let path = dir.join(format!("source{i}.dng"));
+                fs::write(&path, b"source").unwrap();
+                SourceFrame {
+                    path,
+                    name: format!("source{i}.dng"),
+                    key: Vec::new(),
+                }
+            })
+            .collect()
+    }
+    #[test]
+    fn batch_adapter_checks_complete_result_identity_sets() {
+        let dir = work("sets");
+        let sources = sources(&dir);
+        let items: Vec<_> = sources
+            .iter()
+            .enumerate()
+            .map(|(frame_id, source)| PrepareBatchItem { frame_id, source })
+            .collect();
+        for mode in ["ok", "missing", "extra", "duplicate", "source"] {
+            let tool = fake(&dir, mode);
+            let scratch = dir.join(mode);
+            fs::create_dir(&scratch).unwrap();
+            let result = prepare_batch_active(
+                &tool,
+                &items,
+                &PrepareBatchSettings {
+                    scratch_dir: &scratch,
+                    converter: None,
+                    converter_timeout: None,
+                },
+                Default::default(),
+            );
+            if mode == "ok" {
+                assert_eq!(
+                    result
+                        .unwrap()
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .collect::<Vec<_>>(),
+                    [0, 1]
+                );
+            } else {
+                assert!(result.is_err(), "accepted {mode}");
+            }
+        }
+        let scratch = dir.join("duplicate-request");
+        fs::create_dir(&scratch).unwrap();
+        let duplicate = [
+            PrepareBatchItem {
+                frame_id: 1,
+                source: &sources[0],
+            },
+            PrepareBatchItem {
+                frame_id: 1,
+                source: &sources[1],
+            },
+        ];
+        assert!(prepare_batch_active(
+            &fake(&dir, "ok"),
+            &duplicate,
+            &PrepareBatchSettings {
+                scratch_dir: &scratch,
+                converter: None,
+                converter_timeout: None
+            },
+            Default::default()
+        )
+        .is_err());
+    }
+    #[test]
+    fn batch_adapter_rejects_late_success_after_cancel() {
+        use std::io::Write;
+        let dir = work("late");
+        let sources = sources(&dir);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let tool = fake(
+            &dir,
+            &format!("late:{}", listener.local_addr().unwrap().port()),
+        );
+        let scratch = dir.join("scratch");
+        fs::create_dir(&scratch).unwrap();
+        let active: ActiveNative = Default::default();
+        let worker_active = active.clone();
+        let worker = std::thread::spawn(move || {
+            let items: Vec<_> = sources
+                .iter()
+                .enumerate()
+                .map(|(frame_id, source)| PrepareBatchItem { frame_id, source })
+                .collect();
+            prepare_batch_active(
+                &tool,
+                &items,
+                &PrepareBatchSettings {
+                    scratch_dir: &scratch,
+                    converter: None,
+                    converter_timeout: None,
+                },
+                worker_active,
+            )
+        });
+        let start = Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((s, _)) => break s,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(start.elapsed() < Duration::from_secs(10));
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut ready = [0; 5];
+        stream.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        proc::cancel(&active);
+        stream.write_all(b"x").unwrap();
+        assert!(worker
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .message
+            .contains("cancelled"));
+        assert!(active.lock().unwrap().children.is_empty());
+    }
+    /// Executed with RAWTL_BATCH_REAL_WORK and RAWTL_NATIVE_TOOL in S01. With no
+    /// external materials configured, ordinary cargo tests exercise mocks only.
+    #[test]
+    fn batch_real_native_roundtrip_and_single_frame_equivalence() {
+        let Some(work) = std::env::var_os("RAWTL_BATCH_REAL_WORK") else {
+            eprintln!("real batch materials not configured");
+            return;
+        };
+        let dir = PathBuf::from(work);
+        fs::create_dir_all(&dir).unwrap();
+        let tool = PathBuf::from(std::env::var_os("RAWTL_NATIVE_TOOL").expect("RAWTL_NATIVE_TOOL"));
+        let sources: Vec<_> = std::env::var("RAWTL_REAL_CR3")
+            .expect("RAWTL_REAL_CR3")
+            .split(',')
+            .map(|p| SourceFrame {
+                path: PathBuf::from(p),
+                name: Path::new(p).file_name().unwrap().to_str().unwrap().into(),
+                key: Vec::new(),
+            })
+            .collect();
+        let batch_dir = dir.join("batch");
+        fs::create_dir(&batch_dir).unwrap();
+        let items: Vec<_> = sources
+            .iter()
+            .enumerate()
+            .map(|(frame_id, source)| PrepareBatchItem { frame_id, source })
+            .collect();
+        let batch = prepare_batch_active(
+            &tool,
+            &items,
+            &PrepareBatchSettings {
+                scratch_dir: &batch_dir,
+                converter: None,
+                converter_timeout: Some(120),
+            },
+            Default::default(),
+        )
+        .expect("real batch");
+        for ((id, frame), source) in batch.iter().zip(&sources) {
+            let single_dir = dir.join(format!("single-{id}"));
+            fs::create_dir(&single_dir).unwrap();
+            let single = prepare(
+                &tool,
+                source,
+                &PrepareSettings {
+                    scratch_dir: &single_dir,
+                    context_path: &single_dir.join("frame.context"),
+                    log: &single_dir.join("native.log"),
+                    converter: None,
+                    converter_timeout: Some(120),
+                },
+            )
+            .expect("real single");
+            assert_eq!(frame.source_sha256, single.source_sha256);
+            assert_eq!(frame.as_shot_neutral, single.as_shot_neutral);
+            assert_eq!(frame.capture_time, single.capture_time);
+            for method in [
+                crate::color_profile::CameraColorMethod::LegacyInverseCm,
+                crate::color_profile::CameraColorMethod::DngCameraToPcs,
+            ] {
+                if method == crate::color_profile::CameraColorMethod::DngCameraToPcs
+                    && frame.route != PreparedRoute::VendorRaw
+                {
+                    continue;
+                }
+                let settings = PreparedSettings {
+                    camera_color_method: method,
+                };
+                let a = analyze_prepared(
+                    &tool,
+                    frame,
+                    None,
+                    Some(0.),
+                    None,
+                    &settings,
+                    &dir.join(format!("analysis-batch-{id}-{method:?}.log")),
+                )
+                .unwrap();
+                let b = analyze_prepared(
+                    &tool,
+                    &single,
+                    None,
+                    Some(0.),
+                    None,
+                    &settings,
+                    &dir.join(format!("analysis-single-{id}-{method:?}.log")),
+                )
+                .unwrap();
+                assert_eq!(analysis_bytes(&a), analysis_bytes(&b));
+                let mut digests = Vec::new();
+                for (label, f) in [("batch", frame), ("single", &single)] {
+                    develop_prepared(
+                        &tool,
+                        f,
+                        None,
+                        Some(0.25),
+                        &settings,
+                        &dir.join(format!("develop-{label}-{id}-{method:?}.log")),
+                        &mut |info, native| {
+                            digests.push(crate::digest::sha256(
+                                &native.pixels(info.width, info.height)?,
+                            ));
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                }
+                assert_eq!(digests[0], digests[1]);
+                eprintln!(
+                    "frame={id} method={method:?} source={} wb={:?} time={:?} pixel_sha256={}",
+                    frame.source_sha256, frame.as_shot_neutral, frame.capture_time, digests[0]
+                );
+            }
+        }
+        let context = &batch.iter().find(|(_, f)| f.generated).unwrap().1.context;
+        let valid = fs::read_to_string(context).unwrap();
+        for text in [
+            valid.replace("rawtl-prepared-frame/2", "rawtl-prepared-frame/1"),
+            valid[..valid.len() - 10].to_string(),
+            valid.replace("converter_record_sha256=", "converter_record_sha256=0"),
+        ] {
+            let path = dir.join("bad.context");
+            fs::write(&path, text).unwrap();
+            assert!(PreparedFrame::load(&path).is_err());
+        }
+        let parsed = parse_context_fields(valid.as_bytes()).unwrap();
+        let record_path = Path::new(field_value(&parsed, "converter_record").unwrap());
+        let old_hash = field_value(&parsed, "converter_record_sha256").unwrap();
+        let wrong_record = dir.join("wrong.record");
+        let record = fs::read_to_string(record_path)
+            .unwrap()
+            .replace("item0_source=", "item0_source=/wrong-source");
+        fs::write(&wrong_record, &record).unwrap();
+        let wrong_context = dir.join("wrong-record.context");
+        fs::write(
+            &wrong_context,
+            valid
+                .replace(
+                    record_path.to_str().unwrap(),
+                    wrong_record.to_str().unwrap(),
+                )
+                .replace(old_hash, &crate::digest::sha256(record.as_bytes())),
+        )
+        .unwrap();
+        assert!(
+            PreparedFrame::load(&wrong_context).is_err(),
+            "wrong record with matching byte hash"
+        );
+        if let Some((_, deleted)) = batch.iter().find(|(_, f)| f.generated) {
+            fs::remove_file(&deleted.dng).unwrap();
+            let f = batch
+                .iter()
+                .find(|(_, f)| f.dng != deleted.dng)
+                .map(|(_, f)| PreparedFrame::load(&f.context).unwrap())
+                .unwrap();
+            analyze_prepared(
+                &tool,
+                &f,
+                None,
+                Some(0.),
+                None,
+                &PreparedSettings {
+                    camera_color_method: crate::color_profile::CameraColorMethod::LegacyInverseCm,
+                },
+                &dir.join("after-delete.log"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn native_batch_context_fixtures_load_and_consume() {
+        let Some(root) = std::env::var_os("RAWTL_BATCH_FIXTURE_ROOT") else {
+            eprintln!("native batch context fixtures not configured");
+            return;
+        };
+        let root = PathBuf::from(root);
+        let tool = PathBuf::from(std::env::var_os("RAWTL_NATIVE_TOOL").expect("RAWTL_NATIVE_TOOL"));
+        let settings = PreparedSettings {
+            camera_color_method: crate::color_profile::CameraColorMethod::LegacyInverseCm,
+        };
+        for (i, name) in [
+            "many/0.ctx",
+            "noisy/0.ctx",
+            "mapping/5.ctx",
+            "all-direct/0.ctx",
+            "mixed/2.ctx",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let frame = PreparedFrame::load(&root.join(name)).expect("actual native context");
+            analyze_prepared(
+                &tool,
+                &frame,
+                None,
+                Some(0.),
+                None,
+                &settings,
+                &root.join(format!("rust-fixture-{i}-analysis.log")),
+            )
+            .unwrap();
+            develop_prepared(
+                &tool,
+                &frame,
+                None,
+                Some(0.),
+                &settings,
+                &root.join(format!("rust-fixture-{i}-develop.log")),
+                &mut |info, stream| {
+                    assert_eq!(
+                        stream.pixels(info.width, info.height)?.len(),
+                        info.width as usize * info.height as usize * 12
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        for name in [
+            "wrong-record.ctx",
+            "record-version.ctx",
+            "record-truncated.ctx",
+        ] {
+            assert!(
+                PreparedFrame::load(&root.join(name)).is_err(),
+                "accepted {name}"
+            );
+        }
+        let frame = PreparedFrame::load(&root.join("many/0.ctx")).unwrap();
+        let fields = parse_context_fields(&fs::read(&frame.context).unwrap()).unwrap();
+        let record = read_document(
+            Path::new(field_value(&fields, "converter_record").unwrap()),
+            1024 * 1024,
+        )
+        .unwrap();
+        let fields = parse_document_fields(&record, "rawtl-conversion/1", 1024 * 1024).unwrap();
+        assert_eq!(field_value(&fields, "argc").unwrap(), "26");
+    }
+
 }

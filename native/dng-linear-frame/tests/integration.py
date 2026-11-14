@@ -236,14 +236,14 @@ run([exe,base,work/'small.png',work/'small.json','--emit-analysis',work/'small.a
 marker=work/'converter-called'
 def fake(name,body):
     p=work/name;p.write_text('#!/bin/sh\n'+body+'\n');p.chmod(0o755);return p
-conv=fake('converter-copy',f'touch {shlex.quote(str(marker))}\ncp {shlex.quote(str(base))} "$4/converted.dng"')
+conv=fake('converter-copy',f'touch {shlex.quote(str(marker))}\nfor source do :; done\ncp {shlex.quote(str(base))} "$4/$(basename "${{source%.*}}").dng"')
 cfa=dng('cfa',pi=32803)
 run([probe,cfa],23)
 meta=tool(cfa,'converted',options=['--converter',str(conv)]);assert marker.exists() and meta['route']=='cfa-converter-linearraw-sdk'
 marker.unlink()
 for name,fixture,code in [('missing',dng('missing-pi',pi=None),21),('unsupported',dng('unsupported-pi',pi=2),22)]:
     tool(fixture,name,options=['--converter',str(conv)],code=code);assert not marker.exists()
-bad=fake('converter-bad',f'cp {shlex.quote(str(cfa))} "$4/not-linear.dng"')
+bad=fake('converter-bad',f'for source do :; done\ncp {shlex.quote(str(cfa))} "$4/$(basename "${{source%.*}}").dng"')
 tool(cfa,'bad-conversion',options=['--converter',str(bad)],code=23)
 failure=fake('converter-failure','echo deliberate-failure >&2\nexit 7')
 tool(cfa,'failed-conversion',options=['--converter',str(failure)],code=24)
@@ -256,7 +256,7 @@ tool(base,'bad-wb',options=['--white-balance','1,-1,1'],code=2)
 vendor_output=dng('vendor-converted',datetime_original='2010:01:02 03:04:05')
 vendor_direct=tool(vendor_output,'vendor-output-direct')
 assert vendor_direct['route']=='linearraw-sdk'
-conv_vendor=fake('converter-vendor',f'touch {shlex.quote(str(marker))}\ncp {shlex.quote(str(vendor_output))} "$4/converted.dng"')
+conv_vendor=fake('converter-vendor',f'touch {shlex.quote(str(marker))}\nfor source do :; done\ncp {shlex.quote(str(vendor_output))} "$4/$(basename "${{source%.*}}").dng"')
 non_tiff=work/'vendor-cr3-like.CR3'
 non_tiff.write_bytes(b'\0\0\0\x18ftypcrx '*40+b'\x01\x02'+bytes(range(256)))
 marker.unlink(missing_ok=True)
@@ -317,7 +317,7 @@ rejecting=fake('converter-reject','touch '+shlex.quote(str(marker))+'\necho deli
 marker.unlink(missing_ok=True)
 r=run([exe,non_tiff,work/'vendor-reject.png',work/'vendor-reject.json','--converter',str(rejecting)],24)
 assert marker.exists() and b'deliberate-failure' in r.stderr
-bad_vendor=fake('converter-bad-vendor',f'cp {shlex.quote(str(cfa))} "$4/not-linear.dng"')
+bad_vendor=fake('converter-bad-vendor',f'for source do :; done\ncp {shlex.quote(str(cfa))} "$4/$(basename "${{source%.*}}").dng"')
 tool(non_tiff,'vendor-not-linear',options=['--converter',str(bad_vendor)],code=23)
 
 # A recognized DNG stays subject to the unchanged validation (exit 20), and

@@ -1978,10 +1978,8 @@ fn real_cr3_small_sequence_delivers_one_video_and_one_log() {
         .parent()
         .unwrap()
         .join(".agent-work/tmp/node-graph-product/material/cr3-boundary");
-    let native = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("native/build/dng-linear-frame");
+    let native = std::env::var_os("RAWTL_NATIVE_TOOL").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("native/build/dng-linear-frame"));
     let converter = "/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter";
     if !material.is_dir() || !native.is_file() || !Path::new(converter).is_file() {
         eprintln!(

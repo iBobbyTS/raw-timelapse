@@ -143,7 +143,7 @@ assert parsed[2][1]==struct.pack('<'+'H'*(16*16*3),*(expected*256))
 # --- Converter-backed inputs keep their temporary-directory handling --------
 cfa=make_dng(work,'cfa',pi=32803)
 converter=work/'converter-copy'
-converter.write_text('#!/bin/sh\ncp '+shlex.quote(str(base))+' "$4/converted.dng"\n')
+converter.write_text('#!/bin/sh\nfor source do :; done\ncp '+shlex.quote(str(base))+' "$4/$(basename "${source%.*}").dng"\n')
 converter.chmod(0o755)
 r=stream([exe,'--stdout-frame',cfa,'--converter',converter])
 parsed=records(r.stdout)

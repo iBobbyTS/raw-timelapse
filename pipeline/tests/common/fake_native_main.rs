@@ -449,7 +449,7 @@ impl FakeContext {
         let text = fs::read_to_string(path)
             .map_err(|error| (26, format!("cannot read prepared context: {error}")))?;
         let mut lines = text.split('\n');
-        if lines.next() != Some("rawtl-prepared-frame/1") {
+        if lines.next() != Some("rawtl-prepared-frame/2") {
             return Err((26, "unsupported prepared context header".to_string()));
         }
         let mut fields = std::collections::BTreeMap::new();
@@ -581,7 +581,7 @@ fn run_prepare(
         }
         fs::create_dir(&linear)
             .map_err(|error| (26, format!("cannot create scratch: {error}")))?;
-        let dng = linear.join(&name);
+        let dng = linear.join(input.file_stem().unwrap()).with_extension("dng");
         fs::copy(&input, &dng)
             .map_err(|error| (26, format!("cannot stage prepared DNG: {error}")))?;
         dng
@@ -607,8 +607,8 @@ fn run_prepare(
         Some(value) => format!("has_capture_time=1\ncapture_time={}\n", percent_encode(value)),
         None => "has_capture_time=0\n".to_string(),
     };
-    let text = format!(
-        "rawtl-prepared-frame/1\nsource={}\nsource_sha256={}\nroute={}\nprepared_dng={}\nprepared_sha256={}\ngenerated={}\nmain_ifd_width={}\nmain_ifd_height={}\nas_shot_neutral={}\n{}converter_used={}\n",
+    let mut text = format!(
+        "rawtl-prepared-frame/2\nsource={}\nsource_sha256={}\nroute={}\nprepared_dng={}\nprepared_sha256={}\ngenerated={}\nmain_ifd_width={}\nmain_ifd_height={}\nas_shot_neutral={}\n{}converter_used={}\n",
         percent_encode(&source.display().to_string()),
         source_sha,
         route,
@@ -621,6 +621,21 @@ fn run_prepare(
         capture,
         if generated { 1 } else { 0 },
     );
+    if generated {
+        let record_path = prepare.scratch.join("conversion-0.record");
+        let directory = dng.parent().unwrap().display().to_string();
+        let output = dng.file_name().unwrap().to_str().unwrap();
+        let args = ["fake", "-c", "-l", "-d", directory.as_str(), "-mp", source.to_str().unwrap()];
+        let mut record = "rawtl-conversion/1\nexecutable=fake\nversion=test\nargc=7\nexit_code=0\ntranscript=\ncount=1\n".to_string();
+        record.push_str(&format!("directory={}\n",percent_encode(&directory)));
+        for (i,arg) in args.iter().enumerate() { record.push_str(&format!("arg{i}={}\n",percent_encode(arg))); }
+        record.push_str(&format!("item0_source={}\nitem0_source_sha256={}\nitem0_output_name={}\nitem0_output_sha256={}\n",
+            percent_encode(source.to_str().unwrap()), source_sha, percent_encode(output),dng_sha));
+        let hash = digest::sha256(record.as_bytes());
+        fs::write(&record_path,record).map_err(|e|(26,e.to_string()))?;
+        text.push_str(&format!("converter_record={}\nconverter_record_sha256={}\nconverter_output_name={}\nconverter_output_sha256={}\nconverter_photometric=34892\nconverter_cleanup=caller-owned\n",
+            percent_encode(record_path.to_str().unwrap()),hash,percent_encode(output),dng_sha));
+    }
     fs::write(&prepare.emit, text)
         .map_err(|error| (26, format!("cannot write prepared context: {error}")))?;
     Ok(())
