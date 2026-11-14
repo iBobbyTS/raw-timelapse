@@ -617,6 +617,7 @@ struct StreamingEncoder {
     input: Option<std::process::ChildStdin>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    final_input: std::sync::Arc<std::sync::atomic::AtomicBool>,
     watcher: Option<std::thread::JoinHandle<()>>,
     bytes: usize,
 }
@@ -633,18 +634,18 @@ impl StreamingEncoder {
         let child = process.child.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
+        let final_input = Arc::new(AtomicBool::new(false));
+        let final_input_watch = final_input.clone();
         let (stop_watch, failed_watch) = (stop.clone(), failed.clone());
         let watcher = std::thread::spawn(move || {
             while !stop_watch.load(Ordering::SeqCst) {
                 let exited = child.lock().unwrap().try_wait();
                 if let Ok(Some(status)) = exited {
-                    if !status.success() {
+                    if !stop_watch.load(Ordering::SeqCst)
+                        && (!status.success() || !final_input_watch.load(Ordering::SeqCst))
+                    {
                         failed_watch.store(true, Ordering::SeqCst);
-                        let mut state = active.lock().unwrap();
-                        state.cancelled = true;
-                        if let Some(native) = state.child.as_ref() {
-                            proc::terminate(native);
-                        }
+                        proc::cancel(&active);
                     }
                     break;
                 }
@@ -656,22 +657,17 @@ impl StreamingEncoder {
             input,
             stop,
             failed,
+            final_input,
             watcher: Some(watcher),
             bytes: 0,
         })
     }
     fn finish(&mut self, abort: bool) -> Result<std::process::ExitStatus> {
+        // Stop observing before intentional EOF/cancellation. The observer
+        // distinguishes premature exit from successful final input completion.
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(w) = self.watcher.take() { let _ = w.join(); }
         self.input.take();
-        // Stop the observer before our intentional cancellation, so a native
-        // protocol error keeps its primary family 30 rather than becoming 60.
-        if abort {
-            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        if abort {
-            if let Some(w) = self.watcher.take() {
-                let _ = w.join();
-            }
-        }
         let status = self.process.finish(abort);
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(w) = self.watcher.take() {
@@ -819,6 +815,9 @@ impl GraphEncoder {
         &self.config
     }
 
+    pub fn failed(&self) -> bool {
+        self.encoder.as_ref().is_some_and(|e| e.failed.load(std::sync::atomic::Ordering::SeqCst))
+    }
     pub fn begin(&mut self) -> Result<()> {
         proc::check_stop()
     }
@@ -879,6 +878,13 @@ impl GraphEncoder {
         }
         // `yuv444p10le` is 16-bit little-endian words with the code in the low
         // ten bits; the buffer is produced by the colour node.
+        // FFmpeg's -frames:v may finish successfully before explicit end().
+        // Mark the final transfer before writing; a premature close during the
+        // write is still an error (broken pipe), and output validation remains
+        // responsible for exact frame coverage after a successful final write.
+        if info.index == self.frames {
+            encoder.final_input.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let bytes = signal_bytes(signal);
         encoder
             .input
@@ -1059,3 +1065,7 @@ mod signal_byte_tests {
         assert_eq!(bytes.len(), samples.len() * 2);
     }
 }
+
+#[cfg(test)]
+#[path = "encoder_cancels_producers_tests.rs"]
+mod encoder_cancels_producers_tests;

@@ -19,11 +19,14 @@ pub const FFPROBE: &str = "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe";
 pub const WIDTH: u32 = 8;
 pub const HEIGHT: u32 = 6;
 
+fn test_root() -> PathBuf {
+    std::env::var_os("RAWTL_TEST_WORK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp"))
+}
+
 pub fn test_dir(name: &str) -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("test-tmp")
-        .join(format!("{name}-{}", std::process::id()));
+    let root = test_root().join(format!("{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("create test directory");
     root
@@ -410,9 +413,7 @@ fn fake_native_binary() -> PathBuf {
     static BINARY: OnceLock<PathBuf> = OnceLock::new();
     BINARY
         .get_or_init(|| {
-            let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join("fake-native-bin");
+            let directory = test_root().join("fake-native-bin");
             fs::create_dir_all(&directory).expect("create fake native dir");
             let binary = directory.join("fake-native");
             let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -846,11 +847,7 @@ pub fn develop_evs(log: &str) -> Vec<f64> {
 }
 
 /// Product-surface leftovers: only the named video and its log may remain.
-pub fn assert_only_video_and_log(
-    directory: &Path,
-    video_name: &str,
-    allowed_existing: &[&str],
-) {
+pub fn assert_only_video_and_log(directory: &Path, video_name: &str, allowed_existing: &[&str]) {
     let mut names: Vec<String> = fs::read_dir(directory)
         .unwrap_or_else(|err| panic!("cannot read {}: {err}", directory.display()))
         .flatten()

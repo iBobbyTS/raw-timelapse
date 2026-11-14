@@ -4,8 +4,15 @@
 //! consumers on each scheduling turn.
 use crate::encoder::Patch as EncoderPatch;
 use crate::json::{self, Json};
+use ordered_frames::{FrameTask, OrderedStage};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
+#[cfg(test)]
+mod node_concurrency_tests;
+pub mod ordered_frames;
+#[cfg(test)]
+mod ordered_frames_tests;
 
 pub type Result<T> = std::result::Result<T, String>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +46,9 @@ impl Kind {
             Self::Source => Type::Source,
             Self::Prepare | Self::Barrier | Self::References => Type::Frames,
             Self::Solve | Self::Zero => Type::Plan,
-            Self::Develop | Self::Identity | Self::Exposure(_) | Self::Resize { .. } => Type::Linear,
+            Self::Develop | Self::Identity | Self::Exposure(_) | Self::Resize { .. } => {
+                Type::Linear
+            }
             Self::Color => Type::Color,
             _ => Type::None,
         }
@@ -90,6 +99,7 @@ pub struct Node {
     pub inputs: BTreeMap<String, usize>,
     pub waits: Vec<Wait>,
     pub encoder: Option<EncoderPatch>,
+    pub concurrency: usize,
 }
 #[derive(Clone, Debug)]
 pub struct Graph {
@@ -130,6 +140,7 @@ impl Graph {
             for node in &mut graph.nodes {
                 if node.kind == Kind::Solve {
                     node.kind = Kind::Zero;
+                    node.concurrency = 1;
                 }
             }
         }
@@ -163,7 +174,17 @@ impl Graph {
         for n in raw {
             keys(
                 n,
-                &["id", "kind", "inputs", "waits", "ev", "width", "height", "encoder"],
+                &[
+                    "id",
+                    "kind",
+                    "inputs",
+                    "waits",
+                    "ev",
+                    "width",
+                    "height",
+                    "encoder",
+                    "concurrency",
+                ],
             )?;
             let kind = match string(n, "kind")? {
                 "source" => Kind::Source,
@@ -190,6 +211,16 @@ impl Graph {
                 "delete" => Kind::Delete,
                 k => return Err(format!("graph: unknown built-in {k}")),
             };
+            let concurrency = match n.get("concurrency") {
+                None => 1,
+                Some(Json::Int(n)) if (1..=64).contains(n) => *n as usize,
+                _ => return Err("graph: concurrency must be an integer in 1..64".into()),
+            };
+            if concurrency > 1 && !matches!(kind, Kind::Prepare | Kind::Solve) {
+                return Err(format!(
+                    "graph: {kind:?} only supports concurrency 1 in this runtime"
+                ));
+            }
             if n.get("ev").is_some() && !matches!(kind, Kind::Exposure(_)) {
                 return Err("graph: ev only belongs to exposure".into());
             }
@@ -240,6 +271,7 @@ impl Graph {
                 inputs,
                 waits,
                 encoder,
+                concurrency,
             });
         }
         let mut graph = Self {
@@ -253,6 +285,7 @@ impl Graph {
         for n in &mut self.nodes {
             if n.kind == Kind::Solve {
                 n.kind = Kind::Zero;
+                n.concurrency = 1;
             }
         }
     }
@@ -265,6 +298,13 @@ impl Graph {
     /// Declared node IDs in graph order (the run log records them once).
     pub fn node_ids(&self) -> Vec<&str> {
         self.nodes.iter().map(|node| node.id.as_str()).collect()
+    }
+
+    pub fn concurrency_config(&self) -> Vec<(&str, usize)> {
+        self.nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n.concurrency))
+            .collect()
     }
 
     /// The single explicit resize geometry, when the graph declares one.
@@ -318,6 +358,7 @@ impl Graph {
                 inputs: BTreeMap::from([("image".to_string(), producer)]),
                 waits: vec![],
                 encoder: None,
+                concurrency: 1,
             });
             self.nodes[color].inputs.insert("image".into(), index);
         }
@@ -509,12 +550,27 @@ pub struct Event {
 }
 /// Backends own actual I/O; scheduler owns invocation order and event emission.
 pub trait Backend {
-    type Reference: Clone;
+    type Reference: Clone + Send + 'static;
+    type Measurement: Send + 'static;
     type Image;
     fn check(&mut self) -> Result<()>;
-    fn prepare(&mut self, id: usize) -> Result<Self::Reference>;
+    fn source_identity(&self, id: usize) -> String;
+    fn prepare_task(&mut self, id: usize) -> Result<FrameTask<Self::Reference>>;
+    fn commit_prepare(&mut self, id: usize, r: &Self::Reference, elapsed: Duration) -> Result<()>;
+    fn cancel(&mut self) {}
     fn hash<'a>(&self, r: &'a Self::Reference) -> &'a str;
-    fn measure(&mut self, id: usize, r: &Self::Reference) -> Result<()>;
+    fn measure_task(
+        &mut self,
+        id: usize,
+        r: &Self::Reference,
+    ) -> Result<FrameTask<Self::Measurement>>;
+    fn commit_measure(
+        &mut self,
+        id: usize,
+        r: &Self::Reference,
+        measurement: Self::Measurement,
+        elapsed: Duration,
+    ) -> Result<()>;
     fn solve(&mut self) -> Result<Vec<Gain>>;
     fn develop(&mut self, id: usize, r: &Self::Reference, ev: f64) -> Result<Self::Image>;
     fn exposure(&mut self, image: &mut Self::Image, ev: f64) -> Result<()>;
@@ -607,6 +663,24 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
     if count == 0 {
         return Err("graph: empty inventory".into());
     }
+    let (wake, completion_ready) = std::sync::mpsc::channel();
+    let mut preparations: Vec<_> = graph
+        .nodes
+        .iter()
+        .map(|n| {
+            (n.kind == Kind::Prepare)
+                .then(|| OrderedStage::<B::Reference>::new(n.concurrency, wake.clone()))
+        })
+        .collect();
+    let mut measurements: Vec<_> = graph
+        .nodes
+        .iter()
+        .map(|n| {
+            (n.kind == Kind::Solve)
+                .then(|| OrderedStage::<B::Measurement>::new(n.concurrency, wake.clone()))
+        })
+        .collect();
+    let mut measured_inventory = Seal::new(count);
     let mut states: Vec<State<B::Reference, B::Image>> =
         (0..graph.nodes.len()).map(|_| State::default()).collect();
     let deletes: Vec<_> = graph
@@ -626,126 +700,275 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                 .filter(|i| graph.nodes[*i].kind != Kind::Delete),
         )
         .collect();
-    loop {
-        b.check()?;
-        if states.iter().all(|s| s.closed) {
-            return Ok(());
-        }
-        let mut progress = false;
-        for &i in &order {
-            let node = &graph.nodes[i];
-            if states[i].closed {
-                continue;
+    let result = (|| {
+        loop {
+            while completion_ready.try_recv().is_ok() {}
+            b.check()?;
+            // Observe all failures before committing successes or dispatching more.
+            for stage in preparations.iter_mut().flatten() {
+                stage.poll()?;
             }
-            let id = states[i].next;
-            if !ready(
-                node,
-                &states,
-                if node.kind.sequence_only() || id == count {
-                    None
-                } else {
-                    Some(id)
-                },
-            ) {
-                continue;
+            for stage in measurements.iter_mut().flatten() {
+                stage.poll()?;
             }
-            let input = |port: &str| node.inputs[port];
-            let mut frame_done = false;
-            let mut close = false;
-            match node.kind {
-                Kind::Source => {
-                    if id < count {
+            if states.iter().all(|s| s.closed) {
+                return Ok(());
+            }
+            let mut progress = false;
+            for (i, stage) in preparations.iter_mut().enumerate() {
+                if let Some(stage) = stage {
+                    while let Some(output) = stage.commit_next() {
+                        b.check()?;
+                        let id = output.key.frame_id;
+                        if id != states[i].next || output.key.source != b.source_identity(id) {
+                            return Err("graph: prepared completion identity/order mismatch".into());
+                        }
+                        b.commit_prepare(id, &output.value, output.elapsed)?;
+                        states[i].refs.push(output.value);
                         states[i].next += 1;
-                        frame_done = true;
+                        emit(b, &graph.nodes[i], &mut states[i], Some(id))?;
+                        // Prepared references are durably materialized here; they do
+                        // not wait for all graph consumers to release their slots.
+                        stage.delivered(id)?;
+                        progress = true;
+                    }
+                }
+            }
+            for (i, stage) in measurements.iter_mut().enumerate() {
+                if let Some(stage) = stage {
+                    while let Some(output) = stage.commit_next() {
+                        b.check()?;
+                        let id = output.key.frame_id;
+                        let p = graph.nodes[i].inputs["frames"];
+                        let r = &states[p].refs[id];
+                        if id != states[i].next || output.key.source != b.hash(r) {
+                            return Err(
+                                "graph: measurement completion identity/order mismatch".into()
+                            );
+                        }
+                        b.commit_measure(id, r, output.value, output.elapsed)?;
+                        measured_inventory.push(id, ())?;
+                        states[i].next += 1;
+                        stage.delivered(id)?;
+                        progress = true;
+                    }
+                }
+            }
+            for &i in &order {
+                let node = &graph.nodes[i];
+                if states[i].closed {
+                    continue;
+                }
+                b.check()?;
+                let id = preparations[i]
+                    .as_ref()
+                    .map(|s| s.accepted())
+                    .or_else(|| measurements[i].as_ref().map(|s| s.accepted()))
+                    .unwrap_or(states[i].next);
+                if !ready(
+                    node,
+                    &states,
+                    if node.kind.sequence_only() || id == count {
+                        None
                     } else {
-                        close = true;
-                    }
+                        Some(id)
+                    },
+                ) {
+                    continue;
                 }
-                Kind::Prepare => {
-                    let p = input("source");
-                    if states[p].frames.contains(&id) {
-                        let r = b.prepare(id)?;
-                        states[i].refs.push(r);
-                        states[i].next += 1;
-                        frame_done = true;
-                    } else if states[p].closed && id == count {
-                        close = true;
-                    }
-                }
-                Kind::References | Kind::Barrier => {
-                    let p = input("frames");
-                    if node.kind == Kind::Barrier {
-                        if states[p].closed {
-                            if states[p].refs.len() != count {
-                                return Err("graph: barrier EOF coverage mismatch".into());
-                            }
-                            states[i].refs = states[p].refs.clone();
+                let input = |port: &str| node.inputs[port];
+                let mut frame_done = false;
+                let mut close = false;
+                match node.kind {
+                    Kind::Source => {
+                        if id < count {
+                            states[i].next += 1;
+                            frame_done = true;
+                        } else {
                             close = true;
                         }
-                    } else if let Some(r) = states[p].refs.get(id).cloned() {
-                        states[i].refs.push(r);
-                        states[i].next += 1;
-                        frame_done = true;
-                    } else if states[p].closed && id == count {
-                        close = true;
                     }
-                }
-                Kind::Solve | Kind::Zero => {
-                    let p = input("frames");
-                    // Measurements are incremental, but publishing is gated on
-                    // the producer's exact sealed inventory, including EOF.
-                    if let Some(r) = states[p].refs.get(id).cloned() {
-                        if node.kind == Kind::Solve {
-                            b.measure(id, &r)?;
-                        }
-                        states[i].next += 1;
-                        progress = true;
-                    } else if states[p].closed {
-                        if id != count || states[p].refs.len() != count {
-                            return Err("graph: solver EOF coverage mismatch".into());
-                        }
-                        let plan = if node.kind == Kind::Solve {
-                            b.solve()?
-                        } else {
-                            states[p]
-                                .refs
-                                .iter()
-                                .enumerate()
-                                .map(|(frame_id, r)| Gain {
-                                    frame_id,
-                                    source_sha256: b.hash(r).into(),
-                                    ev: 0.,
-                                })
-                                .collect()
-                        };
-                        if plan.len() != count
-                            || plan.iter().enumerate().any(|(id, g)| {
-                                g.frame_id != id
-                                    || g.source_sha256 != b.hash(&states[p].refs[id])
-                                    || !g.ev.is_finite()
-                                    || !g.ev.exp2().is_finite()
-                                    || g.ev.exp2() <= 0.
-                            })
+                    Kind::Prepare => {
+                        let p = input("source");
+                        let stage = preparations[i].as_mut().unwrap();
+                        if id < count && states[p].frames.contains(&id) && stage.has_capacity() {
+                            let task = b.prepare_task(id)?;
+                            stage.submit(
+                                ordered_frames::TaskKey {
+                                    node: node.id.clone(),
+                                    frame_id: id,
+                                    source: b.source_identity(id),
+                                },
+                                task,
+                            )?;
+                            progress = true;
+                        } else if states[p].closed
+                            && states[i].next == count
+                            && stage.outstanding() == 0
                         {
-                            return Err("graph: malformed exposure plan identity/order/gain".into());
+                            close = true;
                         }
-                        states[i].plan = Some(Arc::new(plan));
-                        close = true;
                     }
-                }
-                Kind::Develop => {
-                    let p = input("frames");
-                    let plan = input("plan");
-                    // One full-resolution image in the complete final chain.
-                    let occupied = states.iter().any(|s| s.image.is_some());
-                    if !occupied && states[plan].closed && states[i].image.is_none() {
-                        if let Some(r) = states[p].refs.get(id).cloned() {
-                            let g = &states[plan].plan.as_ref().ok_or("graph: missing plan")?[id];
-                            if g.source_sha256 != b.hash(&r) {
-                                return Err("graph: EV join identity mismatch".into());
+                    Kind::References | Kind::Barrier => {
+                        let p = input("frames");
+                        if node.kind == Kind::Barrier {
+                            if states[p].closed {
+                                if states[p].refs.len() != count {
+                                    return Err("graph: barrier EOF coverage mismatch".into());
+                                }
+                                states[i].refs = states[p].refs.clone();
+                                close = true;
                             }
-                            let image = b.develop(id, &r, g.ev)?;
-                            states[i].image = Some((id, image));
+                        } else if let Some(r) = states[p].refs.get(id).cloned() {
+                            states[i].refs.push(r);
+                            states[i].next += 1;
+                            frame_done = true;
+                        } else if states[p].closed && id == count {
+                            close = true;
+                        }
+                    }
+                    Kind::Solve | Kind::Zero => {
+                        let p = input("frames");
+                        // Measurements are incremental, but publishing is gated on
+                        // the producer's exact sealed inventory, including EOF.
+                        if let Some(r) = states[p].refs.get(id).cloned() {
+                            if let Some(stage) = measurements[i].as_mut() {
+                                if stage.has_capacity() {
+                                    let task = b.measure_task(id, &r)?;
+                                    stage.submit(
+                                        ordered_frames::TaskKey {
+                                            node: node.id.clone(),
+                                            frame_id: id,
+                                            source: b.hash(&r).into(),
+                                        },
+                                        task,
+                                    )?;
+                                    progress = true;
+                                }
+                            } else {
+                                states[i].next += 1;
+                                progress = true;
+                            }
+                        } else if states[p].closed && states[i].next == count {
+                            if id != count || states[p].refs.len() != count {
+                                return Err("graph: solver EOF coverage mismatch".into());
+                            }
+                            if node.kind == Kind::Solve {
+                                measured_inventory.end(count)?;
+                                measured_inventory.ordered()?;
+                            }
+                            let plan = if node.kind == Kind::Solve {
+                                b.solve()?
+                            } else {
+                                states[p]
+                                    .refs
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(frame_id, r)| Gain {
+                                        frame_id,
+                                        source_sha256: b.hash(r).into(),
+                                        ev: 0.,
+                                    })
+                                    .collect()
+                            };
+                            if plan.len() != count
+                                || plan.iter().enumerate().any(|(id, g)| {
+                                    g.frame_id != id
+                                        || g.source_sha256 != b.hash(&states[p].refs[id])
+                                        || !g.ev.is_finite()
+                                        || !g.ev.exp2().is_finite()
+                                        || g.ev.exp2() <= 0.
+                                })
+                            {
+                                return Err(
+                                    "graph: malformed exposure plan identity/order/gain".into()
+                                );
+                            }
+                            states[i].plan = Some(Arc::new(plan));
+                            close = true;
+                        }
+                    }
+                    Kind::Develop => {
+                        let p = input("frames");
+                        let plan = input("plan");
+                        // One full-resolution image in the complete final chain.
+                        let occupied = states.iter().any(|s| s.image.is_some());
+                        if !occupied && states[plan].closed && states[i].image.is_none() {
+                            if let Some(r) = states[p].refs.get(id).cloned() {
+                                let g =
+                                    &states[plan].plan.as_ref().ok_or("graph: missing plan")?[id];
+                                if g.source_sha256 != b.hash(&r) {
+                                    return Err("graph: EV join identity mismatch".into());
+                                }
+                                let image = b.develop(id, &r, g.ev)?;
+                                states[i].image = Some((id, image));
+                                states[i].next += 1;
+                                frame_done = true;
+                            } else if states[p].closed && id == count {
+                                close = true;
+                            }
+                        }
+                    }
+                    Kind::Identity
+                    | Kind::Exposure(_)
+                    | Kind::Resize { .. }
+                    | Kind::Color
+                    | Kind::Encode => {
+                        let p = input("image");
+                        if states[i].image.is_none()
+                            && states[p]
+                                .image
+                                .as_ref()
+                                .is_some_and(|(frame, _)| *frame == id)
+                        {
+                            if node.kind == Kind::Encode && !states[i].begun {
+                                b.begin()?;
+                                states[i].begun = true;
+                            }
+                            let (frame, mut image) = states[p].image.take().unwrap();
+                            match node.kind {
+                                Kind::Exposure(ev) => {
+                                    b.exposure(&mut image, ev)?;
+                                    states[i].image = Some((frame, image));
+                                }
+                                Kind::Resize { width, height } => {
+                                    b.resize(&mut image, width, height)?;
+                                    states[i].image = Some((frame, image));
+                                }
+                                Kind::Color => {
+                                    states[i].image = Some((frame, b.color(image)?));
+                                }
+                                Kind::Encode => b.push(frame, image)?,
+                                _ => states[i].image = Some((frame, image)),
+                            }
+                            states[i].next += 1;
+                            frame_done = true;
+                        } else if states[p].closed && states[p].image.is_none() && id == count {
+                            if node.kind == Kind::Encode {
+                                b.end()?;
+                            }
+                            close = true;
+                        }
+                    }
+                    Kind::Delete => {
+                        let p = input("frames");
+                        if let Some(r) = states[p].refs.get(id).cloned() {
+                            // A reference fork is lightweight, but every future
+                            // native reader must finish this frame before deletion.
+                            let readers_done =
+                                graph
+                                    .nodes
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(reader, n)| match n.kind {
+                                        Kind::Solve => states[reader].next > id,
+                                        Kind::Develop => states[reader].frames.contains(&id),
+                                        _ => true,
+                                    });
+                            if !readers_done {
+                                continue;
+                            }
+                            b.delete(id, &r)?;
                             states[i].next += 1;
                             frame_done = true;
                         } else if states[p].closed && id == count {
@@ -753,67 +976,36 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                         }
                     }
                 }
-                Kind::Identity | Kind::Exposure(_) | Kind::Resize { .. } | Kind::Color | Kind::Encode => {
-                    let p = input("image");
-                    if states[i].image.is_none()
-                        && states[p]
-                            .image
-                            .as_ref()
-                            .is_some_and(|(frame, _)| *frame == id)
-                    {
-                        if node.kind == Kind::Encode && !states[i].begun {
-                            b.begin()?;
-                            states[i].begun = true;
-                        }
-                        let (frame, mut image) = states[p].image.take().unwrap();
-                        match node.kind {
-                            Kind::Exposure(ev) => {
-                                b.exposure(&mut image, ev)?;
-                                states[i].image = Some((frame, image));
-                            }
-                            Kind::Resize { width, height } => {
-                                b.resize(&mut image, width, height)?;
-                                states[i].image = Some((frame, image));
-                            }
-                            Kind::Color => {
-                                states[i].image = Some((frame, b.color(image)?));
-                            }
-                            Kind::Encode => b.push(frame, image)?,
-                            _ => states[i].image = Some((frame, image)),
-                        }
-                        states[i].next += 1;
-                        frame_done = true;
-                    } else if states[p].closed && states[p].image.is_none() && id == count {
-                        if node.kind == Kind::Encode {
-                            b.end()?;
-                        }
-                        close = true;
-                    }
+                if frame_done {
+                    emit(b, node, &mut states[i], Some(id))?;
+                    progress = true;
                 }
-                Kind::Delete => {
-                    let p = input("frames");
-                    if let Some(r) = states[p].refs.get(id).cloned() {
-                        b.delete(id, &r)?;
-                        states[i].next += 1;
-                        frame_done = true;
-                    } else if states[p].closed && id == count {
-                        close = true;
-                    }
+                if close {
+                    emit(b, node, &mut states[i], None)?;
+                    progress = true;
                 }
             }
-            if frame_done {
-                emit(b, node, &mut states[i], Some(id))?;
-                progress = true;
-            }
-            if close {
-                emit(b, node, &mut states[i], None)?;
-                progress = true;
+            if !progress {
+                let active = preparations.iter().flatten().any(|s| s.outstanding() > 0)
+                    || measurements.iter().flatten().any(|s| s.outstanding() > 0);
+                if active {
+                    // Timed wake only exists to observe async-signal-safe STOP;
+                    // completions themselves wake this receiver immediately.
+                    let _ = completion_ready.recv_timeout(Duration::from_millis(50));
+                } else {
+                    return Err("graph: unsatisfied data/EOF/event dependencies".into());
+                }
             }
         }
-        if !progress {
-            return Err("graph: unsatisfied data/EOF/event dependencies".into());
-        }
+    })();
+    if result.is_err() {
+        b.cancel();
     }
+    // Cancel precedes joining/dropping every stage, so blocked native reads
+    // cannot strand the coordinator on the first failing worker.
+    drop(preparations);
+    drop(measurements);
+    result
 }
 #[cfg(test)]
 mod tests;

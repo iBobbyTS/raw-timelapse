@@ -29,8 +29,8 @@
 一个有向无环数据图，外加只指向已声明节点的完成事件连线。配置为 JSON
 （`--graph <file>`），内建默认图与之同一模型；不引入插件安装器、脚本执行或动态节点。
 
-- **imageNode / stream**：每次处理一个 frame token；同一时刻默认只有一张全分辨率帧
-  处于最终处理链，FFmpeg 是流式 sink。
+- **逐帧执行**：prepare 和 solve 的测量阶段共用有界有序执行器，可并发计算独立帧。
+  当前图像链（develop / identity / exposure / resize / color）仍串行，FFmpeg 是单个流式 sink。
 - **sequentialNode / sequence**：可随到达读取 DNG、积累小型测量；收到匹配的完整
   frame-ID 清单并能封口后才发布序列结果（EV 表）。数据端口不要求全图像进入内存。
 - **事件**：节点完成事件带节点 ID、frame ID（逐帧）或序列范围，以及作用域。事件只
@@ -56,7 +56,7 @@ source -> convert-cache --prepared references--------------------+
 - `source`：按数字序发出 frame token。
 - `convert-cache`：每个源调用一次 `dng-linear-frame --prepare`，把 LinearRaw 产物
   写入 scratch，并只保留轻量引用表。该支路不被 EV 支路阻塞。
-- `measure-solve`：逐帧测量（0 EV）并在封口后求解一张完整有限 EV 表。
+- `measure-solve`：可并发逐帧测量（0 EV），按序提交并在完整封口后仅求解一次有限 EV 表。
   `--strength 0` 时该节点替换为 `zero`，不执行测量。
 - `apply-ev`：按帧读取 EV，二次 develop，EV 恰好应用一次，返回自有 FP32 像素。
 - `color`：唯一的 10-bit 4:4:4 量化/编码交接点。
@@ -67,6 +67,34 @@ source -> convert-cache --prepared references--------------------+
 用户图可以插入 identity / exposure / resize 节点、串联另一个 sequential 节点或
 改变事件依赖；缺节点、端口类型不符、环、非法事件作用域、重复/未声明节点均在
 RAW 处理前报配置错误。
+
+### 节点并发配置（当前接入范围）
+
+节点 JSON 可写 `"concurrency":4`；省略为 1，显式值必须是 1..64 的整数。
+null、字符串、布尔、小数、越界和重复字段均在重工作前拒绝。prepare 和 solve 的测量
+阶段支持大于 1；当前图像链和 source / references / barrier / zero / encode / delete
+只允许 1，不会静默忽略大于 1 的声明。内置图全部显式为 1，这是尚未调优的保守默认值。
+`--strength 0` 把合法 solve 规范化为 zero，同时把并发度变为 1，完全跳过测量。
+CLI resize 覆盖保留原节点的并发度，新插入节点为 1。没有全局 --threads 或并发环境变量。
+
+每个已接入逐帧阶段的容量等于节点并发度 N：
+
+```
+accepted_not_delivered = queued_or_running + completed_waiting <= N
+```
+
+计算可乱序完成；只有轮到源帧顺序时才校验身份、有序提交并发出完成事件。结果即使已
+提交，仍占名额，直到下游接收；不等待整波任务结束。prepare 的下游是轻量引用目录，
+目录接收即释放 prepare 名额，不等待 Solve / Develop / Delete 全部消费。
+测量特征、EV 表、引用目录和磁盘缓存仍可随总帧数增长；N 不是总字节或磁盘上限。
+当前图像链继续保持串行资源保障；本节不宣称已接通图像节点并发。
+
+参考白平衡只在源序第 0 帧 prepare 的有序提交中冻结，后续测量使用该只读值。
+Solve 必须等待所有测量和匹配 EOF 封口，完整验证 ID、源摘要、EV 有限性与顺序。
+同一节点的日志按源帧顺序提交，不同节点可交错；计算耗时不包含排队等待，任务耗时
+之和不是整体墙钟时间。所有 prepare / measure / develop 进程按任务身份登记到同一个
+run owner，单任务结束只注销自己；失败、停止或编码失败会取消并回收全部活跃任务，
+取消后的晚到结果不提交。每个阶段/帧有独立 transcript，错误时留在 scratch。
 
 ## 4. 运行日志合同
 
@@ -83,7 +111,7 @@ wall=<epoch 秒.毫秒> elapsed=<单调秒.毫秒> kind=<事件> <有界字段..
 | `run.start` | input / video / log / scratch 路径 |
 | `settings` | fps、白平衡模式、去闪参数、ROI、step 数、reference gain |
 | `inventory` | 帧数、首尾文件名 |
-| `graph` | 图来源（内置/路径）与节点 ID 顺序 |
+| `graph` | 图来源（内置/路径）、节点 ID 顺序与实际 concurrency 配置 |
 | `encoder` | encoder/container/pix_fmt/profile/range/几何 |
 | `colour` | profile、相机颜色方法、matrix/primaries/transfer |
 | `prepare` | 帧号、源名、路由、generated、缓存路径、耗时 |

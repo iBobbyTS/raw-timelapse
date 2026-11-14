@@ -263,3 +263,75 @@ fn invalid_graph_is_rejected_before_prepare_and_writes_nothing() {
         "an invalid graph creates no output directory, log or scratch"
     );
 }
+
+#[test]
+fn invalid_concurrency_is_rejected_before_any_output_or_native_work() {
+    let root = test_dir("concurrency-reject");
+    let input = root.join("input");
+    make_input(&input, &["IMG_1.DNG"]);
+    let native = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("native/build/dng-linear-frame");
+    for (case, value) in [
+        "null",
+        "\"4\"",
+        "true",
+        "0",
+        "-1",
+        "1.0",
+        "1e0",
+        "65",
+        "18446744073709551616",
+        "2,\"concurrency\":3",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut config = graph();
+        set(&mut nodes(&mut config)[1], "concurrency", Json::Int(777));
+        let path = root.join(format!("invalid-{case}.json"));
+        fs::write(
+            &path,
+            json::to_pretty_string(&config)
+                .replace("\"concurrency\": 777", &format!("\"concurrency\": {value}")),
+        )
+        .unwrap();
+        let output = root.join(format!("output-{case}"));
+        let video = output.join(VIDEO_NAME);
+        let result = run_cli(&[
+            "--input",
+            input.to_str().unwrap(),
+            "--output",
+            video.to_str().unwrap(),
+            "--graph",
+            path.to_str().unwrap(),
+            "--dng-linear-frame",
+            native.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            result.status.code(),
+            Some(50),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn strength_zero_normalizes_parallel_solve_and_logs_effective_configuration() {
+    let root = test_dir("parallel-zero");
+    let (input, tool) = cr3_material(&root, &root.join("fixtures"));
+    let mut config = graph();
+    set(&mut nodes(&mut config)[1], "concurrency", Json::Int(4));
+    set(&mut nodes(&mut config)[2], "concurrency", Json::Int(8));
+    let output = run(&root, "output", &input, &tool, &config);
+    let trace = read_log(&output);
+    assert!(
+        trace.contains("convert-cache:4,measure-solve:1,apply-ev:1"),
+        "{trace}"
+    );
+    assert!(log_kind(&trace, "measure").is_empty());
+    assert!(ffprobe(&output.join(VIDEO_NAME)).contains("nb_read_frames=3"));
+}
