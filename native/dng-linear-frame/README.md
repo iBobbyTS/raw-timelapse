@@ -47,6 +47,11 @@ operations are disabled. VC5 support is disabled. No SDK sources are patched.
 
 ## Interface for the sequence consumer
 
+The positional PNG/RGB16 interface below is retained as a historical tool using
+legacy matrix defaults. The current product uses the explicit v2 recipe contract
+in [Streaming stdout protocols](#streaming-stdout-protocols-and-color-contract-v2)
+and [`pipeline/README.md`](../../pipeline/README.md).
+
 ```sh
 native/build/dng-linear-frame input.dng output.png output.json \
   [--white-balance R,G,B] [--converter /absolute/executable] \
@@ -116,9 +121,12 @@ run log, run-specific scratch) is documented in
 [`pipeline/README.md`](../../pipeline/README.md) and
 [`docs/node-graph-workflow.md`](../../docs/node-graph-workflow.md).
 
-## Streaming stdout protocol (v1)
+## Streaming stdout protocols and color contract v2
 
-The original two output modes stream one frame to standard output instead of writing files:
+The original two output modes stream one frame to standard output instead of
+writing files. These bare invocations retain historical legacy matrix defaults;
+current product callers supply the explicit recipe arguments shown below (also
+for analysis). See the [current product contract](../../pipeline/README.md):
 
 ```sh
 native/build/dng-linear-frame --stdout-analysis input.dng \
@@ -130,27 +138,86 @@ native/build/dng-linear-frame --stdout-frame input.dng \
   [--exposure-ev EV]
 ```
 
-The pipeline uses signed-float mode for every profile (matrix choice is independent):
+The pipeline uses signed-float mode for every profile and explicitly selects its
+input recipe. For generic matrix-only development:
+
+```sh
+native/build/dng-linear-frame --stdout-frame-f32 input.dng \
+  --color-contract-version 2 --camera-recipe generic \
+  --camera-color-method dng-camera-to-pcs \
+  --profile-correction none --camera-calibration none \
+  [--white-balance R,G,B] [--exposure-ev EV]
+```
+
+For the Canon CLog3 recipe, using an original Canon CR3 with valid calibration
+metadata:
 
 ```sh
 native/build/dng-linear-frame --stdout-frame-f32 input.CR3 \
-  --camera-color-method dng-camera-to-pcs [--white-balance R,G,B] [--exposure-ev EV]
+  --color-contract-version 2 --camera-recipe canon-clog3 \
+  --camera-color-method dng-camera-to-pcs \
+  --profile-correction hue-sat-map \
+  --camera-calibration canon-normal-white-fixed-v1 \
+  [--white-balance R,G,B] [--exposure-ev EV]
 ```
 
-It emits `RAWTLST2`, ordered 0x01/0x03/0x04 records, IEEE binary32 LE HWC
+These are complete policy tuples; do not mix their recipe/correction/calibration
+values. The Rust CLI resolves the recipe before prepare and restricts Canon
+selection to the CLog3 output profile and original CR3 inputs. Native validates
+the tuple and the original Canon identity/calibration evidence; a failure does
+not retry as generic. Use the same policy arguments with `--stdout-analysis`.
+The native standalone default remains the historical `legacy-test` recipe with
+`legacy-inverse-cm`, correction `none` and calibration `none`; changing only
+`--camera-color-method` does **not** enable profile correction or calibration.
+
+FP32 mode emits `RAWTLST2`, ordered 0x01/0x03/0x04 records, IEEE binary32 LE HWC
 AP1/D60 (12 bytes/pixel), with `space=AP1/D60`, `transfer=linear`,
-`color_contract_version=1`, `byte_length` and actual pixel SHA256 in the
-descriptor. Pixels are written after scene*2^EV and before legacy quantize;
-negative values and values above 4 remain intact. `--camera-color-method`
-also applies to stdout analysis (`RAWTLST1`, no full-frame pixels).
-The default method is `legacy-inverse-cm`; `dng-camera-to-pcs` explicitly
-selects SDK CameraToPCS plus the interpolated profile HueSatMap in linear
-ProPhoto/D50, with its no-FM fallback and no extra WB/CAT. Calibration runs
-before EV in both analysis and pixel modes. LookTable, tone and baseline
-exposure remain disabled. Camera algorithm revision2 records the HSM dimensions,
-encoding, HDR policy and signed-pixel bypass count; matrix metadata describes
-the pre-HSM transform. See [calibration details](../../docs/canon-profile-calibration.md).
-See [Canon dual-profile contract](../../docs/canon-log2-rev-eng.md).
+`color_contract_version=2`, `byte_length` and actual pixel SHA256 in the
+descriptor. Scene values include any requested camera calibration and `2^EV`
+once, before legacy quantization; negative values and values above 4 remain
+intact. Analysis retains `RAWTLST1` framing and no full-frame pixel payload.
+Color contract version 2 is independent of these framing versions and of the
+unchanged top-level JSON `schema_version=1`. Native metadata and FP32 descriptors
+both report color contract version 2; Rust/native must be upgraded together.
+
+SDK CameraToPCS uses ForwardMatrix when present or the SDK inverse-ColorMatrix
+fallback otherwise, including selected WB/PCS adaptation without another WB or
+CAT. Input D50→D60 remains Bradford. Correction policy `hue-sat-map` explicitly
+applies a present, validated interpolated profile HueSatMap in linear
+ProPhoto/D50 before camera exposure calibration and EV. Generic policy `none`
+skips it. LookTable, ToneCurve and BaselineExposure remain unapplied in both
+product recipes. Camera `algorithm_revision=4` records HSM dimensions, encoding,
+HDR policy and signed-pixel bypass count in `color.profile_correction` when
+applied (null for generic); matrix metadata describes the pre-HSM transform.
+
+The `color` object makes requested versus effective processing checkable:
+
+- `recipe_requested` / `recipe_effective` echo the resolved recipe;
+  `method_requested` is the matrix-method token, while `method_effective` is
+  `dng-camera-to-pcs-forward-matrix` or `dng-camera-to-pcs-inverse-fallback`
+  (or `legacy-inverse-cm` for the historical method).
+- `profile_correction_requested` / `profile_correction_effective` and
+  `camera_calibration_requested` / `camera_calibration_effective` describe
+  policies, not proof that a table existed. A HueSatMap policy may be effective
+  with no table present and `hue_sat_map_applied=false`.
+- Each of `hue_sat_map`, `look_table` and `tone_curve` has `_present`, `_applied`
+  and `_status` fields. Status is `absent` when missing, `skipped` when present
+  but disabled, or `applied` when correction actually ran. Generic reports
+  present profile data as skipped. Look/tone never report applied.
+- `baseline_exposure_ev` reports the source value;
+  `baseline_exposure_applied=false`, `baseline_exposure_status=skipped`.
+- Generic `exposure_calibration` is
+  `{"applied":false,"method":"none","status":"uncalibrated"}`.
+  Canon reports `applied=true`, method `canon-normal-white-fixed-v1`, source
+  and metadata-reader provenance, original ADC/black/NormalWhite and converted
+  DNG endpoints, `storage_scale`, `normal_white_gain`, `fixed_scene_gain=1.8`
+  and `native_scene_gain`, with auto tone and baseline exposure disabled.
+  Invalid or missing Canon evidence fails rather than claiming calibration.
+
+See the [current product contract](../../pipeline/README.md) for routing and
+curve-input/user-gain scales, and the
+[Canon calibration record](../../docs/canon-fixed-calibration.md) for historical
+numerical evidence and guards.
 
 The two original modes remain protocol v1. Each call starts with the 8-byte ASCII magic `RAWTLST1` followed by records:
 
@@ -160,7 +227,7 @@ type:u8 | reserved:u8x3 (zero) | length:u64 little-endian | payload[length]
 
 | Type | Payload |
 | --- | --- |
-| `0x01` | Metadata JSON (UTF-8), byte-identical to the positional-mode metadata file, including the trailing newline |
+| `0x01` | Metadata JSON (UTF-8), including the trailing newline; matches the positional-mode file when using the same historical legacy options |
 | `0x02` | Analysis JSON, byte-identical to the `--emit-analysis` sidecar file, including the trailing newline (`--stdout-analysis` only) |
 | `0x03` | Frame descriptor JSON `{"width":W,"height":H,"pixel_format":"rgb48le","pixels_sha256":"<64 hex>"}` |
 | `0x04` | RGB48LE pixels: `width*height*6` bytes, interleaved HWC, little-endian uint16 codes (immediately after its `0x03`) |
@@ -197,14 +264,27 @@ native/build/dng-linear-frame --prepare source.CR3 \
   --scratch DIR --emit-prepared frame.context \
   [--converter PATH] [--converter-timeout SECONDS]
 
-# Consume: identical records to the source-path streaming modes.
+# Consume: generic v2 recipe for both analysis and develop.
 native/build/dng-linear-frame --stdout-analysis --prepared frame.context \
-  [--white-balance R,G,B] [--exposure-ev EV] [--analysis-roi X,Y,W,H] \
-  [--camera-color-method legacy-inverse-cm|dng-camera-to-pcs]
+  --color-contract-version 2 --camera-recipe generic \
+  --camera-color-method dng-camera-to-pcs \
+  --profile-correction none --camera-calibration none \
+  [--white-balance R,G,B] [--exposure-ev EV] [--analysis-roi X,Y,W,H]
 native/build/dng-linear-frame --stdout-frame-f32 --prepared frame.context \
-  [--white-balance R,G,B] [--exposure-ev EV] \
-  [--camera-color-method legacy-inverse-cm|dng-camera-to-pcs]
+  --color-contract-version 2 --camera-recipe generic \
+  --camera-color-method dng-camera-to-pcs \
+  --profile-correction none --camera-calibration none \
+  [--white-balance R,G,B] [--exposure-ev EV]
 ```
+
+For Canon CLog3 consumers, replace the complete generic tuple in **both** calls
+with the Canon tuple above (`canon-clog3`, `dng-camera-to-pcs`, `hue-sat-map`,
+`canon-normal-white-fixed-v1`, contract version 2). The context must identify an
+original Canon CR3 with valid calibration evidence. Prepare records identity and
+conversion provenance, not a recipe: callers freeze and pass the same recipe/WB
+policy to measure and develop. Product measurement uses EV 0 and develop uses its
+solved EV. Both consumers emit the v2 metadata described above; source-path and
+prepared calls retain their respective `prepared.consumed_context` values.
 
 `DIR` must already exist. A generated DNG is written to `DIR/linear/`, which
 must not already exist; the Converter still produces exactly one LinearRaw
@@ -435,7 +515,9 @@ not silently relabeled as uncropped RAW range. Converter clipping/other baking
 is `UNKNOWN`; float-source range behavior is not tested. Each frame records
 camera min/max and residual Stage3 black (a nonzero residual is rejected).
 
-The default `legacy-inverse-cm` uses the DNG Chapter 6 no-ForwardMatrix construction, even if a file also
+The historical standalone default `legacy-inverse-cm` (not the product's generic
+recipe; see the [current contract](../../pipeline/README.md)) uses the DNG
+Chapter 6 no-ForwardMatrix construction, even if a file also
 contains ForwardMatrix. SDK `dng_color_spec` selects/interpolates ColorMatrix
 and calibration per illuminants/signatures and computes selected white from
 the applied neutral. We invert its normalized
@@ -503,6 +585,14 @@ stdout/stderr and real exit codes are saved under the supplied work directory's
 `logs/`. All-39 Converter routing evidence and exact environment/known gaps are
 in `docs/migration-log.md`.
 
-## Canon fixed calibration (revision3)
+## Canon fixed calibration (color contract v2, algorithm revision 4)
 
-The rev-eng CR3 route now requires LibRaw headers/library (`brew install libraw`) for original-file metadata only. Pixel decode remains ADC + DNG SDK. NormalWhite endpoint scaling and fixed scene gain1.8 apply before user EV; Rust converts scene to reflection once with.9. No auto tone or BaselineExposure. Rebuild both tools. See [contract, guards and reproduction](../../docs/canon-fixed-calibration.md).
+Only explicit camera calibration policy `canon-normal-white-fixed-v1` invokes
+LibRaw metadata reading (`brew install libraw`); pixel decode remains ADC + DNG
+SDK. In the product this policy belongs only to the Canon CLog3 recipe. Original
+CR3 NormalWhite endpoint scaling and fixed scene gain 1.8 apply before native
+EV. Generic remains uncalibrated. Rust's separate `curve_input_scale=0.9` for the
+two rev-eng Canon output curves is a curve-unit conversion, not camera
+calibration. No automatic tone or BaselineExposure is applied. See the
+[current product contract](../../pipeline/README.md) and the
+[historical calibration evidence](../../docs/canon-fixed-calibration.md).
