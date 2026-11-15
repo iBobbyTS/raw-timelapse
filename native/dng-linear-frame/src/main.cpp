@@ -211,7 +211,7 @@ FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
     measured = analysis::measure(d, gained_scene, roi, exposure_ev);
   Json metadata{
       {"schema_version", 1},
-      {"color_contract_version", 1},
+      {"color_contract_version", 2},
       {"linear_pixel_format", f32 ? "rgbf32le" : "rgb48le"},
       {"source", prepared.source.string()},
       {"source_sha256", prepared.source_hash},
@@ -415,7 +415,7 @@ int main(int argc, char **argv) {
       PreparedFrame prepared =
           prepare_frame(input, temp.path, converter, timeout, true);
       Decoded decoded = decode_prepared(
-          prepared, wb, CameraColorMethod::legacy_inverse_cm);
+          prepared, wb, CameraRecipe{});
       FrameOutput frame =
           render(prepared, decoded,
                  analysis_path.empty()
@@ -474,7 +474,7 @@ int main(int argc, char **argv) {
     // literal --prepared followed by a prepared-context path; options follow.
     const bool want_analysis = mode == "--stdout-analysis";
     const bool f32 = mode == "--stdout-frame-f32";
-    CameraColorMethod method = CameraColorMethod::legacy_inverse_cm;
+    CameraRecipe recipe;
     if (argc < 3)
       throw Error(2, "option value missing");
     const bool prepared_mode = std::string(argv[2]) == "--prepared";
@@ -513,11 +513,23 @@ int main(int argc, char **argv) {
         exposure_ev = parse_ev(value);
       else if (a == "--camera-color-method") {
         if (value == "dng-camera-to-pcs")
-          method = CameraColorMethod::dng_camera_to_pcs;
+          recipe.method = CameraColorMethod::dng_camera_to_pcs;
         else if (value == "legacy-inverse-cm")
-          method = CameraColorMethod::legacy_inverse_cm;
+          recipe.method = CameraColorMethod::legacy_inverse_cm;
         else
           throw Error(2, "unknown camera color method");
+      } else if (a == "--camera-recipe") {
+        recipe.name = value;
+      } else if (a == "--color-contract-version") {
+        if (value != "2") throw Error(2, "color contract requires matched version 2 tools");
+      } else if (a == "--profile-correction") {
+        if (value == "none") recipe.correction = ProfileCorrection::none;
+        else if (value == "hue-sat-map") recipe.correction = ProfileCorrection::hue_sat_map;
+        else throw Error(2, "unknown profile correction policy");
+      } else if (a == "--camera-calibration") {
+        if (value == "none") recipe.calibration = CameraCalibration::none;
+        else if (value == "canon-normal-white-fixed-v1") recipe.calibration = CameraCalibration::canon_normal_white_fixed_v1;
+        else throw Error(2, "unknown camera calibration policy");
       } else if (a == "--analysis-roi") {
         if (!want_analysis)
           throw Error(2, "--analysis-roi requires --stdout-analysis");
@@ -541,6 +553,11 @@ int main(int argc, char **argv) {
       } else
         throw Error(2, "unknown option: " + a);
     }
+    if ((recipe.name == "generic" && (recipe.method != CameraColorMethod::dng_camera_to_pcs || recipe.correction != ProfileCorrection::none || recipe.calibration != CameraCalibration::none)) ||
+        (recipe.name == "canon-clog3" && (recipe.method != CameraColorMethod::dng_camera_to_pcs || recipe.correction != ProfileCorrection::hue_sat_map || recipe.calibration != CameraCalibration::canon_normal_white_fixed_v1)) ||
+        (recipe.name == "legacy-test" && recipe.calibration != CameraCalibration::none) ||
+        (recipe.name != "generic" && recipe.name != "canon-clog3" && recipe.name != "legacy-test"))
+      throw Error(2, "inconsistent camera recipe policies");
     // A closed consumer pipe must surface as a write error, not a SIGPIPE
     // death: no record, artifact or success claim is published.
     std::signal(SIGPIPE, SIG_IGN);
@@ -552,7 +569,7 @@ int main(int argc, char **argv) {
       temp.emplace();
       prepared = prepare_frame(input, temp->path, converter, timeout, true);
     }
-    Decoded decoded = decode_prepared(prepared, wb, method);
+    Decoded decoded = decode_prepared(prepared, wb, recipe);
     FrameOutput frame =
         render(prepared, decoded, std::optional<fs::path>(), roi, exposure_ev,
                want_analysis, !want_analysis, f32, prepared_mode,
@@ -585,7 +602,7 @@ int main(int argc, char **argv) {
       chunks([&](const auto *data, size_t n) { hash.update(data, n); });
       Json descriptor{{"width", int(frame.width)}, {"height", int(frame.height)},
         {"pixel_format", "rgbf32le"}, {"byte_length", double(frame.floats.size()*4)},
-        {"color_contract_version", 1}, {"space", "AP1/D60"}, {"transfer", "linear"},
+        {"color_contract_version", 2}, {"space", "AP1/D60"}, {"transfer", "linear"},
         {"pixels_sha256", hash.hex()}};
       write_record_text(kRecordFrame, descriptor.text);
       write_record_header(kRecordPixels, uint64_t(frame.floats.size())*4);

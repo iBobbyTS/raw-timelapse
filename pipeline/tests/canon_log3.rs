@@ -1,7 +1,7 @@
 //! Independent oracle: hashes come from the original Canon SDK, not Rust math.
 //! Reproduce with rev-crm-2/scripts/verify_log3_sdk.py; see docs/canon-log3-rev-eng.md.
 use rawtl_linear_video::{
-    color_profile::{lookup, CameraColorMethod, Transfer},
+    color_profile::{lookup, CameraRecipe, Transfer},
     json::{self, Json},
 };
 
@@ -41,7 +41,7 @@ fn production_curve_reproduces_all_589824_original_sdk_codes() {
 fn joins_domain_signed_pixels_and_reference_scale_match_independent_math() {
     let p = lookup(ID).unwrap();
     assert_eq!(p.display_name(), "clog3 (rev-eng crm-dev)");
-    assert_eq!(p.camera_color_method(), CameraColorMethod::DngCameraToPcs);
+    assert_eq!(rawtl_linear_video::color_profile::CameraColor::Auto.resolve(p, true).unwrap(), CameraRecipe::CanonClog3);
     assert!(p.is_rev_eng());
     assert_eq!(p.transfer, Transfer::CanonLog3RevEng);
     let (low, high) = p.transfer.domain();

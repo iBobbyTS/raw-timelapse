@@ -328,12 +328,52 @@ still quantizes once at the encoder input.
 | `nikon-nlog-bt2020` | N-Log / BT.2020 | bt2020nc |
 | `dji-dlog-dgamut` | D-Log / D-Gamut | bt2020nc |
 
-The two rev-eng Canon options require Canon CR3 input and accept
-`--log-reference-gain N` (positive finite, default 1) in addition to the fixed
-Canon NormalWhite calibration; other profiles reject the flag. See
-[calibration evidence](../docs/canon-profile-calibration.md) and
-[Log2](../docs/canon-log2-rev-eng.md) / [Log3](../docs/canon-log3-rev-eng.md)
-records.
+Input development is selected with `--camera-color auto|generic|canon-clog3`
+(default `auto`). After the existing single-extension input enumeration:
+
+| selection | resolved input recipe |
+| --- | --- |
+| auto, CLog3 profile, all original inputs CR3 | Canon CLog3; native verifies Canon metadata for every frame |
+| auto, any other profile or non-CR3 inputs | generic |
+| generic, any profile | generic |
+| canon-clog3 | requires CLog3 and original Canon CR3; otherwise rejected |
+
+A mixed-extension directory is rejected before recipe selection in every mode.
+The recipe is frozen before prepare and shared by measure and develop. A failed
+Canon request never retries as generic; Canon sequences still reject mixed models.
+
+Generic development uses SDK CameraToPCS (ForwardMatrix when present, SDK inverse
+ColorMatrix fallback otherwise), with the selected WB already included. It skips
+and reports profile HueSatMap, LookTable, ToneCurve and BaselineExposure. It applies
+no Canon exposure calibration and reports `uncalibrated`, including when the user
+sets a reference gain. Invalid or singular profile transforms fail explicitly.
+Input D50→D60 adaptation remains Bradford; it is independent of output color.
+
+Only the Canon CLog3 recipe applies the validated profile HueSatMap and original
+CR3 NormalWhite/fixed 1.8 exposure calibration. CLog2RevEng now uses generic input
+by default: its changed input pixels/measurement are an intentional migration.
+Existing output curves, gamuts, tags and Bradford matrices retain their definitions.
+
+`--log-reference-gain N` is a positive finite output gain for every profile,
+default 1. It is applied once before the output transfer function and never enters
+measurement or native EV. The independent `curve_input_scale` is 0.9 for the two
+rev-eng Canon curves and 1 for other profiles; it is a curve input unit conversion,
+not camera calibration. This replaces the historical internal contract field
+`native_scene_to_reflection_scale`. Native calibration metadata no longer reports
+`scene_to_reflection` as a camera calibration factor.
+
+Rust and native must be rebuilt together for `color_contract_version=2` (native
+color algorithm revision 4, output pipeline revision 5). Requests specify
+`--color-contract-version 2 --camera-recipe <generic|canon-clog3>` plus explicit
+`--camera-color-method dng-camera-to-pcs`, `--profile-correction <none|hue-sat-map>`
+and `--camera-calibration <none|canon-normal-white-fixed-v1>`. The reader checks
+requested/effective recipe and policies, profile presence/applied/skip states,
+input CAT and matrices, calibration evidence, source/prepared identity, WB, EV,
+FP32 framing/hash/finite samples, EOF and successful native exit. Old contracts
+fail; prepared v2 and pixel framing are unchanged. The native legacy matrix mode
+is retained only for explicit historical tests/tools, outside product auto routing.
+See [Log2](../docs/canon-log2-rev-eng.md), [Log3](../docs/canon-log3-rev-eng.md)
+and [historical calibration evidence](../docs/canon-fixed-calibration.md).
 
 ## Deflicker node (internal contract)
 

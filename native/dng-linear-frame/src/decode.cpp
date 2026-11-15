@@ -169,7 +169,7 @@ Json optional_matrix(const dng_matrix &m) {
   return m.NotEmpty() ? matrix(mat(m)) : Json();
 }
 } // namespace
-Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMethod method) {
+Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMethod method, ProfileCorrection correction_policy) {
   auto routing = inspect(path);
   if (!routing || route(routing->photometric) != Route::direct)
     throw Error(23, "CFA cannot enter SDK");
@@ -267,15 +267,17 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMe
     buf.fData = d.camera.data();
     image->Get(buf);
     Json correction;
-    if (pcs && profile.HasHueSatDeltas())
+    const bool apply_hsm = correction_policy == ProfileCorrection::hue_sat_map;
+    if (apply_hsm && !pcs) throw Error(40, "profile correction requires CameraToPCS");
+    if (apply_hsm && profile.HasHueSatDeltas())
       correction = calibrate_profile(d, profile, white, host);
     d.color = Json{
-        {"method", pcs ? "DNG SDK CameraToPCS plus profile HueSatMap" : "DNG Ch6 no-ForwardMatrix; inverse(SDK normalized AB*CC*CM*MapWhiteMatrix(D50,selectedWhite))"},
+        {"method", pcs ? "DNG SDK CameraToPCS; explicit profile correction policy" : "DNG Ch6 no-ForwardMatrix; inverse(SDK normalized AB*CC*CM*MapWhiteMatrix(D50,selectedWhite))"},
         {"selected_white_xy", std::vector<Json>{white.x, white.y}},
         {"profile_index", 0},
         {"profile_name", profile.Name().Get()},
         {"profile_fingerprint", profile.Fingerprint().ToUtf8HexString().Get()},
-        {"algorithm_revision", pcs ? 3 : 1},
+        {"algorithm_revision", 4},
         {"calibration_illuminants",
          std::vector<Json>{int(profile.CalibrationIlluminant1()),
                            int(profile.CalibrationIlluminant2()),
@@ -309,11 +311,16 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMe
         {"hue_sat_map_present", profile.HasHueSatDeltas()},
         {"look_table_present", profile.HasLookTable()},
         {"tone_curve_present", profile.ToneCurve().IsValid()},
-        {"hue_sat_map_applied", pcs && profile.HasHueSatDeltas()}, {"look_table_applied", false},
+        {"hue_sat_map_applied", apply_hsm && profile.HasHueSatDeltas()}, {"look_table_applied", false},
         {"tone_curve_applied", false}, {"baseline_exposure_applied", false},
         {"forward_matrix_used", pcs && fm},
         {"matrix_scope", "camera_to_* matrices describe the pre-HueSatMap transform"},
-        {"profile_correction", correction}};
+        {"profile_correction", correction},
+        {"baseline_exposure_ev", baseline},
+        {"baseline_exposure_status", "skipped"},
+        {"hue_sat_map_status", profile.HasHueSatDeltas() ? (apply_hsm ? "applied" : "skipped") : "absent"},
+        {"look_table_status", profile.HasLookTable() ? "skipped" : "absent"},
+        {"tone_curve_status", profile.ToneCurve().IsValid() ? "skipped" : "absent"}};
     auto range = std::minmax_element(d.camera.begin(), d.camera.end());
     d.semantics = Json{
         {"adapter", "SDK Stage1 -> SDK Linearize(FP32 destination) -> Stage2 "

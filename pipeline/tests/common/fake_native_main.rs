@@ -79,6 +79,9 @@ struct Options {
     no_png: bool,
     stdout_mode: Option<String>,
     camera_method: String,
+    recipe: String,
+    correction: String,
+    calibration: String,
     /// Prepared-context path for a --prepared consumer invocation.
     prepared: Option<PathBuf>,
     /// --prepare operation inputs.
@@ -297,9 +300,21 @@ fn run() -> Result<(), (i32, String)> {
         } else if options.camera_method == "dng-camera-to-pcs" {
             "dng-camera-to-pcs-forward-matrix"
         } else { "legacy-inverse-cm" };
-        let contract = format!("\"color_contract_version\":1,\"color\":{{\"profile_fingerprint\":\"controlled-test-profile\",\"algorithm_revision\":3,\"exposure_calibration\":{{\"applied\":true,\"method\":\"canon-normal-white-fixed-v1\",\"adc_maximum\":65535,\"black\":0,\"normal_white\":65535,\"dng_white\":65535,\"dng_black\":0,\"storage_scale\":1,\"normal_white_gain\":1,\"fixed_scene_gain\":1.8,\"native_scene_gain\":1.8,\"scene_to_reflection\":0.9,\"auto_tone_normalization\":false,\"baseline_exposure_applied\":false}},\"hue_sat_map_present\":false,\"hue_sat_map_applied\":false,\"camera_to_xyz_d50\":[[1,0,0],[0,1,0],[0,0,1]],\"camera_to_acescg\":[[1,0,0],[0,1,0],[0,0,1]],\"method_requested\":\"{method}\",\"method_effective\":\"{effective}\",\"camera_model\":\"{model}\"}},");
+        let contract = format!("\"color_contract_version\":2,\"color\":{{\"profile_fingerprint\":\"controlled-test-profile\",\"algorithm_revision\":4,\"exposure_calibration\":{{\"applied\":true,\"method\":\"canon-normal-white-fixed-v1\",\"adc_maximum\":65535,\"black\":0,\"normal_white\":65535,\"dng_white\":65535,\"dng_black\":0,\"storage_scale\":1,\"normal_white_gain\":1,\"fixed_scene_gain\":1.8,\"native_scene_gain\":1.8,\"auto_tone_normalization\":false,\"baseline_exposure_applied\":false}},\"hue_sat_map_present\":false,\"hue_sat_map_applied\":false,\"camera_to_xyz_d50\":[[1,0,0],[0,1,0],[0,0,1]],\"camera_to_acescg\":[[1,0,0],[0,1,0],[0,0,1]],\"method_requested\":\"{method}\",\"method_effective\":\"{effective}\",\"camera_model\":\"{model}\"}},");
+        let mut contract = contract;
+        if options.calibration == "none" {
+            let start = contract.find("\"exposure_calibration\":").unwrap();
+            let end = contract[start..].find("},").unwrap() + start + 1;
+            contract.replace_range(start..end, "\"exposure_calibration\":{\"applied\":false,\"method\":\"none\",\"status\":\"uncalibrated\"}");
+        }
+        let recipe = &options.recipe;
+        let correction = &options.correction;
+        let calibration = &options.calibration;
+        let extra = format!("\"recipe_requested\":\"{recipe}\",\"recipe_effective\":\"{recipe}\",\"profile_correction_requested\":\"{correction}\",\"profile_correction_effective\":\"{correction}\",\"camera_calibration_requested\":\"{calibration}\",\"camera_calibration_effective\":\"{calibration}\",\"xyz_d50_to_acescg\":[[1,0,0],[0,1,0],[0,0,1]],\"sdk_normalized_pcs_to_camera\":[[1,0,0],[0,1,0],[0,0,1]],\"cat\":\"linear Bradford D50->D60; AP1 inverse primaries matrix\",\"hue_sat_map_status\":\"absent\",\"look_table_present\":false,\"look_table_applied\":false,\"look_table_status\":\"absent\",\"tone_curve_present\":false,\"tone_curve_applied\":false,\"tone_curve_status\":\"absent\",\"baseline_exposure_ev\":1.88,\"baseline_exposure_applied\":false,\"baseline_exposure_status\":\"skipped\",\"forward_matrix_present\":true,\"forward_matrix_used\":{},", options.camera_method == "dng-camera-to-pcs");
+        let start = contract.find("\"color\":{").unwrap() + "\"color\":{".len();
+        contract.insert_str(start, &extra);
         let contract = if defect == Some("old-calibration") {
-            contract.replace("\"algorithm_revision\":3", "\"algorithm_revision\":1")
+            contract.replace("\"algorithm_revision\":4", "\"algorithm_revision\":1")
         } else if defect == Some("skipped-fixed") {
             contract.replace("\"applied\":true", "\"applied\":false")
         } else if defect == Some("auto-tone") {
@@ -313,6 +328,17 @@ fn run() -> Result<(), (i32, String)> {
             )
         } else {
             contract
+        };
+        let contract = match defect {
+            Some("contract-v1") => contract.replace("\"color_contract_version\":2", "\"color_contract_version\":1"),
+            Some("recipe-lie") => contract.replace("\"recipe_effective\":\"generic\"", "\"recipe_effective\":\"canon-clog3\""),
+            Some("missing-policy") => contract.replace("\"profile_correction_effective\":", "\"omitted_policy\":"),
+            Some("generic-calibrated") => contract.replace("\"applied\":false", "\"applied\":true"),
+            Some("generic-hsm") => contract.replace("\"hue_sat_map_applied\":false", "\"hue_sat_map_applied\":true"),
+            Some("baseline") => contract.replace("\"baseline_exposure_applied\":false", "\"baseline_exposure_applied\":true"),
+            Some("missing-cat") => contract.replace("\"cat\":", "\"omitted_cat\":"),
+            Some("canon-generic") => contract.replace("\"recipe_effective\":\"canon-clog3\"", "\"recipe_effective\":\"generic\""),
+            _ => contract,
         };
         if defect != Some("missing-contract") {
             metadata.insert_str(1, &contract);
@@ -403,7 +429,7 @@ fn run() -> Result<(), (i32, String)> {
                 } else {
                     config.width
                 };
-                let desc = format!("{{\"width\":{width},\"height\":{},\"pixel_format\":\"{format}\",\"byte_length\":{},\"color_contract_version\":1,\"space\":\"AP1/D60\",\"transfer\":\"linear\",\"pixels_sha256\":\"{hash}\"}}", config.height, pixels.len());
+                let desc = format!("{{\"width\":{width},\"height\":{},\"pixel_format\":\"{format}\",\"byte_length\":{},\"color_contract_version\":2,\"space\":\"AP1/D60\",\"transfer\":\"linear\",\"pixels_sha256\":\"{hash}\"}}", config.height, pixels.len());
                 record(&mut out, 3, desc.as_bytes())?;
             }
             if config.stall_pixels {
@@ -709,6 +735,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
             no_png: false,
             stdout_mode: None,
             camera_method: "legacy-inverse-cm".to_string(),
+            recipe: "legacy-test".into(), correction: "none".into(), calibration: "none".into(),
             prepared: None,
             prepare: Some(PrepareArgs {
                 scratch: scratch.ok_or((2, "--prepare requires --scratch".to_string()))?,
@@ -747,6 +774,9 @@ fn parse_args() -> Result<Options, (i32, String)> {
         )
     };
     let mut camera_method = "legacy-inverse-cm".to_string();
+    let mut recipe = "legacy-test".to_string();
+    let mut correction = "none".to_string();
+    let mut calibration = "none".to_string();
     let mut white_balance = None;
     let mut exposure_ev = 0.0;
     let mut emit_analysis = None;
@@ -755,6 +785,10 @@ fn parse_args() -> Result<Options, (i32, String)> {
     let mut index = start;
     while index < args.len() {
         match args[index].as_str() {
+            "--camera-recipe" => { recipe = value(&args, &mut index)?; index += 1; }
+            "--profile-correction" => { correction = value(&args, &mut index)?; index += 1; }
+            "--camera-calibration" => { calibration = value(&args, &mut index)?; index += 1; }
+            "--color-contract-version" => { let v = value(&args, &mut index)?; if v != "2" { return Err((2,"contract version".into())); } index += 1; }
             "--camera-color-method" => {
                 camera_method = value(&args, &mut index)?;
                 index += 1;
@@ -811,7 +845,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
         analysis_roi,
         no_png,
         stdout_mode,
-        camera_method,
+        camera_method, recipe, correction, calibration,
         prepared,
         prepare: None,
     })

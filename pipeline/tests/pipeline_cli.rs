@@ -1491,7 +1491,7 @@ fn preview_profiles_emit_their_declared_colour_contract() {
         assert!(colour[0].contains(&format!("profile={id}")), "{log}");
         assert!(colour[0].contains(&format!("matrix={matrix}")), "{log}");
         assert!(
-            colour[0].contains("camera_color=legacy-inverse-cm"),
+            colour[0].contains("camera_color=dng-camera-to-pcs"),
             "{log}"
         );
         let encoder_command = log_kind(&log, "encoder.command");
@@ -1823,7 +1823,7 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
         for (knob, expected) in [
             ("rev_defect=version", "magic"),
             ("rev_defect=method", "camera color contract"),
-            ("rev_defect=effective", "camera color contract"),
+            ("rev_defect=effective", "camera"),
             ("rev_defect=missing-contract", "color contract"),
             ("rev_defect=non-canon", "camera color contract"),
             ("rev_defect=mixed-model", "mixed camera models"),
@@ -1856,7 +1856,7 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
             ("descriptor_geometry_mismatch=1", "descriptor geometry"),
             ("nonzero_after_records=1", "exit code 3"),
         ] {
-            if !profile.is_rev_eng()
+            if profile.id != REV3_PROFILE
                 && [
                     "rev_defect=non-canon",
                     "rev_defect=mixed-model",
@@ -1903,48 +1903,13 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
 }
 
 #[test]
-fn log_reference_gain_is_finite_positive_and_exclusive_to_new_profile() {
-    for id in [REV_PROFILE, REV3_PROFILE] {
+fn log_reference_gain_is_finite_positive_for_every_profile() {
+    for profile in &rawtl_linear_video::color_profile::PROFILES {
         for gain in ["0", "-1", "NaN", "inf", "1e999", "oops"] {
-            let result = run_cli(&[
-                "--input",
-                "/tmp",
-                "--output",
-                "/tmp/unused.mov",
-                "--preview-profile",
-                id,
-                "--log-reference-gain",
-                gain,
-            ]);
+            let result = run_cli(&["--input", "/tmp", "--output", "/tmp/unused.mov",
+                "--preview-profile", profile.id, "--log-reference-gain", gain]);
             assert_eq!(result.status.code(), Some(2), "{}", stderr(&result));
         }
-        for profile in ["canon-log2-cinema-gamut", "srgb-preview"] {
-            let result = run_cli(&[
-                "--input",
-                "/tmp",
-                "--output",
-                "/tmp/unused.mov",
-                "--preview-profile",
-                profile,
-                "--log-reference-gain",
-                "1",
-            ]);
-            assert_eq!(result.status.code(), Some(2), "{}", stderr(&result));
-        }
-        let root = test_dir(&format!("rev-reject-dng-{id}"));
-        let input = root.join("material");
-        make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
-        let fixtures = root.join("fixtures");
-        fs::create_dir_all(&fixtures).expect("fixtures");
-        let tool = fake_native_tool(&fixtures, &standard_frames(&fixtures), None, false);
-        let directory = run_directory(&root, "run");
-        let video = video_in(&directory);
-        let mut args = base_args(&input, &video, &tool);
-        args.extend(["--strength", "0", "--preview-profile", id]);
-        let result = run_cli(&args);
-        assert_eq!(result.status.code(), Some(30), "{}", stderr(&result));
-        assert!(stderr(&result).contains("requires Canon CR3"));
-        assert!(!video_in(&directory).exists());
     }
 }
 
@@ -2035,5 +2000,67 @@ fn real_cr3_small_sequence_delivers_one_video_and_one_log() {
             fs::read(input.join(source.file_name().unwrap())).unwrap(),
             "the source material is read-only"
         );
+    }
+}
+
+#[test]
+fn camera_color_cli_routes_before_prepare_and_keeps_single_extension_policy() {
+    for (id, ext, selection, recipe) in [
+        (REV3_PROFILE, "CR3", "auto", "canon-clog3"),
+        (REV3_PROFILE, "DNG", "auto", "generic"),
+        (REV_PROFILE, "CR3", "auto", "generic"),
+        ("srgb-preview", "CR3", "auto", "generic"),
+        (REV3_PROFILE, "CR3", "generic", "generic"),
+        (REV3_PROFILE, "CR3", "canon-clog3", "canon-clog3"),
+    ] {
+        let (root,input,tool) = profile_material_for_extension(&format!("recipe-{id}-{ext}-{selection}"), [1800;3], ext);
+        let directory = run_directory(&root,"run");
+        let video = video_in(&directory);
+        let mut args = base_args(&input,&video,&tool);
+        args.extend(["--strength","0","--preview-profile",id,"--camera-color",selection,"--log-reference-gain","2"]);
+        let result = run_cli(&args);
+        assert!(result.status.success(),"{}",stderr(&result));
+        let log=read_log(&directory);
+        assert!(log.contains(&format!("camera_color_requested={selection} recipe_effective={recipe}")),"{log}");
+        if recipe=="generic" { assert!(log.contains("calibration_status=uncalibrated"),"{log}"); }
+    }
+    for selection in ["auto","generic","canon-clog3"] {
+        let root=test_dir(&format!("mixed-recipe-{selection}"));
+        let input=root.join("material");make_input(&input,&["IMG_1.CR3","IMG_2.DNG"]);
+        let fixtures=root.join("fixtures");fs::create_dir_all(&fixtures).unwrap();
+        let tool=fake_native_tool(&fixtures,&standard_frames(&fixtures),None,false);
+        let directory=run_directory(&root,"run");let video=video_in(&directory);
+        let mut args=base_args(&input,&video,&tool);
+        args.extend(["--preview-profile",REV3_PROFILE,"--camera-color",selection]);
+        let result=run_cli(&args);assert_eq!(result.status.code(),Some(10),"{}",stderr(&result));
+        assert!(!video.exists());
+    }
+    for extra in [vec!["--camera-color",""], vec!["--camera-color","bogus"],vec!["--camera-color"],
+        vec!["--camera-color","auto","--camera-color","generic"],vec!["--camera-color","canon-clog3"]] {
+        let mut args=vec!["--input","/tmp","--output","/tmp/unused.mov"];
+        args.extend(extra);let result=run_cli(&args);
+        assert_eq!(result.status.code(),Some(2),"{}",stderr(&result));
+    }
+    let (root,input,tool)=profile_material_for_extension("recipe-canon-dng-reject",[1800;3],"DNG");
+    let directory=run_directory(&root,"run");let video=video_in(&directory);
+    let mut args=base_args(&input,&video,&tool);
+    args.extend(["--preview-profile",REV3_PROFILE,"--camera-color","canon-clog3"]);
+    let result=run_cli(&args);assert_eq!(result.status.code(),Some(2),"{}",stderr(&result));assert!(!video.exists());
+}
+
+#[test]
+fn camera_color_v2_defects_are_rejected_without_publication() {
+    for (recipe, defect) in [
+        ("generic","contract-v1"),("generic","recipe-lie"),("generic","missing-policy"),
+        ("generic","generic-calibrated"),("generic","generic-hsm"),("generic","baseline"),("generic","missing-cat"),
+        ("canon-clog3","canon-generic"),
+    ] {
+        let (root,input,tool)=profile_material_for_extension(&format!("v2-{recipe}-{defect}"),[1800;3],"CR3");
+        append_config(&root.join("fixtures"),&format!("rev_defect={defect}"));
+        let directory=run_directory(&root,"run");let video=video_in(&directory);
+        let mut args=base_args(&input,&video,&tool);
+        args.extend(["--strength","0","--preview-profile",REV3_PROFILE,"--camera-color",recipe]);
+        let result=run_cli(&args);assert_eq!(result.status.code(),Some(30),"{defect}: {}",stderr(&result));
+        assert!(!video.exists(),"{defect}");
     }
 }

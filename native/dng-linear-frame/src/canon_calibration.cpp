@@ -36,7 +36,7 @@ void calibrate_canon_cr3(const fs::path &source, Decoded &d) {
     {"black", black}, {"normal_white", white}, {"dng_white", d.storage_white},
     {"dng_black", d.storage_black}, {"storage_scale", (d.storage_white+1)/(maximum+1)},
     {"normal_white_gain", d.reference_gain/1.8}, {"fixed_scene_gain", 1.8},
-    {"native_scene_gain", d.reference_gain}, {"scene_to_reflection", 0.9},
+    {"native_scene_gain", d.reference_gain},
     {"auto_tone_normalization", false}, {"baseline_exposure_applied", false}};
 }
 }

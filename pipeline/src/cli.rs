@@ -43,7 +43,8 @@ OPTIONS:
                                canon-log3-cinema-gamut-rev-eng-crm-dev
                                Canon names: clog2(white paper), clog2(rev-eng crm-dev),
                                clog3 (rev-eng crm-dev)
-    --log-reference-gain <N>   Positive reference scale, rev-eng Canon profiles only (default: 1)
+    --camera-color <MODE>      auto|generic|canon-clog3 (default: auto)
+    --log-reference-gain <N>   Positive finite output reference gain, all profiles (default: 1)
     --encoder <NAME>           prores_ks | libx264 | ffv1 (default: prores_ks)
     --pix-fmt <FMT>            Encoder pixel format (default: yuv444p10le; libx264: yuv420p)
     --container <NAME>         mov | mp4 | matroska (default: mov; libx264: mp4; ffv1: matroska)
@@ -303,6 +304,7 @@ pub struct Options {
     pub native_tool: PathBuf,
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
+    pub camera_color: color_profile::CameraColor,
     pub log_reference_gain: f64,
     pub preview_profile: &'static color_profile::ColorProfile,
     pub converter: Option<String>,
@@ -336,6 +338,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut ffprobe = PathBuf::from(DEFAULT_FFPROBE);
     let mut preview_profile = color_profile::default_profile();
     let mut log_reference_gain: Option<f64> = None;
+    let mut camera_color = None;
     let mut converter: Option<String> = None;
     let mut converter_timeout: Option<u64> = None;
     let mut deflicker = DeflickerConfig::default();
@@ -417,6 +420,16 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                         ),
                     )
                 })?;
+            }
+            "--camera-color" => {
+                if camera_color.is_some() { return Err(Error::new(EXIT_USAGE, "duplicate --camera-color")); }
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                camera_color = Some(match value.as_str() {
+                    "auto" => color_profile::CameraColor::Auto,
+                    "generic" => color_profile::CameraColor::Generic,
+                    "canon-clog3" => color_profile::CameraColor::CanonClog3,
+                    _ => return Err(Error::new(EXIT_USAGE, "invalid --camera-color: expected auto|generic|canon-clog3")),
+                });
             }
             "--log-reference-gain" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
@@ -637,11 +650,9 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let (video, log) =
         output.ok_or_else(|| Error::new(EXIT_USAGE, "--output <VIDEO_FILE> is required"))?;
 
-    if log_reference_gain.is_some() && !preview_profile.is_rev_eng() {
-        return Err(Error::new(
-            EXIT_USAGE,
-            "--log-reference-gain requires a rev-eng Canon profile (canon-log2-cinema-gamut-rev-eng-crm-dev or canon-log3-cinema-gamut-rev-eng-crm-dev)",
-        ));
+    if camera_color == Some(color_profile::CameraColor::CanonClog3)
+        && preview_profile.transfer != color_profile::Transfer::CanonLog3RevEng {
+        return Err(Error::new(EXIT_USAGE, "--camera-color canon-clog3 requires the CLog3 profile"));
     }
     encoder.rate = rate;
     if !output_options.is_empty() {
@@ -662,6 +673,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         ffmpeg,
         ffprobe,
         preview_profile,
+        camera_color: camera_color.unwrap_or(color_profile::CameraColor::Auto),
         log_reference_gain: log_reference_gain.unwrap_or(1.0),
         converter,
         converter_timeout,

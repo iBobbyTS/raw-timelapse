@@ -202,6 +202,20 @@ stderr 只保留错误与 scratch 保留提示。
 
 ## 6. 编码与颜色
 
+Input development now freezes one `--camera-color auto|generic|canon-clog3` recipe
+after the existing single-extension enumeration, before prepare. Both measure
+(EV=0) and develop (solved native EV once) use that recipe and WB policy. Auto
+selects Canon calibration only for CLog3 with original CR3 inputs; every other
+combination uses generic SDK CameraToPCS without profile HueSatMap/look/tone or
+BaselineExposure. Explicit generic does not bypass mixed-extension rejection.
+The color node applies the profile's curve input units (0.9 for the rev-eng Canon
+curves) and the positive finite user reference gain once; neither scale enters
+measurement. Native/Rust color contract v2 checks requested/effective policies
+and keeps the existing input Bradford D50→D60 CAT. The output CAT remains the
+existing Bradford transform in this section. See the current CLI contract in
+`pipeline/README.md` for routing and migration details.
+
+
 - 内建默认：`prores_ks` profile 4 / MOV / `yuv444p10le` / limited range / 源几何。
 - 图节点可配置 encoder/container/pix_fmt/profile/rate/options；显式 CLI 覆盖图配置，
   内建默认最低。冲突或不支持组合在 RAW 处理前报错，不静默替换。

@@ -373,7 +373,7 @@ fn every_profile_encodes_black_grey_and_white_reference_codes() {
         "dji-dlog-dgamut",
     ] {
         let profile = lookup(id).expect(id);
-        let extension = if profile.camera_color_method().requires_canon_cr3() {
+        let extension = if profile.transfer == rawtl_linear_video::color_profile::Transfer::CanonLog3RevEng {
             "CR3"
         } else {
             "DNG"
@@ -381,7 +381,7 @@ fn every_profile_encodes_black_grey_and_white_reference_codes() {
         let matrix = profile.scale_filter_token();
         let range = "tv";
         let expected_srgb = [(0.0f64, 0u8), (0.18, 118), (0.9, 243)];
-        let scale = profile.scene_to_reflection_scale();
+        let scale = profile.curve_input_scale();
         let scene: Vec<f64> = reference_linear.iter().map(|value| value / scale).collect();
         let expected: Vec<[u8; 3]> = if profile.transfer == Transfer::Srgb {
             expected_srgb.iter().map(|(_, code)| [*code; 3]).collect()

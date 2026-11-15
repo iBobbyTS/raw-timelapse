@@ -1,5 +1,17 @@
 # Canon CR3 固定曝光标定
 
+> Current migration (generic-color-dlog2 / S01): `--camera-color auto` selects the
+> Canon CameraToPCS + validated HueSatMap + NormalWhite/fixed 1.8 recipe only for
+> CLog3 with original Canon CR3. All other auto combinations, including CLog2RevEng,
+> use generic matrix-only CameraToPCS and report uncalibrated. Explicit generic is
+> available for all profiles. `--log-reference-gain` is now positive finite for all
+> profiles. The 0.9 factor remains an independent curve input unit for both rev-eng
+> Canon curves. Color contract v2 / native algorithm revision 4 must be rebuilt with
+> Rust. See [current CLI contract](../pipeline/README.md). The earlier results and
+> reproduction commands below describe the historical calibration/delivery chain;
+> they are retained as evidence, not current routing or output instructions.
+
+
 本修复以51a7807的profile HueSatMap路线为基础，适用于两个rev-eng Canon Log选项。白皮书和其他厂商选项保持原行为。native camera algorithm revision=3，Rust color pipeline revision=4，必须配套构建。
 
 ## 数值合同

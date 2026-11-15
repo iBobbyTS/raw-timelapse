@@ -18,7 +18,7 @@ def blob(typ,values):
 
 
 # 16x16 is small enough for checked-in generator-only regression coverage.
-def make_dng(work,name,*,pi=34892,black=None,white=1000,pixels=None,table=None,baseline=0,opcodes=None,ab=None,cc=None,neutral=None,w=16,h=16,datetime_original=None,exif_case=None,forward=None,model=None,hue_sat=None):
+def make_dng(work,name,*,pi=34892,black=None,white=1000,pixels=None,table=None,baseline=0,opcodes=None,ab=None,cc=None,neutral=None,w=16,h=16,datetime_original=None,exif_case=None,forward=None,model=None,hue_sat=None,tone=None,look=None):
     work=pathlib.Path(work)
     if pixels is None:pixels=[250,500,750]*(w*h)
     payload=struct.pack('<'+'H'*len(pixels),*pixels)
@@ -28,6 +28,10 @@ def make_dng(work,name,*,pi=34892,black=None,white=1000,pixels=None,table=None,b
     if hue_sat is not None:
         dims,data=hue_sat
         tags[50937]=(4,dims);tags[50938]=(11,data)
+    if tone is not None:tags[50940]=(11,tone)
+    if look is not None:
+        dims,data=look
+        tags[50981]=(4,dims);tags[50982]=(11,data)
     if pi is not None:tags[262]=(3,[pi])
     if table is not None:tags[50712]=(3,table)
     if ab is not None:tags[50727]=(5,ab)

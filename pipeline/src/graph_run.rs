@@ -96,7 +96,7 @@ impl Runner<'_, '_> {
     }
     fn settings(&self) -> PreparedSettings {
         PreparedSettings {
-            camera_color_method: self.context.options.preview_profile.camera_color_method(),
+            camera_recipe: self.context.camera_recipe,
         }
     }
 }
@@ -496,11 +496,7 @@ impl Backend for Runner<'_, '_> {
                     return Err(message);
                 }
             }
-            if self
-                .context
-                .options
-                .preview_profile
-                .camera_color_method()
+            if self.context.camera_recipe
                 .requires_canon_cr3()
                 && self.develop_reference.as_ref().is_some_and(|first_frame| {
                     first_frame
@@ -518,6 +514,15 @@ impl Backend for Runner<'_, '_> {
 
             if id == 0 {
                 self.develop_reference = Some(info.clone());
+                let c = info.camera_color.as_ref().expect("validated color contract");
+                let text = |key| c.get(key).and_then(crate::json::Json::as_str).unwrap_or("unknown");
+                let written = self.log.line(&format!(
+                    "kind=camera.colour color_contract_version=2 algorithm_revision=4 recipe_requested={} recipe_effective={} profile_fingerprint={} camera_model={} hue_sat_map={} look_table={} tone_curve={} baseline_exposure={} calibration={} calibration_status={} input_cat=bradford-d50-d60",
+                    text("recipe_requested"), text("recipe_effective"), quote(text("profile_fingerprint")), quote(text("camera_model")),
+                    text("hue_sat_map_status"), text("look_table_status"), text("tone_curve_status"), text("baseline_exposure_status"), text("camera_calibration_effective"),
+                    if self.context.camera_recipe.requires_canon_cr3() { "calibrated" } else { "uncalibrated" }
+                ));
+                self.result(written)?;
             }
             let written=self.log.line(&format!(
                 "kind=develop frame={} source={} ev={:.9} wb={} wb_source={} as_shot={} source_sha256={} pixels={} pixels_sha256={} duration={:.3}",
@@ -772,13 +777,15 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
     let profile = context.options.preview_profile;
     log.line(&format!(
         "kind=colour profile={} camera_color={} matrix={} primaries={} transfer={} \
-         reference_gain={}",
+         reference_gain={} camera_color_requested={} recipe_effective={} profile_correction={} camera_calibration={} input_cat=bradford-d50-d60 calibration_status={}",
         profile.id,
-        profile.camera_color_method().native_token(),
+        context.camera_recipe.native_token(),
         profile.tag_policy.matrix_token(),
         profile.tag_policy.primaries_token(),
         profile.tag_policy.transfer_token(),
-        context.options.log_reference_gain
+        context.options.log_reference_gain,
+        context.options.camera_color.token(), context.camera_recipe.token(), context.camera_recipe.correction(), context.camera_recipe.calibration(),
+        if context.camera_recipe.requires_canon_cr3() { "pending-native-validation" } else { "uncalibrated" }
     ))?;
 
     let preflight_started = Instant::now();

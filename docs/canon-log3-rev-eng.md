@@ -1,5 +1,17 @@
 # clog3 (rev-eng crm-dev)
 
+> Current migration (generic-color-dlog2 / S01): `--camera-color auto` selects the
+> Canon CameraToPCS + validated HueSatMap + NormalWhite/fixed 1.8 recipe only for
+> CLog3 with original Canon CR3. All other auto combinations, including CLog2RevEng,
+> use generic matrix-only CameraToPCS and report uncalibrated. Explicit generic is
+> available for all profiles. `--log-reference-gain` is now positive finite for all
+> profiles. The 0.9 factor remains an independent curve input unit for both rev-eng
+> Canon curves. Color contract v2 / native algorithm revision 4 must be rebuilt with
+> Rust. See [current CLI contract](../pipeline/README.md). The earlier results and
+> reproduction commands below describe the historical calibration/delivery chain;
+> they are retained as evidence, not current routing or output instructions.
+
+
 当前为固定标定 revision4（native revision3）：原CR3 NormalWhite → 固定scene倍率1.8 → 反射率×0.9。详见[固定标定合同](canon-fixed-calibration.md)。旧验证记录保留历史含义。
 
 

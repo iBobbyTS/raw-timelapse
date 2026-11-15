@@ -47,7 +47,7 @@ pub struct FrameSequence {
 /// consumes `PreparedFrame` through `prepare`/`analyze_prepared`/`develop` only.
 #[cfg(test)]
 pub struct ProduceConfig<'a> {
-    pub camera_color_method: crate::color_profile::CameraColorMethod,
+    pub camera_recipe: crate::color_profile::CameraRecipe,
     pub logs_dir: &'a Path,
     pub exposure_ev: Option<f64>,
     pub analysis_roi: Option<[f64; 4]>,
@@ -722,7 +722,7 @@ impl Drop for NativeStream {
 }
 
 struct NativeRun {
-    method: crate::color_profile::CameraColorMethod,
+    method: crate::color_profile::CameraRecipe,
     log: PathBuf,
     analysis_roi: Option<[f64; 4]>,
     #[cfg(test)]
@@ -735,7 +735,7 @@ impl NativeRun {
     #[cfg(test)]
     fn from_produce(config: &ProduceConfig<'_>) -> Self {
         Self {
-            method: config.camera_color_method,
+            method: config.camera_recipe,
             log: config.logs_dir.join("frame_000001.log"),
             converter: config.converter.map(str::to_string),
             converter_timeout: config.converter_timeout,
@@ -843,7 +843,7 @@ fn produce_inner(
             active.clone(),
             &mut |info, stream| {
                 if let Some(first) = frames.first() {
-                    if config.camera_color_method.requires_canon_cr3()
+                    if config.camera_recipe.requires_canon_cr3()
                         && info
                             .camera_color
                             .as_ref()
@@ -931,7 +931,7 @@ pub struct PrepareSettings<'a> {
 /// Prepared-frame consumer settings. No Converter options exist here on
 /// purpose: a prepared context already records its conversion provenance.
 pub struct PreparedSettings {
-    pub camera_color_method: crate::color_profile::CameraColorMethod,
+    pub camera_recipe: crate::color_profile::CameraRecipe,
 }
 
 /// Run the native prepare operation once for one source and load the resulting
@@ -1176,7 +1176,7 @@ fn prepared_native_run(
     log: &Path,
 ) -> NativeRun {
     NativeRun {
-        method: settings.camera_color_method,
+        method: settings.camera_recipe,
         log: log.to_path_buf(),
         analysis_roi,
         #[cfg(test)]
@@ -1362,6 +1362,10 @@ fn run_frame(
     args.extend([
         "--camera-color-method".into(),
         run.method.native_token().into(),
+        "--color-contract-version".into(), "2".into(),
+        "--camera-recipe".into(), run.method.token().into(),
+        "--profile-correction".into(), run.method.correction().into(),
+        "--camera-calibration".into(), run.method.calibration().into(),
     ]);
     if let Some(wb) = override_wb {
         args.extend(["--white-balance".into(), format_wb(wb)]);
@@ -1418,7 +1422,7 @@ fn run_frame(
         }
 
         if run.method.requires_canon_cr3()
-            && (color.get("algorithm_revision").and_then(Json::as_u64) != Some(3)
+            && (color.get("algorithm_revision").and_then(Json::as_u64) != Some(4)
                 || !valid_fixed_calibration(color)
                 || !matches!(
                     (
@@ -1433,10 +1437,39 @@ fn run_frame(
                 "incomplete camera profile calibration; rebuild matched native/Rust tools",
             ));
         }
-        if sidecar.get("color_contract_version").and_then(Json::as_u64) != Some(1)
+        let eq = |key, value: &str| color.get(key).and_then(Json::as_str) == Some(value);
+        let flag = |key| color.get(key).and_then(Json::as_bool);
+        let valid_presence = |present, applied, status, enabled| {
+            match (flag(present), flag(applied)) {
+                (Some(p), Some(a)) => a == (p && enabled) && eq(status, if !p { "absent" } else if a { "applied" } else { "skipped" }),
+                _ => false,
+            }
+        };
+        let calibration = color.get("exposure_calibration");
+        if !eq("recipe_requested", run.method.token()) || !eq("recipe_effective", run.method.token())
+            || !eq("profile_correction_requested", run.method.correction()) || !eq("profile_correction_effective", run.method.correction())
+            || !eq("camera_calibration_requested", run.method.calibration()) || !eq("camera_calibration_effective", run.method.calibration())
+            || color.get("algorithm_revision").and_then(Json::as_u64) != Some(4)
+            || !valid_matrix("xyz_d50_to_acescg") || !valid_matrix("sdk_normalized_pcs_to_camera")
+            || !eq("cat", "linear Bradford D50->D60; AP1 inverse primaries matrix")
+            || !valid_presence("hue_sat_map_present", "hue_sat_map_applied", "hue_sat_map_status", run.method.requires_canon_cr3())
+            || !valid_presence("look_table_present", "look_table_applied", "look_table_status", false)
+            || !valid_presence("tone_curve_present", "tone_curve_applied", "tone_curve_status", false)
+            || flag("baseline_exposure_applied") != Some(false) || !eq("baseline_exposure_status", "skipped")
+            || !color.get("baseline_exposure_ev").and_then(Json::as_f64).is_some_and(f64::is_finite)
+            || flag("forward_matrix_present").is_none()
+            || flag("forward_matrix_used") != Some(effective == Some("dng-camera-to-pcs-forward-matrix"))
+            || (effective == Some("dng-camera-to-pcs-forward-matrix") && flag("forward_matrix_present") != Some(true))
+            || (effective == Some("dng-camera-to-pcs-inverse-fallback") && flag("forward_matrix_present") != Some(false))
+            || color.get("camera_model").and_then(Json::as_str).is_none_or(str::is_empty)
+            || (!run.method.requires_canon_cr3() && (calibration.and_then(|c| c.get("applied")) != Some(&Json::Bool(false))
+                || calibration.and_then(|c| c.get("method")).and_then(Json::as_str) != Some("none")
+                || calibration.and_then(|c| c.get("status")).and_then(Json::as_str) != Some("uncalibrated")))
+        { return Err(failure("inconsistent camera recipe/profile policy contract")); }
+        if sidecar.get("color_contract_version").and_then(Json::as_u64) != Some(2)
             || color.get("method_requested").and_then(Json::as_str)
                 != Some(run.method.native_token())
-            || !(if run.method.requires_canon_cr3() {
+            || !(if run.method != crate::color_profile::CameraRecipe::LegacyInverseCm {
                 matches!(
                     effective,
                     Some("dng-camera-to-pcs-forward-matrix" | "dng-camera-to-pcs-inverse-fallback")
@@ -1730,7 +1763,7 @@ fn run_frame(
                 || descriptor
                     .get("color_contract_version")
                     .and_then(Json::as_u64)
-                    != Some(1)
+                    != Some(2)
                 || descriptor.get("byte_length").and_then(Json::as_u64) != Some(expected_bytes)
                 || expected_bytes > 2_400_000_000
             {
@@ -2101,7 +2134,6 @@ fn valid_fixed_calibration(color: &Json) -> bool {
         && c.get("method").and_then(Json::as_str) == Some("canon-normal-white-fixed-v1")
         && c.get("auto_tone_normalization") == Some(&Json::Bool(false))
         && c.get("baseline_exposure_applied") == Some(&Json::Bool(false))
-        && number("scene_to_reflection") == Some(0.9)
         && number("fixed_scene_gain") == Some(1.8)
         && max >= 255.0 && max <= 65535.0 && (max + 1.0).fract() == 0.0
         && ((max as u64)+1).is_power_of_two()
@@ -2124,8 +2156,8 @@ mod prepared_tests {
         static BINARY: OnceLock<PathBuf> = OnceLock::new();
         BINARY
             .get_or_init(|| {
-                let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("target")
+                let directory = std::env::var_os("RAWTL_TEST_WORK").map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp"))
                     .join("fake-native-bin");
                 fs::create_dir_all(&directory).expect("create fake native dir");
                 let binary = directory.join("fake-native-prepared");
@@ -2204,7 +2236,7 @@ mod prepared_tests {
 
     fn prepared_settings() -> PreparedSettings {
         PreparedSettings {
-            camera_color_method: crate::color_profile::CameraColorMethod::LegacyInverseCm,
+            camera_recipe: crate::color_profile::CameraRecipe::Generic,
         }
     }
 
@@ -2302,6 +2334,38 @@ mod prepared_tests {
     }
 
     #[test]
+    #[ignore = "controlled synthetic SDK boundary; requires RAWTL_NATIVE_TOOL and RAWTL_CONTROLLED_DNG"]
+    fn generic_controlled_native_round_trip() {
+        let dir = work_dir("generic-real-sdk");
+        let source_path = fs::canonicalize(std::env::var_os("RAWTL_CONTROLLED_DNG").expect("fixture")).unwrap();
+        let tool = PathBuf::from(std::env::var_os("RAWTL_NATIVE_TOOL").expect("matched native"));
+        let source = SourceFrame { name: source_path.file_name().unwrap().to_string_lossy().into(), path: source_path, key: Vec::new() };
+        let prepared = prepare_one(&dir, &tool, &source, "generic");
+        let settings = PreparedSettings { camera_recipe: crate::color_profile::CameraRecipe::Generic };
+        let wb = Some([0.6050808314, 1.0, 0.4825046041]);
+        let analysis = analyze_prepared(&tool, &prepared, wb, Some(0.0), None, &settings, &dir.join("analysis.log")).unwrap();
+        let mut reference: Vec<f32> = Vec::new();
+        for ev in [0.0, -2.0, 2.0] {
+            let info = develop_prepared(&tool, &prepared, wb, Some(ev), &settings, &dir.join(format!("develop-{ev}.log")), &mut |info, stream| {
+                let p = stream.pixels(info.width, info.height)?;
+                let values: Vec<f32> = p.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+                if ev == 0.0 { reference = values; } else {
+                    for (a,b) in values.iter().zip(&reference) { assert!((*a - *b * 2f32.powf(ev as f32)).abs() <= 2e-6 * a.abs().max(1.0)); }
+                }
+                Ok(())
+            }).unwrap();
+            assert_eq!(info.camera_color, analysis.camera_color);
+            assert_eq!(info.source_sha256, analysis.source_sha256);
+            assert_eq!(info.applied_wb, analysis.applied_wb);
+        }
+        for name in ["analysis.log", "develop-0.log", "develop--2.log", "develop-2.log"] {
+            let text=fs::read_to_string(dir.join(name)).unwrap();
+            for expected in ["--camera-recipe generic", "--camera-color-method dng-camera-to-pcs", "--profile-correction none", "--camera-calibration none", "--color-contract-version 2"] { assert!(text.contains(expected), "{text}"); }
+            assert!(!text.contains("reference-gain"));
+        }
+    }
+
+    #[test]
     fn prepared_converter_route_and_canon_method_guard() {
         let dir = work_dir("converter-route");
         let source = source_frame(&dir, "IMG_2.CR3");
@@ -2322,7 +2386,7 @@ mod prepared_tests {
 
         let logs = dir.join("canon-logs");
         let settings = PreparedSettings {
-            camera_color_method: crate::color_profile::CameraColorMethod::DngCameraToPcs,
+            camera_recipe: crate::color_profile::CameraRecipe::CanonClog3,
         };
         let info = analyze_prepared(&tool, &prepared, None, Some(0.0), None, &settings, &logs.join("frame_000001.log"))
             .expect("canon analyze");
@@ -2560,7 +2624,7 @@ mod prepared_tests {
         let prepared_logs = work.join("prepared-logs");
         let legacy_logs = work.join("legacy-logs");
         let settings = PreparedSettings {
-            camera_color_method: crate::color_profile::CameraColorMethod::DngCameraToPcs,
+            camera_recipe: crate::color_profile::CameraRecipe::CanonClog3,
         };
         let sources: Vec<SourceFrame> = materials
             .iter()
@@ -2606,7 +2670,7 @@ mod prepared_tests {
             .expect("prepare analysis");
         let first_wb = first.applied_wb;
         let legacy_config = ProduceConfig {
-            camera_color_method: crate::color_profile::CameraColorMethod::DngCameraToPcs,
+            camera_recipe: crate::color_profile::CameraRecipe::CanonClog3,
             logs_dir: &legacy_logs,
             exposure_ev: None,
             analysis_roi: None,
@@ -2923,16 +2987,16 @@ if mode.startswith('late:'):
             assert_eq!(frame.as_shot_neutral, single.as_shot_neutral);
             assert_eq!(frame.capture_time, single.capture_time);
             for method in [
-                crate::color_profile::CameraColorMethod::LegacyInverseCm,
-                crate::color_profile::CameraColorMethod::DngCameraToPcs,
+                crate::color_profile::CameraRecipe::LegacyInverseCm,
+                crate::color_profile::CameraRecipe::CanonClog3,
             ] {
-                if method == crate::color_profile::CameraColorMethod::DngCameraToPcs
+                if method == crate::color_profile::CameraRecipe::CanonClog3
                     && frame.route != PreparedRoute::VendorRaw
                 {
                     continue;
                 }
                 let settings = PreparedSettings {
-                    camera_color_method: method,
+                    camera_recipe: method,
                 };
                 let a = analyze_prepared(
                     &tool,
@@ -3028,7 +3092,7 @@ if mode.startswith('late:'):
                 Some(0.),
                 None,
                 &PreparedSettings {
-                    camera_color_method: crate::color_profile::CameraColorMethod::LegacyInverseCm,
+                    camera_recipe: crate::color_profile::CameraRecipe::LegacyInverseCm,
                 },
                 &dir.join("after-delete.log"),
             )
@@ -3045,7 +3109,7 @@ if mode.startswith('late:'):
         let root = PathBuf::from(root);
         let tool = PathBuf::from(std::env::var_os("RAWTL_NATIVE_TOOL").expect("RAWTL_NATIVE_TOOL"));
         let settings = PreparedSettings {
-            camera_color_method: crate::color_profile::CameraColorMethod::LegacyInverseCm,
+            camera_recipe: crate::color_profile::CameraRecipe::LegacyInverseCm,
         };
         for name in ["context-nul.ctx", "record-nul.ctx"] {
             let error = PreparedFrame::load(&root.join(name)).expect_err("forged NUL must be rejected");

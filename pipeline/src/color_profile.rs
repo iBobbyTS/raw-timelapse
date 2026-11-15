@@ -664,33 +664,51 @@ impl FrameOutput for std::sync::Arc<[u8]> {
     }
 }
 
+/// Frozen input development recipe. Legacy is retained only for historical tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CameraColorMethod {
+pub enum CameraRecipe {
     LegacyInverseCm,
-    DngCameraToPcs,
+    Generic,
+    CanonClog3,
 }
-impl CameraColorMethod {
+impl CameraRecipe {
     pub fn native_token(self) -> &'static str {
         match self {
             Self::LegacyInverseCm => "legacy-inverse-cm",
-            Self::DngCameraToPcs => "dng-camera-to-pcs",
+            Self::Generic | Self::CanonClog3 => "dng-camera-to-pcs",
         }
     }
-    pub fn requires_canon_cr3(self) -> bool {
-        self == Self::DngCameraToPcs
+    pub fn token(self) -> &'static str {
+        match self { Self::LegacyInverseCm => "legacy-test", Self::Generic => "generic", Self::CanonClog3 => "canon-clog3" }
+    }
+    pub fn correction(self) -> &'static str {
+        if self == Self::CanonClog3 { "hue-sat-map" } else { "none" }
+    }
+    pub fn calibration(self) -> &'static str {
+        if self == Self::CanonClog3 { "canon-normal-white-fixed-v1" } else { "none" }
+    }
+    pub fn requires_canon_cr3(self) -> bool { self == Self::CanonClog3 }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraColor { Auto, Generic, CanonClog3 }
+impl CameraColor {
+    pub fn token(self) -> &'static str { match self { Self::Auto => "auto", Self::Generic => "generic", Self::CanonClog3 => "canon-clog3" } }
+    /// Called after the existing single-extension enumeration, before prepare.
+    pub fn resolve(self, profile: &ColorProfile, all_cr3: bool) -> Result<CameraRecipe, String> {
+        let clog3 = profile.transfer == Transfer::CanonLog3RevEng;
+        match self {
+            Self::Generic => Ok(CameraRecipe::Generic),
+            Self::Auto if clog3 && all_cr3 => Ok(CameraRecipe::CanonClog3),
+            Self::Auto => Ok(CameraRecipe::Generic),
+            Self::CanonClog3 if clog3 && all_cr3 => Ok(CameraRecipe::CanonClog3),
+            Self::CanonClog3 => Err("--camera-color canon-clog3 requires CLog3 profile and original Canon CR3 photos".into()),
+        }
     }
 }
-
 impl ColorProfile {
-    pub fn camera_color_method(&self) -> CameraColorMethod {
-        if self.is_rev_eng() {
-            CameraColorMethod::DngCameraToPcs
-        } else {
-            CameraColorMethod::LegacyInverseCm
-        }
-    }
-    pub fn scene_to_reflection_scale(&self) -> f64 {
-        if self.is_rev_eng() { 0.9 } else { 1.0 }
+    /// Curve input units, independent of the camera recipe and exposure calibration.
+    pub fn curve_input_scale(&self) -> f64 {
+        match self.transfer { Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng => 0.9, _ => 1.0 }
     }
     pub fn is_rev_eng(&self) -> bool {
         matches!(
@@ -720,7 +738,6 @@ impl ColorProfile {
     ) -> Result<[usize; 2], String> {
         if !reference_gain.is_finite()
             || reference_gain <= 0.0
-            || (!self.is_rev_eng() && reference_gain != 1.0)
         {
             return Err("invalid FP32 profile/reference gain".into());
         }
@@ -743,7 +760,7 @@ impl ColorProfile {
                     return Err("nonfinite FP32 sample".into());
                 }
             }
-            let target = preview::mat3_vec(&m, ap1).map(|v| v * reference_gain * self.scene_to_reflection_scale());
+            let target = preview::mat3_vec(&m, ap1).map(|v| v * reference_gain * self.curve_input_scale());
             if target.iter().any(|v| !v.is_finite()) {
                 return Err("nonfinite target color".into());
             }
@@ -785,7 +802,6 @@ impl ColorProfile {
     ) -> Result<[usize; 2], String> {
         if !reference_gain.is_finite()
             || reference_gain <= 0.0
-            || (!self.is_rev_eng() && reference_gain != 1.0)
         {
             return Err("invalid FP32 profile/reference gain".into());
         }
@@ -800,7 +816,7 @@ impl ColorProfile {
         let (kr, kg, kb, div_cb, div_cr) = coding.coefficients();
         let matrix = self.composed_matrix();
         let (low, high) = self.transfer.domain();
-        let scale = reference_gain * self.scene_to_reflection_scale();
+        let scale = reference_gain * self.curve_input_scale();
         out.resize(samples, 0);
         let mut clipped = [0usize; 2];
         for (index, src) in bytes.chunks_exact(12).enumerate() {
@@ -879,7 +895,7 @@ impl ColorProfile {
     /// Convert one scene-linear ACEScg AP1/D60 triple to 8-bit target signal.
     pub fn encode_linear(&self, ap1: [f64; 3]) -> [u8; 3] {
         let target = preview::mat3_vec(&self.composed_matrix(), ap1)
-            .map(|v| v * self.scene_to_reflection_scale());
+            .map(|v| v * self.curve_input_scale());
         self.encode_target_linear(target)
     }
 
@@ -904,8 +920,8 @@ impl ColorProfile {
         height: usize,
         out: &mut impl FrameOutput,
     ) -> Result<(), String> {
-        if self.is_rev_eng() {
-            return Err("rev-eng Canon Log requires signed FP32 input".into());
+        if self.curve_input_scale() != 1.0 {
+            return Err("this curve input scale requires signed FP32 input".into());
         }
 
         let expected = width
@@ -991,8 +1007,8 @@ impl ColorProfile {
         Json::obj(vec![
             ("profile", Json::Str(self.id.to_string())),
             ("display_name", Json::Str(self.display_name().into())),
-            ("native_scene_to_reflection_scale", Json::Float(self.scene_to_reflection_scale())),
-            ("pipeline_revision", Json::Int(if self.is_rev_eng() { 4 } else { 2 })),
+            ("curve_input_scale", Json::Float(self.curve_input_scale())),
+            ("pipeline_revision", Json::Int(5)),
             (
                 "transfer",
                 Json::obj(vec![
@@ -1426,12 +1442,7 @@ mod tests {
                     p.id
                 );
             }
-            if !p.is_rev_eng() {
-                assert!(p.convert_f32_frame(&bytes, 1, 1, 2., &mut out).is_err());
-                assert_eq!(p.camera_color_method(), CameraColorMethod::LegacyInverseCm);
-            } else {
-                assert_eq!(p.camera_color_method(), CameraColorMethod::DngCameraToPcs);
-            }
+            assert!(p.convert_f32_frame(&bytes, 1, 1, 2., &mut out).is_ok());
             assert!(p
                 .convert_f32_frame(&bytes[..11], 1, 1, 1., &mut out)
                 .is_err());
@@ -1654,7 +1665,7 @@ mod tests {
             assert_eq!((out[1], out[2]), (512, 512), "{} neutral chroma", profile.id);
             let signal = profile.transfer.forward(
                 preview::mat3_vec(&profile.composed_matrix(), [0.18; 3])[0]
-                    * profile.scene_to_reflection_scale(),
+                    * profile.curve_input_scale(),
             );
             // The frame adapter and the reference signal encoder agree.
             let expected = profile.encode_signal_yuv10([signal; 3], profile.range).unwrap();
@@ -1669,7 +1680,7 @@ mod tests {
         for profile in &PROFILES {
             let ap1 = [0.4f64, 0.18, 0.09];
             let target = preview::mat3_vec(&profile.composed_matrix(), ap1)
-                .map(|value| value * profile.scene_to_reflection_scale());
+                .map(|value| value * profile.curve_input_scale());
             let (low, high) = profile.transfer.domain();
             let signal = target.map(|value| profile.transfer.forward(value.clamp(low, high)));
             let (kr, kg, kb, div_cb, div_cr) = profile.ycbcr_coding().unwrap().coefficients();
@@ -1748,7 +1759,7 @@ mod tests {
         assert!(lookup("srgb-preview")
             .unwrap()
             .convert_f32_frame_to_yuv10(&negative, 1, 1, 2.0, PreviewRange::Tv, &mut out)
-            .is_err());
+            .is_ok());
     }
 
     #[test]
@@ -1948,5 +1959,50 @@ mod delivered_range_tests {
         assert_eq!(limited, vec![464, 332, 374]);
         assert_eq!(full, vec![467, 306, 354]);
         assert_ne!(limited, full);
+    }
+}
+
+#[cfg(test)]
+mod camera_recipe_tests {
+    use super::*;
+    #[test]
+    fn selection_table_and_curve_units_are_independent() {
+        for profile in PROFILES.iter() {
+            for cr3 in [false, true] {
+                let canon = cr3 && profile.transfer == Transfer::CanonLog3RevEng;
+                assert_eq!(CameraColor::Auto.resolve(profile, cr3).unwrap(), if canon { CameraRecipe::CanonClog3 } else { CameraRecipe::Generic });
+                assert_eq!(CameraColor::Generic.resolve(profile, cr3).unwrap(), CameraRecipe::Generic);
+                assert_eq!(CameraColor::CanonClog3.resolve(profile, cr3).is_ok(), canon);
+                assert_eq!(profile.curve_input_scale(), match profile.transfer { Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng => 0.9, _ => 1.0 });
+            }
+        }
+    }
+    #[test]
+    fn curve_input_units_and_user_gain_are_applied_once() {
+        for (id, code) in [("canon-log2-cinema-gamut-rev-eng-crm-dev", 407u16),
+                           ("canon-log3-cinema-gamut-rev-eng-crm-dev", 351u16)] {
+            let p = lookup(id).unwrap();
+            // Independent published/reconstructed 18% reference, full-range 10-bit.
+            for (scene, gain) in [(0.2f32, 1.0), (0.1, 2.0), (0.4, 0.5)] {
+                let bytes: Vec<_> = [scene; 3].into_iter().flat_map(f32::to_le_bytes).collect();
+                let mut out = Vec::new();
+                p.convert_f32_frame_to_yuv10(&bytes, 1, 1, gain, PreviewRange::Pc, &mut out).unwrap();
+                assert_eq!(out, [code, 512, 512], "{id} scene={scene} gain={gain}");
+            }
+        }
+    }
+    #[test]
+    fn every_profile_accepts_only_positive_finite_reference_gain_in_both_paths() {
+        let bytes: Vec<_> = [0.1f32; 3].into_iter().flat_map(f32::to_le_bytes).collect();
+        for profile in PROFILES.iter() {
+            for gain in [0.5, 1.0, 2.0] {
+                profile.convert_f32_frame(&bytes, 1, 1, gain, &mut Vec::new()).unwrap();
+                profile.convert_f32_frame_to_yuv10(&bytes, 1, 1, gain, PreviewRange::Pc, &mut Vec::new()).unwrap();
+            }
+            for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+                assert!(profile.convert_f32_frame(&bytes, 1, 1, bad, &mut Vec::new()).is_err());
+                assert!(profile.convert_f32_frame_to_yuv10(&bytes, 1, 1, bad, PreviewRange::Pc, &mut Vec::new()).is_err());
+            }
+        }
     }
 }

@@ -61,6 +61,7 @@ fn main() {
 
 pub struct RunContext<'a> {
     pub options: &'a Options,
+    pub camera_recipe: color_profile::CameraRecipe,
     /// Run-specific scratch root: converted cache and child transcripts.
     pub scratch: &'a Path,
     pub sources: &'a [SourceFrame],
@@ -213,7 +214,11 @@ fn execute(
         println!("  {:>3}. {}", index + 1, source.name);
     }
 
+    let camera_recipe = options.camera_color.resolve(options.preview_profile,
+        sources.iter().all(|s| s.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("cr3"))))
+        .map_err(|e| error::Error::new(error::EXIT_USAGE, e))?;
     let context = RunContext {
+        camera_recipe,
         options,
         scratch,
         sources: &sources,
