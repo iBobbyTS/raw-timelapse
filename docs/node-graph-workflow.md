@@ -211,9 +211,15 @@ BaselineExposure. Explicit generic does not bypass mixed-extension rejection.
 The color node applies the profile's curve input units (0.9 for the rev-eng Canon
 curves) and the positive finite user reference gain once; neither scale enters
 measurement. Native/Rust color contract v2 checks requested/effective policies
-and keeps the existing input Bradford D50→D60 CAT. The output CAT remains the
-existing Bradford transform in this section. See the current CLI contract in
-`pipeline/README.md` for routing and migration details.
+and keeps the existing input Bradford D50→D60 CAT. The output CAT is now part of
+the output profile: `--output-cat profile|bradford|cat02` (default `profile`)
+selects the profile's fixed reference realization or an explicit registered
+method. The eight pre-existing profiles keep the published Bradford D60→D65
+matrix and composition order exactly; an explicit different method is a standard
+full-adaptation derivation labeled `custom-adaptation` and changes output pixels.
+The resolved transform is frozen before the graph runs, and neither the input CAT
+nor measure/develop parameters change with the output CAT. See the current CLI
+contract in `pipeline/README.md` for routing and migration details.
 
 
 - 内建默认：`prores_ks` profile 4 / MOV / `yuv444p10le` / limited range / 源几何。

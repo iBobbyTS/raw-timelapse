@@ -406,6 +406,7 @@ impl Backend for Runner<'_, '_> {
         mut image: Image,
     ) -> graph::Result<FrameTask<Image>> {
         let profile = self.context.options.preview_profile;
+        let output_transform = self.context.options.output_transform.clone();
         let range = self.encoder_config.effective_range(profile);
         let reference_gain = self.context.options.log_reference_gain;
         Ok(Box::new(move || {
@@ -453,6 +454,7 @@ impl Backend for Runner<'_, '_> {
                     let mut signal = Vec::new();
                     profile
                         .convert_f32_frame_to_yuv10(
+                            &output_transform,
                             pixels,
                             image.info.width as usize,
                             image.info.height as usize,
@@ -777,7 +779,7 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
     let profile = context.options.preview_profile;
     log.line(&format!(
         "kind=colour profile={} camera_color={} matrix={} primaries={} transfer={} \
-         reference_gain={} camera_color_requested={} recipe_effective={} profile_correction={} camera_calibration={} input_cat=bradford-d50-d60 calibration_status={}",
+         reference_gain={} camera_color_requested={} recipe_effective={} profile_correction={} camera_calibration={} input_cat=bradford-d50-d60 calibration_status={} {}",
         profile.id,
         context.camera_recipe.native_token(),
         profile.tag_policy.matrix_token(),
@@ -785,7 +787,8 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         profile.tag_policy.transfer_token(),
         context.options.log_reference_gain,
         context.options.camera_color.token(), context.camera_recipe.token(), context.camera_recipe.correction(), context.camera_recipe.calibration(),
-        if context.camera_recipe.calibration() != "none" { "pending-native-validation" } else { "uncalibrated" }
+        if context.camera_recipe.calibration() != "none" { "pending-native-validation" } else { "uncalibrated" },
+        context.options.output_transform.log_fields()
     ))?;
 
     let preflight_started = Instant::now();

@@ -35,7 +35,7 @@ rawtl-linear-video --input <RAW_DIR> --output <VIDEO_FILE> \
   [--dng-linear-frame /abs/path/to/dng-linear-frame] \
   [--ffmpeg /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg] \
   [--ffprobe /opt/homebrew/opt/ffmpeg-full/bin/ffprobe] \
-  [--preview-profile <ID>] [--log-reference-gain N] \
+  [--preview-profile <ID>] [--output-cat profile|bradford|cat02] [--log-reference-gain N] \
   [--converter "/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter"] \
   [--converter-timeout 120] \
   [--strength 1.0] [--period 60] [--brightness smooth|uniform] \
@@ -61,6 +61,11 @@ Defaults:
   `canon-log2-cinema-gamut`, `sony-slog3-sgamut3`, `sony-slog3-sgamut3-cine`,
   `nikon-nlog-bt2020`, `canon-log2-cinema-gamut-rev-eng-crm-dev`,
   `canon-log3-cinema-gamut-rev-eng-crm-dev`
+- `--output-cat profile` — `profile` keeps the selected profile's own fixed
+  reference chromatic adaptation. `bradford` or `cat02` name a registered
+  algorithm explicitly; the same value as the profile default is idempotent,
+  while a different value changes output pixels and is reported as
+  `custom-adaptation` (never as the profile's reference match)
 - `--fps 30` (rational rates such as `30000/1001` are accepted)
 - `--white-balance first-frame` — the first numerically ordered frame's as-shot
   neutral is frozen for the sequence; `per-frame` decodes every frame with its
@@ -352,7 +357,27 @@ Input D50→D60 adaptation remains Bradford; it is independent of output color.
 Only the Canon CLog3 recipe applies the validated profile HueSatMap and original
 CR3 NormalWhite/fixed 1.8 exposure calibration. CLog2RevEng now uses generic input
 by default: its changed input pixels/measurement are an intentional migration.
-Existing output curves, gamuts, tags and Bradford matrices retain their definitions.
+Existing output curves, gamuts, tags and the default Bradford output matrices
+retain their definitions.
+
+The output chromatic adaptation belongs to `OutputProfile`, not to the transfer
+curve or the input CAT. `--output-cat profile` (default) uses the profile's fixed
+reference realization; the eight pre-existing profiles keep the published
+Bradford D60→D65 matrix and composition order bit-for-bit. An explicit
+`bradford`/`cat02` equal to the profile default is the same idempotent reference
+selection. A different explicit method uses the standard derivation with column
+vectors — `M_out = inverse(M_target_to_XYZ) × CAT × M_AP1_to_XYZ`, where
+`CAT = inverse(B) × diag((B·W_to)/(B·W_from)) × B`, whites at Y=1, full
+adaptation — and is labeled `custom-adaptation`; it is not claimed to match the
+vendor/reference chain. Bradford and CAT02 have independent fixed cone matrices.
+The gamut's `white_xy` participates in the composition, so target white is
+reported and used rather than assumed D65. Invalid method names, white points,
+singular/non-finite matrices and unknown selections are rejected before RAW
+work; per-pixel conversion uses coefficients frozen at startup. The `colour` log
+line reports `output_cat_requested`, `output_cat_method`,
+`output_cat_realization` (`reference`/`custom-adaptation`), source/target whites
+and a stable transform fingerprint. Adding an algorithm to the static CAT
+registry needs no transfer or native change.
 
 `--log-reference-gain N` is a positive finite output gain for every profile,
 default 1. It is applied once before the output transfer function and never enters

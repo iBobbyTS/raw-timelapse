@@ -2064,3 +2064,185 @@ fn camera_color_v2_defects_are_rejected_without_publication() {
         assert!(!video.exists(),"{defect}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Output chromatic adaptation (profile default vs explicit method)
+// ---------------------------------------------------------------------------
+
+/// First pixel of the first frame as stored in the 10-bit 4:4:4 handoff. The
+/// video is decoded without any colour conversion, so this observes the pixels
+/// the colour node actually delivered.
+fn yuv10_first_pixel(path: &Path, width: u32, height: u32) -> [u16; 3] {
+    let output = std::process::Command::new(FFMPEG)
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-pix_fmt", "yuv444p10le", "-f", "rawvideo", "-"])
+        .output()
+        .expect("decode first frame");
+    assert!(
+        output.status.success(),
+        "ffmpeg decode failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Planar 4:4:4: the whole luma frame, then Cb, then Cr.
+    let pixels = (width * height) as usize;
+    assert!(output.stdout.len() >= 3 * pixels * 2, "short decoded 4:4:4 frame");
+    let value = |plane: usize| {
+        let at = plane * pixels * 2;
+        u16::from_le_bytes([output.stdout[at], output.stdout[at + 1]])
+    };
+    [value(0), value(1), value(2)]
+}
+
+fn saturated_output_cat_material(name: &str) -> SyntheticMaterial {
+    require_ffmpeg();
+    let root = test_dir(name);
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    // AP1/D60 [0.2, 0.4, 0.05]; Bradford and CAT02 differ by ~9 Cb codes here.
+    let png = fixtures.join("saturated.png");
+    let pixels = vec![[3277u16, 6554, 819]; (WIDTH * HEIGHT) as usize];
+    write_rgb48_png(&png, WIDTH, HEIGHT, &pixels);
+    let frames: Vec<FakeFrame> = ["IMG_1.DNG", "IMG_2.DNG"]
+        .into_iter()
+        .map(|frame_name| {
+            let mut frame = FakeFrame::new(frame_name, (1000.0f64 / 16384.0).log2());
+            frame.fixture = Some(png.clone());
+            frame.capture("2026:11:08 20:00:00")
+        })
+        .collect();
+    let tool = fake_native_sequence(&fixtures, &frames, None, false, WIDTH, HEIGHT);
+    SyntheticMaterial {
+        root,
+        input,
+        fixtures,
+        tool,
+    }
+}
+
+#[test]
+fn output_cat_selection_reaches_the_pixels_and_the_run_log() {
+    let material = saturated_output_cat_material("output-cat-pixels");
+    let run = |directory: &str, extra: &[&str]| {
+        let directory = material.root.join(directory);
+        let video = video_in(&directory);
+        let mut args = base_args(&material.input, &video, &material.tool);
+        args.extend(["--strength", "0"]);
+        args.extend(extra);
+        let result = run_cli(&args);
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            stdout(&result),
+            stderr(&result)
+        );
+        (video, read_log(&directory))
+    };
+
+    let (default_video, default_log) = run("default", &[]);
+    let (same_video, same_log) = run("same", &["--output-cat", "bradford"]);
+    let (custom_video, custom_log) = run("custom", &["--output-cat", "cat02"]);
+
+    let colour = |log: &str| {
+        let lines = log_kind(log, "colour");
+        assert_eq!(lines.len(), 1);
+        lines[0].to_string()
+    };
+    let field = |log: &str, key: &str| {
+        log_field(&colour(log), key)
+            .unwrap_or_else(|| panic!("missing {key} in {log}"))
+            .to_string()
+    };
+    assert_eq!(field(&default_log, "output_cat_requested"), "profile");
+    assert_eq!(field(&default_log, "output_cat_method"), "bradford");
+    assert_eq!(field(&default_log, "output_cat_realization"), "reference");
+    assert_eq!(field(&same_log, "output_cat_requested"), "bradford");
+    assert_eq!(field(&same_log, "output_cat_method"), "bradford");
+    assert_eq!(field(&same_log, "output_cat_realization"), "reference");
+    assert_eq!(
+        field(&same_log, "output_cat_fingerprint"),
+        field(&default_log, "output_cat_fingerprint"),
+        "an explicit same-value selection must keep the fixed reference realization"
+    );
+    assert_eq!(field(&custom_log, "output_cat_requested"), "cat02");
+    assert_eq!(field(&custom_log, "output_cat_method"), "cat02");
+    assert_eq!(
+        field(&custom_log, "output_cat_realization"),
+        "custom-adaptation"
+    );
+    assert_ne!(
+        field(&custom_log, "output_cat_fingerprint"),
+        field(&default_log, "output_cat_fingerprint")
+    );
+
+    // The upstream develop pixels are identical: only the output CAT changed.
+    let develop_pixels = |log: &str| {
+        log_kind(log, "develop")
+            .iter()
+            .map(|line| {
+                (
+                    log_field(line, "ev").expect("ev").to_string(),
+                    log_field(line, "pixels_sha256").expect("sha").to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let reference_develop = develop_pixels(&default_log);
+    assert_eq!(reference_develop.len(), 2);
+    assert_eq!(reference_develop, develop_pixels(&same_log));
+    assert_eq!(reference_develop, develop_pixels(&custom_log));
+
+    // Same-value selection keeps the reference pixels bit-for-bit; a different
+    // CAT changes them by a decisive margin (label-only implementations fail).
+    let default_pixel = yuv10_first_pixel(&default_video, WIDTH, HEIGHT);
+    assert_eq!(default_pixel, yuv10_first_pixel(&same_video, WIDTH, HEIGHT));
+    let custom_pixel = yuv10_first_pixel(&custom_video, WIDTH, HEIGHT);
+    assert_ne!(default_pixel, custom_pixel);
+    let difference = default_pixel
+        .iter()
+        .zip(&custom_pixel)
+        .map(|(a, b)| (*a as i32 - *b as i32).abs())
+        .max()
+        .unwrap();
+    assert!(
+        difference >= 5,
+        "expected a decisive CAT pixel change: {default_pixel:?} vs {custom_pixel:?}"
+    );
+    // Independent references: AP1 [0.2,0.4,0.05] through the frozen output
+    // matrices (cat_oracle.py) and the documented BT.709 limited-range coding.
+    // ProRes 4444 reproduces the 10-bit handoff; allow one code of codec slack.
+    for (observed, expected) in [
+        (default_pixel, [557u16, 248, 379]),
+        (custom_pixel, [557, 257, 378]),
+    ] {
+        for channel in 0..3 {
+            assert!(
+                (observed[channel] as i32 - expected[channel] as i32).abs() <= 1,
+                "channel {channel}: {observed:?} vs independent reference {expected:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn unknown_output_cat_is_rejected_before_any_work() {
+    for extra in [
+        vec!["--output-cat", "rec2020"],
+        vec!["--output-cat", ""],
+        vec!["--output-cat"],
+        vec!["--output-cat", "profile", "--output-cat", "cat02"],
+    ] {
+        let mut args = vec!["--input", "/tmp", "--output", "/tmp/unused.mov"];
+        args.extend(extra);
+        let result = run_cli(&args);
+        assert_eq!(result.status.code(), Some(2), "{}", stderr(&result));
+        assert!(
+            stderr(&result).contains("--output-cat"),
+            "{}",
+            stderr(&result)
+        );
+    }
+}

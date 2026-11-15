@@ -6,8 +6,13 @@
 //! * one published or independently recovered curve, with constants and source;
 //! * one target colour gamut defined by official primaries plus white point,
 //!   converted through the staged path
-//!   `AP1/D60 -> XYZ(D60) -> Bradford CAT -> XYZ(D65) -> target linear RGB`
-//!   (every registered gamut is D65-referenced);
+//!   `AP1/D60 -> XYZ(D60) -> output CAT -> target linear RGB`, where the
+//!   adaptation targets the gamut's own white point;
+//! * one pinned default output CAT realization. The eight pre-existing profiles
+//!   keep the published Bradford D60->D65 matrix and the historic composition
+//!   order bit-for-bit; a future profile may pin a different fixed chain. An
+//!   explicit CLI CAT choice that differs from the profile default uses the
+//!   standard derivation and is reported as `custom-adaptation`;
 //! * an explicit input domain derived from the official inverse curve at signal
 //!   0 and 1 (no tone mapping: negatives below the domain clip to the official
 //!   lower endpoint and highlights above it clip to the upper endpoint);
@@ -21,8 +26,12 @@
 //! the `srgb-preview` profile composes the same matrices in the same order as
 //! [`crate::preview::ap1_to_linear_srgb_matrix`].
 
+use crate::chromatic_adaptation::{self as cat, D65_WHITE_XY};
 use crate::json::Json;
 use crate::preview;
+
+/// Re-exported static CAT registration surface (one path for CLI and tests).
+pub use crate::chromatic_adaptation::{CatAlgorithm, CatRegistry};
 
 /// Preview output range: the real signal range written to the encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,8 +518,6 @@ pub struct Gamut {
     pub provenance: &'static str,
 }
 
-const D65_WHITE_XY: [f64; 2] = [0.3127, 0.3290];
-
 /// IEC 61966-2-1 sRGB primaries, D65 white. The `xyz_to_rgb` matrix is the
 /// exact published matrix used by the pre-existing preview path.
 const SRGB_GAMUT: Gamut = Gamut {
@@ -641,6 +648,123 @@ pub struct ColorProfile {
     pub range_reason: &'static str,
     pub ycbcr_reason: &'static str,
     pub tag_policy: TagPolicy,
+    /// The profile's own default output CAT and pinned reference realization.
+    pub output_cat: OutputCatDefault,
+}
+
+/// The output CAT requested for this run. The method belongs to the output
+/// profile (or to the CLI override), never to a transfer curve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputCatSelection {
+    /// The selected profile's own default realization.
+    Profile,
+    /// One explicitly requested registered CAT token.
+    Method(&'static str),
+}
+
+impl OutputCatSelection {
+    /// Requested value as written in the run log and colour contract.
+    pub fn token(self) -> &'static str {
+        match self {
+            OutputCatSelection::Profile => cat::PROFILE_SELECTION,
+            OutputCatSelection::Method(token) => token,
+        }
+    }
+}
+
+/// How the selected CAT was realized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputCatRealization {
+    /// The profile's pinned reference chain, using its fixed published constants.
+    Reference,
+    /// The standard derivation for an explicit non-default method.
+    CustomAdaptation,
+}
+
+impl OutputCatRealization {
+    pub fn token(self) -> &'static str {
+        match self {
+            OutputCatRealization::Reference => "reference",
+            OutputCatRealization::CustomAdaptation => "custom-adaptation",
+        }
+    }
+}
+
+/// A profile's pinned default CAT and its fixed reference realization.
+///
+/// The reference realization is the profile's real extension point: a newly
+/// registered profile declares its method, the adaptation matrix actually
+/// applied between AP1/D60 and the gamut white, and (when the profile's chain is
+/// not expressible as CAT-then-gamut, e.g. a pinned DCTL AP1->AP0->gamut chain)
+/// the complete composed matrix. Reference constants are preserved as published
+/// and are never replaced by a re-derived higher-precision matrix.
+#[derive(Debug, Clone, Copy)]
+pub struct OutputCatDefault {
+    /// Registered CAT algorithm token the reference chain realizes.
+    pub method: &'static str,
+    /// Fixed adaptation matrix actually applied: AP1/D60 -> gamut white point.
+    pub adaptation: [[f64; 3]; 3],
+    /// Pinned full composed AP1/D60 -> target-linear matrix for a profile-specific
+    /// chain. `None` composes `adaptation` with the gamut's declared `xyz_to_rgb`
+    /// in the historic order.
+    pub composed_override: Option<[[f64; 3]; 3]>,
+    /// Source of the fixed chain and its rounding.
+    pub provenance: &'static str,
+}
+
+/// The pre-existing output realization shared by every registered profile: the
+/// published Bradford D60->D65 constant composed exactly as before.
+const PREVIEW_OUTPUT_CAT: OutputCatDefault = OutputCatDefault {
+    method: cat::BRADFORD.token,
+    adaptation: preview::BRADFORD_D60_TO_D65,
+    composed_override: None,
+    provenance: "published Bradford D60(ACES white)->D65 constant already used by the \
+                 pipeline; reference chain is AP1/D60 -> XYZ/D60 -> fixed Bradford -> XYZ/D65 -> \
+                 the profile's declared target linear matrix, in the historic composition order",
+};
+
+/// One resolved output transform: frozen before per-pixel conversion.
+#[derive(Debug, Clone)]
+pub struct OutputTransform {
+    /// Profile id this transform belongs to.
+    pub profile: &'static str,
+    /// The selection as requested (profile default or an explicit token).
+    pub requested: OutputCatSelection,
+    /// Registered CAT token actually realized.
+    pub method: &'static str,
+    /// Human-readable algorithm name.
+    pub method_name: &'static str,
+    pub realization: OutputCatRealization,
+    /// Source white (AP1/D60) and the gamut's target white, encoded at Y=1.
+    pub source_white_xy: [f64; 2],
+    pub target_white_xy: [f64; 2],
+    /// Adaptation matrix actually applied.
+    pub cat_matrix: [[f64; 3]; 3],
+    /// Composed AP1/D60 -> target-linear matrix used per pixel.
+    pub composed_matrix: [[f64; 3]; 3],
+    /// Algorithm/reference source and derivation note.
+    pub provenance: String,
+    /// Stable change-detection fingerprint (not a cryptographic digest).
+    pub fingerprint: String,
+}
+
+impl OutputTransform {
+    /// Bounded one-line provenance for the run log.
+    pub fn log_fields(&self) -> String {
+        format!(
+            "output_cat_requested={} output_cat_method={} output_cat_realization={} \
+             output_cat_source_white={:.5},{:.5} output_cat_target_white={:.5},{:.5} \
+             output_cat_fingerprint={}",
+            self.requested.token(),
+            self.method,
+            self.realization.token(),
+            self.source_white_xy[0],
+            self.source_white_xy[1],
+            self.target_white_xy[0],
+            self.target_white_xy[1],
+            self.fingerprint
+        )
+    }
 }
 
 /// Writable backing for conversion. The pipeline supplies the unique Arc that
@@ -724,6 +848,163 @@ impl ColorProfile {
             _ => self.id,
         }
     }
+
+    /// Resolve the output CAT for this run. The profile's own fixed reference
+    /// realization is used for `Profile` and for an explicit method equal to the
+    /// profile default (idempotent same-value selection). A different explicit
+    /// method uses the standard derivation and is labeled `custom-adaptation`.
+    pub fn resolve_output_cat(
+        &self,
+        requested: OutputCatSelection,
+        registry: &cat::CatRegistry,
+    ) -> Result<OutputTransform, String> {
+        cat::white_xyz(self.gamut.white_xy)?;
+        match requested {
+            OutputCatSelection::Profile => self.reference_output_transform(requested, registry),
+            OutputCatSelection::Method(token) if token == self.output_cat.method => {
+                self.reference_output_transform(requested, registry)
+            }
+            OutputCatSelection::Method(token) => {
+                let algorithm = registry.lookup(token).ok_or_else(|| {
+                    format!(
+                        "invalid output CAT {:?}: expected {} or one of {}",
+                        token,
+                        cat::PROFILE_SELECTION,
+                        registry.tokens()
+                    )
+                })?;
+                self.custom_output_transform(requested, algorithm)
+            }
+        }
+    }
+
+    /// The profile's pinned reference realization, preserving its published
+    /// constants and the historic composition order bit-for-bit.
+    fn reference_output_transform(
+        &self,
+        requested: OutputCatSelection,
+        registry: &cat::CatRegistry,
+    ) -> Result<OutputTransform, String> {
+        let default = &self.output_cat;
+        let algorithm = registry.lookup(default.method).ok_or_else(|| {
+            format!(
+                "profile {} declares unregistered output CAT {:?}; registered: {}",
+                self.id,
+                default.method,
+                registry.tokens()
+            )
+        })?;
+        if !cat::matrix_is_finite(&default.adaptation) {
+            return Err(format!(
+                "profile {} reference output CAT {:?} has a non-finite adaptation matrix",
+                self.id, default.method
+            ));
+        }
+        if !cat::matrix_is_finite(&self.gamut.xyz_to_rgb) {
+            return Err(format!(
+                "profile {} target linear matrix is not finite",
+                self.id
+            ));
+        }
+        let composed = match default.composed_override {
+            Some(matrix) => matrix,
+            None => cat::mat3_mul(
+                &self.gamut.xyz_to_rgb,
+                &cat::mat3_mul(&default.adaptation, &preview::AP1_D60_TO_XYZ_D60),
+            ),
+        };
+        if !cat::matrix_is_finite(&composed) {
+            return Err(format!(
+                "profile {} reference output transform is not finite",
+                self.id
+            ));
+        }
+        // A singular reference chain would silently discard a colour dimension.
+        cat::invert3(&composed).map_err(|message| {
+            format!(
+                "profile {} reference output transform is invalid: {message}",
+                self.id
+            )
+        })?;
+        Ok(self.output_transform(
+            requested,
+            algorithm,
+            OutputCatRealization::Reference,
+            default.adaptation,
+            composed,
+            default.provenance.to_string(),
+        ))
+    }
+
+    /// The standard derivation for an explicit non-default method.
+    fn custom_output_transform(
+        &self,
+        requested: OutputCatSelection,
+        algorithm: &cat::CatAlgorithm,
+    ) -> Result<OutputTransform, String> {
+        let adaptation =
+            cat::adaptation_matrix(algorithm, cat::ACES_WHITE_XY, self.gamut.white_xy)?;
+        let composed = cat::custom_output_matrix(
+            algorithm,
+            cat::ACES_WHITE_XY,
+            self.gamut.white_xy,
+            &preview::AP1_D60_TO_XYZ_D60,
+            &self.gamut.rgb_to_xyz,
+        )?;
+        Ok(self.output_transform(
+            requested,
+            algorithm,
+            OutputCatRealization::CustomAdaptation,
+            adaptation,
+            composed,
+            format!(
+                "{}; standard derivation at run start: inverse(target RGB->XYZ) x \
+                 CAT(AP1/D60, target white) x AP1->XYZ, full adaptation with whites at Y=1",
+                algorithm.provenance
+            ),
+        ))
+    }
+
+    fn output_transform(
+        &self,
+        requested: OutputCatSelection,
+        algorithm: &cat::CatAlgorithm,
+        realization: OutputCatRealization,
+        cat_matrix: [[f64; 3]; 3],
+        composed_matrix: [[f64; 3]; 3],
+        provenance: String,
+    ) -> OutputTransform {
+        let fingerprint = cat::transform_fingerprint(
+            self.id,
+            algorithm.token,
+            realization.token(),
+            cat::ACES_WHITE_XY,
+            self.gamut.white_xy,
+            &cat_matrix,
+            &composed_matrix,
+        );
+        OutputTransform {
+            profile: self.id,
+            requested,
+            method: algorithm.token,
+            method_name: algorithm.name,
+            realization,
+            source_white_xy: cat::ACES_WHITE_XY,
+            target_white_xy: self.gamut.white_xy,
+            cat_matrix,
+            composed_matrix,
+            provenance,
+            fingerprint,
+        }
+    }
+
+    /// The profile's default (reference) output transform. Used by the
+    /// historical 8-bit reference path and the reference-code tests; the
+    /// production encoder handoff receives the run's resolved transform.
+    pub fn default_output_transform(&self) -> OutputTransform {
+        self.resolve_output_cat(OutputCatSelection::Profile, &cat::CatRegistry::standard())
+            .expect("registered profile must resolve its reference output transform")
+    }
     /// Reference 8-bit quantization of signed FP32 AP1 input. Retained for the
     /// historical golden/reference tests; the product encoder node uses
     /// [`Self::convert_f32_frame_to_yuv10`] exclusively, so there is one
@@ -790,9 +1071,12 @@ impl ColorProfile {
     ///
     /// This is the one quantization boundary for every preset. The transfer
     /// curve, gamut matrix, reference scale and range convention all come from
-    /// this profile; the quantizer below is the only place 10-bit codes appear.
+    /// this profile; the resolved `output` transform supplies the frozen CAT and
+    /// gamut composition chosen for the run. The quantizer below is the only
+    /// place 10-bit codes appear.
     pub fn convert_f32_frame_to_yuv10(
         &self,
+        output: &OutputTransform,
         bytes: &[u8],
         width: usize,
         height: usize,
@@ -800,6 +1084,12 @@ impl ColorProfile {
         range: PreviewRange,
         out: &mut Vec<u16>,
     ) -> Result<[usize; 2], String> {
+        if output.profile != self.id {
+            return Err(format!(
+                "output transform profile {:?} does not match {:?}",
+                output.profile, self.id
+            ));
+        }
         if !reference_gain.is_finite()
             || reference_gain <= 0.0
         {
@@ -814,7 +1104,7 @@ impl ColorProfile {
         }
         let coding = self.ycbcr_coding()?;
         let (kr, kg, kb, div_cb, div_cr) = coding.coefficients();
-        let matrix = self.composed_matrix();
+        let matrix = output.composed_matrix;
         let (low, high) = self.transfer.domain();
         let scale = reference_gain * self.curve_input_scale();
         out.resize(samples, 0);
@@ -874,14 +1164,13 @@ impl ColorProfile {
         ])
     }
 
-    /// Composed AP1/D60 scene-linear -> target linear matrix. The order of the
-    /// matrix products matches `preview::ap1_to_linear_srgb_matrix` exactly so
-    /// the sRGB profile stays bit-identical to the pre-existing path.
+    /// Composed AP1/D60 scene-linear -> target linear matrix for the profile's
+    /// default reference realization. The order of the matrix products matches
+    /// `preview::ap1_to_linear_srgb_matrix` exactly so the sRGB profile stays
+    /// bit-identical to the pre-existing path. Production conversion uses the
+    /// run's resolved [`OutputTransform`], not this convenience accessor.
     pub fn composed_matrix(&self) -> [[f64; 3]; 3] {
-        preview::mat3_mul(
-            &self.gamut.xyz_to_rgb,
-            &preview::mat3_mul(&preview::BRADFORD_D60_TO_D65, &preview::AP1_D60_TO_XYZ_D60),
-        )
+        self.default_output_transform().composed_matrix
     }
 
     pub fn scale_filter_token(&self) -> &'static str {
@@ -970,27 +1259,37 @@ impl ColorProfile {
         )
     }
 
-    /// The complete per-profile colour contract consumed by the encoder/colour node.
-    pub fn contract_json(&self) -> Json {
+    /// The complete per-profile colour contract for one resolved run transform.
+    pub fn contract_json(&self, output: &OutputTransform) -> Json {
+        debug_assert_eq!(output.profile, self.id);
         let (low, high) = self.transfer.domain();
         let mut matrices = vec![
             (
                 "acescg_ap1_d60_to_xyz_d60",
                 preview::matrix_json(&preview::AP1_D60_TO_XYZ_D60),
             ),
+            ("output_cat", preview::matrix_json(&output.cat_matrix)),
             (
-                "bradford_cat_d60_to_d65",
-                preview::matrix_json(&preview::BRADFORD_D60_TO_D65),
-            ),
-            (
-                "xyz_d65_to_target_linear",
+                "xyz_to_target_linear",
                 preview::matrix_json(&self.gamut.xyz_to_rgb),
             ),
             (
                 "composed_ap1_d60_to_target_linear",
-                preview::matrix_json(&self.composed_matrix()),
+                preview::matrix_json(&output.composed_matrix),
             ),
         ];
+        if output.method == cat::BRADFORD.token
+            && output.realization == OutputCatRealization::Reference
+            && output.target_white_xy == D65_WHITE_XY
+        {
+            // Legacy-compatible field with its true old meaning: the published
+            // Bradford D60->D65 constant that the pre-existing profiles apply.
+            // It is never emitted for a different method or a custom derivation.
+            matrices.push((
+                "bradford_cat_d60_to_d65",
+                preview::matrix_json(&output.cat_matrix),
+            ));
+        }
         if self.id == "srgb-preview" {
             // Keep the pre-existing sRGB contract keys available to the encoder
             // readers while the generic per-profile keys above are added.
@@ -1061,6 +1360,33 @@ impl ColorProfile {
                     ("white_xy", pair_json(self.gamut.white_xy)),
                     ("rgb_to_xyz", preview::matrix_json(&self.gamut.rgb_to_xyz)),
                     ("xyz_to_rgb", preview::matrix_json(&self.gamut.xyz_to_rgb)),
+                ]),
+            ),
+            (
+                "output_cat",
+                Json::obj(vec![
+                    ("requested", Json::Str(output.requested.token().into())),
+                    ("method", Json::Str(output.method.into())),
+                    ("algorithm", Json::Str(output.method_name.into())),
+                    ("realization", Json::Str(output.realization.token().into())),
+                    (
+                        "reference",
+                        Json::Bool(output.realization == OutputCatRealization::Reference),
+                    ),
+                    (
+                        "custom_adaptation",
+                        Json::Bool(
+                            output.realization == OutputCatRealization::CustomAdaptation,
+                        ),
+                    ),
+                    (
+                        "direction",
+                        Json::Str("AP1/D60 source white -> target gamut white".into()),
+                    ),
+                    ("source_white_xy", pair_json(output.source_white_xy)),
+                    ("target_white_xy", pair_json(output.target_white_xy)),
+                    ("fingerprint", Json::Str(output.fingerprint.clone())),
+                    ("provenance", Json::Str(output.provenance.clone())),
                 ]),
             ),
             ("matrices", Json::obj(matrices)),
@@ -1267,6 +1593,7 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: "existing display-referred sRGB review delivery uses limited (tv) range",
         ycbcr_reason: "existing sRGB preview conversion uses the BT.709 matrix",
         tag_policy: TagPolicy::SRGB,
+        output_cat: PREVIEW_OUTPUT_CAT,
     },
     ColorProfile {
         id: "sony-slog3-sgamut3",
@@ -1277,6 +1604,7 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
+        output_cat: PREVIEW_OUTPUT_CAT,
     },
     ColorProfile {
         id: "sony-slog3-sgamut3-cine",
@@ -1287,6 +1615,7 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
+        output_cat: PREVIEW_OUTPUT_CAT,
     },
     ColorProfile {
         id: "canon-log2-cinema-gamut",
@@ -1297,6 +1626,7 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
+        output_cat: PREVIEW_OUTPUT_CAT,
     },
     ColorProfile {
         id: "nikon-nlog-bt2020",
@@ -1307,6 +1637,7 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::NIKON_LOG,
+        output_cat: PREVIEW_OUTPUT_CAT,
     },
     ColorProfile {
         id: "dji-dlog-dgamut",
@@ -1317,6 +1648,7 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
+        output_cat: PREVIEW_OUTPUT_CAT,
     },
     ColorProfile {
         id: "canon-log2-cinema-gamut-rev-eng-crm-dev",
@@ -1327,6 +1659,7 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
+        output_cat: PREVIEW_OUTPUT_CAT,
     },
     ColorProfile {
         id: "canon-log3-cinema-gamut-rev-eng-crm-dev",
@@ -1337,6 +1670,7 @@ pub static PROFILES: [ColorProfile; 8] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
+        output_cat: PREVIEW_OUTPUT_CAT,
     },
 ];
 
@@ -1365,7 +1699,7 @@ mod tests {
             "clog2(white paper)"
         );
         assert_ne!(p.transfer, Transfer::CanonLog2);
-        let contract = p.contract_json();
+        let contract = p.contract_json(&p.default_output_transform());
         let input = contract
             .get("input_domain")
             .unwrap()
@@ -1417,7 +1751,7 @@ mod tests {
             let mut out = vec![];
             p.convert_f32_frame(&bytes, 1, 1, 1., &mut out).unwrap();
             assert_eq!(out.len(), 3);
-            let input = p.contract_json();
+            let input = p.contract_json(&p.default_output_transform());
             let input = input
                 .get("input_domain")
                 .unwrap()
@@ -1658,7 +1992,7 @@ mod tests {
                 .collect();
             let mut out = Vec::new();
             let clipped = profile
-                .convert_f32_frame_to_yuv10(&bytes, 1, 1, 1.0, profile.range, &mut out)
+                .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, 1.0, profile.range, &mut out)
                 .unwrap();
             assert_eq!(clipped, [0, 0], "{}", profile.id);
             assert_eq!(out.len(), 3);
@@ -1692,7 +2026,7 @@ mod tests {
                 .collect();
             let mut out = Vec::new();
             profile
-                .convert_f32_frame_to_yuv10(&bytes, 1, 1, 1.0, profile.range, &mut out)
+                .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, 1.0, profile.range, &mut out)
                 .unwrap();
             assert_eq!(out[0], quantize_luma(luma, profile.range), "{}", profile.id);
             assert_eq!(
@@ -1721,7 +2055,7 @@ mod tests {
             .flat_map(f32::to_le_bytes)
             .collect();
         let counts = profile
-            .convert_f32_frame_to_yuv10(&negative, 1, 1, 1.0, profile.range, &mut out)
+            .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &negative, 1, 1, 1.0, profile.range, &mut out)
             .unwrap();
         assert!(counts[0] > 0 && counts[1] == 0);
         assert_eq!(
@@ -1735,7 +2069,7 @@ mod tests {
             .flat_map(f32::to_le_bytes)
             .collect();
         let counts = profile
-            .convert_f32_frame_to_yuv10(&highlight, 1, 1, 1.0, profile.range, &mut out)
+            .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &highlight, 1, 1, 1.0, profile.range, &mut out)
             .unwrap();
         assert!(counts[1] > 0 && counts[0] == 0);
         assert_eq!(
@@ -1747,18 +2081,18 @@ mod tests {
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let bytes: Vec<_> = [bad; 3].into_iter().flat_map(f32::to_le_bytes).collect();
             assert!(profile
-                .convert_f32_frame_to_yuv10(&bytes, 1, 1, 1.0, profile.range, &mut out)
+                .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, 1.0, profile.range, &mut out)
                 .is_err());
         }
         assert!(profile
-            .convert_f32_frame_to_yuv10(&negative[..11], 1, 1, 1.0, profile.range, &mut out)
+            .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &negative[..11], 1, 1, 1.0, profile.range, &mut out)
             .is_err());
         assert!(profile
-            .convert_f32_frame_to_yuv10(&negative, 1, 1, 0.0, profile.range, &mut out)
+            .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &negative, 1, 1, 0.0, profile.range, &mut out)
             .is_err());
-        assert!(lookup("srgb-preview")
-            .unwrap()
-            .convert_f32_frame_to_yuv10(&negative, 1, 1, 2.0, PreviewRange::Tv, &mut out)
+        let srgb = lookup("srgb-preview").unwrap();
+        assert!(srgb
+            .convert_f32_frame_to_yuv10(&srgb.default_output_transform(), &negative, 1, 1, 2.0, PreviewRange::Tv, &mut out)
             .is_ok());
     }
 
@@ -1818,7 +2152,7 @@ mod tests {
     #[test]
     fn contract_json_records_sources_domain_range_and_tag_policy() {
         for profile in &PROFILES {
-            let contract = profile.contract_json();
+            let contract = profile.contract_json(&profile.default_output_transform());
             assert_eq!(
                 contract.get("profile").and_then(|value| value.as_str()),
                 Some(profile.id)
@@ -1901,7 +2235,9 @@ mod tests {
                 );
             }
         }
-        let srgb = lookup("srgb-preview").expect("srgb").contract_json();
+        let srgb = lookup("srgb-preview").expect("srgb");
+        let srgb_contract = srgb.contract_json(&srgb.default_output_transform());
+        let srgb = &srgb_contract;
         let matrices = srgb.get("matrices").expect("matrices");
         for key in [
             "acescg_ap1_d60_to_xyz_d60",
@@ -1940,11 +2276,11 @@ mod delivered_range_tests {
         );
         let mut limited = Vec::new();
         profile
-            .convert_f32_frame_to_yuv10(&bytes, 1, 1, 1.0, PreviewRange::Tv, &mut limited)
+            .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, 1.0, PreviewRange::Tv, &mut limited)
             .unwrap();
         let mut full = Vec::new();
         profile
-            .convert_f32_frame_to_yuv10(&bytes, 1, 1, 1.0, PreviewRange::Pc, &mut full)
+            .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, 1.0, PreviewRange::Pc, &mut full)
             .unwrap();
         // Y=64+876*Y', Cb/Cr=512+896*Cb/Cr for the delivered (limited) range.
         let y = 0.2627 * signal[0] + 0.6780 * signal[1] + 0.0593 * signal[2];
@@ -1986,7 +2322,7 @@ mod camera_recipe_tests {
             for (scene, gain) in [(0.2f32, 1.0), (0.1, 2.0), (0.4, 0.5)] {
                 let bytes: Vec<_> = [scene; 3].into_iter().flat_map(f32::to_le_bytes).collect();
                 let mut out = Vec::new();
-                p.convert_f32_frame_to_yuv10(&bytes, 1, 1, gain, PreviewRange::Pc, &mut out).unwrap();
+                p.convert_f32_frame_to_yuv10(&p.default_output_transform(), &bytes, 1, 1, gain, PreviewRange::Pc, &mut out).unwrap();
                 assert_eq!(out, [code, 512, 512], "{id} scene={scene} gain={gain}");
             }
         }
@@ -1997,12 +2333,522 @@ mod camera_recipe_tests {
         for profile in PROFILES.iter() {
             for gain in [0.5, 1.0, 2.0] {
                 profile.convert_f32_frame(&bytes, 1, 1, gain, &mut Vec::new()).unwrap();
-                profile.convert_f32_frame_to_yuv10(&bytes, 1, 1, gain, PreviewRange::Pc, &mut Vec::new()).unwrap();
+                profile.convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, gain, PreviewRange::Pc, &mut Vec::new()).unwrap();
             }
             for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
                 assert!(profile.convert_f32_frame(&bytes, 1, 1, bad, &mut Vec::new()).is_err());
-                assert!(profile.convert_f32_frame_to_yuv10(&bytes, 1, 1, bad, PreviewRange::Pc, &mut Vec::new()).is_err());
+                assert!(profile.convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, bad, PreviewRange::Pc, &mut Vec::new()).is_err());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod output_cat_tests {
+    use super::*;
+
+    fn assert_close(observed: f64, expected: f64, tolerance: f64, label: &str) {
+        let difference = (observed - expected).abs();
+        assert!(
+            difference <= tolerance || difference <= tolerance * expected.abs(),
+            "{label}: {observed:.17} vs {expected:.17} (abs {difference:e})"
+        );
+    }
+
+    fn assert_matrix_close(
+        observed: [[f64; 3]; 3],
+        expected: [[f64; 3]; 3],
+        tolerance: f64,
+        label: &str,
+    ) {
+        for row in 0..3 {
+            for column in 0..3 {
+                assert_close(
+                    observed[row][column],
+                    expected[row][column],
+                    tolerance,
+                    &format!("{label} [{row}][{column}]"),
+                );
+            }
+        }
+    }
+
+    /// sRGB primaries normalised to the CIE D50 white; an independent fixture
+    /// for a non-D65 target white. Matrix values were derived with exact
+    /// rational arithmetic (cat_oracle.py), not with production code.
+    static D50_TEST_GAMUT: Gamut = Gamut {
+        name: "test fixture: sRGB primaries / CIE D50 white",
+        primaries_xy: [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]],
+        white_xy: [0.3457, 0.3585],
+        rgb_to_xyz: [
+            [0.4851629670705136, 0.348865475850403, 0.13026723350865105],
+            [0.25016215489573357, 0.697730951700806, 0.052106893403460426],
+            [0.022742014081430322, 0.11628849195013434, 0.6860740964788956],
+        ],
+        xyz_to_rgb: [
+            [2.7548396630707845, -1.30678291709768, -0.4238214866262745],
+            [-0.9934670220281292, 1.922851775736947, 0.042593603493674116],
+            [0.07707356924796838, -0.2826030872425507, 1.4643978157113986],
+        ],
+        provenance: "test fixture: published sRGB primaries normalised to CIE D50",
+    };
+
+    /// A pinned, vendor-rounded reference chain: four-decimal values that no
+    /// re-derivation would produce. The resolver must return it verbatim.
+    const PINNED_CHAIN: [[f64; 3]; 3] = [
+        [1.7051, -0.6218, -0.0833],
+        [-0.1303, 1.1408, -0.0105],
+        [-0.0240, -0.1290, 1.1530],
+    ];
+    const PINNED_BRADFORD_D60_D50: [[f64; 3]; 3] = [
+        [1.0342, 0.0168, -0.0375],
+        [0.0217, 0.9922, -0.0127],
+        [-0.0069, 0.0113, 0.8132],
+    ];
+    const PINNED_CAT02_D60_D65: [[f64; 3]; 3] = [
+        [0.9882, -0.0079, 0.0168],
+        [-0.0057, 0.9987, 0.0067],
+        [0.0004, 0.0011, 1.0781],
+    ];
+
+    fn test_profile(
+        id: &'static str,
+        gamut: &'static Gamut,
+        output_cat: OutputCatDefault,
+    ) -> ColorProfile {
+        ColorProfile {
+            id,
+            transfer: Transfer::Srgb,
+            gamut,
+            range: PreviewRange::Tv,
+            ycbcr_matrix: "bt709",
+            range_reason: "test fixture",
+            ycbcr_reason: "test fixture",
+            tag_policy: TagPolicy::SRGB,
+            output_cat,
+        }
+    }
+
+    #[test]
+    fn every_registered_profile_keeps_its_fixed_reference_realization() {
+        let registry = CatRegistry::standard();
+        for profile in PROFILES.iter() {
+            let output = profile
+                .resolve_output_cat(OutputCatSelection::Profile, &registry)
+                .unwrap();
+            assert_eq!(output.method, profile.output_cat.method, "{}", profile.id);
+            assert_eq!(output.realization, OutputCatRealization::Reference);
+            assert_eq!(output.target_white_xy, profile.gamut.white_xy);
+            // The historic composition, expressed with the same constants and
+            // multiplication order, must be reproduced bit-for-bit.
+            let historic = cat::mat3_mul(
+                &profile.gamut.xyz_to_rgb,
+                &cat::mat3_mul(&preview::BRADFORD_D60_TO_D65, &preview::AP1_D60_TO_XYZ_D60),
+            );
+            for row in 0..3 {
+                for column in 0..3 {
+                    assert_eq!(
+                        output.composed_matrix[row][column].to_bits(),
+                        historic[row][column].to_bits(),
+                        "{} composed [{row}][{column}]",
+                        profile.id
+                    );
+                    assert_eq!(
+                        output.cat_matrix[row][column].to_bits(),
+                        preview::BRADFORD_D60_TO_D65[row][column].to_bits(),
+                        "{} cat [{row}][{column}]",
+                        profile.id
+                    );
+                }
+            }
+            // White stays neutral: the eight profiles' default output transform
+            // maps AP1/D60 white to target white.
+            let white = cat::mat3_vec(&output.composed_matrix, [1.0; 3]);
+            for channel in 0..3 {
+                assert_close(white[channel], 1.0, 1e-9, &format!("{} white {channel}", profile.id));
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_same_value_selection_is_idempotent() {
+        let registry = CatRegistry::standard();
+        for profile in PROFILES.iter() {
+            let default = profile
+                .resolve_output_cat(OutputCatSelection::Profile, &registry)
+                .unwrap();
+            let same = profile
+                .resolve_output_cat(
+                    OutputCatSelection::Method(profile.output_cat.method),
+                    &registry,
+                )
+                .unwrap();
+            assert_eq!(same.method, default.method, "{}", profile.id);
+            assert_eq!(same.realization, OutputCatRealization::Reference);
+            assert_eq!(same.fingerprint, default.fingerprint, "{}", profile.id);
+            assert_eq!(same.composed_matrix, default.composed_matrix);
+            assert_eq!(same.cat_matrix, default.cat_matrix);
+        }
+    }
+
+    #[test]
+    fn srgb_reference_and_custom_transforms_match_the_independent_oracle() {
+        // Frozen exact-rational oracle (cat_oracle.py). The reference path keeps
+        // the published 12-decimal Bradford constant; the custom path uses the
+        // standard derivation with the CAT02 cone matrix.
+        let reference_expected = [
+            [1.7050509926055784, -0.6217921204861147, -0.08325887199715537],
+            [-0.1302564174633593, 1.140804736511389, -0.010548319079933866],
+            [-0.024003356819728795, -0.12896897609304023, 1.1529723328565],
+        ];
+        let custom_expected = [
+            [1.7050796435565116, -0.6242334613015463, -0.08084618213163959],
+            [-0.12970053007433263, 1.138468546504952, -0.008768016463546534],
+            [-0.024166344958335986, -0.12461415808102454, 1.1487805029813045],
+        ];
+        let profile = lookup("srgb-preview").unwrap();
+        let registry = CatRegistry::standard();
+        let reference = profile
+            .resolve_output_cat(OutputCatSelection::Profile, &registry)
+            .unwrap();
+        assert_matrix_close(reference.composed_matrix, reference_expected, 1e-10, "srgb reference");
+        // Bit-identical to the pre-existing preview path.
+        let legacy = preview::ap1_to_linear_srgb_matrix();
+        for row in 0..3 {
+            for column in 0..3 {
+                assert_eq!(
+                    reference.composed_matrix[row][column].to_bits(),
+                    legacy[row][column].to_bits(),
+                    "srgb legacy [{row}][{column}]"
+                );
+            }
+        }
+
+        let custom = profile
+            .resolve_output_cat(OutputCatSelection::Method("cat02"), &registry)
+            .unwrap();
+        assert_eq!(custom.realization, OutputCatRealization::CustomAdaptation);
+        assert_eq!(custom.method, "cat02");
+        assert_ne!(custom.fingerprint, reference.fingerprint);
+        assert_matrix_close(custom.composed_matrix, custom_expected, 1e-10, "srgb custom cat02");
+        assert_matrix_close(
+            custom.cat_matrix,
+            [
+                [0.9882325471218135, -0.007885454399865814, 0.016757635451623946],
+                [-0.005693191933411921, 0.9986923398294999, 0.006672372202884866],
+                [0.0003532731423422887, 0.0011239768688093192, 1.0780829488488732],
+            ],
+            1e-10,
+            "srgb custom cat02 adaptation",
+        );
+
+        // Non-neutral, signed and HDR probes; the oracle values are the exact
+        // linear results of the two composed matrices above.
+        for (ap1, reference_linear, custom_linear) in [
+            (
+                [0.4, 0.18, 0.09],
+                [0.5626045168749867, 0.15229293686951223, 0.07095175153244623],
+                [0.5623936779964788, 0.1522550048594391, 0.0712931588303986],
+            ),
+            (
+                [0.05, 0.1, 1.0],
+                [-0.060185534415487914, 0.09701933369803706, 1.1388752674062095],
+                [-0.05801554608396864, 0.09859381168323203, 1.1351107699252854],
+            ),
+            (
+                [-0.02, 0.5, 2.0],
+                [-0.5115148240894796, 0.5519108584450939, 2.2419402448028745],
+                [-0.5079106877851826, 0.5542922509268695, 2.235737253821264],
+            ),
+        ] {
+            let observed = cat::mat3_vec(&reference.composed_matrix, ap1);
+            let observed_custom = cat::mat3_vec(&custom.composed_matrix, ap1);
+            for channel in 0..3 {
+                assert_close(
+                    observed[channel],
+                    reference_linear[channel],
+                    1e-10,
+                    &format!("reference probe {ap1:?} channel {channel}"),
+                );
+                assert_close(
+                    observed_custom[channel],
+                    custom_linear[channel],
+                    1e-10,
+                    &format!("custom probe {ap1:?} channel {channel}"),
+                );
+            }
+        }
+        // White stays neutral through the custom derivation as well.
+        let white = cat::mat3_vec(&custom.composed_matrix, [1.0; 3]);
+        for channel in 0..3 {
+            assert_close(white[channel], 1.0, 1e-9, "custom white");
+        }
+    }
+
+    #[test]
+    fn pixel_conversion_uses_the_resolved_transform_not_a_label() {
+        let profile = lookup("srgb-preview").unwrap();
+        let registry = CatRegistry::standard();
+        // A saturated AP1 green-blue: Bradford and CAT02 differ by ~9 Cb codes,
+        // far above quantization noise.
+        let ap1 = [0.2f32, 0.4, 0.05];
+        let bytes: Vec<_> = ap1.into_iter().flat_map(f32::to_le_bytes).collect();
+        let convert = |output: &OutputTransform| {
+            let mut out = Vec::new();
+            profile
+                .convert_f32_frame_to_yuv10(output, &bytes, 1, 1, 1.0, profile.range, &mut out)
+                .unwrap();
+            out
+        };
+        let default = profile.default_output_transform();
+        let same = profile
+            .resolve_output_cat(OutputCatSelection::Method("bradford"), &registry)
+            .unwrap();
+        let custom = profile
+            .resolve_output_cat(OutputCatSelection::Method("cat02"), &registry)
+            .unwrap();
+        let default_codes = convert(&default);
+        assert_eq!(default_codes, convert(&same), "same-value selection must keep the reference pixels");
+        let custom_codes = convert(&custom);
+        assert_ne!(default_codes, custom_codes, "a different CAT must change pixels");
+        let difference = default_codes
+            .iter()
+            .zip(&custom_codes)
+            .map(|(a, b)| (*a as i32 - *b as i32).abs())
+            .max()
+            .unwrap();
+        assert!(difference >= 5, "expected a decisive pixel change, got {difference} codes: {default_codes:?} vs {custom_codes:?}");
+
+        // A transform resolved for another profile cannot be applied here.
+        let other = lookup("sony-slog3-sgamut3").unwrap().default_output_transform();
+        let mut out = Vec::new();
+        assert!(profile
+            .convert_f32_frame_to_yuv10(&other, &bytes, 1, 1, 1.0, profile.range, &mut out)
+            .is_err());
+    }
+
+    #[test]
+    fn fixed_reference_chain_and_new_cat_registration_are_declaration_only() {
+        // A new profile declares a fixed reference chain. It is returned
+        // verbatim (no re-derivation) and same-value selection keeps it.
+        let pinned = test_profile(
+            "test-pinned-d50",
+            &D50_TEST_GAMUT,
+            OutputCatDefault {
+                method: "bradford",
+                adaptation: PINNED_BRADFORD_D60_D50,
+                composed_override: Some(PINNED_CHAIN),
+                provenance: "test fixture: pinned four-decimal chain",
+            },
+        );
+        let registry = CatRegistry::standard();
+        let reference = pinned
+            .resolve_output_cat(OutputCatSelection::Profile, &registry)
+            .unwrap();
+        assert_eq!(reference.realization, OutputCatRealization::Reference);
+        assert_eq!(reference.target_white_xy, [0.3457, 0.3585]);
+        assert_eq!(reference.composed_matrix, PINNED_CHAIN);
+        assert_eq!(reference.cat_matrix, PINNED_BRADFORD_D60_D50);
+        let same = pinned
+            .resolve_output_cat(OutputCatSelection::Method("bradford"), &registry)
+            .unwrap();
+        assert_eq!(same.composed_matrix, PINNED_CHAIN);
+        assert_eq!(same.fingerprint, reference.fingerprint);
+
+        // A different explicit method uses the standard derivation and respects
+        // the D50 target white (the frozen CAT02 D60->D50 oracle).
+        let custom = pinned
+            .resolve_output_cat(OutputCatSelection::Method("cat02"), &registry)
+            .unwrap();
+        assert_eq!(custom.realization, OutputCatRealization::CustomAdaptation);
+        assert_matrix_close(
+            custom.cat_matrix,
+            [
+                [1.030110927178595, 0.0225701512453698, -0.03925913684386439],
+                [0.016221083785699784, 1.0003478529389636, -0.015662579580460134],
+                [-0.0008625790421145067, -0.002550635686881516, 0.8212294692745158],
+            ],
+            1e-10,
+            "custom CAT02 D60->D50",
+        );
+        assert_ne!(custom.composed_matrix, PINNED_CHAIN);
+
+        // A profile whose default is a pinned CAT02 chain (the shape the DLog2
+        // section will register): `cat02` keeps the reference chain, `bradford`
+        // is custom.
+        let cat02_default = test_profile(
+            "test-pinned-cat02",
+            &SRGB_GAMUT,
+            OutputCatDefault {
+                method: "cat02",
+                adaptation: PINNED_CAT02_D60_D65,
+                composed_override: Some(PINNED_CHAIN),
+                provenance: "test fixture: pinned CAT02 chain",
+            },
+        );
+        let reference = cat02_default
+            .resolve_output_cat(OutputCatSelection::Profile, &registry)
+            .unwrap();
+        assert_eq!(reference.realization, OutputCatRealization::Reference);
+        assert_eq!(reference.composed_matrix, PINNED_CHAIN);
+        let explicit = cat02_default
+            .resolve_output_cat(OutputCatSelection::Method("cat02"), &registry)
+            .unwrap();
+        assert_eq!(explicit.composed_matrix, PINNED_CHAIN);
+        assert_eq!(explicit.fingerprint, reference.fingerprint);
+        assert_eq!(
+            cat02_default
+                .resolve_output_cat(OutputCatSelection::Method("bradford"), &registry)
+                .unwrap()
+                .realization,
+            OutputCatRealization::CustomAdaptation
+        );
+
+        // Adding an algorithm is registration only: no Transfer variant and no
+        // native change. The registered cone matrix drives the derivation.
+        let mut extended = CatRegistry::standard();
+        extended
+            .register(CatAlgorithm {
+                token: "test-diagonal",
+                name: "test diagonal cone",
+                cone_matrix: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                provenance: "test fixture",
+            })
+            .unwrap();
+        let output = pinned
+            .resolve_output_cat(OutputCatSelection::Method("test-diagonal"), &extended)
+            .unwrap();
+        assert_eq!(output.method, "test-diagonal");
+        assert_eq!(output.realization, OutputCatRealization::CustomAdaptation);
+        let algorithm = extended.lookup("test-diagonal").unwrap();
+        let derived = cat::adaptation_matrix(algorithm, cat::ACES_WHITE_XY, [0.3457, 0.3585])
+            .unwrap();
+        assert_eq!(output.cat_matrix, derived);
+        assert_ne!(output.cat_matrix, reference.cat_matrix);
+    }
+
+    #[test]
+    fn contract_reports_the_actual_transform() {
+        let profile = lookup("srgb-preview").unwrap();
+        let registry = CatRegistry::standard();
+        let reference = profile.default_output_transform();
+        let contract = profile.contract_json(&reference);
+        let output_cat = contract.get("output_cat").unwrap();
+        assert_eq!(output_cat.get("requested").and_then(Json::as_str), Some("profile"));
+        assert_eq!(output_cat.get("method").and_then(Json::as_str), Some("bradford"));
+        assert_eq!(
+            output_cat.get("realization").and_then(Json::as_str),
+            Some("reference")
+        );
+        assert_eq!(output_cat.get("reference").and_then(Json::as_bool), Some(true));
+        assert_eq!(
+            output_cat.get("fingerprint").and_then(Json::as_str),
+            Some(reference.fingerprint.as_str())
+        );
+        let matrices = contract.get("matrices").unwrap();
+        assert!(matrices.get("output_cat").is_some());
+        assert!(matrices.get("bradford_cat_d60_to_d65").is_some());
+        assert!(matrices.get("composed_ap1_d60_to_target_linear").is_some());
+
+        let custom = profile
+            .resolve_output_cat(OutputCatSelection::Method("cat02"), &registry)
+            .unwrap();
+        let contract = profile.contract_json(&custom);
+        let output_cat = contract.get("output_cat").unwrap();
+        assert_eq!(output_cat.get("requested").and_then(Json::as_str), Some("cat02"));
+        assert_eq!(output_cat.get("method").and_then(Json::as_str), Some("cat02"));
+        assert_eq!(
+            output_cat.get("realization").and_then(Json::as_str),
+            Some("custom-adaptation")
+        );
+        assert_eq!(
+            output_cat.get("custom_adaptation").and_then(Json::as_bool),
+            Some(true)
+        );
+        assert_ne!(
+            output_cat.get("fingerprint").and_then(Json::as_str),
+            Some(reference.fingerprint.as_str())
+        );
+        let matrices = contract.get("matrices").unwrap();
+        // A non-Bradford realization must not carry the legacy Bradford field.
+        assert!(matrices.get("bradford_cat_d60_to_d65").is_none());
+        assert!(matrices.get("output_cat").is_some());
+    }
+
+    #[test]
+    fn invalid_registrations_and_selections_are_rejected() {
+        let registry = CatRegistry::standard();
+        let broken = test_profile(
+            "test-broken-reference",
+            &SRGB_GAMUT,
+            OutputCatDefault {
+                method: "bradford",
+                adaptation: [
+                    [f64::NAN, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                composed_override: None,
+                provenance: "test fixture",
+            },
+        );
+        assert!(broken
+            .resolve_output_cat(OutputCatSelection::Profile, &registry)
+            .is_err());
+
+        let singular_reference = test_profile(
+            "test-singular-reference",
+            &SRGB_GAMUT,
+            OutputCatDefault {
+                method: "bradford",
+                adaptation: [
+                    [1.0, 1.0, 0.0],
+                    [1.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                composed_override: None,
+                provenance: "test fixture",
+            },
+        );
+        assert!(singular_reference
+            .resolve_output_cat(OutputCatSelection::Profile, &registry)
+            .is_err());
+
+        let unregistered = test_profile(
+            "test-unregistered-default",
+            &SRGB_GAMUT,
+            OutputCatDefault {
+                method: "not-registered",
+                adaptation: PINNED_BRADFORD_D60_D50,
+                composed_override: Some(PINNED_CHAIN),
+                provenance: "test fixture",
+            },
+        );
+        assert!(unregistered
+            .resolve_output_cat(OutputCatSelection::Profile, &registry)
+            .is_err());
+
+        let profile = lookup("srgb-preview").unwrap();
+        assert!(profile
+            .resolve_output_cat(OutputCatSelection::Method("not-registered"), &registry)
+            .is_err());
+        assert!(profile
+            .resolve_output_cat(OutputCatSelection::Method(""), &registry)
+            .is_err());
+
+        // A singular target primaries matrix rejects the custom derivation at
+        // startup instead of producing unbounded coefficients.
+        static SINGULAR_GAMUT: Gamut = Gamut {
+            name: "test singular",
+            primaries_xy: [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]],
+            white_xy: [0.3127, 0.3290],
+            rgb_to_xyz: [[1.0; 3]; 3],
+            xyz_to_rgb: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            provenance: "test fixture",
+        };
+        let singular = test_profile("test-singular", &SINGULAR_GAMUT, PREVIEW_OUTPUT_CAT);
+        assert!(singular
+            .resolve_output_cat(OutputCatSelection::Method("cat02"), &registry)
+            .is_err());
     }
 }

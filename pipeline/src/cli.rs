@@ -43,6 +43,10 @@ OPTIONS:
                                canon-log3-cinema-gamut-rev-eng-crm-dev
                                Canon names: clog2(white paper), clog2(rev-eng crm-dev),
                                clog3 (rev-eng crm-dev)
+    --output-cat <MODE>        profile|bradford|cat02 (default: profile)
+                               profile keeps the selected profile's fixed reference
+                               adaptation; an explicit different method changes the
+                               output pixels and is reported as custom-adaptation
     --camera-color <MODE>      auto|generic|canon-clog3 (default: auto)
     --log-reference-gain <N>   Positive finite output reference gain, all profiles (default: 1)
     --encoder <NAME>           prores_ks | libx264 | ffv1 (default: prores_ks)
@@ -305,6 +309,9 @@ pub struct Options {
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
     pub camera_color: color_profile::CameraColor,
+    /// Frozen output CAT selection/realization resolved at startup; per-pixel
+    /// conversion uses these coefficients.
+    pub output_transform: color_profile::OutputTransform,
     pub log_reference_gain: f64,
     pub preview_profile: &'static color_profile::ColorProfile,
     pub converter: Option<String>,
@@ -337,6 +344,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut ffmpeg = PathBuf::from(DEFAULT_FFMPEG);
     let mut ffprobe = PathBuf::from(DEFAULT_FFPROBE);
     let mut preview_profile = color_profile::default_profile();
+    let mut output_cat: Option<color_profile::OutputCatSelection> = None;
     let mut log_reference_gain: Option<f64> = None;
     let mut camera_color = None;
     let mut converter: Option<String> = None;
@@ -420,6 +428,33 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                         ),
                     )
                 })?;
+            }
+            "--output-cat" => {
+                if output_cat.is_some() {
+                    return Err(Error::new(EXIT_USAGE, "duplicate --output-cat"));
+                }
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                output_cat = Some(match value.as_str() {
+                    "profile" => color_profile::OutputCatSelection::Profile,
+                    other => {
+                        let registry = color_profile::CatRegistry::standard();
+                        registry
+                            .lookup(other)
+                            .map(|algorithm| {
+                                color_profile::OutputCatSelection::Method(algorithm.token)
+                            })
+                            .ok_or_else(|| {
+                                Error::new(
+                                    EXIT_USAGE,
+                                    format!(
+                                        "invalid --output-cat {value:?}: expected profile or one \
+                                         of {}",
+                                        registry.tokens()
+                                    ),
+                                )
+                            })?
+                    }
+                });
             }
             "--camera-color" => {
                 if camera_color.is_some() { return Err(Error::new(EXIT_USAGE, "duplicate --camera-color")); }
@@ -661,6 +696,11 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 .map_err(|message| Error::new(EXIT_USAGE, message))?,
         );
     }
+    let output_cat = output_cat.unwrap_or(color_profile::OutputCatSelection::Profile);
+    // Resolve, validate and compose the output CAT once, before any RAW work.
+    let output_transform = preview_profile
+        .resolve_output_cat(output_cat, &color_profile::CatRegistry::standard())
+        .map_err(|message| Error::new(EXIT_USAGE, message))?;
     Ok(Parsed::Run(Options {
         graph,
         input,
@@ -673,6 +713,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         ffmpeg,
         ffprobe,
         preview_profile,
+        output_transform,
         camera_color: camera_color.unwrap_or(color_profile::CameraColor::Auto),
         log_reference_gain: log_reference_gain.unwrap_or(1.0),
         converter,
@@ -1269,6 +1310,85 @@ mod tests {
         let error = parse_run(&["--input", "in", "--output", "out.mov", "--preview-profile="])
             .expect_err("empty inline value");
         assert_eq!(error.code, EXIT_USAGE);
+    }
+
+    #[test]
+    fn parses_output_cat_default_same_value_and_override() {
+        let default = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");
+        assert_eq!(default.output_transform.requested.token(), "profile");
+        assert_eq!(
+            default.output_transform.realization,
+            color_profile::OutputCatRealization::Reference
+        );
+        assert_eq!(default.output_transform.method, "bradford");
+
+        let same = parse_run(&[
+            "--input", "in", "--output", "out.mov", "--output-cat", "bradford",
+        ])
+        .expect("parse");
+        assert_eq!(same.output_transform.requested.token(), "bradford");
+        assert_eq!(
+            same.output_transform.realization,
+            color_profile::OutputCatRealization::Reference
+        );
+        assert_eq!(
+            same.output_transform.fingerprint,
+            default.output_transform.fingerprint,
+            "an explicit same-value selection must keep the fixed reference realization"
+        );
+        assert_eq!(
+            same.output_transform.composed_matrix,
+            default.output_transform.composed_matrix
+        );
+
+        let custom = parse_run(&[
+            "--input", "in", "--output", "out.mov",
+            "--preview-profile", "nikon-nlog-bt2020", "--output-cat", "cat02",
+        ])
+        .expect("parse");
+        assert_eq!(custom.output_transform.requested.token(), "cat02");
+        assert_eq!(custom.output_transform.method, "cat02");
+        assert_eq!(
+            custom.output_transform.realization,
+            color_profile::OutputCatRealization::CustomAdaptation
+        );
+        assert_ne!(
+            custom.output_transform.fingerprint,
+            custom.preview_profile.default_output_transform().fingerprint
+        );
+        // Flag order does not matter: the profile is resolved after parsing.
+        let reversed = parse_run(&[
+            "--input", "in", "--output", "out.mov",
+            "--output-cat", "cat02", "--preview-profile", "nikon-nlog-bt2020",
+        ])
+        .expect("parse");
+        assert_eq!(
+            reversed.output_transform.composed_matrix,
+            custom.output_transform.composed_matrix
+        );
+        assert_eq!(reversed.output_transform.target_white_xy, [0.3127, 0.3290]);
+    }
+
+    #[test]
+    fn rejects_invalid_output_cat_values_and_duplicates() {
+        for value in ["", "rec2020", "Profile", "profile ", "bradford-cat", "CAT02"] {
+            let args = [
+                "--input", "in", "--output", "out.mov", "--output-cat", value,
+            ];
+            let error = parse_run(&args).expect_err("must reject");
+            assert_eq!(error.code, EXIT_USAGE, "{value:?}");
+            assert!(error.message.contains("--output-cat"), "{}", error.message);
+        }
+        let error = parse_run(&["--input", "in", "--output", "out.mov", "--output-cat"])
+            .expect_err("missing value");
+        assert!(error.message.contains("missing value"));
+        let error = parse_run(&[
+            "--input", "in", "--output", "out.mov",
+            "--output-cat", "profile", "--output-cat", "profile",
+        ])
+        .expect_err("duplicate");
+        assert_eq!(error.code, EXIT_USAGE);
+        assert!(error.message.contains("duplicate --output-cat"));
     }
 
     #[test]
