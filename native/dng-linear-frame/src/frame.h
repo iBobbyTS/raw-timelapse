@@ -1,6 +1,8 @@
 #pragma once
 #include "json.h"
 #include "highlight.h"
+#include "lens.h"
+#include "lens_metadata.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -51,9 +53,11 @@ struct Decoded {
   // Calibrated, unexposed AP1 samples when a profile HueSatMap is present.
   // Keep camera separately for the sensor-domain saturation mask.
   std::vector<float> calibrated_scene;
-  // Separate delivery camera buffer; measurement always keeps camera observations.
-  std::vector<float> recovered_camera;
+  // Owned camera-linear delivery chain. Colour consumers do not know which
+  // upstream image modules ran; measurement always retains camera observations.
+  std::vector<float> delivery_camera;
   Json highlight_recovery = Json{{"requested", false}, {"status", "off"}, {"revision", 1}};
+  Json lens_correction;
   Vec as_shot{}, applied{};
   Mat camera_to_d50{}, camera_to_ap1{};
   Json color, semantics;
@@ -71,7 +75,8 @@ struct CameraRecipe {
   bool highlight_recovery = false;
 };
 Decoded decode(const fs::path &, const std::optional<Vec> &,
-               CameraRecipe = CameraRecipe{}, void (*cancel)() = nullptr);
+               CameraRecipe = CameraRecipe{}, void (*cancel)() = nullptr,
+               lens::Request lens_request = {});
 double canon_normal_white_gain(double maximum, double black, double white,
                                double dng_white, double dng_black);
 void calibrate_canon_cr3(const fs::path &, Decoded &);
@@ -80,7 +85,7 @@ struct ProcessResult {
   bool timed_out;
 };
 ProcessResult run_process(const std::vector<std::string> &, const fs::path &log,
-                          int timeout_seconds);
+                          int timeout_seconds, std::optional<fs::path> stdout_path = std::nullopt);
 // One verified output plus a reference to its shared invocation record.
 struct ConversionInfo {
   bool used = false;
@@ -127,6 +132,7 @@ struct PreparedFrame {
   ConversionInfo conversion;    // provenance copied into frame metadata
   std::optional<std::string> capture_time;
   Vec own{};                    // original/as-shot camera neutral
+  lens::Calibration lens_calibration; // frozen Prepare -> Develop contract
 };
 const char *route_name(Route);
 // Routing + optional Converter step + identity metadata. Performs no SDK
@@ -135,14 +141,14 @@ const char *route_name(Route);
 // provenance cleanup wording.
 PreparedFrame prepare_frame(const fs::path &source, const fs::path &scratch,
                             const std::string &converter, int timeout_seconds,
-                            bool temporary);
+                            bool temporary, const lens::PrepareOptions &lens_options = {});
 // Batch and single-frame commands use this same routing/conversion core.
 std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
                             const fs::path &scratch, const std::string &converter,
-                            int timeout_seconds, bool temporary);
+                            int timeout_seconds, bool temporary, const lens::PrepareOptions &lens_options = {});
 void prepare_batch(const fs::path &request, const fs::path &scratch,
                    const fs::path &result, const std::string &converter,
-                   int timeout_seconds);
+                   int timeout_seconds, const lens::PrepareOptions &lens_options = {});
 // Deterministic versioned context document (not the metadata sidecar).
 void write_prepared(const PreparedFrame &, const fs::path &context_path);
 // Strictly parses the context and revalidates every original/prepared identity:
@@ -152,7 +158,7 @@ PreparedFrame read_prepared(const fs::path &context_path);
 // SDK decode of the prepared artifact, then the unchanged fixed Canon CR3
 // calibration when requested. Never invokes the Converter or deletes a file.
 Decoded decode_prepared(const PreparedFrame &, const std::optional<Vec> &wb,
-                        CameraRecipe recipe);
+                        CameraRecipe recipe, bool lens_enabled = false);
 std::string sha256(const fs::path &);
 void write_png(const fs::path &, uint32_t, uint32_t,
                const std::vector<uint16_t> &);

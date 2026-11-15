@@ -12,6 +12,7 @@ mod error;
 mod frame;
 mod graph_run;
 mod guard;
+mod lens;
 mod order;
 mod proc;
 mod resample;

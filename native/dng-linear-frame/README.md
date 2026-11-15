@@ -4,7 +4,7 @@ C++20 single-frame producer for S01 / T08 (T06/T07/T09 semantics). macOS only.
 
 ## Build
 
-Requires CMake ≥3.24, Apple clang, libpng, libjpeg, zlib and libjxl (including
+Requires CMake ≥3.24, Apple clang, LibXml2, libpng, libjpeg, zlib and libjxl (including
 `libjxl_threads`). The Adobe SDK and XMP core are compiled from the supplied
 sources; libjpeg/libjxl/libpng are linked from the local dependency installation.
 No Python is used by the tool. Python 3 is used only by tests and setup examples.
@@ -44,6 +44,18 @@ reusing an older build directory, clear its cached PNG/JPEG include selections
 or configure a new build directory.
 XMP core is required by the SDK's unguarded JXL code; file scanning and document
 operations are disabled. VC5 support is disabled. No SDK sources are patched.
+
+## Lens correction
+
+The product enables independent camera-linear lens correction with `--lens-correction auto`.
+Standalone native diagnostics default to `off`; `off` cannot undo Converter/SDK processing.
+Prepare collects original calibration, per-component upstream state and frozen installed
+LCP parameters using read-only ExifTool (`--exiftool /absolute/executable`, default
+`/opt/homebrew/bin/exiftool`). Repeatable `--lens-profile-dir /absolute/directory`
+replaces the default installed Adobe roots. ExifTool is required only for Prepare auto;
+Develop consumes the versioned calibration from its prepared context and does not
+discover profiles or start metadata tools. `--stdout-analysis` never applies new correction.
+See [module contract, model support and limits](../../docs/lens-correction.md).
 
 ## Interface for the sequence consumer
 

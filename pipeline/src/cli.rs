@@ -60,6 +60,9 @@ OPTIONS:
     --output-option <K=V>      Repeatable bounded encoder option, e.g. -preset=medium
                                allowed: -preset -tune -vendor -threads -g -bf -level
     --resize <WxH>             Explicit scene-linear resize; omit to keep source geometry
+    --lens-correction <MODE>   auto | off (default: auto; cannot undo upstream correction)
+    --exiftool <PATH>          Read-only Prepare metadata tool (default: /opt/homebrew/bin/exiftool)
+    --lens-profile-dir <DIR>   Installed LCP root, repeatable; replaces default Adobe roots
     --converter <PATH>         Adobe DNG Converter override passed to the native tool
     --converter-timeout <SEC>  Total timeout per ADC call, including batches (1-3600 seconds)
     --verify-output           Verify the encoded output in full after encoding: frame-count
@@ -317,6 +320,7 @@ pub struct Options {
     pub preview_profile: &'static color_profile::ColorProfile,
     pub converter: Option<String>,
     pub converter_timeout: Option<u64>,
+    pub lens: crate::lens::Settings,
     pub deflicker: DeflickerConfig,
     /// Explicit CLI encoder layer; empty when no encoder flag was given.
     pub encoder: Patch,
@@ -350,6 +354,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut camera_color = None;
     let mut converter: Option<String> = None;
     let mut converter_timeout: Option<u64> = None;
+    let mut lens = crate::lens::Settings { mode: crate::lens::Mode::Auto, ..Default::default() };
     let mut deflicker = DeflickerConfig::default();
     let mut encoder = Patch::default();
     let mut output_options: Vec<String> = Vec::new();
@@ -487,6 +492,18 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                     flag,
                     inline_value,
                 )?))
+            }
+            "--lens-correction" => {
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                lens.mode = match value.as_str() {
+                    "auto" => crate::lens::Mode::Auto, "off" => crate::lens::Mode::Off,
+                    _ => return Err(Error::new(EXIT_USAGE, "--lens-correction expects auto or off")),
+                };
+            }
+            "--exiftool" | "--lens-profile-dir" => {
+                let value = PathBuf::from(take_value(args, &mut index, flag, inline_value)?);
+                if !value.is_absolute() { return Err(Error::new(EXIT_USAGE, format!("{flag} requires an absolute path"))); }
+                if flag == "--exiftool" { lens.exiftool = value; } else { lens.profile_roots.push(value); }
             }
             "--converter" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
@@ -719,6 +736,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         log_reference_gain: log_reference_gain.unwrap_or(1.0),
         converter,
         converter_timeout,
+        lens,
         deflicker,
         encoder,
         resize,

@@ -83,6 +83,7 @@ struct Options {
     correction: String,
     calibration: String,
     highlight_recovery: bool,
+    lens_auto: bool,
     /// Prepared-context path for a --prepared consumer invocation.
     prepared: Option<PathBuf>,
     /// --prepare operation inputs.
@@ -297,6 +298,11 @@ fn run() -> Result<(), (i32, String)> {
         _ => recovery,
     };
     metadata.insert_str(1, &recovery);
+    let lens_requested = options.lens_auto && is_f32;
+    let lens_status = if lens_requested { "no-usable-model" } else { "off" };
+    let lens_components: Vec<_> = ["vignette", "distortion", "ca"].iter().map(|name| format!(r#"{{"component":"{name}","status":"{lens_status}"}}"#)).collect();
+    let lens = format!(r#""lens_correction":{{"revision":1,"requested":{lens_requested},"collected":true,"upstream_reversible":false,"components":[{}]}},"#, lens_components.join(","));
+    metadata.insert_str(1, &lens);
     let mut metadata = metadata;
     {
         let defect = config.rev_defect.as_deref();
@@ -730,7 +736,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
                     emit = Some(PathBuf::from(value(&args, &mut index)?));
                     index += 1;
                 }
-                "--converter" | "--converter-timeout" => {
+                "--converter" | "--converter-timeout" | "--lens-correction" | "--exiftool" | "--lens-profile-dir" => {
                     let _ = value(&args, &mut index)?;
                     index += 1;
                 }
@@ -750,6 +756,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
             camera_method: "legacy-inverse-cm".to_string(),
             recipe: "legacy-test".into(), correction: "none".into(), calibration: "none".into(),
             highlight_recovery: false,
+            lens_auto: false,
             prepared: None,
             prepare: Some(PrepareArgs {
                 scratch: scratch.ok_or((2, "--prepare requires --scratch".to_string()))?,
@@ -792,6 +799,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
     let mut correction = "none".to_string();
     let mut calibration = "none".to_string();
     let mut highlight_recovery = false;
+    let mut lens_auto = false;
     let mut white_balance = None;
     let mut exposure_ev = 0.0;
     let mut emit_analysis = None;
@@ -804,6 +812,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
             "--profile-correction" => { correction = value(&args, &mut index)?; index += 1; }
             "--camera-calibration" => { calibration = value(&args, &mut index)?; index += 1; }
             "--highlight-recovery" => { highlight_recovery = value(&args, &mut index)? == "on"; index += 1; }
+            "--lens-correction" => { lens_auto = value(&args, &mut index)? == "auto"; index += 1; }
             "--color-contract-version" => { let v = value(&args, &mut index)?; if v != "2" { return Err((2,"contract version".into())); } index += 1; }
             "--camera-color-method" => {
                 camera_method = value(&args, &mut index)?;
@@ -861,7 +870,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
         analysis_roi,
         no_png,
         stdout_mode,
-        camera_method, recipe, correction, calibration, highlight_recovery,
+        camera_method, recipe, correction, calibration, highlight_recovery, lens_auto,
         prepared,
         prepare: None,
     })

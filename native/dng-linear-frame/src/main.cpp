@@ -186,7 +186,7 @@ FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
     gained_scene.resize(d.camera.size());
   double low = INFINITY, high = -INFINITY;
   size_t negatives = 0, upper = 0;
-  const auto &camera_pixels = d.recovered_camera.empty() ? d.camera : d.recovered_camera;
+  const auto &camera_pixels = d.delivery_camera.empty() ? d.camera : d.delivery_camera;
   for (size_t i = 0; i < d.camera.size(); i += 3) {
     Vec camera{camera_pixels[i], camera_pixels[i + 1], camera_pixels[i + 2]};
     Vec scene = d.calibrated_scene.empty()
@@ -249,6 +249,7 @@ FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
         v.text += ",\"exposure_calibration\":" + d.exposure_calibration.text + "}"; return v; }()},
       {"decode_semantics", d.semantics},
       {"highlight_recovery", d.highlight_recovery},
+      {"lens_correction", d.lens_correction},
       {"observed_scene_min", low},
       {"observed_scene_max", high},
       {"quantization",
@@ -300,6 +301,7 @@ int main(int argc, char **argv) {
       fs::path input = argv[2];
       fs::path scratch, context;
       bool scratch_set = false, context_set = false;
+      lens::PrepareOptions lens_options;
       std::string converter = default_converter;
       int timeout = 120;
       for (int i = 3; i < argc; ++i) {
@@ -313,7 +315,12 @@ int main(int argc, char **argv) {
         } else if (a == (batch_mode ? "--emit-result" : "--emit-prepared")) {
           context = value;
           context_set = true;
-        } else if (a == "--converter")
+        } else if (a == "--lens-correction") {
+          if (value != "auto" && value != "off") throw Error(2, "lens correction expects auto or off");
+          lens_options.collect = value == "auto";
+        } else if (a == "--exiftool") lens_options.exiftool = value;
+        else if (a == "--lens-profile-dir") lens_options.profile_roots.emplace_back(value);
+        else if (a == "--converter")
           converter = value;
         else if (a == "--converter-timeout") {
           size_t end = 0;
@@ -332,11 +339,11 @@ int main(int argc, char **argv) {
       if (!context_set)
         throw Error(2, mode + (batch_mode ? " requires --emit-result" : " requires --emit-prepared"));
       if (batch_mode) {
-        prepare_batch(input, scratch, context, converter, timeout);
+        prepare_batch(input, scratch, context, converter, timeout, lens_options);
         return 0;
       }
       PreparedFrame prepared =
-          prepare_frame(input, scratch, converter, timeout, false);
+          prepare_frame(input, scratch, converter, timeout, false, lens_options);
       check_cancelled();
       write_prepared(prepared, context);
       std::cerr << "prepared " << prepared.source << " -> "
@@ -477,6 +484,8 @@ int main(int argc, char **argv) {
     const bool want_analysis = mode == "--stdout-analysis";
     const bool f32 = mode == "--stdout-frame-f32";
     CameraRecipe recipe;
+    lens::PrepareOptions lens_options;
+    bool lens_enabled = false;
     if (argc < 3)
       throw Error(2, "option value missing");
     const bool prepared_mode = std::string(argv[2]) == "--prepared";
@@ -520,6 +529,13 @@ int main(int argc, char **argv) {
           recipe.method = CameraColorMethod::legacy_inverse_cm;
         else
           throw Error(2, "unknown camera color method");
+      } else if (a == "--lens-correction") {
+        if (value != "auto" && value != "off") throw Error(2, "lens correction expects auto or off");
+        lens_enabled = value == "auto"; lens_options.collect = lens_enabled;
+      } else if (a == "--exiftool" || a == "--lens-profile-dir") {
+        if (prepared_mode) throw Error(2, a + " belongs to Prepare, not Develop");
+        if (a == "--exiftool") lens_options.exiftool = value;
+        else lens_options.profile_roots.emplace_back(value);
       } else if (a == "--highlight-recovery") {
         if (value != "on" && value != "off") throw Error(2, "highlight recovery expects on or off");
         recipe.highlight_recovery = value == "on";
@@ -564,7 +580,7 @@ int main(int argc, char **argv) {
         (recipe.name != "generic" && recipe.name != "canon-clog3" && recipe.name != "legacy-test"))
       throw Error(2, "inconsistent camera recipe policies");
     // Measurement never consumes invented radiance, regardless of delivery policy.
-    if (want_analysis) recipe.highlight_recovery = false;
+    if (want_analysis) { recipe.highlight_recovery = false; lens_enabled = false; }
     // A closed consumer pipe must surface as a write error, not a SIGPIPE
     // death: no record, artifact or success claim is published.
     std::signal(SIGPIPE, SIG_IGN);
@@ -574,9 +590,9 @@ int main(int argc, char **argv) {
       prepared = read_prepared(context);
     } else {
       temp.emplace();
-      prepared = prepare_frame(input, temp->path, converter, timeout, true);
+      prepared = prepare_frame(input, temp->path, converter, timeout, true, lens_options);
     }
-    Decoded decoded = decode_prepared(prepared, wb, recipe);
+    Decoded decoded = decode_prepared(prepared, wb, recipe, lens_enabled);
     FrameOutput frame =
         render(prepared, decoded, std::optional<fs::path>(), roi, exposure_ev,
                want_analysis, !want_analysis, f32, prepared_mode,

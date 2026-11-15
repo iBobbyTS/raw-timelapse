@@ -79,6 +79,22 @@ Defaults:
   10-bit and no lossless claim is made. `--resize` is the only scaling stage and
   runs in the scene-linear FP32 domain.
 
+## Lens correction
+
+`--lens-correction auto|off` defaults to `auto`. Prepare freezes original calibration,
+Converter component state and installed LCP parameters; Develop applies only missing
+components through an independent camera-linear module. Supported embedded models
+win over LCP even when identity; already-applied components are never stacked.
+`off` disables only the new module, not corrections baked upstream.
+
+Prepare auto requires ExifTool (default `/opt/homebrew/bin/exiftool`, override with
+`--exiftool /absolute/executable`). Repeatable `--lens-profile-dir /absolute/directory`
+replaces default Adobe profile roots. The product still has no Python dependency.
+Each developed frame records `kind=lens` with per-component decisions and fingerprints.
+Output dimensions remain fixed; samples outside the source are black, with no hidden
+auto-crop. Missing/unsupported/ambiguous calibration is reported, not called success.
+See [architecture, model coverage and limits](../docs/lens-correction.md).
+
 ## RAW highlight recovery
 
 Product development enables camera-domain highlight reconstruction before color

@@ -60,7 +60,7 @@ source -> convert-cache --prepared references--------------------+
   全批成功后按源序发布轻量引用；下一批转换可与上一批测量重叠。
 - `measure-solve`：可并发逐帧测量（0 EV），按序提交并在完整封口后仅求解一次有限 EV 表。
   `--strength 0` 时该节点替换为 `zero`，不执行测量。
-- `apply-ev`：按帧读取 EV，二次 develop，EV 恰好应用一次，返回自有 FP32 像素。
+- `apply-ev`：按帧读取 EV，二次 develop，EV 恰好应用一次，返回自有 FP32 像素。Develop 内部的[独立镜头校正模块](lens-correction.md)只消费 Prepare 冻结的分项校准，不重新读取 RAW 元数据或查找 LCP，不与高光/颜色配方互相耦合。
 - `color`：唯一的 10-bit 4:4:4 量化/编码交接点。
 - `encode`：FFmpeg 流式 sink；第一帧时启动，序列结束时关闭并校验。
 - `delete-cache`：等待对应帧的 `apply-ev` 完成事件，只删除本 run 生成的缓存 DNG；

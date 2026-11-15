@@ -352,9 +352,10 @@ Json ConversionInfo::record() const {
 
 std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
                             const fs::path &scratch_in, const std::string &converter,
-                            int timeout, bool temporary) {
+                            int timeout, bool temporary, const lens::PrepareOptions &lens_options) {
   auto started = std::chrono::steady_clock::now();
   if (sources.empty() || sources.size() > 64) throw Error(26, "batch count must be 1..64");
+  lens::validate_prepare_options(lens_options);
   auto scratch = canonical_existing(scratch_in, "scratch directory");
   if (!fs::is_directory(scratch)) throw Error(26, "prepare scratch is not a directory");
   std::vector<PreparedFrame> frames;
@@ -421,6 +422,13 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
     out.main_ifd_height = check->height;
     out.capture_time = read_capture_time(out.kind == Route::vendor_raw ? out.prepared_dng : out.source);
   }
+  std::vector<lens::SourcePair> lens_sources;
+  for (const auto &f : frames) lens_sources.push_back({f.source, f.prepared_dng, f.generated, f.main_ifd_width, f.main_ifd_height});
+  try {
+    auto calibration = lens::collect(lens_sources, scratch, lens_options);
+    for (size_t i = 0; i < frames.size(); ++i) frames[i].lens_calibration = std::move(calibration[i]);
+  } catch (const Error &) { throw; }
+  catch (const std::exception &e) { throw Error(26, std::string("lens calibration acquisition failed: ") + e.what()); }
   auto end = std::chrono::steady_clock::now();
   auto seconds = [](auto a, auto b) { return std::chrono::duration<double>(b-a).count(); };
   std::cerr << "prepare batch count=" << frames.size() << " adc_calls=" << groups.size()
@@ -430,12 +438,12 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
   return frames;
 }
 PreparedFrame prepare_frame(const fs::path &source, const fs::path &scratch,
-                            const std::string &converter, int timeout, bool temporary) {
-  return prepare_frames({source}, scratch, converter, timeout, temporary).front();
+                            const std::string &converter, int timeout, bool temporary, const lens::PrepareOptions &lens_options) {
+  return prepare_frames({source}, scratch, converter, timeout, temporary, lens_options).front();
 }
 
 void prepare_batch(const fs::path &request, const fs::path &scratch_in,
-                   const fs::path &result_in, const std::string &converter, int timeout) {
+                   const fs::path &result_in, const std::string &converter, int timeout, const lens::PrepareOptions &lens_options) {
   auto started = std::chrono::steady_clock::now();
   auto scratch = canonical_existing(scratch_in, "batch scratch");
   auto doc = parse_context(read_bounded(request,kDocumentLimit), "rawtl-prepare-request/1", kDocumentLimit);
@@ -451,7 +459,7 @@ void prepare_batch(const fs::path &request, const fs::path &scratch_in,
     if (relative.empty() || *relative.begin() == ".." || resolved == scratch)
       throw Error(26, "batch outputs must be inside scratch");
     auto first = relative.begin()->string();
-    if (first == "linear" || first.starts_with("linear-") || first.starts_with("conversion-"))
+    if (first == "lens" || first == "linear" || first.starts_with("linear-") || first.starts_with("conversion-"))
       throw Error(26, "batch output overlaps reserved conversion scratch");
     if (!targets.insert(resolved.string()).second || fs::exists(resolved))
       throw Error(26, "batch output target already exists or is duplicated: " + resolved.string());
@@ -473,7 +481,7 @@ void prepare_batch(const fs::path &request, const fs::path &scratch_in,
       throw Error(26, "batch output/request must be distinct from source");
   for (const auto &path : contexts)
     if (fs::weakly_canonical(request) == path) throw Error(26, "batch context must differ from request");
-  auto frames = prepare_frames(sources,scratch,converter,timeout,false);
+  auto frames = prepare_frames(sources,scratch,converter,timeout,false,lens_options);
   std::ostringstream out;
   out << "rawtl-prepare-result/1\ncount=" << count << '\n';
   for (size_t i = 0; i < count; ++i) {
@@ -531,6 +539,7 @@ void write_prepared(const PreparedFrame &prepared,
     field(out, "converter_photometric", std::to_string(conversion.photometric));
     field(out, "converter_cleanup", conversion.cleanup);
   }
+  if (prepared.lens_calibration.collected) field(out, "lens_calibration", lens::serialize(prepared.lens_calibration));
   atomic_document(context_path, out.str(), kContextLimit);
 }
 
@@ -603,6 +612,11 @@ PreparedFrame read_prepared(const fs::path &context_path) {
     if (conversion.photometric != 34892) throw Error(26, "prepared context converter output is not LinearRaw");
     // Association is checked after the prepared artifact's own structural checks.
   }
+  if (context.has("lens_calibration")) {
+    allowed.insert("lens_calibration");
+    try { out.lens_calibration = lens::deserialize(context.at("lens_calibration")); }
+    catch (const std::exception &e) { throw Error(26, std::string("invalid prepared lens calibration: ") + e.what()); }
+  }
   context.require_only(allowed);
 
   if (!fs::path(context.at("source")).is_absolute() ||
@@ -658,9 +672,10 @@ PreparedFrame read_prepared(const fs::path &context_path) {
 
 Decoded decode_prepared(const PreparedFrame &prepared,
                         const std::optional<Vec> &wb,
-                        CameraRecipe recipe) {
+                        CameraRecipe recipe, bool lens_enabled) {
+  if (lens_enabled && !prepared.lens_calibration.collected) throw Error(26, "lens auto requires a context prepared with lens metadata collection");
   Decoded decoded = decode(prepared.prepared_dng,
-                           wb ? wb : std::optional<Vec>(prepared.own), recipe, check_cancelled);
+                           wb ? wb : std::optional<Vec>(prepared.own), recipe, check_cancelled, {&prepared.lens_calibration, lens_enabled});
   if (recipe.calibration == CameraCalibration::canon_normal_white_fixed_v1) {
     if (prepared.kind != Route::vendor_raw) throw Error(40, "Canon calibration requires original Canon CR3");
     calibrate_canon_cr3(prepared.source, decoded);

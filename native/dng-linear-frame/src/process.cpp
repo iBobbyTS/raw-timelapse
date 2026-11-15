@@ -158,7 +158,7 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
   return outputs;
 }
 ProcessResult run_process(const std::vector<std::string> &args,
-                          const fs::path &log, int timeout) {
+                          const fs::path &log, int timeout, std::optional<fs::path> stdout_path) {
   check_cancelled();
   std::vector<char *> argv;
   for (auto &a : args)
@@ -166,9 +166,12 @@ ProcessResult run_process(const std::vector<std::string> &args,
   argv.push_back(nullptr);
   posix_spawn_file_actions_t actions;
   posix_spawn_file_actions_init(&actions);
-  posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, log.c_str(),
+  posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, stdout_path.value_or(log).c_str(),
                                    O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+  if (stdout_path)
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  else
+    posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
   posix_spawnattr_t attr;
   posix_spawnattr_init(&attr);
   posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
@@ -178,7 +181,7 @@ ProcessResult run_process(const std::vector<std::string> &args,
   posix_spawnattr_destroy(&attr);
   posix_spawn_file_actions_destroy(&actions);
   if (err)
-    throw Error(24, "cannot spawn Converter: " + std::to_string(err));
+    throw Error(24, "cannot spawn child " + args.front() + ": " + std::to_string(err));
   auto start = std::chrono::steady_clock::now();
   bool expired = false, reaped = false;
   int status = 0;

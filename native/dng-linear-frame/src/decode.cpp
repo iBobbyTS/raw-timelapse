@@ -105,7 +105,7 @@ Json calibrate_profile(Decoded &d, const dng_camera_profile &profile,
   std::array<double, chunk> scale{};
   std::array<bool, chunk> bypass{};
   size_t bypassed = 0;
-  const auto &camera_pixels = d.recovered_camera.empty() ? d.camera : d.recovered_camera;
+  const auto &camera_pixels = d.delivery_camera.empty() ? d.camera : d.delivery_camera;
   d.calibrated_scene.resize(d.camera.size());
   for (size_t start = 0; start < d.camera.size() / 3; start += chunk) {
     size_t count = std::min(chunk, d.camera.size() / 3 - start);
@@ -170,7 +170,7 @@ Json optional_matrix(const dng_matrix &m) {
   return m.NotEmpty() ? matrix(mat(m)) : Json();
 }
 } // namespace
-Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe recipe, void (*cancel)()) {
+Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe recipe, void (*cancel)(), lens::Request lens_request) {
   auto routing = inspect(path);
   if (!routing || route(routing->photometric) != Route::direct)
     throw Error(23, "CFA cannot enter SDK");
@@ -248,6 +248,9 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe 
     // Capture endpoint-changing operations in that exact interval.
     const bool highlight_endpoints_supported = ifd.fSampleFormat[0] == 1 &&
         n->OpcodeList2().Count() == 0 && n->OpcodeList3().Count() == 0;
+    lens::Calibration lens_calibration = lens_request.calibration ? *lens_request.calibration : lens::Calibration{};
+    if (n->OpcodeList1().Count() || n->OpcodeList2().Count() || n->OpcodeList3().Count())
+      for (auto &state : lens_calibration.upstream) if (state != lens::Upstream::applied) state = lens::Upstream::sdk;
     n->BuildStage2Image(host);
     n->BuildStage3Image(host);
     const auto *image = n->Stage3Image();
@@ -292,8 +295,12 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe 
         {"partial_pixels", double(s.partial)}, {"full_pixels", double(s.full)},
         {"spatial_pixels", double(s.spatial)}, {"fallback_pixels", double(s.fallback)},
         {"max_channel_ratio", s.max_ratio}, {"measurement_uses_observations", true}};
-      d.recovered_camera = std::move(recovered.camera);
+      d.delivery_camera = std::move(recovered.camera);
     }
+    auto corrected = lens::correct(d.delivery_camera.empty() ? d.camera : d.delivery_camera,
+                                   d.width, d.height, lens_calibration, lens_request.enabled, cancel);
+    d.lens_correction = lens::report(lens_calibration, corrected, lens_request.enabled);
+    if (!corrected.pixels.empty()) d.delivery_camera = std::move(corrected.pixels);
     Json correction;
     const bool apply_hsm = recipe.correction == ProfileCorrection::hue_sat_map;
     if (apply_hsm && !pcs) throw Error(40, "profile correction requires CameraToPCS");

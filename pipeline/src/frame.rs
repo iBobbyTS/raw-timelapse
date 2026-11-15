@@ -24,6 +24,7 @@ pub struct FrameInfo {
     pub source_name: String,
     pub camera_color: Option<Json>,
     pub highlight_recovery: Option<Json>,
+    pub lens_correction: Option<Json>,
     pub source_sha256: Option<String>,
     pub pixels_sha256: Option<String>,
     pub width: u32,
@@ -418,6 +419,12 @@ fn validate_conversion(
     .iter()
     .map(|s| s.to_string())
     .collect();
+    if fields.iter().any(|(key, _)| key == "lens_calibration") {
+        if !get("lens_calibration")?.starts_with("rawtl-lens-calibration/1 ") {
+            return Err(failure("unsupported prepared lens calibration"));
+        }
+        allowed.push("lens_calibration".into());
+    }
     if get("has_capture_time")? == "1" {
         allowed.push("capture_time".into());
     }
@@ -724,6 +731,7 @@ impl Drop for NativeStream {
 
 struct NativeRun {
     method: crate::color_profile::CameraRecipe,
+    lens: crate::lens::Mode,
     log: PathBuf,
     analysis_roi: Option<[f64; 4]>,
     #[cfg(test)]
@@ -737,6 +745,7 @@ impl NativeRun {
     fn from_produce(config: &ProduceConfig<'_>) -> Self {
         Self {
             method: config.camera_recipe,
+            lens: crate::lens::Mode::Off,
             log: config.logs_dir.join("frame_000001.log"),
             converter: config.converter.map(str::to_string),
             converter_timeout: config.converter_timeout,
@@ -927,12 +936,14 @@ pub struct PrepareSettings<'a> {
     pub log: &'a Path,
     pub converter: Option<&'a str>,
     pub converter_timeout: Option<u64>,
+    pub lens: crate::lens::Settings,
 }
 
 /// Prepared-frame consumer settings. No Converter options exist here on
 /// purpose: a prepared context already records its conversion provenance.
 pub struct PreparedSettings {
     pub camera_recipe: crate::color_profile::CameraRecipe,
+    pub lens: crate::lens::Mode,
 }
 
 /// Run the native prepare operation once for one source and load the resulting
@@ -966,6 +977,7 @@ pub fn prepare_active(
     if let Some(seconds) = settings.converter_timeout {
         args.extend(["--converter-timeout".into(), seconds.to_string()]);
     }
+    settings.lens.prepare_args(&mut args);
     let captured = proc::run_capture_active(tool, &args, EXIT_FRAME, settings.log, active)?;
     write_prepare_log(settings.log, tool, &args, &captured)?;
     proc::check_stop()?;
@@ -1011,6 +1023,7 @@ pub struct PrepareBatchSettings<'a> {
     pub scratch_dir: &'a Path,
     pub converter: Option<&'a str>,
     pub converter_timeout: Option<u64>,
+    pub lens: crate::lens::Settings,
 }
 fn batch_check_stop(active: &ActiveNative) -> Result<()> {
     proc::check_stop()?;
@@ -1082,6 +1095,7 @@ pub fn prepare_batch_active(
     if let Some(seconds) = settings.converter_timeout {
         args.extend(["--converter-timeout".into(), seconds.to_string()]);
     }
+    settings.lens.prepare_args(&mut args);
     let captured = proc::run_capture_active(tool, &args, EXIT_FRAME, &log, active.clone())?;
     write_prepare_log(&log, tool, &args, &captured)?;
     batch_check_stop(&active)?;
@@ -1178,6 +1192,7 @@ fn prepared_native_run(
 ) -> NativeRun {
     NativeRun {
         method: settings.camera_recipe,
+        lens: settings.lens,
         log: log.to_path_buf(),
         analysis_roi,
         #[cfg(test)]
@@ -1370,6 +1385,8 @@ fn run_frame(
         "--highlight-recovery".into(),
         if pixels && run.method != crate::color_profile::CameraRecipe::LegacyInverseCm { "on" } else { "off" }.into(),
     ]);
+    let lens_mode = if pixels { run.lens } else { crate::lens::Mode::Off };
+    args.extend(["--lens-correction".into(), lens_mode.token().into()]);
     if let Some(wb) = override_wb {
         args.extend(["--white-balance".into(), format_wb(wb)]);
     }
@@ -1399,6 +1416,11 @@ fn run_frame(
     let mut stream = NativeStream::open(tool, &args, &run.log, active)?;
     let bytes = stream.json(1)?;
     let sidecar = parse_json(&bytes)?;
+    if let Some(report) = sidecar.get("lens_correction") {
+        crate::lens::validate_report(report, lens_mode)?;
+    } else if lens_mode == crate::lens::Mode::Auto {
+        return Err(failure("missing lens correction contract"));
+    }
     if pixels && run.method != crate::color_profile::CameraRecipe::LegacyInverseCm {
         let recovery = sidecar.get("highlight_recovery")
             .ok_or_else(|| failure("missing highlight recovery contract"))?;
@@ -1739,6 +1761,7 @@ fn run_frame(
         source_name: input.name().to_string(),
         camera_color: sidecar.get("color").cloned(),
         highlight_recovery: sidecar.get("highlight_recovery").cloned(),
+        lens_correction: sidecar.get("lens_correction").cloned(),
         source_sha256,
         pixels_sha256: None,
         width: frame_width,
@@ -2250,6 +2273,7 @@ mod prepared_tests {
 
     fn prepared_settings() -> PreparedSettings {
         PreparedSettings {
+            lens: Default::default(),
             camera_recipe: crate::color_profile::CameraRecipe::Generic,
         }
     }
@@ -2266,6 +2290,7 @@ mod prepared_tests {
             tool,
             source,
             &PrepareSettings {
+                lens: Default::default(),
                 scratch_dir: &scratch,
                 context_path: &dir.join(format!("{name}.ctx")),
                 log: &dir.join(format!("{name}-prepare.log")),
@@ -2355,7 +2380,7 @@ mod prepared_tests {
         let tool = PathBuf::from(std::env::var_os("RAWTL_NATIVE_TOOL").expect("matched native"));
         let source = SourceFrame { name: source_path.file_name().unwrap().to_string_lossy().into(), path: source_path, key: Vec::new() };
         let prepared = prepare_one(&dir, &tool, &source, "generic");
-        let settings = PreparedSettings { camera_recipe: crate::color_profile::CameraRecipe::Generic };
+        let settings = PreparedSettings { lens: Default::default(), camera_recipe: crate::color_profile::CameraRecipe::Generic };
         let wb = Some([0.6050808314, 1.0, 0.4825046041]);
         let analysis = analyze_prepared(&tool, &prepared, wb, Some(0.0), None, &settings, &dir.join("analysis.log")).unwrap();
         let mut reference: Vec<f32> = Vec::new();
@@ -2400,6 +2425,7 @@ mod prepared_tests {
 
         let logs = dir.join("canon-logs");
         let settings = PreparedSettings {
+            lens: Default::default(),
             camera_recipe: crate::color_profile::CameraRecipe::CanonClog3,
         };
         let info = analyze_prepared(&tool, &prepared, None, Some(0.0), None, &settings, &logs.join("frame_000001.log"))
@@ -2438,7 +2464,7 @@ mod prepared_tests {
         let source = source_frame(&dir, "IMG_1.DNG");
         let base = fake_tool(&dir, &[FRAME_1], "");
         let prepared = prepare_one(&dir, &base, &source, "base");
-        let settings = PreparedSettings { camera_recipe: crate::color_profile::CameraRecipe::Generic };
+        let settings = PreparedSettings { lens: Default::default(), camera_recipe: crate::color_profile::CameraRecipe::Generic };
         let analysis = analyze_prepared(&base, &prepared, None, Some(0.), None, &settings, &dir.join("analysis.log")).unwrap();
         assert_eq!(analysis.highlight_recovery.as_ref().and_then(|r| r.get("requested")).and_then(Json::as_bool), Some(false));
         for defect in ["highlight-missing", "highlight-disabled", "highlight-version", "highlight-status"] {
@@ -2490,6 +2516,7 @@ mod prepared_tests {
         fs::create_dir_all(&scratch).unwrap();
         let context = dir.join("IMG_1.ctx");
         let settings = PrepareSettings {
+            lens: Default::default(),
             scratch_dir: &scratch,
             context_path: &context,
             log: &dir.join("prepare.log"),
@@ -2501,6 +2528,7 @@ mod prepared_tests {
 
         // A missing scratch directory is rejected before any conversion.
         let missing = PrepareSettings {
+            lens: Default::default(),
             scratch_dir: &dir.join("absent"),
             context_path: &dir.join("absent.ctx"),
             log: &dir.join("absent.log"),
@@ -2657,6 +2685,7 @@ mod prepared_tests {
         let prepared_logs = work.join("prepared-logs");
         let legacy_logs = work.join("legacy-logs");
         let settings = PreparedSettings {
+            lens: Default::default(),
             camera_recipe: crate::color_profile::CameraRecipe::CanonClog3,
         };
         let sources: Vec<SourceFrame> = materials
@@ -2678,6 +2707,7 @@ mod prepared_tests {
                 &tool,
                 source,
                 &PrepareSettings {
+                    lens: Default::default(),
                     scratch_dir: &scratch,
                     context_path: &work.join(format!("frame-{index}.ctx")),
                     log: &work.join(format!("prepare-{index}.log")),
@@ -2773,6 +2803,7 @@ mod prepared_tests {
             &tool,
             &sources[0],
             &PrepareSettings {
+                lens: Default::default(),
                 scratch_dir: &scratch,
                 context_path: &work.join("delete.ctx"),
                 log: &work.join("prepare-delete.log"),
@@ -2861,6 +2892,7 @@ if mode.startswith('late:'):
                 &tool,
                 &items,
                 &PrepareBatchSettings {
+                    lens: Default::default(),
                     scratch_dir: &scratch,
                     converter: None,
                     converter_timeout: None,
@@ -2896,6 +2928,7 @@ if mode.startswith('late:'):
             &fake(&dir, "ok"),
             &duplicate,
             &PrepareBatchSettings {
+                lens: Default::default(),
                 scratch_dir: &scratch,
                 converter: None,
                 converter_timeout: None
@@ -2929,6 +2962,7 @@ if mode.startswith('late:'):
                 &tool,
                 &items,
                 &PrepareBatchSettings {
+                    lens: Default::default(),
                     scratch_dir: &scratch,
                     converter: None,
                     converter_timeout: None,
@@ -2994,6 +3028,7 @@ if mode.startswith('late:'):
             &tool,
             &items,
             &PrepareBatchSettings {
+                lens: Default::default(),
                 scratch_dir: &batch_dir,
                 converter: None,
                 converter_timeout: Some(120),
@@ -3008,6 +3043,7 @@ if mode.startswith('late:'):
                 &tool,
                 source,
                 &PrepareSettings {
+                    lens: Default::default(),
                     scratch_dir: &single_dir,
                     context_path: &single_dir.join("frame.context"),
                     log: &single_dir.join("native.log"),
@@ -3029,6 +3065,7 @@ if mode.startswith('late:'):
                     continue;
                 }
                 let settings = PreparedSettings {
+                    lens: Default::default(),
                     camera_recipe: method,
                 };
                 let a = analyze_prepared(
@@ -3125,6 +3162,7 @@ if mode.startswith('late:'):
                 Some(0.),
                 None,
                 &PreparedSettings {
+                    lens: Default::default(),
                     camera_recipe: crate::color_profile::CameraRecipe::LegacyInverseCm,
                 },
                 &dir.join("after-delete.log"),
@@ -3142,6 +3180,7 @@ if mode.startswith('late:'):
         let root = PathBuf::from(root);
         let tool = PathBuf::from(std::env::var_os("RAWTL_NATIVE_TOOL").expect("RAWTL_NATIVE_TOOL"));
         let settings = PreparedSettings {
+            lens: Default::default(),
             camera_recipe: crate::color_profile::CameraRecipe::LegacyInverseCm,
         };
         for name in ["context-nul.ctx", "record-nul.ctx"] {

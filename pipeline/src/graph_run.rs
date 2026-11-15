@@ -105,6 +105,7 @@ impl Runner<'_, '_> {
     }
     fn settings(&self) -> PreparedSettings {
         PreparedSettings {
+            lens: self.context.options.lens.mode,
             camera_recipe: self.context.camera_recipe,
         }
     }
@@ -141,6 +142,7 @@ impl Backend for Runner<'_, '_> {
         let tool = self.context.options.native_tool.clone();
         let converter = self.context.options.converter.clone();
         let converter_timeout = self.context.options.converter_timeout;
+        let lens = self.context.options.lens.clone();
         let active = self.active.clone();
         Ok(Box::new(move || {
             fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
@@ -153,6 +155,7 @@ impl Backend for Runner<'_, '_> {
                     log: &log,
                     converter: converter.as_deref(),
                     converter_timeout,
+                    lens,
                 },
                 active,
             )
@@ -175,6 +178,7 @@ impl Backend for Runner<'_, '_> {
         let tool = self.context.options.native_tool.clone();
         let converter = self.context.options.converter.clone();
         let converter_timeout = self.context.options.converter_timeout;
+        let lens = self.context.options.lens.clone();
         let active = self.active.clone();
         Ok(Box::new(move || {
             fs::create_dir_all(scratch.parent().unwrap()).map_err(|e| e.to_string())?;
@@ -194,6 +198,7 @@ impl Backend for Runner<'_, '_> {
                     scratch_dir: &scratch,
                     converter: converter.as_deref(),
                     converter_timeout,
+                    lens,
                 },
                 active,
             )
@@ -534,6 +539,10 @@ impl Backend for Runner<'_, '_> {
                     text("hue_sat_map_status"), text("look_table_status"), text("tone_curve_status"), text("baseline_exposure_status"), text("camera_calibration_effective"),
                     if self.context.camera_recipe.calibration() != "none" { "calibrated" } else { "uncalibrated" }
                 ));
+                self.result(written)?;
+            }
+            if let Some(lens) = &info.lens_correction {
+                let written = self.log.line(&format!("kind=lens frame={} report={}", info.index, crate::json::to_pretty_string(lens).replace('\n', "")));
                 self.result(written)?;
             }
             if let Some(recovery) = &info.highlight_recovery {
