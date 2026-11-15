@@ -660,7 +660,7 @@ Decoded decode_prepared(const PreparedFrame &prepared,
                         const std::optional<Vec> &wb,
                         CameraRecipe recipe) {
   Decoded decoded = decode(prepared.prepared_dng,
-                           wb ? wb : std::optional<Vec>(prepared.own), recipe);
+                           wb ? wb : std::optional<Vec>(prepared.own), recipe, check_cancelled);
   if (recipe.calibration == CameraCalibration::canon_normal_white_fixed_v1) {
     if (prepared.kind != Route::vendor_raw) throw Error(40, "Canon calibration requires original Canon CR3");
     calibrate_canon_cr3(prepared.source, decoded);

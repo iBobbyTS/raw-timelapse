@@ -105,12 +105,13 @@ Json calibrate_profile(Decoded &d, const dng_camera_profile &profile,
   std::array<double, chunk> scale{};
   std::array<bool, chunk> bypass{};
   size_t bypassed = 0;
+  const auto &camera_pixels = d.recovered_camera.empty() ? d.camera : d.recovered_camera;
   d.calibrated_scene.resize(d.camera.size());
   for (size_t start = 0; start < d.camera.size() / 3; start += chunk) {
     size_t count = std::min(chunk, d.camera.size() / 3 - start);
     for (size_t j = 0; j < count; ++j) {
       size_t i = (start + j) * 3;
-      Vec camera{d.camera[i], d.camera[i + 1], d.camera[i + 2]};
+      Vec camera{camera_pixels[i], camera_pixels[i + 1], camera_pixels[i + 2]};
       Vec rgb = multiply(to_rgb, camera);
       // HSV calibration is undefined for negative ProPhoto components. Keep
       // the signed matrix result for those pixels instead of clipping them.
@@ -131,7 +132,7 @@ Json calibrate_profile(Decoded &d, const dng_camera_profile &profile,
       size_t i = (start + j) * 3;
       Vec scene = bypass[j]
                       ? multiply(d.camera_to_ap1,
-                                 Vec{d.camera[i], d.camera[i + 1], d.camera[i + 2]})
+                                 Vec{camera_pixels[i], camera_pixels[i + 1], camera_pixels[i + 2]})
                       : multiply(to_ap1, Vec{r[j] * scale[j], g[j] * scale[j],
                                              b[j] * scale[j]});
       for (int c = 0; c < 3; ++c) {
@@ -169,7 +170,7 @@ Json optional_matrix(const dng_matrix &m) {
   return m.NotEmpty() ? matrix(mat(m)) : Json();
 }
 } // namespace
-Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe recipe) {
+Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe recipe, void (*cancel)()) {
   auto routing = inspect(path);
   if (!routing || route(routing->photometric) != Route::direct)
     throw Error(23, "CFA cannot enter SDK");
@@ -243,6 +244,10 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe 
     }
     double baseline = n->BaselineExposure();
     n->ReadStage1Image(host, stream, info);
+    // ReadStage1Image loads the lists; BuildStage2/3 applies and clears them.
+    // Capture endpoint-changing operations in that exact interval.
+    const bool highlight_endpoints_supported = ifd.fSampleFormat[0] == 1 &&
+        n->OpcodeList2().Count() == 0 && n->OpcodeList3().Count() == 0;
     n->BuildStage2Image(host);
     n->BuildStage3Image(host);
     const auto *image = n->Stage3Image();
@@ -266,6 +271,29 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe 
     buf.fPixelSize = 4;
     buf.fData = d.camera.data();
     image->Get(buf);
+    if (recipe.highlight_recovery) {
+      highlight::Evidence evidence;
+      // Only this measured integer Linearize route has known normalized ceilings.
+      // OpcodeList2/3 may change scale; float sources have unverified endpoints.
+      evidence.supported = highlight_endpoints_supported;
+      evidence.source = evidence.supported ? "SDK integer Linearize camera-domain ceiling; upstream CFA unknown"
+                                           : "unsupported float/opcode endpoint semantics";
+      for (int c = 0; c < 3; ++c) {
+        const double range = ifd.fWhiteLevel[c] - ifd.fBlackLevel[0][0][c];
+        evidence.transition[c] = std::max(.005, 8. / std::max(16., range));
+      }
+      const auto &sdk_white = spec.CameraWhite();
+      const Vec camera_white{sdk_white[0], sdk_white[1], sdk_white[2]};
+      auto recovered = highlight::reconstruct(d.camera, d.width, d.height, camera_white, evidence, cancel);
+      const auto &s = recovered.statistics;
+      d.highlight_recovery = Json{{"requested", true}, {"revision", 1},
+        {"status", !evidence.supported ? "unsupported" : s.affected ? "processed" : "unchanged"},
+        {"evidence", evidence.source}, {"affected_pixels", double(s.affected)},
+        {"partial_pixels", double(s.partial)}, {"full_pixels", double(s.full)},
+        {"spatial_pixels", double(s.spatial)}, {"fallback_pixels", double(s.fallback)},
+        {"max_channel_ratio", s.max_ratio}, {"measurement_uses_observations", true}};
+      d.recovered_camera = std::move(recovered.camera);
+    }
     Json correction;
     const bool apply_hsm = recipe.correction == ProfileCorrection::hue_sat_map;
     if (apply_hsm && !pcs) throw Error(40, "profile correction requires CameraToPCS");

@@ -138,6 +138,12 @@ native/build/dng-linear-frame --stdout-frame input.dng \
   [--exposure-ev EV]
 ```
 
+Stdout consumers accept `--highlight-recovery on|off` (standalone default off).
+The product explicitly enables it for delivery and disables it for analysis.
+It runs in camera space before matrix/HueSatMap, preserving original measurement
+observations; float/opcode endpoint limitations are reported, never guessed.
+See the [algorithm, ownership and limits](../../docs/raw-highlight-recovery.md).
+
 The pipeline uses signed-float mode for every profile and explicitly selects its
 input recipe. For generic matrix-only development:
 

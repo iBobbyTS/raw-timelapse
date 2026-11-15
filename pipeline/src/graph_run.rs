@@ -536,6 +536,15 @@ impl Backend for Runner<'_, '_> {
                 ));
                 self.result(written)?;
             }
+            if let Some(recovery) = &info.highlight_recovery {
+                let text = |key| recovery.get(key).and_then(crate::json::Json::as_str).unwrap_or("unknown");
+                let count = |key| recovery.get(key).and_then(crate::json::Json::as_u64).unwrap_or(0);
+                let written = self.log.line(&format!(
+                    "kind=highlight frame={} revision=1 status={} affected={} partial={} full={} spatial={} fallback={} evidence={}",
+                    info.index, text("status"), count("affected_pixels"), count("partial_pixels"),
+                    count("full_pixels"), count("spatial_pixels"), count("fallback_pixels"), quote(text("evidence"))));
+                self.result(written)?;
+            }
             let written=self.log.line(&format!(
                 "kind=develop frame={} source={} ev={:.9} wb={} wb_source={} as_shot={} source_sha256={} pixels={} pixels_sha256={} duration={:.3}",
                 info.index,quote(&info.source_name),info.exposure_ev,frame::format_wb(info.applied_wb),info.wb_source,frame::format_wb(info.as_shot_neutral),info.source_sha256.as_deref().unwrap_or("unknown"),

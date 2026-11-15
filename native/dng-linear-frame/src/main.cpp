@@ -186,8 +186,9 @@ FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
     gained_scene.resize(d.camera.size());
   double low = INFINITY, high = -INFINITY;
   size_t negatives = 0, upper = 0;
+  const auto &camera_pixels = d.recovered_camera.empty() ? d.camera : d.recovered_camera;
   for (size_t i = 0; i < d.camera.size(); i += 3) {
-    Vec camera{d.camera[i], d.camera[i + 1], d.camera[i + 2]};
+    Vec camera{camera_pixels[i], camera_pixels[i + 1], camera_pixels[i + 2]};
     Vec scene = d.calibrated_scene.empty()
                     ? multiply(d.camera_to_ap1, camera)
                     : Vec{d.calibrated_scene[i], d.calibrated_scene[i + 1],
@@ -247,6 +248,7 @@ FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
       {"color", [&] { Json v = d.color; v.text.pop_back();
         v.text += ",\"exposure_calibration\":" + d.exposure_calibration.text + "}"; return v; }()},
       {"decode_semantics", d.semantics},
+      {"highlight_recovery", d.highlight_recovery},
       {"observed_scene_min", low},
       {"observed_scene_max", high},
       {"quantization",
@@ -518,6 +520,9 @@ int main(int argc, char **argv) {
           recipe.method = CameraColorMethod::legacy_inverse_cm;
         else
           throw Error(2, "unknown camera color method");
+      } else if (a == "--highlight-recovery") {
+        if (value != "on" && value != "off") throw Error(2, "highlight recovery expects on or off");
+        recipe.highlight_recovery = value == "on";
       } else if (a == "--camera-recipe") {
         recipe.name = value;
       } else if (a == "--color-contract-version") {
@@ -558,6 +563,8 @@ int main(int argc, char **argv) {
         (recipe.name == "legacy-test" && recipe.calibration != CameraCalibration::none) ||
         (recipe.name != "generic" && recipe.name != "canon-clog3" && recipe.name != "legacy-test"))
       throw Error(2, "inconsistent camera recipe policies");
+    // Measurement never consumes invented radiance, regardless of delivery policy.
+    if (want_analysis) recipe.highlight_recovery = false;
     // A closed consumer pipe must surface as a write error, not a SIGPIPE
     // death: no record, artifact or success claim is published.
     std::signal(SIGPIPE, SIG_IGN);

@@ -79,6 +79,15 @@ Defaults:
   10-bit and no lossless claim is made. `--resize` is the only scaling stage and
   runs in the scene-linear FP32 domain.
 
+## RAW highlight recovery
+
+Product development enables camera-domain highlight reconstruction before color
+matrices, profile correction and EV; measurement remains observation-only.
+No new graph node is introduced. The same-stem log reports `kind=highlight`,
+including unsupported decoder endpoint semantics rather than claiming recovery.
+See [algorithm and limits](../docs/raw-highlight-recovery.md). Native standalone
+consumers default to recovery off for matrix-only diagnostics.
+
 ## Output
 
 ```

@@ -82,6 +82,7 @@ struct Options {
     recipe: String,
     correction: String,
     calibration: String,
+    highlight_recovery: bool,
     /// Prepared-context path for a --prepared consumer invocation.
     prepared: Option<PathBuf>,
     /// --prepare operation inputs.
@@ -284,6 +285,18 @@ fn run() -> Result<(), (i32, String)> {
         metadata
     };
     let is_f32 = options.stdout_mode.as_deref() == Some("--stdout-frame-f32");
+    let mut metadata = metadata;
+    let requested = options.highlight_recovery && is_f32;
+    let status = if requested { "unchanged" } else { "off" };
+    let recovery = format!("\"highlight_recovery\":{{\"revision\":1,\"requested\":{requested},\"status\":\"{status}\"}},");
+    let recovery = match config.rev_defect.as_deref() {
+        Some("highlight-missing") => String::new(),
+        Some("highlight-disabled") => recovery.replace("\"requested\":true", "\"requested\":false"),
+        Some("highlight-version") => recovery.replace("\"revision\":1", "\"revision\":9"),
+        Some("highlight-status") => recovery.replace("\"status\":\"unchanged\"", "\"status\":\"healthy\""),
+        _ => recovery,
+    };
+    metadata.insert_str(1, &recovery);
     let mut metadata = metadata;
     {
         let defect = config.rev_defect.as_deref();
@@ -736,6 +749,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
             stdout_mode: None,
             camera_method: "legacy-inverse-cm".to_string(),
             recipe: "legacy-test".into(), correction: "none".into(), calibration: "none".into(),
+            highlight_recovery: false,
             prepared: None,
             prepare: Some(PrepareArgs {
                 scratch: scratch.ok_or((2, "--prepare requires --scratch".to_string()))?,
@@ -777,6 +791,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
     let mut recipe = "legacy-test".to_string();
     let mut correction = "none".to_string();
     let mut calibration = "none".to_string();
+    let mut highlight_recovery = false;
     let mut white_balance = None;
     let mut exposure_ev = 0.0;
     let mut emit_analysis = None;
@@ -788,6 +803,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
             "--camera-recipe" => { recipe = value(&args, &mut index)?; index += 1; }
             "--profile-correction" => { correction = value(&args, &mut index)?; index += 1; }
             "--camera-calibration" => { calibration = value(&args, &mut index)?; index += 1; }
+            "--highlight-recovery" => { highlight_recovery = value(&args, &mut index)? == "on"; index += 1; }
             "--color-contract-version" => { let v = value(&args, &mut index)?; if v != "2" { return Err((2,"contract version".into())); } index += 1; }
             "--camera-color-method" => {
                 camera_method = value(&args, &mut index)?;
@@ -845,7 +861,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
         analysis_roi,
         no_png,
         stdout_mode,
-        camera_method, recipe, correction, calibration,
+        camera_method, recipe, correction, calibration, highlight_recovery,
         prepared,
         prepare: None,
     })

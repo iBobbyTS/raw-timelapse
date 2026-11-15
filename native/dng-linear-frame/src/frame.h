@@ -1,5 +1,6 @@
 #pragma once
 #include "json.h"
+#include "highlight.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +51,9 @@ struct Decoded {
   // Calibrated, unexposed AP1 samples when a profile HueSatMap is present.
   // Keep camera separately for the sensor-domain saturation mask.
   std::vector<float> calibrated_scene;
+  // Separate delivery camera buffer; measurement always keeps camera observations.
+  std::vector<float> recovered_camera;
+  Json highlight_recovery = Json{{"requested", false}, {"status", "off"}, {"revision", 1}};
   Vec as_shot{}, applied{};
   Mat camera_to_d50{}, camera_to_ap1{};
   Json color, semantics;
@@ -64,9 +68,10 @@ struct CameraRecipe {
   ProfileCorrection correction = ProfileCorrection::none;
   CameraCalibration calibration = CameraCalibration::none;
   std::string name = "legacy-test";
+  bool highlight_recovery = false;
 };
 Decoded decode(const fs::path &, const std::optional<Vec> &,
-               CameraRecipe = CameraRecipe{});
+               CameraRecipe = CameraRecipe{}, void (*cancel)() = nullptr);
 double canon_normal_white_gain(double maximum, double black, double white,
                                double dng_white, double dng_black);
 void calibrate_canon_cr3(const fs::path &, Decoded &);

@@ -23,6 +23,7 @@ pub struct FrameInfo {
     pub index: usize,
     pub source_name: String,
     pub camera_color: Option<Json>,
+    pub highlight_recovery: Option<Json>,
     pub source_sha256: Option<String>,
     pub pixels_sha256: Option<String>,
     pub width: u32,
@@ -1366,6 +1367,8 @@ fn run_frame(
         "--camera-recipe".into(), run.method.token().into(),
         "--profile-correction".into(), run.method.correction().into(),
         "--camera-calibration".into(), run.method.calibration().into(),
+        "--highlight-recovery".into(),
+        if pixels && run.method != crate::color_profile::CameraRecipe::LegacyInverseCm { "on" } else { "off" }.into(),
     ]);
     if let Some(wb) = override_wb {
         args.extend(["--white-balance".into(), format_wb(wb)]);
@@ -1396,6 +1399,16 @@ fn run_frame(
     let mut stream = NativeStream::open(tool, &args, &run.log, active)?;
     let bytes = stream.json(1)?;
     let sidecar = parse_json(&bytes)?;
+    if pixels && run.method != crate::color_profile::CameraRecipe::LegacyInverseCm {
+        let recovery = sidecar.get("highlight_recovery")
+            .ok_or_else(|| failure("missing highlight recovery contract"))?;
+        if recovery.get("revision").and_then(Json::as_u64) != Some(1)
+            || recovery.get("requested").and_then(Json::as_bool) != Some(true)
+            || !matches!(recovery.get("status").and_then(Json::as_str), Some("processed" | "unchanged" | "unsupported"))
+        {
+            return Err(failure("invalid highlight recovery contract"));
+        }
+    }
     {
         let color = sidecar
             .get("color")
@@ -1725,6 +1738,7 @@ fn run_frame(
         index,
         source_name: input.name().to_string(),
         camera_color: sidecar.get("color").cloned(),
+        highlight_recovery: sidecar.get("highlight_recovery").cloned(),
         source_sha256,
         pixels_sha256: None,
         width: frame_width,
@@ -2416,6 +2430,25 @@ mod prepared_tests {
             "{}",
             error.message
         );
+    }
+
+    #[test]
+    fn delivery_requires_recovery_contract_and_analysis_disables_it() {
+        let dir = work_dir("highlight-contract");
+        let source = source_frame(&dir, "IMG_1.DNG");
+        let base = fake_tool(&dir, &[FRAME_1], "");
+        let prepared = prepare_one(&dir, &base, &source, "base");
+        let settings = PreparedSettings { camera_recipe: crate::color_profile::CameraRecipe::Generic };
+        let analysis = analyze_prepared(&base, &prepared, None, Some(0.), None, &settings, &dir.join("analysis.log")).unwrap();
+        assert_eq!(analysis.highlight_recovery.as_ref().and_then(|r| r.get("requested")).and_then(Json::as_bool), Some(false));
+        for defect in ["highlight-missing", "highlight-disabled", "highlight-version", "highlight-status"] {
+            let tool = fake_tool(&dir, &[FRAME_1], &format!("rev_defect={defect}"));
+            let error = develop_prepared(&tool, &prepared, None, Some(0.), &settings, &dir.join(format!("{defect}.log")), &mut |info, native| {
+                native.pixels(info.width, info.height)?;
+                Ok(())
+            }).expect_err(defect);
+            assert!(error.message.contains("highlight recovery contract"), "{defect}: {}", error.message);
+        }
     }
 
     #[test]
