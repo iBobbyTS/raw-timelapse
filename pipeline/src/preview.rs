@@ -16,6 +16,11 @@
 
 use crate::json::Json;
 
+/// Shared 3x3 helpers. The output-CAT derivation and this preview path must use
+/// one implementation with one accumulation order so the reference composition
+/// and the per-pixel conversion cannot drift apart.
+pub use crate::chromatic_adaptation::{mat3_mul, mat3_vec};
+
 pub const SCENE_SCALE: f64 = 16384.0;
 
 /// ACEScg AP1 (D60 white) -> CIE XYZ (D60).
@@ -39,29 +44,6 @@ pub const XYZ_D65_TO_LINEAR_SRGB: [[f64; 3]; 3] = [
     [-0.969243636280879, 1.875967501507720, 0.041555057407175],
     [0.055630079696993, -0.203976958888976, 1.056971514242878],
 ];
-
-pub fn mat3_mul(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let mut out = [[0.0; 3]; 3];
-    for row in 0..3 {
-        for column in 0..3 {
-            let mut sum = 0.0;
-            for k in 0..3 {
-                sum += a[row][k] * b[k][column];
-            }
-            out[row][column] = sum;
-        }
-    }
-    out
-}
-
-pub fn mat3_vec(matrix: &[[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
-    let mut out = [0.0; 3];
-    for row in 0..3 {
-        out[row] =
-            matrix[row][0] * vector[0] + matrix[row][1] * vector[1] + matrix[row][2] * vector[2];
-    }
-    out
-}
 
 /// Composed AP1/D60 scene-linear -> linear sRGB/D65 matrix.
 pub fn ap1_to_linear_srgb_matrix() -> [[f64; 3]; 3] {
