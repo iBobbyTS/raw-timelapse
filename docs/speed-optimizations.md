@@ -44,11 +44,28 @@
 
 首轮全片对（14:20–15:41 窗口）批 3155.3s vs 逐帧 1670.5s（批"慢 88.9%"）。诊断（换序重跑+240 帧配对+逐帧分布分析）判定为该窗口外部 I/O 扰动：同时段逐帧侧也被拖慢 3.6×（prepare 10.2→2.35s/帧），批侧 develop 出现 30–105s U 态尖峰（重跑中完全消失，p99 1.92s）。结论：非批机制固有行为；长计时测量需警惕此类窗口。诊断报告：`.agent-work/evidence/adc-batch-prepare/full-pair-repeat/DIAGNOSIS.md`。
 
+## 4. color 并发 4（本次交付为默认）
+
+依据三规模换序对照（仅改 color 节点并发，其余图与二进制不变；正确性门 4 帧×2 profile×C1/C2/C4 全等，含 MOV 字节级一致）：
+
+| 规模 | 环境 | C1 | C4 | 墙钟 |
+|---|---|---|---|---|
+| 19 帧 | 本地 SSD | 36.56s | 27.52s | −24.7% |
+| 96 帧 | SMB 源 + 4T 输出 | 141.46s | 98.25s | −30.5% |
+| 476 帧 | SMB 源 + 4T 输出 | 692.16s（两轮均值） | 489.60s | **−29.3%** |
+
+- 代价：采样 CPU +6.8%；峰值树 RSS 区间重叠；swap 前后快照持平（≈6.78GiB，快照仅）。四次全片 MOV 字节级一致。
+- 落地验证（2026-11-15）：`pipeline/src/graph/default.json` color `concurrency` 1→4；`cargo test --lib -- graph::` 通过；19 帧默认图（无 `--graph`）冒烟输出与显式 C4 图成品**字节一致**（SHA-256 29872e20…，32.2s）。
+- 性质：C4 减少等待而非计算量；solve 后关键路径 456.9→256.0s（−44.0%），后半段此后受 develop（D4）限制而非 color。
+- 证据：`.agent-work/tmp/color-concurrency/REPORT-batch1.md` 及 `real/` 全套收据。
+
 ## 未采纳/暂缓的方向
 
 - measure+develop 双解码（全片 611s+962s 各解码同一 DNG 一次）：受 solve 屏障内存约束，降采样测量会改变估计器语义——产品决策，暂缓。
 - 更细并发/批大小搜索：按用户指示"暂时不做"；B32 为工程初值。
 - 常驻转换服务、文件监听式提前发布：设计阶段排除（正确性边界不可靠）。
+- native f32 双趟直写合并（LE 上 float 内存即 rgbf32le 线上序列）：分段级 A/B 实测净差 −0.010s/帧（−0.9%，噪声级），不采纳；补丁存档 `.agent-work/tmp/color-concurrency/segtime-rawpass.patch`。
+- 继续调参/存储矩阵/GPU：native 分段诊断（3 帧×2 模式×8 轮，含 SMB 源与 4T 输出变体）显示 develop 的 45% 在 SDK LinearRaw 读取（0.50s/帧），各段均在做必要工作，无值得继续的局部优化；按停止规则停止。证据：`.agent-work/tmp/color-concurrency/REPORT-hotspot-diagnosis.md`。
 
 ## 收据索引
 
@@ -56,3 +73,4 @@
 - 验证探测：`.agent-work/tmp/native-overhead-probe/probe-all.log`（D1/D2/D3）。
 - 批量实现/评审/测试：`.agent-work/tmp/adc-batch-prepare/{s01,s01-repair,s02,s02-simp2,s02-full}/`。
 - 批量性能与诊断：`.agent-work/tmp/adc-batch-prepare/s02/perf-final-*`（19 帧×4 轮）、`.agent-work/evidence/adc-batch-prepare/full-pair-repeat/`（240/476 配对+诊断）；视频在 `/Volumes/4T/Projects/raw-timelapse/adc-batch-prepare-*`。
+- color 并发与热点诊断：`.agent-work/tmp/color-concurrency/`（campaign.py、REPORT-batch1.md、REPORT-hotspot-diagnosis.md、real/ 收据、diag-segtime-*、segtime-*.patch）；全片成品在 `/Volumes/4T/Projects/raw-timelapse/color-concurrency-full/`。
