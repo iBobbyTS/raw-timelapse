@@ -1452,7 +1452,7 @@ fn run_frame(
             || color.get("algorithm_revision").and_then(Json::as_u64) != Some(4)
             || !valid_matrix("xyz_d50_to_acescg") || !valid_matrix("sdk_normalized_pcs_to_camera")
             || !eq("cat", "linear Bradford D50->D60; AP1 inverse primaries matrix")
-            || !valid_presence("hue_sat_map_present", "hue_sat_map_applied", "hue_sat_map_status", run.method.requires_canon_cr3())
+            || !valid_presence("hue_sat_map_present", "hue_sat_map_applied", "hue_sat_map_status", run.method.correction() == "hue-sat-map")
             || !valid_presence("look_table_present", "look_table_applied", "look_table_status", false)
             || !valid_presence("tone_curve_present", "tone_curve_applied", "tone_curve_status", false)
             || flag("baseline_exposure_applied") != Some(false) || !eq("baseline_exposure_status", "skipped")
@@ -1462,7 +1462,7 @@ fn run_frame(
             || (effective == Some("dng-camera-to-pcs-forward-matrix") && flag("forward_matrix_present") != Some(true))
             || (effective == Some("dng-camera-to-pcs-inverse-fallback") && flag("forward_matrix_present") != Some(false))
             || color.get("camera_model").and_then(Json::as_str).is_none_or(str::is_empty)
-            || (!run.method.requires_canon_cr3() && (calibration.and_then(|c| c.get("applied")) != Some(&Json::Bool(false))
+            || (run.method.calibration() == "none" && (calibration.and_then(|c| c.get("applied")) != Some(&Json::Bool(false))
                 || calibration.and_then(|c| c.get("method")).and_then(Json::as_str) != Some("none")
                 || calibration.and_then(|c| c.get("status")).and_then(Json::as_str) != Some("uncalibrated")))
         { return Err(failure("inconsistent camera recipe/profile policy contract")); }

@@ -169,7 +169,7 @@ Json optional_matrix(const dng_matrix &m) {
   return m.NotEmpty() ? matrix(mat(m)) : Json();
 }
 } // namespace
-Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMethod method, ProfileCorrection correction_policy) {
+Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe recipe) {
   auto routing = inspect(path);
   if (!routing || route(routing->photometric) != Route::direct)
     throw Error(23, "CFA cannot enter SDK");
@@ -211,7 +211,7 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMe
     // Both SDK paths include the selected neutral and PCS white adaptation.
     // Legacy deliberately ignores FM; the calibrated strategy uses
     // CameraToPCS, including SDK's no-FM fallback. Do not add another WB/CAT.
-    const bool pcs = method == CameraColorMethod::dng_camera_to_pcs;
+    const bool pcs = recipe.method == CameraColorMethod::dng_camera_to_pcs;
     const bool fm = profile.ForwardMatrix1().NotEmpty() ||
                     profile.ForwardMatrix2().NotEmpty() ||
                     profile.ForwardMatrix3().NotEmpty();
@@ -267,10 +267,12 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMe
     buf.fData = d.camera.data();
     image->Get(buf);
     Json correction;
-    const bool apply_hsm = correction_policy == ProfileCorrection::hue_sat_map;
+    const bool apply_hsm = recipe.correction == ProfileCorrection::hue_sat_map;
     if (apply_hsm && !pcs) throw Error(40, "profile correction requires CameraToPCS");
     if (apply_hsm && profile.HasHueSatDeltas())
       correction = calibrate_profile(d, profile, white, host);
+    const char *correction_policy = recipe.correction == ProfileCorrection::none ? "none" : "hue-sat-map";
+    const char *calibration_policy = recipe.calibration == CameraCalibration::none ? "none" : "canon-normal-white-fixed-v1";
     d.color = Json{
         {"method", pcs ? "DNG SDK CameraToPCS; explicit profile correction policy" : "DNG Ch6 no-ForwardMatrix; inverse(SDK normalized AB*CC*CM*MapWhiteMatrix(D50,selectedWhite))"},
         {"selected_white_xy", std::vector<Json>{white.x, white.y}},
@@ -320,7 +322,13 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraColorMe
         {"baseline_exposure_status", "skipped"},
         {"hue_sat_map_status", profile.HasHueSatDeltas() ? (apply_hsm ? "applied" : "skipped") : "absent"},
         {"look_table_status", profile.HasLookTable() ? "skipped" : "absent"},
-        {"tone_curve_status", profile.ToneCurve().IsValid() ? "skipped" : "absent"}};
+        {"tone_curve_status", profile.ToneCurve().IsValid() ? "skipped" : "absent"},
+        {"recipe_requested", recipe.name},
+        {"recipe_effective", recipe.name},
+        {"profile_correction_requested", correction_policy},
+        {"profile_correction_effective", correction_policy},
+        {"camera_calibration_requested", calibration_policy},
+        {"camera_calibration_effective", calibration_policy}};
     auto range = std::minmax_element(d.camera.begin(), d.camera.end());
     d.semantics = Json{
         {"adapter", "SDK Stage1 -> SDK Linearize(FP32 destination) -> Stage2 "

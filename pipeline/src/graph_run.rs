@@ -520,7 +520,7 @@ impl Backend for Runner<'_, '_> {
                     "kind=camera.colour color_contract_version=2 algorithm_revision=4 recipe_requested={} recipe_effective={} profile_fingerprint={} camera_model={} hue_sat_map={} look_table={} tone_curve={} baseline_exposure={} calibration={} calibration_status={} input_cat=bradford-d50-d60",
                     text("recipe_requested"), text("recipe_effective"), quote(text("profile_fingerprint")), quote(text("camera_model")),
                     text("hue_sat_map_status"), text("look_table_status"), text("tone_curve_status"), text("baseline_exposure_status"), text("camera_calibration_effective"),
-                    if self.context.camera_recipe.requires_canon_cr3() { "calibrated" } else { "uncalibrated" }
+                    if self.context.camera_recipe.calibration() != "none" { "calibrated" } else { "uncalibrated" }
                 ));
                 self.result(written)?;
             }
@@ -785,7 +785,7 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         profile.tag_policy.transfer_token(),
         context.options.log_reference_gain,
         context.options.camera_color.token(), context.camera_recipe.token(), context.camera_recipe.correction(), context.camera_recipe.calibration(),
-        if context.camera_recipe.requires_canon_cr3() { "pending-native-validation" } else { "uncalibrated" }
+        if context.camera_recipe.calibration() != "none" { "pending-native-validation" } else { "uncalibrated" }
     ))?;
 
     let preflight_started = Instant::now();

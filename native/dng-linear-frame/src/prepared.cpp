@@ -660,20 +660,11 @@ Decoded decode_prepared(const PreparedFrame &prepared,
                         const std::optional<Vec> &wb,
                         CameraRecipe recipe) {
   Decoded decoded = decode(prepared.prepared_dng,
-                           wb ? wb : std::optional<Vec>(prepared.own), recipe.method, recipe.correction);
+                           wb ? wb : std::optional<Vec>(prepared.own), recipe);
   if (recipe.calibration == CameraCalibration::canon_normal_white_fixed_v1) {
     if (prepared.kind != Route::vendor_raw) throw Error(40, "Canon calibration requires original Canon CR3");
     calibrate_canon_cr3(prepared.source, decoded);
   }
-  const char *correction = recipe.correction == ProfileCorrection::none ? "none" : "hue-sat-map";
-  const char *calibration = recipe.calibration == CameraCalibration::none ? "none" : "canon-normal-white-fixed-v1";
-  decoded.color.text.pop_back();
-  decoded.color.text += ",\"recipe_requested\":" + Json(recipe.name).text +
-    ",\"recipe_effective\":" + Json(recipe.name).text +
-    ",\"profile_correction_requested\":" + Json(correction).text +
-    ",\"profile_correction_effective\":" + Json(correction).text +
-    ",\"camera_calibration_requested\":" + Json(calibration).text +
-    ",\"camera_calibration_effective\":" + Json(calibration).text + "}";
   return decoded;
 }
 } // namespace frame

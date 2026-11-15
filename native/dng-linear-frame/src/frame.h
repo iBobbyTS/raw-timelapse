@@ -66,8 +66,7 @@ struct CameraRecipe {
   std::string name = "legacy-test";
 };
 Decoded decode(const fs::path &, const std::optional<Vec> &,
-               CameraColorMethod = CameraColorMethod::legacy_inverse_cm,
-               ProfileCorrection = ProfileCorrection::none);
+               CameraRecipe = CameraRecipe{});
 double canon_normal_white_gain(double maximum, double black, double white,
                                double dng_white, double dng_black);
 void calibrate_canon_cr3(const fs::path &, Decoded &);
