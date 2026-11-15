@@ -1292,14 +1292,18 @@ impl ColorProfile {
         }
         if self.id == "srgb-preview" {
             // Keep the pre-existing sRGB contract keys available to the encoder
-            // readers while the generic per-profile keys above are added.
+            // readers. Both describe the effective conversion, not a default
+            // helper: the composed key must follow the run's resolved transform
+            // so a custom realization cannot publish two incompatible
+            // compositions. For the reference realization it is bit-identical to
+            // `preview::ap1_to_linear_srgb_matrix()`.
             matrices.push((
                 "xyz_d65_to_linear_srgb",
                 preview::matrix_json(&preview::XYZ_D65_TO_LINEAR_SRGB),
             ));
             matrices.push((
                 "composed_ap1_d60_to_linear_srgb_d65",
-                preview::matrix_json(&preview::ap1_to_linear_srgb_matrix()),
+                preview::matrix_json(&output.composed_matrix),
             ));
         }
 
@@ -2373,6 +2377,29 @@ mod output_cat_tests {
         }
     }
 
+    /// Read one serialized matrix back as f64 values. `Json::Float` keeps the
+    /// exact f64 value, so equality here is bit-identity of the published
+    /// numbers, not a re-derivation.
+    fn json_matrix(matrix: &Json, label: &str) -> [[f64; 3]; 3] {
+        let rows = matrix
+            .as_array()
+            .unwrap_or_else(|| panic!("{label} is not an array"));
+        assert_eq!(rows.len(), 3, "{label} row count");
+        let mut out = [[0.0; 3]; 3];
+        for (row, values) in rows.iter().enumerate() {
+            let values = values
+                .as_array()
+                .unwrap_or_else(|| panic!("{label} row {row} is not an array"));
+            assert_eq!(values.len(), 3, "{label} row {row} width");
+            for column in 0..3 {
+                out[row][column] = values[column]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("{label} [{row}][{column}] is not a number"));
+            }
+        }
+        out
+    }
+
     /// sRGB primaries normalised to the CIE D50 white; an independent fixture
     /// for a non-D65 target white. Matrix values were derived with exact
     /// rational arithmetic (cat_oracle.py), not with production code.
@@ -2749,6 +2776,40 @@ mod output_cat_tests {
         assert!(matrices.get("output_cat").is_some());
         assert!(matrices.get("bradford_cat_d60_to_d65").is_some());
         assert!(matrices.get("composed_ap1_d60_to_target_linear").is_some());
+        // The legacy composed key describes the effective conversion; on the
+        // reference path it is the historic Bradford composition exactly.
+        let reference_composed = json_matrix(
+            matrices
+                .get("composed_ap1_d60_to_target_linear")
+                .expect("generic composed matrix"),
+            "reference generic composed",
+        );
+        let reference_legacy = json_matrix(
+            matrices
+                .get("composed_ap1_d60_to_linear_srgb_d65")
+                .expect("legacy composed matrix"),
+            "reference legacy composed",
+        );
+        assert_eq!(reference_legacy, reference_composed);
+        assert_eq!(reference_legacy, preview::ap1_to_linear_srgb_matrix());
+        let reference_fixture = [
+            [1.7050509926055784, -0.6217921204861147, -0.08325887199715537],
+            [-0.1302564174633593, 1.140804736511389, -0.010548319079933866],
+            [-0.024003356819728795, -0.12896897609304023, 1.1529723328565],
+        ];
+        assert_matrix_close(reference_legacy, reference_fixture, 1e-10, "reference legacy composed");
+        // The legacy XYZ stage is the gamut's fixed target decode and stays the
+        // same under any CAT; it must still match the generic target matrix.
+        assert_eq!(
+            json_matrix(
+                matrices.get("xyz_d65_to_linear_srgb").expect("legacy xyz"),
+                "legacy xyz",
+            ),
+            json_matrix(
+                matrices.get("xyz_to_target_linear").expect("generic xyz"),
+                "generic xyz",
+            )
+        );
 
         let custom = profile
             .resolve_output_cat(OutputCatSelection::Method("cat02"), &registry)
@@ -2773,6 +2834,50 @@ mod output_cat_tests {
         // A non-Bradford realization must not carry the legacy Bradford field.
         assert!(matrices.get("bradford_cat_d60_to_d65").is_none());
         assert!(matrices.get("output_cat").is_some());
+        // Every composed key must publish the CAT02-derived effective matrix,
+        // not the reference helper (B1-01: two incompatible compositions under
+        // one conversion). The custom composed matrix differs from the Bradford
+        // fixture, so an unconditional default-path helper fails here.
+        let custom_expected = [
+            [1.7050796435565116, -0.6242334613015463, -0.08084618213163959],
+            [-0.12970053007433263, 1.138468546504952, -0.008768016463546534],
+            [-0.024166344958335986, -0.12461415808102454, 1.1487805029813045],
+        ];
+        let custom_composed = json_matrix(
+            matrices
+                .get("composed_ap1_d60_to_target_linear")
+                .expect("custom generic composed"),
+            "custom generic composed",
+        );
+        let custom_legacy = json_matrix(
+            matrices
+                .get("composed_ap1_d60_to_linear_srgb_d65")
+                .expect("custom legacy composed"),
+            "custom legacy composed",
+        );
+        assert_eq!(custom_legacy, custom_composed);
+        assert_matrix_close(custom_legacy, custom_expected, 1e-10, "custom legacy composed");
+        assert_ne!(
+            custom_legacy, reference_fixture,
+            "a custom realization must not publish the Bradford composition"
+        );
+        assert_matrix_close(
+            custom_legacy,
+            custom.composed_matrix,
+            0.0,
+            "custom legacy equals the resolved transform",
+        );
+        // The CAT-independent target decode is still truthful.
+        assert_eq!(
+            json_matrix(
+                matrices.get("xyz_d65_to_linear_srgb").expect("legacy xyz"),
+                "legacy xyz",
+            ),
+            json_matrix(
+                matrices.get("xyz_to_target_linear").expect("generic xyz"),
+                "generic xyz",
+            )
+        );
     }
 
     #[test]
