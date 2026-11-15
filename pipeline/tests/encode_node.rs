@@ -371,6 +371,7 @@ fn every_profile_encodes_black_grey_and_white_reference_codes() {
         "canon-log3-cinema-gamut-rev-eng-crm-dev",
         "nikon-nlog-bt2020",
         "dji-dlog-dgamut",
+        "dji-dlog2-dgamut2",
     ] {
         let profile = lookup(id).expect(id);
         let extension = if profile.transfer == rawtl_linear_video::color_profile::Transfer::CanonLog3RevEng {

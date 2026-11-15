@@ -8,9 +8,10 @@
 //!   converted through the staged path
 //!   `AP1/D60 -> XYZ(D60) -> output CAT -> target linear RGB`, where the
 //!   adaptation targets the gamut's own white point;
-//! * one pinned default output CAT realization. The eight pre-existing profiles
-//!   keep the published Bradford D60->D65 matrix and the historic composition
-//!   order bit-for-bit; a future profile may pin a different fixed chain. An
+//! * one pinned default output CAT realization. The pre-existing profiles keep
+//!   the published Bradford D60->D65 matrix and the historic composition order
+//!   bit-for-bit; a profile may pin a different fixed chain (D-Log 2 pins its
+//!   DCTL AP1->AP0->D-Gamut 2/CAT02 chain). An
 //!   explicit CLI CAT choice that differs from the profile default uses the
 //!   standard derivation and is reported as `custom-adaptation`;
 //! * an explicit input domain derived from the official inverse curve at signal
@@ -223,7 +224,29 @@ pub enum Transfer {
     NikonNLog,
     /// DJI D-Log (original D-Log, not D-Log 2).
     DjiDLog,
+    /// DJI D-Log 2 (fixed three-segment DCTL definition).
+    DjiDLog2,
 }
+
+// Pinned D-Log 2 constants, transcribed from the fixed DCTL
+// (`specs/DLog2_DGamut2_to_ACES_AP0_cat02.dctl`, dwg-transforms 5614391).
+// They are the curve definition, not values recovered from an encoder LUT.
+const DJI_DLOG2_H: f64 = 475.0;
+const DJI_DLOG2_A: f64 = 16.285770761945304;
+const DJI_DLOG2_K1: f64 = 0.059439938321493;
+const DJI_DLOG2_B1: f64 = 0.304985337243402;
+const DJI_DLOG2_K2: f64 = 2.960935245492250;
+const DJI_DLOG2_B2: f64 = 0.148314799066323;
+const DJI_DLOG2_T: f64 = 0.028961695254132;
+/// `0.18` is the published middle-grey pivot of both inner segments.
+const DJI_DLOG2_MID: f64 = 0.18;
+/// The oracle's rounded f64 of the exact `2^A` for the pinned `A` (the platform
+/// `exp2` may differ by a few ulp, far inside the 1e-12 curve budget). The
+/// per-sample path therefore needs no `exp2` for a constant.
+const DJI_DLOG2_TWO_POW_A: f64 = 79892.40627605369;
+const DJI_DLOG2_TWO_POW_A_MINUS_1: f64 = DJI_DLOG2_TWO_POW_A - 1.0;
+/// `H / (2^A - 1)`, the published highlight-segment scale.
+const DJI_DLOG2_UPPER_SCALE: f64 = DJI_DLOG2_H / DJI_DLOG2_TWO_POW_A_MINUS_1;
 
 impl Transfer {
     pub fn name(self) -> &'static str {
@@ -235,6 +258,7 @@ impl Transfer {
             Transfer::CanonLog2 => "Canon Log 2",
             Transfer::NikonNLog => "Nikon N-Log",
             Transfer::DjiDLog => "DJI D-Log",
+            Transfer::DjiDLog2 => "DJI D-Log 2",
         }
     }
 
@@ -259,6 +283,12 @@ impl Transfer {
                 "if x <= 0.0078: y = 6.025*x + 0.0929; \
                  else y = log10(x*0.9892+0.0108)*0.256663 + 0.584555"
             }
+            Transfer::DjiDLog2 => {
+                "H=475, A=16.285770761945304, K1=0.059439938321493, B1=0.304985337243402, \
+                 K2=2.960935245492250, B2=0.148314799066323, T=0.028961695254132; \
+                 if x < T: y = B2 + K2*(x-T); else if x < 0.18: y = B1 + K1*log2(x/0.18); \
+                 else: y = log2(1 + x*(2^A-1)/H)/A"
+            }
         }
     }
 
@@ -277,6 +307,9 @@ impl Transfer {
             }
             Transfer::NikonNLog => "N-Log Specification Document",
             Transfer::DjiDLog => "D-Log and D-Gamut White Paper",
+            Transfer::DjiDLog2 => {
+                "D-Log 2 / D-Gamut 2 to ACES AP0 (CAT02) fixed DCTL transform spec"
+            }
         }
     }
 
@@ -290,6 +323,10 @@ impl Transfer {
             Transfer::CanonLog2 => "2018-11-01",
             Transfer::NikonNLog => "1.0.0 (2018-09-01)",
             Transfer::DjiDLog => "2017-10-10 (Zenmuse X7)",
+            Transfer::DjiDLog2 => {
+                "dwg-transforms 56143916e275c617471f7845b5c6b57795d0ee28, DCTL SHA256 \
+                 c0f4d7e7854fcb86df4d330d9ddb1e84fc9c22378cd49c61033f3ca0db4f47e5"
+            }
         }
     }
 
@@ -313,6 +350,11 @@ impl Transfer {
             Transfer::DjiDLog => {
                 "https://dl.djicdn.com/downloads/zenmuse+x7/20171010/\
                  D-Log_D-Gamut_Whitepaper.pdf"
+            }
+            Transfer::DjiDLog2 => {
+                "https://github.com/thatcherfreeman/dwg-transforms/blob/\
+                 56143916e275c617471f7845b5c6b57795d0ee28/specs/\
+                 DLog2_DGamut2_to_ACES_AP0_cat02.dctl"
             }
         }
     }
@@ -367,6 +409,21 @@ impl Transfer {
                     6.025 * value + 0.0929
                 } else {
                     (value * 0.9892 + 0.0108).log10() * 0.256663 + 0.584555
+                }
+            }
+            Transfer::DjiDLog2 => {
+                // Three-segment DCTL curve, evaluated branch-by-branch with the
+                // pinned constants. The negative toe is not clipped here: pure
+                // curve functions keep signed/over-range values, and delivery
+                // clips to the encodable signal domain later.
+                if value < DJI_DLOG2_T {
+                    DJI_DLOG2_B2 + DJI_DLOG2_K2 * (value - DJI_DLOG2_T)
+                } else if value < DJI_DLOG2_MID {
+                    DJI_DLOG2_B1
+                        + DJI_DLOG2_K1 * (value / DJI_DLOG2_MID).log2()
+                } else {
+                    (1.0 + value * DJI_DLOG2_TWO_POW_A_MINUS_1 / DJI_DLOG2_H).log2()
+                        / DJI_DLOG2_A
                 }
             }
         }
@@ -427,6 +484,19 @@ impl Transfer {
                     (10.0_f64.powf(3.89616 * signal - 2.27752) - 0.0108) / 0.9892
                 }
             }
+            Transfer::DjiDLog2 => {
+                // Analytic inverse of the pinned forward curve. The DCTL prints
+                // this direction; `forward` above is its exact inverse.
+                if signal < DJI_DLOG2_B2 {
+                    DJI_DLOG2_T + (signal - DJI_DLOG2_B2) / DJI_DLOG2_K2
+                } else if signal < DJI_DLOG2_B1 {
+                    DJI_DLOG2_MID
+                        * ((signal - DJI_DLOG2_B1) / DJI_DLOG2_K1).exp2()
+                } else {
+                    DJI_DLOG2_UPPER_SCALE
+                        * ((DJI_DLOG2_A * signal).exp2() - 1.0)
+                }
+            }
         }
     }
 
@@ -445,6 +515,7 @@ impl Transfer {
             Transfer::CanonLog2 => &CANON_REFERENCES,
             Transfer::NikonNLog => &NIKON_REFERENCES,
             Transfer::DjiDLog => &DJI_REFERENCES,
+            Transfer::DjiDLog2 => &DJI_DLOG2_REFERENCES,
         }
     }
 
@@ -466,6 +537,12 @@ impl Transfer {
             }
             Transfer::DjiDLog => {
                 "published 10-bit code values in the DJI white paper characteristics table"
+            }
+            Transfer::DjiDLog2 => {
+                "evaluated from the pinned fixed DCTL formula at the stated reflection values \
+                 and quantized to the full 10-bit signal range; the DCTL publishes no vendor \
+                 code table, so these are reference codes for this implementation, not a \
+                 camera/video matching claim"
             }
         }
     }
@@ -505,6 +582,20 @@ const DJI_REFERENCES: [ReferenceCode; 3] = [
     ReferenceCode::new(0.0, "0% black", 95),
     ReferenceCode::new(0.18, "18% grey", 408),
     ReferenceCode::new(0.9, "90% white", 586),
+];
+
+/// Full-range reference codes of the pinned D-Log 2 definition. The vendor DCTL
+/// publishes the formula rather than a code table, so these values are derived
+/// from it and are not a camera-internal ISO/EI clipping table (nor limited-range
+/// Y codes; delivery range is applied separately).
+const DJI_DLOG2_REFERENCES: [ReferenceCode; 7] = [
+    ReferenceCode::new(0.0, "0% black (linear segment origin)", 64),
+    ReferenceCode::new(0.028961695254132, "lower breakpoint T", 152),
+    ReferenceCode::new(0.18, "18% grey", 312),
+    ReferenceCode::new(0.9, "90% white", 456),
+    ReferenceCode::new(46.08, "800% (8 stops above 18% grey)", 812),
+    ReferenceCode::new(184.32, "1024x 18% grey (10 stops)", 937),
+    ReferenceCode::new(475.0, "upper clip limit H", 1023),
 ];
 
 /// One target colour gamut with its official primaries and white point.
@@ -637,6 +728,95 @@ const DGAMUT_GAMUT: Gamut = Gamut {
                  printed matrices to 1.84e-4",
 };
 
+/// DJI D-Gamut 2. The fixed DCTL publishes only the 4-decimal D-Gamut 2 ->
+/// XYZ(D65) matrix, so the primary chromaticities here are recovered from that
+/// rounded matrix (they are not an infinite-precision official primary table)
+/// and the matrix is used digit for digit. Its row sums are 0.9503/0.9999/1.0891,
+/// i.e. the rounded chain is not exactly neutral at D65; that residual is kept.
+const DGAMUT2_GAMUT: Gamut = Gamut {
+    name: "DJI D-Gamut 2",
+    primaries_xy: [
+        [0.7346787041954328, 0.2653212958045672],
+        [0.15996792623032977, 0.8400320737696703],
+        [0.08999181892555222, -0.0799927279338242],
+    ],
+    white_xy: D65_WHITE_XY,
+    rgb_to_xyz: DCTL_DGAMUT2_TO_XYZ65,
+    xyz_to_rgb: DGAMUT2_TO_XYZ65_INVERSE,
+    provenance: "derived-from-rounded-matrix: primary chromaticities recovered from the \
+                 pinned DCTL's 4-decimal D-Gamut 2->XYZ65 matrix; D65 white is the chain's \
+                 own coding white. The matrix is used as published, never normalised to an \
+                 exact neutral axis (max rgb-white residual 2.5e-4). Not an infinite-precision \
+                 official DJI primaries table",
+};
+
+/// Pinned DCTL D-Gamut 2 -> XYZ(D65), copied digit for digit (row major).
+const DCTL_DGAMUT2_TO_XYZ65: [[f64; 3]; 3] = [
+    [0.6917, 0.1596, 0.0990],
+    [0.2498, 0.8381, -0.0880],
+    [0.0, 0.0, 1.0891],
+];
+
+/// Pinned DCTL CAT02 XYZ(D65)->XYZ(D60), copied digit for digit. It is applied
+/// in this printed direction inside the reference chain; its 4-decimal rounding
+/// contributes to the chain's white-axis residual and is preserved.
+const DCTL_CAT02_D65_TO_D60: [[f64; 3]; 3] = [
+    [1.0120, 0.0080, -0.0158],
+    [0.0058, 1.0014, -0.0063],
+    [-0.0003, -0.0010, 0.9276],
+];
+
+/// Pinned DCTL XYZ(D60) -> ACES AP0, copied digit for digit.
+const DCTL_XYZ60_TO_AP0: [[f64; 3]; 3] = [
+    [1.0498, 0.0, -0.0001],
+    [-0.4959, 1.3733, 0.0982],
+    [0.0, 0.0, 0.9913],
+];
+
+/// ACES AP1 -> AP0 in f64 from the ACES v1.3 chromaticities (common D60
+/// 0.32168/0.33767), by the normalised-primary-matrix construction. Derived by
+/// the independent oracle (`dlog2_oracle.py`); not the DCTL's rounded XYZ->AP0.
+const ACES_AP1_TO_AP0: [[f64; 3]; 3] = [
+    [0.6954522413574518, 0.14067869647029416, 0.16386906217225408],
+    [0.04479456337203771, 0.8596711184564219, 0.09553431817154041],
+    [-0.005525882558113589, 0.004025210305978657, 1.001500672252135],
+];
+
+/// Pinned DCTL D-Gamut 2 -> ACES AP0: `M_XYZ60_AP0 * M_CAT02_65_60 * M_DG2_XYZ65`.
+const DJI_DLOG2_DGAMUT2_TO_AP0: [[f64; 3]; 3] = [
+    [0.736958385971, 0.176597444598, 0.08627254501],
+    [0.000873985052, 1.07033801293, -0.071242291115],
+    [-0.000453331403, -0.000878271974, 1.001517785098],
+];
+
+/// Inverse of the pinned DCTL D-Gamut 2 -> XYZ(D65) matrix (the gamut's declared
+/// `xyz_to_rgb`), derived in f64 by the independent oracle.
+const DGAMUT2_TO_XYZ65_INVERSE: [[f64; 3]; 3] = [
+    [1.5524806727641005, -0.29564003743365996, -0.16500955825710037],
+    [-0.462724820494538, 1.281292066997886, 0.14559127639773503],
+    [0.0, 0.0, 0.918189330639978],
+];
+
+/// The complete pinned reference chain used per pixel:
+/// `inverse(M_DG2_AP0) * M_AP1_AP0`, i.e. AP1/D60 -> AP0/D60 -> (the DCTL's
+/// printed CAT02 D65->D60 inverted) -> XYZ/D65 -> D-Gamut 2 linear.
+const DJI_DLOG2_AP1_TO_DGAMUT2: [[f64; 3]; 3] = [
+    [0.9345061440003459, -0.0022031394702776525, 0.06794785515875235],
+    [0.04075107103644273, 0.8034933746397581, 0.15577128678091975],
+    [-0.005058772922983332, 0.0047227291779441995, 1.0001502715262953],
+];
+
+/// Net AP1/D60 -> D-Gamut 2/D65 chromatic adaptation realized by the pinned
+/// chain, reported as the `output_cat` matrix. It is the exact f64 inverse of the
+/// DCTL's printed CAT02 D65->D60 constant (not a re-derivation from primaries);
+/// the per-pixel chain still uses the printed constant through
+/// [`DJI_DLOG2_AP1_TO_DGAMUT2`].
+const DJI_DLOG2_NET_D60_TO_D65: [[f64; 3]; 3] = [
+    [0.9881924154338105, -0.007877731919166615, 0.01677857961703693],
+    [-0.00572153126675796, 0.9986543412975397, 0.006685125222250674],
+    [0.00031342841026669386, 0.0010740524166901572, 1.078063517355657],
+];
+
 /// One registered preview output profile.
 #[derive(Debug, Clone, Copy)]
 pub struct ColorProfile {
@@ -721,6 +901,23 @@ const PREVIEW_OUTPUT_CAT: OutputCatDefault = OutputCatDefault {
     provenance: "published Bradford D60(ACES white)->D65 constant already used by the \
                  pipeline; reference chain is AP1/D60 -> XYZ/D60 -> fixed Bradford -> XYZ/D65 -> \
                  the profile's declared target linear matrix, in the historic composition order",
+};
+
+/// The D-Log 2 profile's pinned reference realization: the fixed DCTL chain,
+/// preserving its four-decimal constants (including the white-axis residual).
+const DJI_DLOG2_OUTPUT_CAT: OutputCatDefault = OutputCatDefault {
+    method: cat::CAT02.token,
+    adaptation: DJI_DLOG2_NET_D60_TO_D65,
+    composed_override: Some(DJI_DLOG2_AP1_TO_DGAMUT2),
+    provenance: "derived-from-pinned-DCTL: AP1/D60 -> AP0/D60 (ACES v1.3 chromaticities, \
+                 f64 normalised-primary construction) -> XYZ/D60 -> the DCTL's printed CAT02 \
+                 D65->D60 constant applied in its printed direction -> XYZ/D65 -> D-Gamut 2 \
+                 linear (inverse of the DCTL's 4-decimal D-Gamut 2->XYZ65 matrix). The three \
+                 DCTL matrices are used digit for digit; the rounded chain's white-axis \
+                 residual (max 2.5e-4) is preserved and never normalised away. The reported \
+                 adaptation matrix is the net D60->D65 step (exact f64 inverse of the printed \
+                 constant), not a re-derived CAT. reference_status=unverified refers to camera \
+                 exposure/video matching, not to this math implementation",
 };
 
 /// One resolved output transform: frozen before per-pixel conversion.
@@ -1290,6 +1487,31 @@ impl ColorProfile {
                 preview::matrix_json(&output.cat_matrix),
             ));
         }
+        if self.id == "dji-dlog2-dgamut2" {
+            // Full traceability for the pinned reference chain. `output_cat`
+            // above is the net D60->D65 adaptation; these are the printed DCTL
+            // intermediates and the f64 ACES AP1->AP0 derivation it consumes.
+            matrices.push((
+                "dgamut2_to_xyz65",
+                preview::matrix_json(&DCTL_DGAMUT2_TO_XYZ65),
+            ));
+            matrices.push((
+                "cat02_d65_to_d60",
+                preview::matrix_json(&DCTL_CAT02_D65_TO_D60),
+            ));
+            matrices.push((
+                "xyz60_to_acesap0",
+                preview::matrix_json(&DCTL_XYZ60_TO_AP0),
+            ));
+            matrices.push((
+                "dgamut2_to_acesap0",
+                preview::matrix_json(&DJI_DLOG2_DGAMUT2_TO_AP0),
+            ));
+            matrices.push((
+                "acesap1_to_acesap0",
+                preview::matrix_json(&ACES_AP1_TO_AP0),
+            ));
+        }
         if self.id == "srgb-preview" {
             // Keep the pre-existing sRGB contract keys available to the encoder
             // readers. Both describe the effective conversion, not a default
@@ -1587,7 +1809,7 @@ const LOG_RANGE_REASON: &str = "Rawtl full-range (pc) delivery convention, not a
      (https://nps.nikonimaging.com/technical_info/technical_solutions/z9_tips/3d_lut/); \
      the transfer's code domain alone does not determine the delivery range.";
 
-pub static PROFILES: [ColorProfile; 8] = [
+pub static PROFILES: [ColorProfile; 9] = [
     ColorProfile {
         id: "srgb-preview",
         transfer: Transfer::Srgb,
@@ -1653,6 +1875,17 @@ pub static PROFILES: [ColorProfile; 8] = [
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
         output_cat: PREVIEW_OUTPUT_CAT,
+    },
+    ColorProfile {
+        id: "dji-dlog2-dgamut2",
+        transfer: Transfer::DjiDLog2,
+        gamut: &DGAMUT2_GAMUT,
+        range: PreviewRange::Pc,
+        ycbcr_matrix: "bt2020nc",
+        range_reason: LOG_RANGE_REASON,
+        ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
+        tag_policy: TagPolicy::VENDOR_LOG,
+        output_cat: DJI_DLOG2_OUTPUT_CAT,
     },
     ColorProfile {
         id: "canon-log2-cinema-gamut-rev-eng-crm-dev",
@@ -1792,12 +2025,13 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_eight_profiles_and_srgb_default() {
-        assert_eq!(PROFILES.len(), 8);
+    fn registry_has_nine_profiles_and_srgb_default() {
+        assert_eq!(PROFILES.len(), 9);
         assert_eq!(default_profile().id, "srgb-preview");
         for id in [
             "srgb-preview",
             "dji-dlog-dgamut",
+            "dji-dlog2-dgamut2",
             "canon-log2-cinema-gamut",
             "canon-log2-cinema-gamut-rev-eng-crm-dev",
             "canon-log3-cinema-gamut-rev-eng-crm-dev",
@@ -1837,6 +2071,28 @@ mod tests {
         for profile in &PROFILES {
             let matrix = profile.composed_matrix();
             let linear = preview::mat3_vec(&matrix, [0.18, 0.18, 0.18]);
+            if profile.id == "dji-dlog2-dgamut2" {
+                // The pinned DCTL chain is deliberately not normalised to an exact
+                // neutral axis; its rounded white-axis residual is frozen here as
+                // the oracle's AP1-white mapping scaled by 0.18.
+                const WHITE_MAPPED: [f64; 3] =
+                    [1.0002508596888207, 1.0000157324571206, 0.9998142277812561];
+                for channel in 0..3 {
+                    let expected = WHITE_MAPPED[channel] * 0.18;
+                    assert!(
+                        close(linear[channel], expected, 1e-12),
+                        "{} channel {channel} = {} vs {expected}",
+                        profile.id,
+                        linear[channel]
+                    );
+                    assert!(
+                        (linear[channel] - 0.18).abs() > 1e-6,
+                        "{} must keep the rounded-chain residual",
+                        profile.id
+                    );
+                }
+                continue;
+            }
             for channel in 0..3 {
                 assert!(
                     close(linear[channel], 0.18, 1e-9),
@@ -2000,12 +2256,22 @@ mod tests {
                 .unwrap();
             assert_eq!(clipped, [0, 0], "{}", profile.id);
             assert_eq!(out.len(), 3);
-            assert_eq!((out[1], out[2]), (512, 512), "{} neutral chroma", profile.id);
+            if profile.id == "dji-dlog2-dgamut2" {
+                // The pinned rounded chain keeps a ~2.5e-4 white-axis residual, so
+                // a neutral input lands one chroma code below the midpoint. This
+                // frozen expectation proves the residual was not normalised away.
+                assert_eq!((out[1], out[2]), (511, 512), "{} neutral chroma", profile.id);
+            } else {
+                assert_eq!((out[1], out[2]), (512, 512), "{} neutral chroma", profile.id);
+            }
             let signal = profile.transfer.forward(
                 preview::mat3_vec(&profile.composed_matrix(), [0.18; 3])[0]
                     * profile.curve_input_scale(),
             );
             // The frame adapter and the reference signal encoder agree.
+            if profile.id == "dji-dlog2-dgamut2" {
+                continue;
+            }
             let expected = profile.encode_signal_yuv10([signal; 3], profile.range).unwrap();
             assert_eq!(&out[..], &expected, "{}", profile.id);
         }
@@ -2466,6 +2732,21 @@ mod output_cat_tests {
             assert_eq!(output.method, profile.output_cat.method, "{}", profile.id);
             assert_eq!(output.realization, OutputCatRealization::Reference);
             assert_eq!(output.target_white_xy, profile.gamut.white_xy);
+            if let Some(pinned) = profile.output_cat.composed_override {
+                // A profile with a pinned vendor chain reproduces it verbatim; its
+                // own test owns the chain/provenance assertions.
+                assert_eq!(
+                    output.composed_matrix, pinned,
+                    "{} must keep its pinned composed chain",
+                    profile.id
+                );
+                assert_eq!(
+                    output.cat_matrix, profile.output_cat.adaptation,
+                    "{} must report its declared adaptation",
+                    profile.id
+                );
+                continue;
+            }
             // The historic composition, expressed with the same constants and
             // multiplication order, must be reproduced bit-for-bit.
             let historic = cat::mat3_mul(
@@ -2488,8 +2769,8 @@ mod output_cat_tests {
                     );
                 }
             }
-            // White stays neutral: the eight profiles' default output transform
-            // maps AP1/D60 white to target white.
+            // White stays neutral for the Bradford reference realization; the
+            // pinned-chain profile owns its residual expectation in its own test.
             let white = cat::mat3_vec(&output.composed_matrix, [1.0; 3]);
             for channel in 0..3 {
                 assert_close(white[channel], 1.0, 1e-9, &format!("{} white {channel}", profile.id));
@@ -2955,5 +3236,446 @@ mod output_cat_tests {
         assert!(singular
             .resolve_output_cat(OutputCatSelection::Method("cat02"), &registry)
             .is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // D-Log 2 / D-Gamut 2. Every expected value below is a frozen literal from
+    // the independent exact-arithmetic oracle
+    // (`work/dlog2-delivery-impl/dlog2_oracle.py`, Decimal prec=80); no
+    // production function generated its own expectation.
+    // -----------------------------------------------------------------------
+
+    const DLOG2_PROFILE: &str = "dji-dlog2-dgamut2";
+
+    /// `(x, E(x), D(E(x)))` evaluated with Decimal arithmetic.
+    const DLOG2_CURVE_TABLE: [(f64, f64, f64); 46] = [
+        (-0.02, 0.0033423899093129347, -0.02),
+        (-0.018, 0.009264260400297436, -0.018),
+        (0.0, 0.06256109481915793, 0.0),
+        (0.028961694254132, 0.14831479610538775, 0.028961694254132),
+        (0.028961695254132, 0.14831479906632428, 0.028961695254132),
+        (0.028961696254132, 0.14831480202725947, 0.028961696254132),
+        (0.028966695254132, 0.1483296024647456, 0.028966695254132),
+        (0.179999999, 0.3049853367669925, 0.179999999),
+        (0.18, 0.3049853372434017, 0.17999999999999944),
+        (0.180000001, 0.3049853377198112, 0.180000001),
+        (0.180005, 0.30498771925871637, 0.180005),
+        (0.5, 0.3936579476875581, 0.5),
+        (0.9, 0.4452638679050807, 0.9),
+        (1.0, 0.45453920205905907, 1.0),
+        (7.2, 0.6289635845258591, 7.2),
+        (14.4, 0.6903303269095441, 14.4),
+        (46.08, 0.7933443332817633, 46.08),
+        (100.0, 0.8619739998501822, 100.0),
+        (184.32, 0.9161423531223952, 184.32),
+        (300.0, 0.9592924100042289, 300.0),
+        (474.999999, 0.999999999813505, 474.999999),
+        (475.0, 1.0, 475.0),
+        (150.39779326365692, 0.8981254762291176, 150.39779326365692),
+        (328.8269775283602, 0.9674199748426283, 328.8269775283602),
+        (282.1527625083657, 0.9538591874283551, 282.1527625083657),
+        (51.16504897258945, 0.8026161954492318, 51.16504897258945),
+        (23.4394745314631, 0.7334748474646435, 23.4394745314631),
+        (449.5213767104369, 0.9951161804220953, 449.5213767104369),
+        (75.66944227286588, 0.8372782264263015, 75.66944227286588),
+        (399.17844737217223, 0.9845945114300898, 399.17844737217223),
+        (6.806006529087203, 0.6239825820646916, 6.806006529087203),
+        (364.2272219149476, 0.9764774246557627, 364.2272219149476),
+        (329.2867154608838, 0.9675437398443811, 329.2867154608838),
+        (159.16108294471684, 0.9031421918956427, 159.16108294471684),
+        (467.7246328509946, 0.9986326823471917, 467.7246328509946),
+        (398.06072613813484, 0.9843461209794062, 398.06072613813484),
+        (209.9598677105037, 0.9276797431373521, 209.9598677105037),
+        (10.140500028026523, 0.6592792983449932, 10.140500028026523),
+        (84.94667467453363, 0.8475224011990078, 84.94667467453363),
+        (161.059519279585, 0.9041925368309099, 161.059519279585),
+        (315.9380390860737, 0.9638778672546596, 315.9380390860737),
+        (121.84617753719733, 0.8794767400364846, 121.84617753719733),
+        (171.9687241793418, 0.9099981506690425, 171.9687241793418),
+        (116.04251215356985, 0.8751537000147835, 116.04251215356985),
+        (339.2393206459607, 0.9701815226297833, 339.2393206459607),
+        (411.24517361532673, 0.9872326603670275, 411.24517361532673),
+    ];
+
+    /// `AP1/D60 -> D-Gamut 2` pinned chain (Decimal chain, rounded to f64).
+    const DLOG2_AP1_TO_DGAMUT2: [[f64; 3]; 3] = [
+        [0.9345061440003459, -0.0022031394702776525, 0.06794785515875235],
+        [0.04075107103644273, 0.8034933746397581, 0.15577128678091975],
+        [-0.005058772922983332, 0.0047227291779441995, 1.0001502715262953],
+    ];
+
+    fn assert_oracle_close(observed: f64, expected: f64, absolute: f64, relative: f64, label: &str) {
+        let difference = (observed - expected).abs();
+        assert!(
+            difference <= absolute || difference <= relative * expected.abs(),
+            "{label}: {observed:.17} vs {expected:.17} (abs {difference:e})"
+        );
+    }
+
+    #[test]
+    fn dji_dlog2_curve_matches_the_independent_high_precision_oracle() {
+        let transfer = Transfer::DjiDLog2;
+        // The pinned 2^A literal is the oracle's rounded f64; the platform
+        // `exp2` may differ by a few ulp, far inside the curve budget.
+        assert!((DJI_DLOG2_TWO_POW_A - DJI_DLOG2_A.exp2()).abs() <= 1e-10);
+        for (linear, signal, roundtrip) in DLOG2_CURVE_TABLE {
+            let observed = transfer.forward(linear);
+            assert_oracle_close(
+                observed,
+                signal,
+                1e-12,
+                1e-12,
+                &format!("E({linear})"),
+            );
+            let back = transfer.inverse(signal);
+            assert_oracle_close(
+                back,
+                roundtrip,
+                1e-10,
+                1e-10,
+                &format!("D(E({linear}))"),
+            );
+        }
+        // Strictly increasing over the whole pinned domain.
+        let mut ordered: Vec<(f64, f64)> = DLOG2_CURVE_TABLE
+            .iter()
+            .map(|(linear, signal, _)| (*linear, *signal))
+            .collect();
+        ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        for pair in ordered.windows(2) {
+            assert!(
+                pair[1].1 > pair[0].1,
+                "curve is not monotone between {} and {}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+        // Segment joins are continuous at the pinned (not rounded) breakpoints.
+        for x in [
+            DJI_DLOG2_T,
+            DJI_DLOG2_MID,
+            DJI_DLOG2_B2,
+            DJI_DLOG2_B1,
+        ] {
+            let left = transfer.forward(x - 1e-12);
+            let right = transfer.forward(x + 1e-12);
+            assert!((left - right).abs() < 1e-11, "join at {x}");
+        }
+        // A rounded threshold (0.029 instead of the pinned T) would move
+        // E(T+5e-6) by ~8.6e-5, far outside the 1e-12 budget.
+        let near = DJI_DLOG2_T + 5e-6;
+        assert_oracle_close(
+            transfer.forward(near),
+            0.1483296024647456,
+            1e-12,
+            1e-12,
+            "pinned T branch",
+        );
+        let rounded_threshold_value =
+            DJI_DLOG2_B2 + DJI_DLOG2_K2 * (near - 0.029);
+        assert!(
+            (transfer.forward(near) - rounded_threshold_value).abs() > 1e-5,
+            "a rounded T threshold must not pass"
+        );
+    }
+
+    #[test]
+    fn dji_dlog2_reference_codes_are_the_theoretical_full_range_goldens() {
+        let transfer = Transfer::DjiDLog2;
+        let goldens = [
+            (0.0, 64u16),
+            (0.028961695254132, 152),
+            (0.18, 312),
+            (0.9, 456),
+            (46.08, 812),
+            (184.32, 937),
+            (475.0, 1023),
+        ];
+        let references = transfer.references();
+        assert_eq!(references.len(), goldens.len());
+        for (reference, (linear, code)) in references.iter().zip(goldens) {
+            assert_eq!(reference.linear, linear);
+            assert_eq!(reference.code10, code);
+            assert_eq!(
+                (transfer.forward(linear) * 1023.0)
+                    .round()
+                    .clamp(0.0, 1023.0),
+                f64::from(code),
+                "full-range code at {linear}"
+            );
+            assert_eq!(reference.code8(), (f64::from(code) * 255.0 / 1023.0).round() as u16);
+        }
+        // The delivery domain is the inverse of the encodable signal range.
+        assert_eq!(transfer.domain(), (transfer.inverse(0.0), transfer.inverse(1.0)));
+        assert_oracle_close(
+            transfer.domain().0,
+            -0.021128829113842125,
+            1e-15,
+            0.0,
+            "D(0)",
+        );
+        assert_oracle_close(transfer.domain().1, 475.0, 1e-12, 1e-12, "D(1)");
+    }
+
+    #[test]
+    fn dji_dlog2_curve_is_pure_and_delivery_clipping_equals_signal_clipping() {
+        let transfer = Transfer::DjiDLog2;
+        // Pure curve: no pre-clamping of negatives or over-range values.
+        assert!(transfer.forward(-0.5) < 0.0);
+        assert!(transfer.forward(1000.0) > 1.0);
+        assert_oracle_close(
+            transfer.forward(-0.02),
+            0.0033423899093129347,
+            1e-12,
+            1e-12,
+            "signed toe",
+        );
+
+        // For the monotone curve, clipping in the target-linear domain to the
+        // inverse endpoints is equivalent to clipping the signal to [0, 1].
+        let (low, high) = transfer.domain();
+        for target in [-1000.0, -1.0, -0.5, -0.0212, low, 0.0, 0.18, 475.0, high, 476.0, 1000.0] {
+            let target_clipped = transfer.forward(target.clamp(low, high));
+            let signal_clipped = transfer.forward(target).clamp(0.0, 1.0);
+            assert_oracle_close(
+                target_clipped,
+                signal_clipped,
+                1e-14,
+                0.0,
+                &format!("clip equivalence at {target}"),
+            );
+        }
+
+        // The production conversion reports the same domain clips in channel
+        // samples and never applies them before the pure curve.
+        let profile = lookup(DLOG2_PROFILE).unwrap();
+        let output = profile.default_output_transform();
+        let mut codes = Vec::new();
+        let low_bytes: Vec<u8> = [-0.5f32; 3]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let counts = profile
+            .convert_f32_frame_to_yuv10(&output, &low_bytes, 1, 1, 1.0, PreviewRange::Pc, &mut codes)
+            .unwrap();
+        assert_eq!(counts, [3, 0]);
+        assert_eq!(codes[0], 0, "clipped-low luma is the signal-domain zero");
+        assert!(matches!(codes[1], 511 | 512), "{codes:?}");
+        assert!(matches!(codes[2], 511 | 512), "{codes:?}");
+        let high_bytes: Vec<u8> = [1000f32; 3]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let counts = profile
+            .convert_f32_frame_to_yuv10(&output, &high_bytes, 1, 1, 1.0, PreviewRange::Pc, &mut codes)
+            .unwrap();
+        assert_eq!(counts, [0, 3]);
+        assert_eq!(codes[0], 1023);
+        assert!(matches!(codes[1], 511 | 512), "{codes:?}");
+        assert!(matches!(codes[2], 511 | 512), "{codes:?}");
+    }
+
+    #[test]
+    fn dji_dlog2_f32_signal_stays_within_the_recorded_one_e_minus_five_budget() {
+        // A hypothetical f32 evaluation of the same pinned formula; the product
+        // itself evaluates in f64. Recorded separately from the f64 budget.
+        fn forward_f32(value: f32) -> f32 {
+            let h = 475.0f32;
+            let a = 16.285770761945304f32;
+            let k1 = 0.059439938321493f32;
+            let b1 = 0.304985337243402f32;
+            let k2 = 2.960935245492250f32;
+            let b2 = 0.148314799066323f32;
+            let t = 0.028961695254132f32;
+            let two_pow_a_minus_1 = 79891.40627605369f32;
+            if value < t {
+                b2 + k2 * (value - t)
+            } else if value < 0.18 {
+                b1 + k1 * (value / 0.18).log2()
+            } else {
+                (1.0 + value * two_pow_a_minus_1 / h).log2() / a
+            }
+        }
+        let mut worst = 0.0f64;
+        for (linear, signal, _) in DLOG2_CURVE_TABLE {
+            let observed = f64::from(forward_f32(linear as f32));
+            let difference = (observed - signal).abs();
+            worst = worst.max(difference);
+            assert!(
+                difference <= 1e-5,
+                "f32 E({linear}) = {observed:.9} vs f64 {signal:.9} (abs {difference:e})"
+            );
+        }
+        eprintln!("dji_dlog2 f32-vs-f64 max signal error: {worst:e} (budget 1e-5)");
+        assert!(worst <= 1e-5);
+    }
+
+    #[test]
+    fn dji_dlog2_matrices_preserve_the_pinned_rounded_chain() {
+        let profile = lookup(DLOG2_PROFILE).unwrap();
+        let output = profile.default_output_transform();
+        for row in 0..3 {
+            for column in 0..3 {
+                assert_oracle_close(
+                    output.composed_matrix[row][column],
+                    DLOG2_AP1_TO_DGAMUT2[row][column],
+                    1e-12,
+                    1e-12,
+                    &format!("composed [{row}][{column}]"),
+                );
+            }
+        }
+        // Closed loop: the chain is inverse(M_DG2_AP0) * M_AP1_AP0.
+        let chain = preview::mat3_mul(
+            &cat::invert3(&DJI_DLOG2_DGAMUT2_TO_AP0).unwrap(),
+            &ACES_AP1_TO_AP0,
+        );
+        for row in 0..3 {
+            for column in 0..3 {
+                assert_oracle_close(
+                    chain[row][column],
+                    output.composed_matrix[row][column],
+                    1e-12,
+                    1e-12,
+                    &format!("chain [{row}][{column}]"),
+                );
+            }
+        }
+        // The three DCTL matrices are the printed four-decimal values.
+        assert_eq!(
+            profile.gamut.rgb_to_xyz,
+            [[0.6917, 0.1596, 0.0990], [0.2498, 0.8381, -0.0880], [0.0, 0.0, 1.0891]]
+        );
+        assert_eq!(
+            DCTL_CAT02_D65_TO_D60,
+            [[1.0120, 0.0080, -0.0158], [0.0058, 1.0014, -0.0063], [-0.0003, -0.0010, 0.9276]]
+        );
+        assert_eq!(
+            DCTL_XYZ60_TO_AP0,
+            [[1.0498, 0.0, -0.0001], [-0.4959, 1.3733, 0.0982], [0.0, 0.0, 0.9913]]
+        );
+        // M_DG2_AP0 is the printed product, not a re-derivation.
+        let product = preview::mat3_mul(
+            &DCTL_XYZ60_TO_AP0,
+            &preview::mat3_mul(&DCTL_CAT02_D65_TO_D60, &DCTL_DGAMUT2_TO_XYZ65),
+        );
+        for row in 0..3 {
+            for column in 0..3 {
+                assert_oracle_close(
+                    product[row][column],
+                    DJI_DLOG2_DGAMUT2_TO_AP0[row][column],
+                    1e-15,
+                    1e-15,
+                    &format!("M_DG2_AP0 [{row}][{column}]"),
+                );
+            }
+        }
+        // The reported adaptation is the exact inverse of the printed constant.
+        let net = cat::invert3(&DCTL_CAT02_D65_TO_D60).unwrap();
+        for row in 0..3 {
+            for column in 0..3 {
+                assert_oracle_close(
+                    output.cat_matrix[row][column],
+                    net[row][column],
+                    1e-12,
+                    1e-12,
+                    &format!("net adaptation [{row}][{column}]"),
+                );
+            }
+        }
+        assert_eq!(output.method, "cat02");
+        assert_eq!(output.realization, OutputCatRealization::Reference);
+        // The rounded chain's white-axis residual is preserved, not normalised.
+        let white = preview::mat3_vec(&output.composed_matrix, [1.0, 1.0, 1.0]);
+        let residual = white
+            .iter()
+            .fold(0.0f64, |largest, value| largest.max((value - 1.0).abs()));
+        assert_oracle_close(residual, 0.0002508596888206352, 1e-12, 0.0, "white residual");
+        assert!(residual > 1e-4, "the chain must not be normalised to neutral");
+        // A Bradford chain with the same gamut is measurably different: CAT02 is
+        // not silently replaced by the pre-existing default.
+        let bradford = preview::mat3_mul(
+            &DGAMUT2_TO_XYZ65_INVERSE,
+            &preview::mat3_mul(&preview::BRADFORD_D60_TO_D65, &preview::AP1_D60_TO_XYZ_D60),
+        );
+        let difference = bradford
+            .iter()
+            .flatten()
+            .zip(output.composed_matrix.iter().flatten())
+            .fold(0.0f64, |largest, (a, b)| largest.max((a - b).abs()));
+        assert!(difference > 1e-3, "CAT02 and Bradford chains coincide: {difference:e}");
+        // A custom explicit method derives a different matrix and says so.
+        let custom = profile
+            .resolve_output_cat(
+                OutputCatSelection::Method("bradford"),
+                &cat::CatRegistry::standard(),
+            )
+            .unwrap();
+        assert_eq!(custom.realization, OutputCatRealization::CustomAdaptation);
+        assert_ne!(custom.composed_matrix, output.composed_matrix);
+        assert_ne!(custom.fingerprint, output.fingerprint);
+    }
+
+    #[test]
+    fn dji_dlog2_profile_reports_its_effective_contract() {
+        let profile = lookup(DLOG2_PROFILE).unwrap();
+        assert_eq!(profile.transfer.name(), "DJI D-Log 2");
+        assert_eq!(profile.curve_input_scale(), 1.0);
+        assert!(!profile.is_rev_eng());
+        // The new profile has an independent identity from the original D-Log
+        // profile: different transfer, gamut, reference chain and codes.
+        assert_ne!(Transfer::DjiDLog2, Transfer::DjiDLog);
+        let original = lookup("dji-dlog-dgamut").unwrap();
+        assert_ne!(original.transfer.forward(0.18), profile.transfer.forward(0.18));
+        assert_ne!(original.composed_matrix(), profile.composed_matrix());
+        assert_ne!(original.gamut.name, profile.gamut.name);
+        assert_eq!(profile.gamut.name, "DJI D-Gamut 2");
+        assert_eq!(profile.range, PreviewRange::Pc);
+        assert_eq!(profile.ycbcr_matrix, "bt2020nc");
+        assert_eq!(profile.tag_policy, TagPolicy::VENDOR_LOG);
+        // The vendor Log tag policy leaves primaries/transfer unspecified; the
+        // YCbCr matrix tag describes coding, not BT.2020 primaries.
+        assert_eq!(profile.tag_policy.primaries_token(), "unknown");
+        assert_eq!(profile.tag_policy.transfer_token(), "unknown");
+        assert_eq!(profile.tag_policy.matrix_token(), "bt2020nc");
+
+        let output = profile.default_output_transform();
+        let contract = profile.contract_json(&output);
+        let cat = contract.get("output_cat").expect("output_cat");
+        assert_eq!(cat.get("method").and_then(Json::as_str), Some("cat02"));
+        assert_eq!(cat.get("realization").and_then(Json::as_str), Some("reference"));
+        assert_eq!(cat.get("reference").and_then(Json::as_bool), Some(true));
+        assert_eq!(
+            cat.get("custom_adaptation").and_then(Json::as_bool),
+            Some(false)
+        );
+        let matrices = contract.get("matrices").expect("matrices");
+        // Legacy Bradford key keeps its old meaning only; this reference is not
+        // a Bradford/D65 realization and must not emit it.
+        assert!(matrices.get("bradford_cat_d60_to_d65").is_none());
+        let printed = matrices
+            .get("cat02_d65_to_d60")
+            .expect("printed DCTL CAT02 matrix");
+        assert_eq!(
+            printed,
+            &preview::matrix_json(&DCTL_CAT02_D65_TO_D60),
+            "the contract must expose the printed constant for traceability"
+        );
+        assert!(matrices.get("dgamut2_to_acesap0").is_some());
+        assert!(matrices.get("acesap1_to_acesap0").is_some());
+        let transfer = contract.get("transfer").expect("transfer");
+        assert_eq!(
+            transfer.get("source").and_then(|s| s.get("url")).and_then(Json::as_str),
+            Some(
+                "https://github.com/thatcherfreeman/dwg-transforms/blob/\
+                 56143916e275c617471f7845b5c6b57795d0ee28/specs/\
+                 DLog2_DGamut2_to_ACES_AP0_cat02.dctl"
+            )
+        );
+        let gamut = contract.get("gamut").expect("gamut");
+        assert_eq!(
+            gamut.get("white_xy"),
+            Some(&pair_json(D65_WHITE_XY))
+        );
     }
 }

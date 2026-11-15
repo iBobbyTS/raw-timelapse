@@ -1451,7 +1451,7 @@ fn run_profile(root: &Path, input: &Path, tool: &Path, id: &str) -> (Output, Pat
 
 #[test]
 fn preview_profiles_emit_their_declared_colour_contract() {
-    let cases: [(&str, &str, bool, &str, &str); 6] = [
+    let cases: [(&str, &str, bool, &str, &str); 7] = [
         ("srgb-preview", "bt709", false, "bt709", "iec.ch"),
         ("sony-slog3-sgamut3", "bt2020nc", true, "unknown", "sony.jp"),
         (
@@ -1470,6 +1470,7 @@ fn preview_profiles_emit_their_declared_colour_contract() {
         ),
         ("nikon-nlog-bt2020", "bt2020nc", true, "bt2020", "nikon"),
         ("dji-dlog-dgamut", "bt2020nc", true, "unknown", "djicdn"),
+        ("dji-dlog2-dgamut2", "bt2020nc", true, "unknown", "github"),
     ];
 
     for (id, matrix, vendor, primaries, _source) in cases {

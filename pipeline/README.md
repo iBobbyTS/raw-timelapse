@@ -58,8 +58,9 @@ Defaults:
   path when using a work-directory build)
 - `--ffmpeg` / `--ffprobe` at `/opt/homebrew/opt/ffmpeg-full/bin/`
 - `--preview-profile srgb-preview` — one of `srgb-preview`, `dji-dlog-dgamut`,
-  `canon-log2-cinema-gamut`, `sony-slog3-sgamut3`, `sony-slog3-sgamut3-cine`,
-  `nikon-nlog-bt2020`, `canon-log2-cinema-gamut-rev-eng-crm-dev`,
+  `dji-dlog2-dgamut2`, `canon-log2-cinema-gamut`, `sony-slog3-sgamut3`,
+  `sony-slog3-sgamut3-cine`, `nikon-nlog-bt2020`,
+  `canon-log2-cinema-gamut-rev-eng-crm-dev`,
   `canon-log3-cinema-gamut-rev-eng-crm-dev`
 - `--output-cat profile` — `profile` keeps the selected profile's own fixed
   reference chromatic adaptation. `bradford` or `cat02` name a registered
@@ -332,6 +333,7 @@ still quantizes once at the encoder input.
 | `canon-log3-cinema-gamut-rev-eng-crm-dev` | clog3 (rev-eng crm-dev) / Cinema Gamut | bt2020nc |
 | `nikon-nlog-bt2020` | N-Log / BT.2020 | bt2020nc |
 | `dji-dlog-dgamut` | D-Log / D-Gamut | bt2020nc |
+| `dji-dlog2-dgamut2` | D-Log 2 / D-Gamut 2 (pinned DCTL, CAT02) | bt2020nc |
 
 Input development is selected with `--camera-color auto|generic|canon-clog3`
 (default `auto`). After the existing single-extension input enumeration:
@@ -362,8 +364,9 @@ retain their definitions.
 
 The output chromatic adaptation belongs to `OutputProfile`, not to the transfer
 curve or the input CAT. `--output-cat profile` (default) uses the profile's fixed
-reference realization; the eight pre-existing profiles keep the published
-Bradford D60→D65 matrix and composition order bit-for-bit. An explicit
+reference realization; the pre-existing profiles keep the published Bradford
+D60→D65 matrix and composition order bit-for-bit, while `dji-dlog2-dgamut2`
+pins its own DCTL chain. An explicit
 `bradford`/`cat02` equal to the profile default is the same idempotent reference
 selection. A different explicit method uses the standard derivation with column
 vectors — `M_out = inverse(M_target_to_XYZ) × CAT × M_AP1_to_XYZ`, where
@@ -378,6 +381,44 @@ line reports `output_cat_requested`, `output_cat_method`,
 `output_cat_realization` (`reference`/`custom-adaptation`), source/target whites
 and a stable transform fingerprint. Adding an algorithm to the static CAT
 registry needs no transfer or native change.
+
+### D-Log 2 / D-Gamut 2 (`dji-dlog2-dgamut2`)
+
+This profile implements the fixed three-segment D-Log 2 curve and the pinned
+D-Gamut 2 -> ACES AP0 (CAT02) DCTL chain; it is independent of the original
+`dji-dlog-dgamut` profile. Curve constants are `H=475`,
+`A=16.285770761945304`, `K1=0.059439938321493`, `B1=0.304985337243402`,
+`K2=2.960935245492250`, `B2=0.148314799066323`, `T=0.028961695254132`. The curve
+runs in linear reflection units (`curve_input_scale = 1`) and its encodable
+domain is `[D(0), D(1)] = [-0.021128829113842125, 475]`; values outside it are
+clipped to that domain per channel, which for this monotone curve is equivalent
+to clipping the encoded signal to `[0, 1]`.
+
+The default output CAT is the DCTL's real chain, not Bradford:
+`AP1/D60 -> AP0/D60 (ACES v1.3 chromaticities) -> XYZ/D60 -> the DCTL's printed
+CAT02 D65->D60 constant -> XYZ/D65 -> D-Gamut 2`. Its three four-decimal matrices
+are used digit for digit and the rounded chain's white-axis residual (max
+2.5e-4) is preserved, never normalised away. `--output-cat profile` (or `cat02`)
+selects this reference realization; another method derives a
+`custom-adaptation` matrix and does not claim the reference chain. The colour
+contract also exposes the printed `cat02_d65_to_d60`, `xyz60_to_acesap0`,
+`dgamut2_to_acesap0` and derived `acesap1_to_acesap0` matrices for traceability.
+
+The full-range theoretical 10-bit codes (0 -> 64, T -> 152, 0.18 -> 312,
+0.9 -> 456, 46.08 -> 812, 184.32 -> 937, 475 -> 1023) describe the curve only;
+they are not camera ISO/EI clipping points and not limited-range Y codes. ProRes
+still delivers limited range (`yuv444p10le` handoff, 64..940), FFV1 delivers the
+profile's full range, and both use one resolved range for quantization and
+encoder. Tags follow the vendor Log policy (primaries/transfer unspecified,
+`bt2020nc` coding), which does not mean BT.2020 primaries. `reference_status`
+remains `unverified`: this is a math implementation, not a claim of matching DJI
+camera exposure or in-camera video.
+
+Every successful run logs one `kind=clip` line with `clipped_low`,
+`clipped_high`, `clipped_total` and `total_channel_samples` (`unit=channel_samples`,
+three samples per pixel), accumulated from ordered colour commits only. Frames
+that fail or never commit are excluded; an incomplete run publishes no video and
+no clip summary. The clipping counters are not an added per-frame audit file.
 
 `--log-reference-gain N` is a positive finite output gain for every profile,
 default 1. It is applied once before the output transfer function and never enters

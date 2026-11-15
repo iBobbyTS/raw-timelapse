@@ -40,6 +40,9 @@ enum Pixels {
 struct Image {
     info: FrameInfo,
     pixels: Pixels,
+    /// Channel samples that the colour node clipped below/above the transfer's
+    /// encodable domain. Only the ordered commit accumulates them.
+    clips: [usize; 2],
 }
 
 struct Runner<'a, 'b> {
@@ -61,6 +64,12 @@ struct Runner<'a, 'b> {
     worker_failure: Arc<Mutex<Option<Error>>>,
     failure: Option<Error>,
     prepare_batch_size: usize,
+    /// Ordered per-run clipping totals, accumulated only from committed colour
+    /// frames. Unit is channel samples (3 per pixel), never pixels.
+    clipped_low: usize,
+    clipped_high: usize,
+    color_channel_samples: usize,
+    color_frames: usize,
 }
 fn frame_failure(id: usize, total: usize, name: &str, message: &str) -> String {
     format!(
@@ -396,6 +405,7 @@ impl Backend for Runner<'_, '_> {
             Ok(Image {
                 info,
                 pixels: Pixels::Linear(pixels.ok_or("graph: develop returned no owned pixels")?),
+                clips: [0, 0],
             })
         }))
     }
@@ -452,7 +462,7 @@ impl Backend for Runner<'_, '_> {
                         return Err("graph: colour conversion requires scene-linear pixels".into());
                     };
                     let mut signal = Vec::new();
-                    profile
+                    image.clips = profile
                         .convert_f32_frame_to_yuv10(
                             &output_transform,
                             pixels,
@@ -559,6 +569,19 @@ impl Backend for Runner<'_, '_> {
                 Kind::Color => "color",
                 _ => unreachable!("only image transformations reach this commit"),
             };
+            if kind == Kind::Color {
+                // Ordered commit: one accumulation per delivered frame. Worker
+                // threads never share these counters, so concurrency cannot
+                // duplicate or drop a frame's samples.
+                let samples = (info.width as usize)
+                    .checked_mul(info.height as usize)
+                    .and_then(|pixels| pixels.checked_mul(3))
+                    .ok_or("graph: colour geometry overflow")?;
+                self.clipped_low += image.clips[0];
+                self.clipped_high += image.clips[1];
+                self.color_channel_samples += samples;
+                self.color_frames += 1;
+            }
             let written = self.log.line(&format!(
                 "kind=image node_kind={token} frame={} duration={:.3}",
                 info.index,
@@ -779,13 +802,16 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
     let profile = context.options.preview_profile;
     log.line(&format!(
         "kind=colour profile={} camera_color={} matrix={} primaries={} transfer={} \
-         reference_gain={} camera_color_requested={} recipe_effective={} profile_correction={} camera_calibration={} input_cat=bradford-d50-d60 calibration_status={} {}",
+         reference_gain={} reference_status=unverified effective_range={} \
+         camera_color_requested={} recipe_effective={} profile_correction={} camera_calibration={} \
+         input_cat=bradford-d50-d60 calibration_status={} {}",
         profile.id,
         context.camera_recipe.native_token(),
         profile.tag_policy.matrix_token(),
         profile.tag_policy.primaries_token(),
         profile.tag_policy.transfer_token(),
         context.options.log_reference_gain,
+        range.as_str(),
         context.options.camera_color.token(), context.camera_recipe.token(), context.camera_recipe.correction(), context.camera_recipe.calibration(),
         if context.camera_recipe.calibration() != "none" { "pending-native-validation" } else { "uncalibrated" },
         context.options.output_transform.log_fields()
@@ -833,6 +859,10 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         worker_failure: Default::default(),
         failure: None,
         prepare_batch_size: graph.prepare_batch_size(),
+        clipped_low: 0,
+        clipped_high: 0,
+        color_channel_samples: 0,
+        color_frames: 0,
     };
     let graph_started = Instant::now();
     let result = graph::execute(&graph, context.sources.len(), &mut runner);
@@ -910,6 +940,23 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         },
     )?;
     timings.insert("validate_video".into(), validation_started.elapsed());
+    // Delivered clipping statistics: written only after the graph completed and
+    // the deliverable passed its output check. Frames that failed or never
+    // committed are excluded because only ordered colour commits reached these
+    // counters; the unit is channel samples (three per pixel), never pixels.
+    let clip_frames = runner.color_frames;
+    let clip_low = runner.clipped_low;
+    let clip_high = runner.clipped_high;
+    let clip_samples = runner.color_channel_samples;
+    runner.log.line(&format!(
+        "kind=clip frames={} clipped_low={} clipped_high={} clipped_total={} \
+         total_channel_samples={} unit=channel_samples",
+        clip_frames,
+        clip_low,
+        clip_high,
+        clip_low + clip_high,
+        clip_samples
+    ))?;
     let bytes = video::file_size(&output)
         .ok_or_else(|| Error::new(EXIT_PREVIEW, "graph encoder produced no video"))?;
     let artifact = video::video_envelope_with_gain(

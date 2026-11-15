@@ -37,6 +37,7 @@ OPTIONS:
     --ffprobe <PATH>           ffprobe executable (default: /opt/homebrew/opt/ffmpeg-full/bin/ffprobe)
     --preview-profile <ID>     Output colour/Log profile (default: srgb-preview)
                                one of: srgb-preview, dji-dlog-dgamut,
+                               dji-dlog2-dgamut2,
                                canon-log2-cinema-gamut, sony-slog3-sgamut3,
                                sony-slog3-sgamut3-cine, nikon-nlog-bt2020,
                                canon-log2-cinema-gamut-rev-eng-crm-dev,
@@ -1283,6 +1284,20 @@ mod tests {
         ])
         .expect("parse");
         assert_eq!(options.preview_profile.id, "nikon-nlog-bt2020");
+    }
+
+    #[test]
+    fn usage_lists_every_registered_profile_id() {
+        // T13: the help surface is a hard-coded list; adding a profile must not
+        // leave the CLI documentation behind the registry.
+        for profile in color_profile::PROFILES.iter() {
+            assert!(
+                USAGE.contains(profile.id),
+                "CLI help is missing registered profile {:?}",
+                profile.id
+            );
+        }
+        assert!(USAGE.contains("--output-cat <MODE>        profile|bradford|cat02"));
     }
 
     #[test]

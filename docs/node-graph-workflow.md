@@ -155,12 +155,13 @@ wall=<epoch 秒.毫秒> elapsed=<单调秒.毫秒> kind=<事件> <有界字段..
 | `inventory` | 帧数、首尾文件名 |
 | `graph` | 图来源（内置/路径）、节点 ID 顺序、实际 concurrency/batch_size 与容量单位 |
 | `encoder` | encoder/container/pix_fmt/profile/range/几何 |
-| `colour` | profile、相机颜色方法、matrix/primaries/transfer |
+| `colour` | profile、相机颜色方法、matrix/primaries/transfer、effective range、reference_status、输出 CAT |
 | `prepare` | 帧号、源名、路由、generated、缓存路径、mode/duration_scope、独立耗时 |
 | `prepare.batch` | 批 ID、帧范围/数、实际 ADC 调用数、转换/核验/总墙钟 |
 | `measure` | 帧号、源名、耗时 |
 | `develop` | 帧号、源名、EV、应用/自身白平衡、源与像素摘要、像素字节数、耗时 |
 | `image` / `encode` | 图像/编码单帧任务计算耗时（不含排序等待） |
+| `clip` | 一次成功运行的通道样本裁切汇总：frames、clipped_low/high/total、total_channel_samples（unit=channel_samples） |
 | `stage` | 节点容量、接收/提交/交付数与在途峰值 |
 | `node` | 每个节点的逐帧/序列完成事件（节点顺序） |
 | `delete` | 帧号、源名、被删缓存路径 |
@@ -214,7 +215,11 @@ measurement. Native/Rust color contract v2 checks requested/effective policies
 and keeps the existing input Bradford D50→D60 CAT. The output CAT is now part of
 the output profile: `--output-cat profile|bradford|cat02` (default `profile`)
 selects the profile's fixed reference realization or an explicit registered
-method. The eight pre-existing profiles keep the published Bradford D60→D65
+method. `dji-dlog2-dgamut2` pins the fixed DCTL AP1→AP0→D-Gamut 2/CAT02 chain
+(three four-decimal matrices used digit-for-digit, white-axis residual kept,
+reported as `cat02`/`reference`); `--output-cat` with a different method derives
+and reports `custom-adaptation` instead. The pre-existing profiles keep the
+published Bradford D60→D65
 matrix and composition order exactly; an explicit different method is a standard
 full-adaptation derivation labeled `custom-adaptation` and changes output pixels.
 The resolved transform is frozen before the graph runs, and neither the input CAT
