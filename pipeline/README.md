@@ -395,10 +395,11 @@ clipped to that domain per channel, which for this monotone curve is equivalent
 to clipping the encoded signal to `[0, 1]`.
 
 The default output CAT is the DCTL's real chain, not Bradford:
-`AP1/D60 -> AP0/D60 (ACES v1.3 chromaticities) -> XYZ/D60 -> the DCTL's printed
-CAT02 D65->D60 constant -> XYZ/D65 -> D-Gamut 2`. Its three four-decimal matrices
-are used digit for digit and the rounded chain's white-axis residual (max
-2.5e-4) is preserved, never normalised away. `--output-cat profile` (or `cat02`)
+`AP1/D60 -> AP0/D60 (ACES v1.3 chromaticities) -> XYZ/D60 -> the inverse of the
+DCTL's printed CAT02 D65->D60 constant (XYZ/D60 -> XYZ/D65, as required by
+inverse(M_DG2_AP0) x M_AP1_AP0) -> XYZ/D65 -> D-Gamut 2`. Its three four-decimal
+matrices are used digit for digit and the rounded chain's white-axis residual
+(max 2.5e-4) is preserved, never normalised away. `--output-cat profile` (or `cat02`)
 selects this reference realization; another method derives a
 `custom-adaptation` matrix and does not claim the reference chain. The colour
 contract also exposes the printed `cat02_d65_to_d60`, `xyz60_to_acesap0`,

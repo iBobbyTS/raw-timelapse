@@ -757,9 +757,11 @@ const DCTL_DGAMUT2_TO_XYZ65: [[f64; 3]; 3] = [
     [0.0, 0.0, 1.0891],
 ];
 
-/// Pinned DCTL CAT02 XYZ(D65)->XYZ(D60), copied digit for digit. It is applied
-/// in this printed direction inside the reference chain; its 4-decimal rounding
-/// contributes to the chain's white-axis residual and is preserved.
+/// Pinned DCTL CAT02 XYZ(D65)->XYZ(D60), copied digit for digit. The reference
+/// chain applies its inverse (XYZ(D60)->XYZ(D65)), as required by
+/// `inverse(M_DG2_AP0) * M_AP1_AP0`; the printed constant itself is preserved
+/// digit for digit and its 4-decimal rounding contributes to the chain's
+/// white-axis residual.
 const DCTL_CAT02_D65_TO_D60: [[f64; 3]; 3] = [
     [1.0120, 0.0080, -0.0158],
     [0.0058, 1.0014, -0.0063],
@@ -910,14 +912,16 @@ const DJI_DLOG2_OUTPUT_CAT: OutputCatDefault = OutputCatDefault {
     adaptation: DJI_DLOG2_NET_D60_TO_D65,
     composed_override: Some(DJI_DLOG2_AP1_TO_DGAMUT2),
     provenance: "derived-from-pinned-DCTL: AP1/D60 -> AP0/D60 (ACES v1.3 chromaticities, \
-                 f64 normalised-primary construction) -> XYZ/D60 -> the DCTL's printed CAT02 \
-                 D65->D60 constant applied in its printed direction -> XYZ/D65 -> D-Gamut 2 \
-                 linear (inverse of the DCTL's 4-decimal D-Gamut 2->XYZ65 matrix). The three \
-                 DCTL matrices are used digit for digit; the rounded chain's white-axis \
-                 residual (max 2.5e-4) is preserved and never normalised away. The reported \
-                 adaptation matrix is the net D60->D65 step (exact f64 inverse of the printed \
-                 constant), not a re-derived CAT. reference_status=unverified refers to camera \
-                 exposure/video matching, not to this math implementation",
+                 f64 normalised-primary construction) -> XYZ/D60 -> the inverse of the DCTL's \
+                 printed CAT02 D65->D60 constant (i.e. XYZ/D60 -> XYZ/D65, as required by \
+                 inverse(M_DG2_AP0) * M_AP1_AP0) -> XYZ/D65 -> D-Gamut 2 linear (inverse of \
+                 the DCTL's 4-decimal D-Gamut 2->XYZ65 matrix). The three DCTL matrices are \
+                 used digit for digit; the rounded chain's white-axis residual (max 2.5e-4) \
+                 is preserved and never normalised away. The reported adaptation matrix is \
+                 the net D60->D65 step (exact f64 inverse of the printed constant, i.e. the \
+                 matrix actually applied here), not a re-derived CAT. reference_status=\
+                 unverified refers to camera exposure/video matching, not to this math \
+                 implementation",
 };
 
 /// One resolved output transform: frozen before per-pixel conversion.
