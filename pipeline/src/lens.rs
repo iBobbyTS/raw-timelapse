@@ -19,8 +19,8 @@ impl Mode {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Sampling {
-    #[default]
     Bilinear,
+    #[default]
     Quality,
 }
 impl Sampling {
@@ -54,7 +54,7 @@ impl Default for Policy {
         Self {
             components: [true; 3],
             vignette_strength: 1.,
-            sampling: Sampling::Bilinear,
+            sampling: Sampling::Quality,
         }
     }
 }
@@ -266,7 +266,7 @@ pub fn intersect(a: [f64; 4], b: [f64; 4]) -> Result<[f64; 4]> {
 mod tests {
     use super::*;
     fn report(requested: bool, status: &str) -> Json {
-        crate::json::parse(&format!(r#"{{"revision":2,"requested":{requested},"collected":true,"upstream_reversible":false,"vignette_strength":1,"resampling":"bilinear","gain_min":1,"gain_max":1,"components":[{{"component":"vignette","status":"{status}","requested":{requested}}},{{"component":"distortion","status":"{status}","requested":{requested}}},{{"component":"ca","status":"{status}","requested":{requested}}}]}}"#)).unwrap()
+        crate::json::parse(&format!(r#"{{"revision":2,"requested":{requested},"collected":true,"upstream_reversible":false,"vignette_strength":1,"resampling":"quality","gain_min":1,"gain_max":1,"components":[{{"component":"vignette","status":"{status}","requested":{requested}}},{{"component":"distortion","status":"{status}","requested":{requested}}},{{"component":"ca","status":"{status}","requested":{requested}}}]}}"#)).unwrap()
     }
     #[test]
     fn validates_per_component_execution_not_generic_success() {
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn certified_area_is_bound_to_identity_and_policy_and_intersects() {
         let settings = Settings::default();
-        let text = r#"{"revision":1,"source_sha256":"source","prepared_sha256":"prepared","width":64,"height":48,"area":[0.1,0.1,0.9,0.9],"coordinate_system":"normalized-pixel-centres","certified":true,"mode":"off","components":[true,true,true],"vignette_strength":1,"resampling":"bilinear"}"#;
+        let text = r#"{"revision":1,"source_sha256":"source","prepared_sha256":"prepared","width":64,"height":48,"area":[0.1,0.1,0.9,0.9],"coordinate_system":"normalized-pixel-centres","certified":true,"mode":"off","components":[true,true,true],"vignette_strength":1,"resampling":"quality"}"#;
         let area = ValidArea::parse(
             &crate::json::parse(text).unwrap(),
             "source",
@@ -340,7 +340,7 @@ mod tests {
         for broken in [
             text.replace(r#""source""#, r#""other""#),
             text.replace(r#""certified":true"#, r#""certified":false"#),
-            text.replace("bilinear", "quality"),
+            text.replace("quality", "bilinear"),
             text.replace("0.9,0.9", "0.0,0.0"),
         ] {
             assert!(ValidArea::parse(
@@ -373,7 +373,7 @@ mod tests {
                 "--lens-correction",
                 "auto",
                 "--lens-vignette", "auto", "--lens-distortion", "auto", "--lens-ca", "auto",
-                "--lens-vignette-strength", "1", "--lens-resampling", "bilinear",
+                "--lens-vignette-strength", "1", "--lens-resampling", "quality",
                 "--exiftool",
                 "/tool with spaces/exiftool",
                 "--lens-profile-dir",
@@ -384,6 +384,6 @@ mod tests {
         );
         let mut off = Vec::new();
         Settings::default().prepare_args(&mut off);
-        assert_eq!(off, ["--lens-correction", "off", "--lens-vignette", "auto", "--lens-distortion", "auto", "--lens-ca", "auto", "--lens-vignette-strength", "1", "--lens-resampling", "bilinear"]);
+        assert_eq!(off, ["--lens-correction", "off", "--lens-vignette", "auto", "--lens-distortion", "auto", "--lens-ca", "auto", "--lens-vignette-strength", "1", "--lens-resampling", "quality"]);
     }
 }

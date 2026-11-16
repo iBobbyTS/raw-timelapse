@@ -41,7 +41,8 @@ enum class Sampling { bilinear, quality };
 struct Policy {
   std::array<bool, 3> components{true, true, true};
   double vignette_strength = 1;
-  Sampling sampling = Sampling::bilinear;
+  // quality is the product default; bilinear remains the explicit low-cost path.
+  Sampling sampling = Sampling::quality;
 };
 void validate_policy(const Policy &);
 struct Request {

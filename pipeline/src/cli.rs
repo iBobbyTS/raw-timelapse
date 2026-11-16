@@ -63,7 +63,7 @@ OPTIONS:
     --lens-correction <MODE>   auto | off (default: auto; cannot undo upstream correction)
     --lens-vignette <MODE>     auto | off (default: auto), likewise --lens-distortion / --lens-ca
     --lens-vignette-strength N Exposure-domain strength 0..1 (default: 1)
-    --lens-resampling <MODE>   bilinear | quality (default: bilinear)
+    --lens-resampling <MODE>   bilinear | quality (default: quality; quality costs more per frame)
     --lens-crop <MODE>         preserve | safe | sequence-safe (default: preserve; safe is fixed over video)
     --exiftool <PATH>          Read-only Prepare metadata tool (default: /opt/homebrew/bin/exiftool)
     --lens-profile-dir <DIR>   Installed LCP root, repeatable; replaces default Adobe roots
@@ -1145,6 +1145,9 @@ mod tests {
         assert_eq!(defaults.lens.mode,crate::lens::Mode::Auto);
         assert_eq!(defaults.lens.crop,crate::lens::Crop::Preserve);
         assert_eq!(defaults.lens.policy,crate::lens::Policy::default());
+        assert_eq!(defaults.lens.policy.sampling,crate::lens::Sampling::Quality);
+        let bilinear=parse_run(&["--input","in","--output","out.mov","--lens-resampling","bilinear"]).unwrap();
+        assert_eq!(bilinear.lens.policy.sampling,crate::lens::Sampling::Bilinear);
         let options=parse_run(&["--input","in","--output","out.mov","--lens-vignette","off","--lens-distortion","off","--lens-vignette-strength","0.5","--lens-resampling","quality","--lens-crop","sequence-safe"]).unwrap();
         assert_eq!(options.lens.policy.components,[false,false,true]);
         assert_eq!(options.lens.policy.vignette_strength,0.5);

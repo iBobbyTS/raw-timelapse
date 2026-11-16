@@ -78,7 +78,9 @@ int main() {
             "identity embedded did not win over LCP");
     // An affine ramp is exactly reconstructed by bilinear resampling; this
     // proves mapping direction, normalization, red/blue independence and signed
-    // HDR.
+    // HDR. That exactness claim is bilinear-specific, so pin the sampler.
+    Policy nearest;
+    nearest.sampling = Sampling::bilinear;
     c = ready();
     c.fallback[1] = perspective();
     c.fallback[1].plane[0].k[0] = -.2;
@@ -86,7 +88,7 @@ int main() {
       for (uint32_t x = 0; x < w; ++x)
         for (int ch = 0; ch < 3; ++ch)
           rgb[(size_t(y) * w + x) * 3 + ch] = float(x + 2 * y + ch - 20.);
-    r = correct(rgb, w, h, c, true);
+    r = correct(rgb, w, h, c, true, nullptr, nearest);
     uint32_t x = 10, y = 12;
     double dx = x - 32., dy = y - 24., rad = (dx * dx + dy * dy) / (65. * 65),
            f = 1 - .2 * rad;
@@ -97,7 +99,7 @@ int main() {
     c.fallback[2] = perspective();
     c.fallback[2].plane[0].scale = .98;
     c.fallback[2].plane[2].scale = 1.02;
-    r = correct(rgb, w, h, c, true);
+    r = correct(rgb, w, h, c, true, nullptr, nearest);
     for (int ch = 0; ch < 3; ++ch) {
       double scale = ch == 0 ? .98 : ch == 2 ? 1.02 : 1;
       near(r.pixels[(size_t(y) * w + x) * 3 + ch],

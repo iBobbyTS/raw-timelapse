@@ -6,11 +6,11 @@ using namespace frame::lens;
 void require(bool v,const char*m){if(!v)throw std::runtime_error(m);}
 Calibration calibration(double scale){Calibration c;c.collected=true;c.upstream.fill(Upstream::not_reported);auto&m=c.fallback[1];m.kind=Kind::perspective;m.source="synthetic:analytic-map";m.plane[0].scale=scale;return c;}
 int main(){try{
- const unsigned w=257,h=97;constexpr double pi=3.14159265358979323846;Policy quality;quality.sampling=Sampling::quality;
+ const unsigned w=257,h=97;constexpr double pi=3.14159265358979323846;Policy quality;quality.sampling=Sampling::quality;Policy bilinear;bilinear.sampling=Sampling::bilinear;
  for(double scale:{.99,1.5})for(double frequency:{.05,.25,.4}){
   auto c=calibration(scale);std::vector<float>pixels(size_t(w)*h*3);
   for(unsigned y=0;y<h;y++)for(unsigned x=0;x<w;x++)for(unsigned ch=0;ch<3;ch++)pixels[(size_t(y)*w+x)*3+ch]=float(std::sin(2*pi*frequency*x));
-  auto linear=correct(pixels,w,h,c,true);auto better=correct(pixels,w,h,c,true,nullptr,quality);double a=0,b=0;
+  auto linear=correct(pixels,w,h,c,true,nullptr,bilinear);auto better=correct(pixels,w,h,c,true,nullptr,quality);double a=0,b=0;
   for(unsigned y=16;y<h-16;y++)for(unsigned x=64;x<w-64;x++){
    const double position=(w-1)*.5+(x-(w-1)*.5)*scale;
    const double truth=frequency*scale>=.5?0:std::sin(2*pi*frequency*position);
@@ -37,7 +37,7 @@ int main(){try{
  // kernel footprint must fit without taking input-edge extension shortcuts.
  c=calibration(1.05);c.fallback[2].kind=Kind::perspective;c.fallback[2].source="synthetic:area-ca";
  c.fallback[2].plane[0].scale=1.02;c.fallback[2].plane[2].scale=1.04;
- const auto bilinear_area=safe_area(c,w,h,true),area=safe_area(c,w,h,true,quality);
+ const auto bilinear_area=safe_area(c,w,h,true,bilinear),area=safe_area(c,w,h,true,quality);
  require(area[0]>bilinear_area[0]&&area[2]<bilinear_area[2],"safe area ignored quality footprint");
  std::vector<float>ones(size_t(w)*h*3,1);r=correct(ones,w,h,c,true,nullptr,quality);
  for(unsigned y=unsigned(std::ceil(area[1]*(h-1)));y<=unsigned(std::floor(area[3]*(h-1)));++y)
