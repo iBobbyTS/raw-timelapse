@@ -28,13 +28,19 @@ fn lanczos3(x: f64) -> f64 {
 
 /// Normalized source contributions for one output coordinate, with the kernel
 /// widened by the scale factor when downsampling to suppress aliasing.
-fn contributions(input: u32, output: u32) -> Vec<Vec<(usize, f64)>> {
-    let ratio = f64::from(input) / f64::from(output);
+fn contributions_window(
+    output: u32,
+    start: f64,
+    end: f64,
+    low: i64,
+    high: i64,
+) -> Vec<Vec<(usize, f64)>> {
+    let ratio = (end - start) / f64::from(output);
     let filter_scale = ratio.max(1.0);
     let support = 3.0 * filter_scale;
     (0..output)
         .map(|index| {
-            let center = (f64::from(index) + 0.5) * ratio - 0.5;
+            let center = start + (f64::from(index) + 0.5) * ratio - 0.5;
             let start = (center - support).ceil() as i64;
             let end = (center + support).floor() as i64;
             let mut taps = Vec::new();
@@ -44,7 +50,7 @@ fn contributions(input: u32, output: u32) -> Vec<Vec<(usize, f64)>> {
                 if weight == 0.0 {
                     continue;
                 }
-                let clamped = source.clamp(0, i64::from(input) - 1) as usize;
+                let clamped = source.clamp(low, high) as usize;
                 match taps.iter_mut().find(|(index, _)| *index == clamped) {
                     Some((_, existing)) => *existing += weight,
                     None => taps.push((clamped, weight)),
@@ -52,7 +58,7 @@ fn contributions(input: u32, output: u32) -> Vec<Vec<(usize, f64)>> {
                 total += weight;
             }
             if total == 0.0 {
-                taps.push((center.round().clamp(0.0, f64::from(input - 1)) as usize, 1.0));
+                taps.push((center.round().clamp(low as f64, high as f64) as usize, 1.0));
             } else {
                 for (_, weight) in &mut taps {
                     *weight /= total;
@@ -63,6 +69,62 @@ fn contributions(input: u32, output: u32) -> Vec<Vec<(usize, f64)>> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CropWindow {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub low_x: i64,
+    pub high_x: i64,
+    pub low_y: i64,
+    pub high_y: i64,
+}
+pub fn crop_window(
+    width: u32,
+    height: u32,
+    out_width: u32,
+    out_height: u32,
+    bounds: [f64; 4],
+) -> Result<CropWindow, String> {
+    if width == 0
+        || height == 0
+        || out_width == 0
+        || out_height == 0
+        || bounds.iter().any(|v| !v.is_finite() || *v < 0. || *v > 1.)
+        || bounds[0] >= bounds[2]
+        || bounds[1] >= bounds[3]
+    {
+        return Err("invalid lens crop bounds or output geometry".into());
+    }
+    // Only complete certified output pixels are eligible as resize taps. The
+    // reconstruction footprint is clamped to these valid pixels, never black
+    // pixels beyond the certified rectangle.
+    let low_x = (bounds[0] * f64::from(width - 1)).ceil() as i64;
+    let high_x = (bounds[2] * f64::from(width - 1)).floor() as i64;
+    let low_y = (bounds[1] * f64::from(height - 1)).ceil() as i64;
+    let high_y = (bounds[3] * f64::from(height - 1)).floor() as i64;
+    if low_x > high_x || low_y > high_y {
+        return Err("lens crop contains no complete pixels".into());
+    }
+    let available_width = (high_x - low_x + 1) as f64;
+    let available_height = (high_y - low_y + 1) as f64;
+    let aspect = f64::from(out_width) / f64::from(out_height);
+    let crop_width = available_width.min(available_height * aspect);
+    let crop_height = available_height.min(available_width / aspect);
+    let left = low_x as f64 + (available_width - crop_width) * 0.5;
+    let top = low_y as f64 + (available_height - crop_height) * 0.5;
+    Ok(CropWindow {
+        left,
+        top,
+        right: left + crop_width,
+        bottom: top + crop_height,
+        low_x,
+        high_x,
+        low_y,
+        high_y,
+    })
+}
 /// Resample one interleaved little-endian FP32 RGB frame into new geometry.
 pub fn resize_scene_linear(
     input: &[u8],
@@ -70,6 +132,16 @@ pub fn resize_scene_linear(
     height: u32,
     out_width: u32,
     out_height: u32,
+) -> Result<Vec<u8>, String> {
+    resize_scene_linear_region(input, width, height, out_width, out_height, None)
+}
+pub fn resize_scene_linear_region(
+    input: &[u8],
+    width: u32,
+    height: u32,
+    out_width: u32,
+    out_height: u32,
+    bounds: Option<[f64; 4]>,
 ) -> Result<Vec<u8>, String> {
     if width == 0 || height == 0 || out_width == 0 || out_height == 0 {
         return Err("resize geometry must be positive".into());
@@ -83,14 +155,39 @@ pub fn resize_scene_linear(
             height
         ));
     }
-    if width == out_width && height == out_height {
+    let window = match bounds {
+        Some(bounds) => crop_window(width, height, out_width, out_height, bounds)?,
+        None => CropWindow {
+            left: 0.,
+            top: 0.,
+            right: f64::from(width),
+            bottom: f64::from(height),
+            low_x: 0,
+            high_x: i64::from(width - 1),
+            low_y: 0,
+            high_y: i64::from(height - 1),
+        },
+    };
+    if width == out_width
+        && height == out_height
+        && window.left == 0.
+        && window.top == 0.
+        && window.right == f64::from(width)
+        && window.bottom == f64::from(height)
+    {
         return Ok(input.to_vec());
     }
     let sample = |frame: &[u8], index: usize| -> f64 {
         f32::from_le_bytes(frame[index * 4..index * 4 + 4].try_into().unwrap()) as f64
     };
 
-    let horizontal = contributions(width, out_width);
+    let horizontal = contributions_window(
+        out_width,
+        window.left,
+        window.right,
+        window.low_x,
+        window.high_x,
+    );
     let mut intermediate = vec![0.0f32; out_width as usize * height as usize * 3];
     for y in 0..height as usize {
         let row = y * width as usize * 3;
@@ -109,7 +206,13 @@ pub fn resize_scene_linear(
         }
     }
 
-    let vertical = contributions(height, out_height);
+    let vertical = contributions_window(
+        out_height,
+        window.top,
+        window.bottom,
+        window.low_y,
+        window.high_y,
+    );
     let mut output = vec![0u8; out_width as usize * out_height as usize * 12];
     for (y, taps) in vertical.iter().enumerate() {
         for x in 0..out_width as usize {
@@ -204,6 +307,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn safe_crop_never_samples_invalid_frame_border_and_preserves_aspect() {
+        let source = frame(32, 24, |x, y| {
+            if (4..28).contains(&x) && (3..21).contains(&y) {
+                [-0.25, 0.5, 4.]
+            } else {
+                [1000., -1000., 0.]
+            }
+        });
+        let bounds = [4. / 31., 3. / 23., 27. / 31., 20. / 23.];
+        for (w, h) in [(32, 24), (64, 36), (8, 8)] {
+            let window = crop_window(32, 24, w, h, bounds).unwrap();
+            assert!(
+                ((window.right - window.left) / (window.bottom - window.top)
+                    - f64::from(w) / f64::from(h))
+                .abs()
+                    < 1e-12
+            );
+            let out = resize_scene_linear_region(&source, 32, 24, w, h, Some(bounds)).unwrap();
+            for y in 0..h {
+                for x in 0..w {
+                    assert_eq!(pixel(&out, w, x, y), [-0.25, 0.5, 4.]);
+                }
+            }
+        }
+        let unchanged =
+            resize_scene_linear_region(&source, 32, 24, 32, 24, Some([0., 0., 1., 1.])).unwrap();
+        assert_eq!(unchanged, source);
+        assert!(crop_window(32, 24, 64, 36, [0.8, 0.8, 0.1, 0.1]).is_err());
+    }
     #[test]
     fn rejects_mismatched_or_degenerate_geometry() {
         let source = frame(4, 3, |_, _| [0.1; 3]);

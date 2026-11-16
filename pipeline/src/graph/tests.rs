@@ -253,7 +253,7 @@ impl Backend for Fake {
 #[test]
 fn explicit_resize_node_stays_between_develop_and_colour() {
     let text = include_str!("default.json").replace(
-        "{\"id\":\"color\", \"kind\":\"color\", \"concurrency\":1, \"inputs\":{\"image\":\"apply-ev\"}}",
+        "{\"id\":\"color\", \"kind\":\"color\", \"concurrency\":4, \"inputs\":{\"image\":\"apply-ev\"}}",
         "{\"id\":\"resize\",\"kind\":\"resize\",\"width\":16,\"height\":12,\"inputs\":{\"image\":\"apply-ev\"}},{\"id\":\"color\",\"kind\":\"color\",\"inputs\":{\"image\":\"resize\"}}",
     );
     let graph = Graph::parse(&text).unwrap();
@@ -300,7 +300,7 @@ fn cli_resize_inserts_or_overrides_the_single_explicit_node() {
     assert_eq!(fake.resizes, vec![(8, 6); 3]);
 
     let duplicated = include_str!("default.json").replace(
-        "{\"id\":\"color\", \"kind\":\"color\", \"concurrency\":1, \"inputs\":{\"image\":\"apply-ev\"}}",
+        "{\"id\":\"color\", \"kind\":\"color\", \"concurrency\":4, \"inputs\":{\"image\":\"apply-ev\"}}",
         "{\"id\":\"resize-one\",\"kind\":\"resize\",\"width\":16,\"height\":12,\"inputs\":{\"image\":\"apply-ev\"}},{\"id\":\"resize-two\",\"kind\":\"resize\",\"width\":8,\"height\":6,\"inputs\":{\"image\":\"resize-one\"}},{\"id\":\"color\",\"kind\":\"color\",\"inputs\":{\"image\":\"resize-two\"}}",
     );
     assert!(Graph::parse(&duplicated)
@@ -353,7 +353,7 @@ fn encode_node_owns_the_bounded_encoder_configuration() {
         assert!(error.contains(marker), "{error}");
     }
     let missing = include_str!("default.json").replace(
-        "{\"id\":\"color\", \"kind\":\"color\", \"concurrency\":1, \"inputs\":{\"image\":\"apply-ev\"}}",
+        "{\"id\":\"color\", \"kind\":\"color\", \"concurrency\":4, \"inputs\":{\"image\":\"apply-ev\"}}",
         "{\"id\":\"resize\",\"kind\":\"resize\",\"width\":16,\"inputs\":{\"image\":\"apply-ev\"}},{\"id\":\"color\",\"kind\":\"color\",\"inputs\":{\"image\":\"resize\"}}",
     );
     assert!(Graph::parse(&missing)

@@ -5,6 +5,7 @@
 namespace frame::lens {
 struct PrepareOptions {
   bool collect = false;
+  Policy policy;
   std::string exiftool = "/opt/homebrew/bin/exiftool";
   // Empty uses installed Adobe locations; explicit roots replace discovery.
   std::vector<std::filesystem::path> profile_roots;

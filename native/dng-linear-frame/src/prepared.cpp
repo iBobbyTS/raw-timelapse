@@ -21,7 +21,8 @@
 namespace frame {
 namespace {
 constexpr const char *kContextMagic = "rawtl-prepared-frame/2";
-constexpr size_t kContextLimit = 65536;
+// Calibration/2 can carry eight image-field endpoints per component.
+constexpr size_t kContextLimit = 256 * 1024;
 constexpr size_t kDocumentLimit = 1024 * 1024;
 
 std::string escape(const std::string &text) {
@@ -672,10 +673,10 @@ PreparedFrame read_prepared(const fs::path &context_path) {
 
 Decoded decode_prepared(const PreparedFrame &prepared,
                         const std::optional<Vec> &wb,
-                        CameraRecipe recipe, bool lens_enabled) {
+                        CameraRecipe recipe, bool lens_enabled, const lens::Policy &policy) {
   if (lens_enabled && !prepared.lens_calibration.collected) throw Error(26, "lens auto requires a context prepared with lens metadata collection");
   Decoded decoded = decode(prepared.prepared_dng,
-                           wb ? wb : std::optional<Vec>(prepared.own), recipe, check_cancelled, {&prepared.lens_calibration, lens_enabled});
+                           wb ? wb : std::optional<Vec>(prepared.own), recipe, check_cancelled, {&prepared.lens_calibration, lens_enabled, policy});
   if (recipe.calibration == CameraCalibration::canon_normal_white_fixed_v1) {
     if (prepared.kind != Route::vendor_raw) throw Error(40, "Canon calibration requires original Canon CR3");
     calibrate_canon_cr3(prepared.source, decoded);

@@ -1,4 +1,5 @@
 #include "lens.h"
+#include "lens_exact_sum.h"
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -36,6 +37,13 @@ void rejects(const auto &f) {
 } // namespace
 int main() {
   try {
+    detail::ExactSum residue;
+    const double next=std::nextafter(1.,2.);
+    residue.add({next,next}); residue.add({-1.,1+2*(next-1)});
+    require(!residue.is_zero(),"rounded product erased an exact nonzero residual");
+    detail::ExactSum underflow;
+    underflow.add({std::numeric_limits<double>::denorm_min(),.5});
+    require(!underflow.is_zero(),"underflow was accepted as proof of exact zero");
     const uint32_t w = 65, h = 49;
     std::vector<float> rgb(size_t(w) * h * 3);
     for (size_t i = 0; i < rgb.size(); i += 3) {
@@ -114,6 +122,62 @@ int main() {
     require(r.pixels.empty() &&
                 r.decisions[0].status == "upstream-geometry-unmapped",
             "source vignette applied in unknown warped coordinates");
+    c = ready();
+    c.fallback[1] = perspective();
+    PerspectiveTerm positive, negative;
+    positive.weight = negative.weight = .5;
+    positive.plane[0].k[0] = .01; negative.plane[0].k[0] = -.01;
+    c.fallback[1].terms = {positive, negative};
+    r = correct(rgb,w,h,c,true);
+    require(r.pixels.empty() && r.outside_samples == 0 && r.decisions[1].status == "identity",
+            "cancelling image field was not an exact no-op");
+    for (size_t component : {size_t(0),size_t(2)}) {
+      c = ready(); c.fallback[component] = perspective();
+      c.fallback[component].terms={positive,negative};
+      require(correct(rgb,w,h,c,true).pixels.empty(),"cancelling vignette/CA not identity");
+    }
+    c=ready(); c.fallback[1]=perspective();
+    positive.plane[0].fx=positive.plane[0].fy=2; positive.plane[0].k[0]=.04;
+    c.fallback[1].terms={positive,negative};
+    require(correct(rgb,w,h,c,true).pixels.empty(),"equivalent-normalization cancellation not identity");
+    c.fallback[1].terms[0].plane[0].fx=c.fallback[1].terms[0].plane[0].fy=3;
+    c.fallback[1].terms[0].plane[0].k[0]=9;
+    c.fallback[1].terms[1].plane[0].k[0]=-1;
+    require(correct(rgb,w,h,c,true).pixels.empty(),"non-dyadic normalization cancellation not identity");
+    c.fallback[1].terms[0].weight=.6; c.fallback[1].terms[1].weight=.4;
+    require(!correct(rgb,w,h,c,true).pixels.empty(),"nonzero mixture was silently treated as identity");
+    c=ready(); c.fallback[1]=perspective();
+    PerspectiveTerm huge,small,opposite;
+    huge.weight=.25; huge.plane[0].k[0]=std::ldexp(1.,100);
+    small.weight=.25; small.plane[0].k[0]=-4;
+    opposite.weight=.5; opposite.plane[0].k[0]=-std::ldexp(1.,99);
+    c.fallback[1].terms={huge,small,opposite};
+    rejects([&]{validate_domain(c,w,h);}); // Exact combined k0=-1, not rounded zero.
+    // A radial mapping can have positive corner Jacobians yet fold in an
+    // interior annulus. Domain certification must not be a corner-only test.
+    c = ready();
+    c.fallback[1] = perspective();
+    c.fallback[1].plane[0].k = {-8, 20, 0, 0, 0};
+    rejects([&] { validate_domain(c, w, h); });
+    // Continuous-domain minima include interior annuli, not just corners.
+    c = ready();
+    c.fallback[0] = perspective();
+    c.fallback[0].plane[0].k = {-20, 80, 0, 0, 0};
+    rejects([&] { validate_domain(c, w, h); });
+    // Convex support is frozen losslessly and cannot be malformed into arbitrary
+    // extrapolation or silently mistaken for identity via the unused base plane.
+    c = ready();
+    c.fallback[0] = perspective();
+    PerspectiveTerm term;
+    term.plane[0].k[0] = -.2;
+    c.fallback[0].terms.push_back(term);
+    auto text = serialize(c);
+    require(serialize(deserialize(text)) == text, "field support transport not lossless");
+    require(!correct(rgb, w, h, c, true).pixels.empty(), "field support mistaken for identity");
+    c.fallback[0].terms[0].weight = .5;
+    rejects([&] { serialize(c); });
+    c.fallback[0].terms[0].weight = -1;
+    rejects([&] { serialize(c); });
     // Sony knots use a half-knot origin, and vignette must be sampled before
     // warp.
     c = ready();
@@ -134,6 +198,12 @@ int main() {
          {std::string(""), std::string("rawtl-lens-calibration/2"),
           serialized + " garbage", serialized.substr(0, serialized.size() / 2)})
       rejects([&] { deserialize(bad); });
+    auto oversized=ready();
+    oversized.make=oversized.camera=oversized.lens=oversized.selection=std::string(4096,'x');
+    oversized.evidence=std::string(32768,'x');
+    for (auto *set : {&oversized.embedded,&oversized.fallback})
+      for (auto &model : *set) {model=perspective();model.source=std::string(4096,'x');}
+    rejects([&] {serialize(oversized);});
     c.embedded[0].table[0][0] = std::numeric_limits<double>::infinity();
     rejects([&] { correct(rgb, w, h, c, true); });
     rejects([&] { correct(rgb, 0, h, ready(), true); });

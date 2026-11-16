@@ -103,8 +103,34 @@ for mode in ["auto","off"]:
   rgb_p=[sum(a*b for a,b in zip(row,m[i:i+3])) for row in ap1_to_prophoto]
   peak=max(rgb_p); gain=1 if min(rgb_p)<0 or peak<=0 else 1+(peak-min(rgb_p))/peak
   assert all(abs(y-gain*x)<5e-5*max(1,abs(y)) for x,y in zip(m[i:i+3],h[i:i+3])),("HSM did not consume corrected delivery pixels",mode,i,gain,m[i:i+3],h[i:i+3])
+# Per-component policy is a real SDK delivery contract, not a boolean alias.
+_,disabled=stream(context,extra=['--lens-vignette','off','--lens-distortion','off','--lens-ca','off'])
+assert disabled[4]==b[4], 'all components off was not exact off output'
+_,zero=stream(context,extra=['--lens-vignette-strength','0','--lens-distortion','off','--lens-ca','off'])
+assert zero[4]==b[4], 'zero vignette strength was not exact no-op'
+_,half=stream(context,extra=['--lens-vignette-strength','.5','--lens-distortion','off','--lens-ca','off'])
+base=struct.unpack('<'+'f'*(len(b[4])//4),b[4]); partial=struct.unpack('<'+'f'*(len(half[4])//4),half[4])
+t=math.log(20/10)/math.log(30/10); factor=(1-t)/3+t
+for yy in range(48):
+ for xx in range(64):
+  r2=((xx-31.5)**2+(yy-23.5)**2)/64**2
+  gain=(1/(1-.6*factor*r2))**.5
+  for ch in range(3):
+   i=(yy*64+xx)*3+ch
+   assert abs(partial[i]-base[i]*gain)<2e-5*max(1,abs(partial[i])), 'exposure-domain strength mismatch'
+quality_meta,quality=stream(context,extra=['--lens-resampling','quality'])
+assert quality_meta['lens_correction']['resampling']=='quality'
+assert all(math.isfinite(v) for v in struct.unpack('<'+'f'*(len(quality[4])//4),quality[4]))
+area=json.loads(command(['--lens-valid-area','--prepared',context,'--lens-correction','auto','--lens-resampling','quality']))
+assert area['source_sha256']==original_hash and area['certified'] and len(area['area'])==4
+assert 0<=area['area'][0]<area['area'][2]<=1 and 0<=area['area'][1]<area['area'][3]<=1
+full=json.loads(command(['--lens-valid-area','--prepared',context,'--lens-correction','off']))
+assert full['area']==[0,0,1,1], 'off valid-area query implied crop'
+command(['--stdout-frame-f32','--prepared',context,'--lens-correction','auto','--lens-vignette-strength','1.1'],2)
+command(['--stdout-frame-f32','--prepared',context,'--lens-correction','auto','--lens-resampling','unknown'],2)
+assert stream(context,analysis=True,extra=['--lens-resampling','quality','--lens-vignette-strength','.5'])[1][2]==px[2]
 # Corrupt/missing versions fail closed, before emitting pixel success.
-bad=work/'bad.context';bad.write_text(context.read_text().replace('rawtl-lens-calibration/1','rawtl-lens-calibration/9'))
+bad=work/'bad.context';bad.write_text(context.read_text().replace('rawtl-lens-calibration/2','rawtl-lens-calibration/9'))
 command(['--stdout-frame-f32','--prepared',bad,'--lens-correction','auto'],26)
 command(['--stdout-frame-f32','--prepared',context,'--exiftool',metadata],2)
 assert hashlib.sha256(source.read_bytes()).hexdigest()==original_hash

@@ -94,6 +94,22 @@ double parse_ev(const std::string &s) {
     throw Error(3, "exposure EV gain is not finite");
   return value;
 }
+bool parse_lens_policy(const std::string &a, const std::string &value, lens::Policy &policy) {
+  if (a=="--lens-vignette" || a=="--lens-distortion" || a=="--lens-ca") {
+    if (value!="auto" && value!="off") throw Error(2,a+" expects auto or off");
+    const size_t component=a=="--lens-vignette"?0:a=="--lens-distortion"?1:2;
+    policy.components[component]=value=="auto";
+  } else if (a=="--lens-vignette-strength") {
+    try { policy.vignette_strength=parse_ev(value); }
+    catch (const std::exception &) { throw Error(2,"lens vignette strength must be 0..1"); }
+    if (policy.vignette_strength<0 || policy.vignette_strength>1)
+      throw Error(2,"lens vignette strength must be 0..1");
+  } else if (a=="--lens-resampling") {
+    if (value!="bilinear" && value!="quality") throw Error(2,"lens resampling expects bilinear or quality");
+    policy.sampling=value=="quality"?lens::Sampling::quality:lens::Sampling::bilinear;
+  } else return false;
+  return true;
+}
 analysis::Roi parse_roi(const std::string &s) {
   std::stringstream in(s);
   analysis::Roi roi;
@@ -288,7 +304,7 @@ int main(int argc, char **argv) {
     const bool prepare_mode = mode == "--prepare" || batch_mode;
     const bool stdout_mode = mode == "--stdout-analysis" ||
                              mode == "--stdout-frame" ||
-                             mode == "--stdout-frame-f32";
+                             mode == "--stdout-frame-f32" || mode == "--lens-valid-area";
     const std::string default_converter =
         "/Applications/Adobe DNG "
         "Converter.app/Contents/MacOS/Adobe DNG Converter";
@@ -315,6 +331,9 @@ int main(int argc, char **argv) {
         } else if (a == (batch_mode ? "--emit-result" : "--emit-prepared")) {
           context = value;
           context_set = true;
+        } else if (parse_lens_policy(a,value,lens_options.policy)) {
+          // Acquisition freezes all structurally valid models; numerical domain
+          // certification follows the intended delivery components.
         } else if (a == "--lens-correction") {
           if (value != "auto" && value != "off") throw Error(2, "lens correction expects auto or off");
           lens_options.collect = value == "auto";
@@ -486,9 +505,12 @@ int main(int argc, char **argv) {
     CameraRecipe recipe;
     lens::PrepareOptions lens_options;
     bool lens_enabled = false;
+    lens::Policy lens_policy;
     if (argc < 3)
       throw Error(2, "option value missing");
     const bool prepared_mode = std::string(argv[2]) == "--prepared";
+    if (mode == "--lens-valid-area" && !prepared_mode)
+      throw Error(2, "lens valid-area query requires a frozen prepared context");
     fs::path input, context;
     int option_start = 3;
     if (prepared_mode) {
@@ -529,6 +551,8 @@ int main(int argc, char **argv) {
           recipe.method = CameraColorMethod::legacy_inverse_cm;
         else
           throw Error(2, "unknown camera color method");
+      } else if (parse_lens_policy(a,value,lens_policy)) {
+        // Same policy grammar as Prepare.
       } else if (a == "--lens-correction") {
         if (value != "auto" && value != "off") throw Error(2, "lens correction expects auto or off");
         lens_enabled = value == "auto"; lens_options.collect = lens_enabled;
@@ -579,6 +603,7 @@ int main(int argc, char **argv) {
         (recipe.name == "legacy-test" && recipe.calibration != CameraCalibration::none) ||
         (recipe.name != "generic" && recipe.name != "canon-clog3" && recipe.name != "legacy-test"))
       throw Error(2, "inconsistent camera recipe policies");
+    lens_options.policy=lens_policy;
     // Measurement never consumes invented radiance, regardless of delivery policy.
     if (want_analysis) { recipe.highlight_recovery = false; lens_enabled = false; }
     // A closed consumer pipe must surface as a write error, not a SIGPIPE
@@ -592,7 +617,30 @@ int main(int argc, char **argv) {
       temp.emplace();
       prepared = prepare_frame(input, temp->path, converter, timeout, true, lens_options);
     }
-    Decoded decoded = decode_prepared(prepared, wb, recipe, lens_enabled);
+    if (mode == "--lens-valid-area") {
+      if (lens_enabled && !prepared.lens_calibration.collected)
+        throw Error(26, "lens auto requires a context prepared with lens metadata collection");
+      if (!prepared_mode) throw Error(2, "lens valid-area query requires a frozen prepared context");
+      uint32_t width=prepared.main_ifd_width,height=prepared.main_ifd_height;
+      const auto decisions=lens::decide(prepared.lens_calibration,lens_enabled,lens_policy);
+      if (decisions[1].model || decisions[2].model) {
+        // Stage3 can differ from the main IFD. Never assume sensor dimensions.
+        recipe.highlight_recovery=false;
+        const auto geometry=decode_prepared(prepared,wb,recipe,false);
+        width=geometry.width; height=geometry.height;
+      }
+      const auto area=lens::safe_area(prepared.lens_calibration,width,height,lens_enabled,lens_policy,check_cancelled);
+      std::cout << Json{{"revision",1},{"source_sha256",prepared.source_hash},
+          {"prepared_sha256",prepared.prepared_hash},{"width",double(width)},{"height",double(height)},
+          {"area",std::vector<Json>{area[0],area[1],area[2],area[3]}},
+          {"coordinate_system","normalized-pixel-centres"},{"certified",true},
+          {"mode",lens_enabled ? "auto" : "off"},
+          {"components",std::vector<Json>{lens_policy.components[0],lens_policy.components[1],lens_policy.components[2]}},
+          {"vignette_strength",lens_policy.vignette_strength},
+          {"resampling",lens_policy.sampling == lens::Sampling::bilinear ? "bilinear" : "quality"}}.text << '\n';
+      return 0;
+    }
+    Decoded decoded = decode_prepared(prepared, wb, recipe, lens_enabled, lens_policy);
     FrameOutput frame =
         render(prepared, decoded, std::optional<fs::path>(), roi, exposure_ev,
                want_analysis, !want_analysis, f32, prepared_mode,

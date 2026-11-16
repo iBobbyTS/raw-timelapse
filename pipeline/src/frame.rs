@@ -65,6 +65,7 @@ pub struct ProduceConfig<'a> {
 /// bytes and the native consumer revalidates every hash before decoding.
 #[allow(dead_code)] // consumed by the graph scheduling integration
 pub const PREPARED_CONTEXT_MAGIC: &str = "rawtl-prepared-frame/2";
+const PREPARED_CONTEXT_LIMIT: usize = 256 * 1024;
 
 /// Routing identity carried by a prepared context. `Direct` is a LinearRaw
 /// source used as-is; the other two routes have a Converter-produced DNG.
@@ -114,6 +115,7 @@ pub struct PreparedFrame {
     pub main_ifd_height: u32,
     pub as_shot_neutral: [f64; 3],
     pub capture_time: Option<String>,
+    pub lens_valid_area: Option<crate::lens::ValidArea>,
 }
 
 #[allow(dead_code)] // consumed by the graph scheduling integration
@@ -124,7 +126,7 @@ impl PreparedFrame {
     /// consistency and file existence so a mis-wired graph fails before a
     /// native process is started.
     pub fn load(context: &Path) -> Result<Self> {
-        let bytes = read_document(context, 65536)?;
+        let bytes = read_document(context, PREPARED_CONTEXT_LIMIT)?;
         let fields = parse_context_fields(&bytes)?;
         let get = |key: &str| -> Result<&str> {
             fields
@@ -216,13 +218,14 @@ impl PreparedFrame {
             main_ifd_height,
             as_shot_neutral,
             capture_time,
+            lens_valid_area: None,
         })
     }
 }
 
 #[allow(dead_code)] // consumed by the graph scheduling integration
 fn parse_context_fields(bytes: &[u8]) -> Result<Vec<(String, String)>> {
-    parse_document_fields(bytes, PREPARED_CONTEXT_MAGIC, 65536)
+    parse_document_fields(bytes, PREPARED_CONTEXT_MAGIC, PREPARED_CONTEXT_LIMIT)
 }
 
 fn parse_document_fields(bytes: &[u8], header: &str, limit: usize) -> Result<Vec<(String, String)>> {
@@ -420,8 +423,8 @@ fn validate_conversion(
     .map(|s| s.to_string())
     .collect();
     if fields.iter().any(|(key, _)| key == "lens_calibration") {
-        if !get("lens_calibration")?.starts_with("rawtl-lens-calibration/1 ") {
-            return Err(failure("unsupported prepared lens calibration"));
+        if !get("lens_calibration")?.starts_with("rawtl-lens-calibration/2 ") {
+            return Err(failure("unsupported prepared lens calibration; run Prepare again"));
         }
         allowed.push("lens_calibration".into());
     }
@@ -731,7 +734,7 @@ impl Drop for NativeStream {
 
 struct NativeRun {
     method: crate::color_profile::CameraRecipe,
-    lens: crate::lens::Mode,
+    lens: crate::lens::Settings,
     log: PathBuf,
     analysis_roi: Option<[f64; 4]>,
     #[cfg(test)]
@@ -745,7 +748,7 @@ impl NativeRun {
     fn from_produce(config: &ProduceConfig<'_>) -> Self {
         Self {
             method: config.camera_recipe,
-            lens: crate::lens::Mode::Off,
+            lens: crate::lens::Settings::default(),
             log: config.logs_dir.join("frame_000001.log"),
             converter: config.converter.map(str::to_string),
             converter_timeout: config.converter_timeout,
@@ -943,7 +946,7 @@ pub struct PrepareSettings<'a> {
 /// purpose: a prepared context already records its conversion provenance.
 pub struct PreparedSettings {
     pub camera_recipe: crate::color_profile::CameraRecipe,
-    pub lens: crate::lens::Mode,
+    pub lens: crate::lens::Settings,
 }
 
 /// Run the native prepare operation once for one source and load the resulting
@@ -978,7 +981,7 @@ pub fn prepare_active(
         args.extend(["--converter-timeout".into(), seconds.to_string()]);
     }
     settings.lens.prepare_args(&mut args);
-    let captured = proc::run_capture_active(tool, &args, EXIT_FRAME, settings.log, active)?;
+    let captured = proc::run_capture_active(tool, &args, EXIT_FRAME, settings.log, active.clone())?;
     write_prepare_log(settings.log, tool, &args, &captured)?;
     proc::check_stop()?;
     if !captured.status.success() {
@@ -993,7 +996,7 @@ pub fn prepare_active(
             ),
         ));
     }
-    let prepared = PreparedFrame::load(settings.context_path)?;
+    let mut prepared = PreparedFrame::load(settings.context_path)?;
     let expected = fs::canonicalize(&source.path).map_err(|e| {
         failure(format!(
             "requested source {} cannot be resolved: {e}",
@@ -1008,6 +1011,7 @@ pub fn prepare_active(
             expected.display()
         )));
     }
+    query_lens_area(tool, &mut prepared, &settings.lens, active)?;
     Ok(prepared)
 }
 
@@ -1107,7 +1111,8 @@ pub fn prepare_batch_active(
             proc::tail(&captured.stderr, 1200)
         )));
     }
-    let prepared = load_batch_result(&result, &expected)?;
+    let mut prepared = load_batch_result(&result, &expected)?;
+    for (_, frame) in &mut prepared { query_lens_area(tool, frame, &settings.lens, active.clone())?; }
     batch_check_stop(&active)?; // Late success cannot revive cancelled work.
     Ok(prepared)
 }
@@ -1164,6 +1169,22 @@ fn load_batch_result(
         .collect()
 }
 
+fn query_lens_area(tool:&Path,prepared:&mut PreparedFrame,settings:&crate::lens::Settings,active:ActiveNative)->Result<()> {
+    if !settings.crop.is_safe() { return Ok(()); }
+    let log=prepared.context.with_extension("lens-area.log");
+    let mut args=vec!["--lens-valid-area".into(),"--prepared".into(),prepared.context.display().to_string(),
+        "--camera-recipe".into(),"generic".into(),"--camera-color-method".into(),"dng-camera-to-pcs".into(),
+        "--profile-correction".into(),"none".into(),"--camera-calibration".into(),"none".into(),"--highlight-recovery".into(),"off".into()];
+    settings.policy.args(settings.mode,&mut args);
+    let captured=proc::run_capture_active(tool,&args,EXIT_FRAME,&log,active)?;
+    write_prepare_log(&log,tool,&args,&captured)?;
+    proc::check_stop()?;
+    if !captured.status.success() {return Err(failure(format!("lens valid-area query failed: {}; transcript {}: {}",proc::exit_description(&captured.status),log.display(),proc::tail(&captured.stderr,1200))));}
+    if captured.stdout.len()>16384 {return Err(failure("lens valid-area response exceeds bound"));}
+    let value=crate::json::parse(&captured.stdout).map_err(|e|failure(format!("lens valid-area JSON: {e}")))?;
+    prepared.lens_valid_area=Some(crate::lens::ValidArea::parse(&value,&prepared.source_sha256,&prepared.dng_sha256,settings)?);
+    Ok(())
+}
 fn write_prepare_log(
     log: &Path,
     tool: &Path,
@@ -1192,7 +1213,7 @@ fn prepared_native_run(
 ) -> NativeRun {
     NativeRun {
         method: settings.camera_recipe,
-        lens: settings.lens,
+        lens: settings.lens.clone(),
         log: log.to_path_buf(),
         analysis_roi,
         #[cfg(test)]
@@ -1385,8 +1406,9 @@ fn run_frame(
         "--highlight-recovery".into(),
         if pixels && run.method != crate::color_profile::CameraRecipe::LegacyInverseCm { "on" } else { "off" }.into(),
     ]);
-    let lens_mode = if pixels { run.lens } else { crate::lens::Mode::Off };
-    args.extend(["--lens-correction".into(), lens_mode.token().into()]);
+    let lens_mode = if pixels { run.lens.mode } else { crate::lens::Mode::Off };
+    let lens_policy = if pixels { run.lens.policy } else { crate::lens::Policy::default() };
+    lens_policy.args(lens_mode, &mut args);
     if let Some(wb) = override_wb {
         args.extend(["--white-balance".into(), format_wb(wb)]);
     }
@@ -1417,7 +1439,7 @@ fn run_frame(
     let bytes = stream.json(1)?;
     let sidecar = parse_json(&bytes)?;
     if let Some(report) = sidecar.get("lens_correction") {
-        crate::lens::validate_report(report, lens_mode)?;
+        crate::lens::validate_report(report, lens_mode, lens_policy)?;
     } else if lens_mode == crate::lens::Mode::Auto {
         return Err(failure("missing lens correction contract"));
     }

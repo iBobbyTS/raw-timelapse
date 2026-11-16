@@ -84,6 +84,9 @@ struct Options {
     calibration: String,
     highlight_recovery: bool,
     lens_auto: bool,
+    lens_components: [bool;3],
+    lens_strength: f64,
+    lens_sampling: String,
     /// Prepared-context path for a --prepared consumer invocation.
     prepared: Option<PathBuf>,
     /// --prepare operation inputs.
@@ -134,7 +137,10 @@ fn run() -> Result<(), (i32, String)> {
             .append(true)
             .open(path)
             .unwrap();
-        writeln!(f, "{}", std::process::id()).unwrap();
+        // One append write per record: formatting PID/newline separately races
+        // with the other native workers and can concatenate two PIDs.
+        let record = format!("{}\n", std::process::id());
+        f.write_all(record.as_bytes()).unwrap();
     }
     if matches!(options.stdout_mode.as_deref(), Some("--stdout-frame" | "--stdout-frame-f32"))
         && config.frame_fail_on.as_deref() == Some(&name)
@@ -299,9 +305,8 @@ fn run() -> Result<(), (i32, String)> {
     };
     metadata.insert_str(1, &recovery);
     let lens_requested = options.lens_auto && is_f32;
-    let lens_status = if lens_requested { "no-usable-model" } else { "off" };
-    let lens_components: Vec<_> = ["vignette", "distortion", "ca"].iter().map(|name| format!(r#"{{"component":"{name}","status":"{lens_status}"}}"#)).collect();
-    let lens = format!(r#""lens_correction":{{"revision":1,"requested":{lens_requested},"collected":true,"upstream_reversible":false,"components":[{}]}},"#, lens_components.join(","));
+    let lens_components: Vec<_> = ["vignette", "distortion", "ca"].iter().enumerate().map(|(i,name)| {let requested=lens_requested&&options.lens_components[i]&&(i!=0||options.lens_strength>0.0);let status=if requested{"no-usable-model"}else{"off"};format!(r#"{{"component":"{name}","status":"{status}","requested":{requested}}}"#)}).collect();
+    let lens = format!(r#""lens_correction":{{"revision":2,"requested":{lens_requested},"collected":true,"upstream_reversible":false,"vignette_strength":{},"resampling":"{}","gain_min":1,"gain_max":1,"components":[{}]}},"#,options.lens_strength,options.lens_sampling,lens_components.join(","));
     metadata.insert_str(1, &lens);
     let mut metadata = metadata;
     {
@@ -736,7 +741,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
                     emit = Some(PathBuf::from(value(&args, &mut index)?));
                     index += 1;
                 }
-                "--converter" | "--converter-timeout" | "--lens-correction" | "--exiftool" | "--lens-profile-dir" => {
+                "--converter" | "--converter-timeout" | "--lens-correction" | "--lens-vignette" | "--lens-distortion" | "--lens-ca" | "--lens-vignette-strength" | "--lens-resampling" | "--exiftool" | "--lens-profile-dir" => {
                     let _ = value(&args, &mut index)?;
                     index += 1;
                 }
@@ -757,6 +762,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
             recipe: "legacy-test".into(), correction: "none".into(), calibration: "none".into(),
             highlight_recovery: false,
             lens_auto: false,
+            lens_components:[true;3],lens_strength:1.0,lens_sampling:"bilinear".into(),
             prepared: None,
             prepare: Some(PrepareArgs {
                 scratch: scratch.ok_or((2, "--prepare requires --scratch".to_string()))?,
@@ -800,6 +806,9 @@ fn parse_args() -> Result<Options, (i32, String)> {
     let mut calibration = "none".to_string();
     let mut highlight_recovery = false;
     let mut lens_auto = false;
+    let mut lens_components=[true;3];
+    let mut lens_strength=1.0;
+    let mut lens_sampling="bilinear".to_string();
     let mut white_balance = None;
     let mut exposure_ev = 0.0;
     let mut emit_analysis = None;
@@ -812,6 +821,9 @@ fn parse_args() -> Result<Options, (i32, String)> {
             "--profile-correction" => { correction = value(&args, &mut index)?; index += 1; }
             "--camera-calibration" => { calibration = value(&args, &mut index)?; index += 1; }
             "--highlight-recovery" => { highlight_recovery = value(&args, &mut index)? == "on"; index += 1; }
+            "--lens-vignette" | "--lens-distortion" | "--lens-ca" => {let component=match args[index].as_str(){"--lens-vignette"=>0,"--lens-distortion"=>1,_=>2};lens_components[component]=value(&args,&mut index)?=="auto";index+=1;}
+            "--lens-vignette-strength" => {lens_strength=value(&args,&mut index)?.parse().map_err(|_|(2,"invalid lens strength".to_string()))?;index+=1;}
+            "--lens-resampling" => {lens_sampling=value(&args,&mut index)?;index+=1;}
             "--lens-correction" => { lens_auto = value(&args, &mut index)? == "auto"; index += 1; }
             "--color-contract-version" => { let v = value(&args, &mut index)?; if v != "2" { return Err((2,"contract version".into())); } index += 1; }
             "--camera-color-method" => {
@@ -870,7 +882,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
         analysis_roi,
         no_png,
         stdout_mode,
-        camera_method, recipe, correction, calibration, highlight_recovery, lens_auto,
+        camera_method, recipe, correction, calibration, highlight_recovery, lens_auto, lens_components,lens_strength,lens_sampling,
         prepared,
         prepare: None,
     })

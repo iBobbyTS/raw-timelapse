@@ -12,6 +12,7 @@ struct ProfileSample {
 };
 struct Profile {
   std::string make, camera, lens, path, fingerprint;
+  std::vector<std::string> aliases;
   double crop = 1, aspect = 1.5;
   bool raw = false, unsupported = false;
   std::vector<ProfileSample> samples;

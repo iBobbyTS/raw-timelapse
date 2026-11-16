@@ -61,6 +61,10 @@ OPTIONS:
                                allowed: -preset -tune -vendor -threads -g -bf -level
     --resize <WxH>             Explicit scene-linear resize; omit to keep source geometry
     --lens-correction <MODE>   auto | off (default: auto; cannot undo upstream correction)
+    --lens-vignette <MODE>     auto | off (default: auto), likewise --lens-distortion / --lens-ca
+    --lens-vignette-strength N Exposure-domain strength 0..1 (default: 1)
+    --lens-resampling <MODE>   bilinear | quality (default: bilinear)
+    --lens-crop <MODE>         preserve | safe | sequence-safe (default: preserve; safe is fixed over video)
     --exiftool <PATH>          Read-only Prepare metadata tool (default: /opt/homebrew/bin/exiftool)
     --lens-profile-dir <DIR>   Installed LCP root, repeatable; replaces default Adobe roots
     --converter <PATH>         Adobe DNG Converter override passed to the native tool
@@ -492,6 +496,26 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                     flag,
                     inline_value,
                 )?))
+            }
+            "--lens-vignette" | "--lens-distortion" | "--lens-ca" => {
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                let enabled = match value.as_str() {"auto"=>true,"off"=>false,_=>return Err(Error::new(EXIT_USAGE,format!("{flag} expects auto or off")))};
+                let component = match flag {"--lens-vignette"=>0,"--lens-distortion"=>1,_=>2};
+                lens.policy.components[component] = enabled;
+            }
+            "--lens-vignette-strength" => {
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                let strength = value.parse::<f64>().map_err(|_|Error::new(EXIT_USAGE,"lens vignette strength must be 0..1"))?;
+                if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {return Err(Error::new(EXIT_USAGE,"lens vignette strength must be 0..1"));}
+                lens.policy.vignette_strength = strength;
+            }
+            "--lens-resampling" => {
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                lens.policy.sampling = match value.as_str() {"bilinear"=>crate::lens::Sampling::Bilinear,"quality"=>crate::lens::Sampling::Quality,_=>return Err(Error::new(EXIT_USAGE,"lens resampling expects bilinear or quality"))};
+            }
+            "--lens-crop" => {
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                lens.crop = match value.as_str() {"preserve"=>crate::lens::Crop::Preserve,"safe"=>crate::lens::Crop::Safe,"sequence-safe"=>crate::lens::Crop::SequenceSafe,_=>return Err(Error::new(EXIT_USAGE,"lens crop expects preserve, safe or sequence-safe"))};
             }
             "--lens-correction" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
@@ -1115,6 +1139,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lens_policy_defaults_and_explicit_controls() {
+        let defaults=parse_run(&["--input","in","--output","out.mov"]).unwrap();
+        assert_eq!(defaults.lens.mode,crate::lens::Mode::Auto);
+        assert_eq!(defaults.lens.crop,crate::lens::Crop::Preserve);
+        assert_eq!(defaults.lens.policy,crate::lens::Policy::default());
+        let options=parse_run(&["--input","in","--output","out.mov","--lens-vignette","off","--lens-distortion","off","--lens-vignette-strength","0.5","--lens-resampling","quality","--lens-crop","sequence-safe"]).unwrap();
+        assert_eq!(options.lens.policy.components,[false,false,true]);
+        assert_eq!(options.lens.policy.vignette_strength,0.5);
+        assert_eq!(options.lens.policy.sampling,crate::lens::Sampling::Quality);
+        assert!(options.lens.crop.is_safe());
+        for (flag,value) in [("--lens-vignette-strength","NaN"),("--lens-vignette-strength","-0.1"),("--lens-vignette-strength","1.1"),("--lens-ca","on"),("--lens-resampling","unknown"),("--lens-crop","per-frame")] {
+            assert!(parse_run(&["--input","in","--output","out.mov",flag,value]).is_err());
+        }
+    }
     #[test]
     fn requires_input_and_output() {
         assert!(parse_run(&[]).is_err());

@@ -43,6 +43,8 @@ struct Image {
     /// Channel samples that the colour node clipped below/above the transfer's
     /// encodable domain. Only the ordered commit accumulates them.
     clips: [usize; 2],
+    crop: Option<[f64;4]>,
+    crop_record: Option<crate::resample::CropWindow>,
 }
 
 struct Runner<'a, 'b> {
@@ -55,6 +57,7 @@ struct Runner<'a, 'b> {
     source_geometry: Option<(u32, u32)>,
     resize_target: Option<(u32, u32)>,
     resize: Option<ResizeRecord>,
+    lens_area: Option<[f64;4]>,
     generated_paths: Vec<std::path::PathBuf>,
     encoder: Arc<Mutex<video::GraphEncoder>>,
     active: proc::ActiveNative,
@@ -105,7 +108,7 @@ impl Runner<'_, '_> {
     }
     fn settings(&self) -> PreparedSettings {
         PreparedSettings {
-            lens: self.context.options.lens.mode,
+            lens: self.context.options.lens.clone(),
             camera_recipe: self.context.camera_recipe,
         }
     }
@@ -254,6 +257,10 @@ impl Backend for Runner<'_, '_> {
         if id == 0 {
             self.reference_wb = Some(prepared.as_shot_neutral);
         }
+        if self.context.options.lens.crop.is_safe() {
+            let area=prepared.lens_valid_area.ok_or("graph: prepared frame has no certified lens area")?;
+            self.lens_area=Some(crate::lens::intersect(self.lens_area.unwrap_or([0.,0.,1.,1.]),area.bounds).map_err(|e|e.message)?);
+        }
         self.capture_times.push(prepared.capture_time.clone());
         if prepared.generated {
             self.generated_paths.push(prepared.dng.clone());
@@ -384,6 +391,10 @@ impl Backend for Runner<'_, '_> {
         let prepared = r.clone();
         let wb = self.wb(id);
         let settings = self.settings();
+        let crop=if self.context.options.lens.crop.is_safe() {
+            if self.capture_times.len()!=self.context.sources.len() {return Err("graph: sequence crop requires the complete prepared inventory".into());}
+            Some(self.lens_area.ok_or("graph: missing common sequence lens area")?)
+        } else {None};
         let total = self.context.sources.len();
         let active = self.active.clone();
         if id > 0 && self.context.options.white_balance.freezes_reference() && wb.is_none() {
@@ -402,6 +413,9 @@ impl Backend for Runner<'_, '_> {
                 &log,
                 active,
                 &mut |info, native| {
+                    if let Some(area)=prepared.lens_valid_area {
+                        if area.bounds!=[0.,0.,1.,1.]&&(area.width!=info.width||area.height!=info.height) {return Err(Error::new(EXIT_FRAME,"lens valid-area geometry differs from delivery"));}
+                    }
                     pixels = Some(native.pixels(info.width, info.height)?);
                     Ok(())
                 },
@@ -411,6 +425,8 @@ impl Backend for Runner<'_, '_> {
                 info,
                 pixels: Pixels::Linear(pixels.ok_or("graph: develop returned no owned pixels")?),
                 clips: [0, 0],
+                crop,
+                crop_record: None,
             })
         }))
     }
@@ -425,6 +441,7 @@ impl Backend for Runner<'_, '_> {
         let range = self.encoder_config.effective_range(profile);
         let reference_gain = self.context.options.log_reference_gain;
         Ok(Box::new(move || {
+            image.crop_record=None;
             match kind {
                 Kind::Identity => (),
                 Kind::Exposure(ev) => {
@@ -449,12 +466,15 @@ impl Backend for Runner<'_, '_> {
                             "graph: resize requires scene-linear pixels before colour".into()
                         );
                     };
-                    let resized = crate::resample::resize_scene_linear(
+                    let bounds=image.crop.take();
+                    if let Some(area)=bounds {image.crop_record=Some(crate::resample::crop_window(image.info.width,image.info.height,width,height,area)?);}
+                    let resized = crate::resample::resize_scene_linear_region(
                         pixels,
                         image.info.width,
                         image.info.height,
                         width,
                         height,
+                        bounds,
                     )
                     .map_err(|e| format!("graph: resize: {e}"))?;
                     image.info.pixels_sha256 = Some(crate::digest::sha256(&resized));
@@ -463,6 +483,13 @@ impl Backend for Runner<'_, '_> {
                     image.info.height = height;
                 }
                 Kind::Color => {
+                    if let Some(area)=image.crop.take() {
+                        let Pixels::Linear(pixels)=&image.pixels else {return Err("graph: lens crop requires linear pixels".into());};
+                        image.crop_record=Some(crate::resample::crop_window(image.info.width,image.info.height,image.info.width,image.info.height,area)?);
+                        let cropped=crate::resample::resize_scene_linear_region(pixels,image.info.width,image.info.height,image.info.width,image.info.height,Some(area))?;
+                        image.info.pixels_sha256=Some(crate::digest::sha256(&cropped));
+                        image.pixels=Pixels::Linear(Arc::from(cropped));
+                    }
                     let Pixels::Linear(pixels) = &image.pixels else {
                         return Err("graph: colour conversion requires scene-linear pixels".into());
                     };
@@ -495,6 +522,10 @@ impl Backend for Runner<'_, '_> {
         let info = &image.info;
         if info.index != id + 1 || info.source_sha256.as_deref().is_none() {
             return Err("graph: image identity mismatch".into());
+        }
+        if let Some(window)=image.crop_record {
+            let written=self.log.line(&format!("kind=lens.crop frame={} fixed_sequence=true window={:.9},{:.9},{:.9},{:.9} output={}x{} scale={:.9},{:.9}",info.index,window.left,window.top,window.right,window.bottom,info.width,info.height,f64::from(info.width)/(window.right-window.left),f64::from(info.height)/(window.bottom-window.top)));
+            self.result(written)?;
         }
         if kind == Kind::Develop {
             if let Some((width, height)) = self.source_geometry {
@@ -863,6 +894,7 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         source_geometry: None,
         resize_target: explicit_resize,
         resize: None,
+        lens_area: None,
         generated_paths: vec![],
         encoder: {
             let mut encoder =

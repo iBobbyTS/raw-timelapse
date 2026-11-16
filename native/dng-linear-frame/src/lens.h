@@ -15,6 +15,12 @@ struct Perspective {
   double fx = 1, fy = 1, cx = .5, cy = .5, scale = 1;
   std::array<double, 5> k{};
 };
+// A bounded convex combination in image coordinates. Each term retains its
+// own normalization, including the green coordinate system for relative CA.
+struct PerspectiveTerm {
+  double weight = 1;
+  std::array<Perspective, 3> plane;
+};
 struct Model {
   Kind kind = Kind::none;
   std::string source, fingerprint;
@@ -22,6 +28,7 @@ struct Model {
   std::array<std::vector<double>, 3> table;
   // LCP: normalised focal lengths (long edge), centres (width/height).
   std::array<Perspective, 3> plane;
+  std::vector<PerspectiveTerm> terms;
 };
 struct Calibration {
   bool collected = false;
@@ -30,9 +37,17 @@ struct Calibration {
   std::array<Upstream, 3> upstream{};
   std::array<Model, 3> embedded, fallback;
 };
+enum class Sampling { bilinear, quality };
+struct Policy {
+  std::array<bool, 3> components{true, true, true};
+  double vignette_strength = 1;
+  Sampling sampling = Sampling::bilinear;
+};
+void validate_policy(const Policy &);
 struct Request {
   const Calibration *calibration = nullptr;
   bool enabled = false;
+  Policy policy;
 };
 struct Decision {
   std::string status, source, fingerprint;
@@ -44,12 +59,20 @@ struct Result {
   std::vector<float> pixels;
   std::array<Decision, 3> decisions;
   uint64_t outside_samples = 0;
+  double gain_min = 1, gain_max = 1;
 };
-std::array<Decision, 3> decide(const Calibration &, bool enabled);
+std::array<Decision, 3> decide(const Calibration &, bool enabled, const Policy & = {});
 Result correct(std::span<const float> rgb, uint32_t width, uint32_t height,
-               const Calibration &, bool enabled, void (*cancel)() = nullptr);
+               const Calibration &, bool enabled, void (*cancel)() = nullptr,
+               const Policy & = {});
+// Normalized pixel-centre rectangle certified for all three channels and the
+// selected sampler footprint. The output/sequence layer owns its application.
+std::array<double, 4> safe_area(const Calibration &, uint32_t width, uint32_t height,
+                                bool enabled, const Policy & = {}, void (*cancel)() = nullptr);
 void validate(const Calibration &);
+void validate_domain(const Calibration &, uint32_t width, uint32_t height,
+                     const Policy & = {}, void (*cancel)() = nullptr);
 std::string serialize(const Calibration &);
 Calibration deserialize(const std::string &);
-Json report(const Calibration &, const Result &, bool enabled);
+Json report(const Calibration &, const Result &, bool enabled, const Policy & = {});
 } // namespace frame::lens

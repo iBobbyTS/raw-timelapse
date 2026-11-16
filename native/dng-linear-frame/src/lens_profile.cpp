@@ -89,7 +89,7 @@ Perspective perspective(xmlNode *n, double focal, double crop, bool vignette) {
 }
 // Read only the header for indexing; do not load thousands of calibration
 // tables.
-Fields identity_header(const std::filesystem::path &path) {
+Fields identity_header(const std::filesystem::path &path, std::vector<std::string> &aliases) {
   auto *r = xmlReaderForFile(path.c_str(), nullptr,
                              XML_PARSE_NONET | XML_PARSE_NOERROR |
                                  XML_PARSE_NOWARNING);
@@ -100,7 +100,7 @@ Fields identity_header(const std::filesystem::path &path) {
     ~Guard() { xmlFreeTextReader(r); }
   } guard{r};
   Fields f;
-  int count = 0, status;
+  int count = 0, status, alternate_depth = -1;
   while ((status = xmlTextReaderRead(r)) == 1) {
     if (++count > 4096)
       throw std::runtime_error("LCP header exceeds bound");
@@ -108,9 +108,27 @@ Fields identity_header(const std::filesystem::path &path) {
     if (type == XML_READER_TYPE_DOCUMENT_TYPE ||
         type == XML_READER_TYPE_ENTITY_REFERENCE)
       throw std::runtime_error("LCP DTD/entities forbidden");
+    if (type == XML_READER_TYPE_END_ELEMENT &&
+        xmlTextReaderDepth(r) == alternate_depth)
+      alternate_depth = -1;
     if (type != XML_READER_TYPE_ELEMENT)
       continue;
     auto local = reinterpret_cast<const char *>(xmlTextReaderConstLocalName(r));
+    const auto *element_ns = xmlTextReaderConstNamespaceUri(r);
+    if (std::string(local) == "AlternateLensNames" && element_ns &&
+        camera_ns == reinterpret_cast<const char *>(element_ns))
+      alternate_depth = xmlTextReaderDepth(r);
+    else if (alternate_depth >= 0 && std::string(local) == "li" && element_ns &&
+             std::string(reinterpret_cast<const char *>(element_ns)) ==
+                 "http://www.w3.org/1999/02/22-rdf-syntax-ns#") {
+      auto *value = xmlTextReaderReadString(r);
+      if (value) {
+        aliases.emplace_back(reinterpret_cast<const char *>(value));
+        xmlFree(value);
+      }
+      if (aliases.size() > 128)
+        throw std::runtime_error("LCP alias count exceeds bound");
+    }
     if (std::string(local) == "PerspectiveModel" ||
         std::string(local) == "FisheyeModel")
       break;
@@ -146,17 +164,22 @@ Model blend(const Model &a, const Model &b, double t) {
   if (t >= 1)
     return b;
   Model m = a;
-  for (int c = 0; c < 3; ++c) {
-    auto &p = m.plane[c];
-    const auto &q = b.plane[c];
-    p.fx += (q.fx - p.fx) * t;
-    p.fy += (q.fy - p.fy) * t;
-    p.cx += (q.cx - p.cx) * t;
-    p.cy += (q.cy - p.cy) * t;
-    p.scale += (q.scale - p.scale) * t;
-    for (int i = 0; i < 5; ++i)
-      p.k[i] += (q.k[i] - p.k[i]) * t;
-  }
+  m.terms.clear();
+  auto append = [&](const Model &endpoint, double weight) {
+    if (endpoint.terms.empty())
+      m.terms.push_back({weight, endpoint.plane});
+    else
+      for (auto term : endpoint.terms) {
+        term.weight *= weight;
+        m.terms.push_back(std::move(term));
+      }
+  };
+  // Interpolate attenuation or complete pixel-coordinate maps, not independent
+  // coefficients whose units change with focal normalization and principal point.
+  append(a, 1 - t);
+  append(b, t);
+  if (m.terms.size() > 8)
+    throw std::runtime_error("LCP interpolation exceeds trilinear support");
   return m;
 }
 // Nested clamped interpolation handles ragged focal/aperture/focus grids
@@ -208,6 +231,22 @@ Profile read_profile(const std::filesystem::path &path) {
           p.make = text(f, "Make");
           p.camera = text(f, "Model");
           p.lens = text(f, "Lens");
+          if (auto *alternates = descendant(n, "AlternateLensNames")) {
+            std::function<void(xmlNode *)> names = [&](xmlNode *node) {
+              for (; node; node = node->next) {
+                if (node->type != XML_ELEMENT_NODE)
+                  continue;
+                if (xml::name(node) == "li" && xml::ns(node) ==
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+                  p.aliases.push_back(xml::value(node));
+                else
+                  names(node->children);
+              }
+            };
+            names(alternates->children);
+            if (p.aliases.size() > 128)
+              throw std::runtime_error("LCP alias count exceeds bound");
+          }
           p.raw = text(f, "CameraRawProfile") == "True";
           p.crop = number(f, "SensorFormatFactor", 1);
           double h = number(f, "ImageLength");
@@ -285,12 +324,17 @@ std::array<Model, 3> interpolate_profile(const Profile &p, double focal,
                     {std::log(focal), fnumber > 0 ? 2 * std::log2(fnumber) : 0,
                      std::log(std::max(.001, focus > 0 ? focus : far))});
     double ratio = crop / p.crop;
-    for (auto &a : out[i].plane) {
-      a.fx *= ratio;
-      a.fy *= ratio;
-      a.cx = .5 + (a.cx - .5) * ratio;
-      a.cy = .5 + (a.cy - .5) * ratio;
-    }
+    auto adjust = [&](auto &planes) {
+      for (auto &a : planes) {
+        a.fx *= ratio;
+        a.fy *= ratio;
+        a.cx = .5 + (a.cx - .5) * ratio;
+        a.cy = .5 + (a.cy - .5) * ratio;
+      }
+    };
+    adjust(out[i].plane);
+    for (auto &term : out[i].terms)
+      adjust(term.plane);
   }
   return out;
 }
@@ -339,11 +383,17 @@ std::array<Model, 3> ProfileCatalog::resolve(const Calibration &c, double crop,
         auto path = std::filesystem::canonical(entry.path());
         if (!seen.insert(path).second)
           continue;
-        auto f = identity_header(path);
+        std::vector<std::string> aliases;
+        auto f = identity_header(path, aliases);
         if (text(f, "CameraRawProfile") != "True")
           continue;
-        index_[normalized(text(f, "Make")) + "/" + normalized(text(f, "Lens"))]
-            .push_back(path);
+        aliases.push_back(text(f, "Lens"));
+        std::set<std::string> keys;
+        for (const auto &name : aliases) {
+          auto key = normalized(name);
+          if (!key.empty() && keys.insert(key).second)
+            index_[normalized(text(f, "Make")) + "/" + key].push_back(path);
+        }
       }
     }
     indexed_ = true;
@@ -358,9 +408,13 @@ std::array<Model, 3> ProfileCatalog::resolve(const Calibration &c, double crop,
   std::set<std::string> hashes;
   for (const auto &path : it->second) {
     auto p = read_profile(path);
+    const auto lens_key = normalized(c.lens);
+    const bool named = normalized(p.lens) == lens_key ||
+        std::any_of(p.aliases.begin(), p.aliases.end(), [&](const auto &alias) {
+          return normalized(alias) == lens_key;
+        });
     if (!p.raw || p.unsupported || p.samples.empty() ||
-        normalized(p.make) != normalized(c.make) ||
-        normalized(p.lens) != normalized(c.lens))
+        normalized(p.make) != normalized(c.make) || !named)
       continue;
     // Calibration axes are sensor axes, not EXIF display orientation. Without
     // an explicit axis transform, a transposed aspect is not compatible.
@@ -383,7 +437,9 @@ std::array<Model, 3> ProfileCatalog::resolve(const Calibration &c, double crop,
     reason = "ambiguous-lcp-match";
     return {};
   }
-  reason = "lcp-clamped-log-focal-apex-aperture-log-focus; missing-focus=far";
+  reason = normalized(candidates.front().lens) == normalized(c.lens)
+      ? "match=primary-lens; " : "match=official-alias; ";
+  reason += "lcp-image-field-log-focal-apex-aperture-log-focus; missing-focus=far";
   return interpolate_profile(candidates.front(), c.focal, c.aperture, c.focus,
                              crop);
 }

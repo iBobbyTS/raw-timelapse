@@ -1,9 +1,11 @@
 #include "lens_metadata.h"
+#include "lens_identity.h"
 #include "frame.h"
 #include "lens_profile.h"
 #include "lens_xml.h"
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <iomanip>
 #include <map>
 #include <set>
@@ -157,6 +159,7 @@ double sensor_crop(const Tags &t, double focal) {
 }
 } // namespace
 void validate_prepare_options(const PrepareOptions &options) {
+  validate_policy(options.policy);
   if (!options.collect)
     return;
   if (!std::filesystem::path(options.exiftool).is_absolute() ||
@@ -189,6 +192,7 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
       "-Make",
       "-Model",
       "-LensModel",
+      "-LensType", "-LensID", "-Lens", "-LensSpec",
       "-FocalLength",
       "-FocalLengthIn35mmFormat",
       "-FNumber",
@@ -243,9 +247,24 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
     if (status.timed_out || status.exit_code != 0)
       throw Error(26, "lens metadata extraction failed; see " +
                           transcript.string());
-    for (auto &[path, tags] : metadata(output))
+    std::vector<std::string> named = {options.exiftool, "-config", "", "-X", "-a", "-G1",
+        "-LensID", "-LensType", "-Lens", "-LensSpec", "-Error", "-Warning"};
+    named.insert(named.end(), invocation.begin() + args.size(), invocation.end());
+    const auto named_output = directory / ("identities-" + std::to_string(part) + ".xml");
+    const auto named_log = directory / ("identities-" + std::to_string(part) + ".log");
+    const auto named_status = run_process(named, named_log, 120, named_output);
+    if (named_status.timed_out || named_status.exit_code != 0)
+      throw Error(26, "lens identity extraction failed; see " + named_log.string());
+    auto labels = metadata(named_output);
+    for (auto &[path, tags] : metadata(output)) {
+      const auto label = labels.find(path);
+      if (label == labels.end())
+        throw Error(26, "lens identity extraction omitted an input");
+      for (const auto &[key, value] : label->second)
+        tags.emplace("display:" + key, value);
       if (!records.emplace(path, std::move(tags)).second)
         throw Error(26, "duplicate lens metadata source");
+    }
     invocation = args;
     bytes = base_bytes;
     ++part;
@@ -275,8 +294,8 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
     c.collected = true;
     c.make = first(original, {"IFD0:Make", "XMP-tiff:Make"});
     c.camera = first(original, {"IFD0:Model", "XMP-tiff:Model"});
-    c.lens = first(original,
-                   {"ExifIFD:LensModel", "Sony:LensModel", "Canon:LensModel"});
+    const auto lens_identity = identity_detail::resolve(original);
+    c.lens = lens_identity.first;
     c.focal =
         numeric(first(original, {"ExifIFD:FocalLength", "Sony:FocalLength",
                                  "Nikon:FocalLength"}));
@@ -285,6 +304,7 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
         numeric(first(original, {"Nikon:FocusDistance", "Sony:FocusDistance2",
                                  "Composite:FocusDistance"}));
     std::ostringstream evidence;
+    evidence << "identity-source=" << lens_identity.second << char(10);
     for (const auto &[k, v] : original)
       evidence << k << '=' << v << char(10);
     for (const auto &[k, v] : prepared)
@@ -336,6 +356,7 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
     else
       c.selection = "embedded-or-upstream-owned";
     validate(c);
+    validate_domain(c, s.width, s.height, options.policy, check_cancelled);
   }
   return out;
 }

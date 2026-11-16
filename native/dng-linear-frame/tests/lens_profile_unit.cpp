@@ -11,6 +11,14 @@ void require(bool value, const char *message) {
   if (!value)
     throw std::runtime_error(message);
 }
+double coefficient(const Model &m) {
+  if (m.terms.empty())
+    return m.plane[0].k[0];
+  double sum = 0;
+  for (const auto &term : m.terms)
+    sum += term.weight * term.plane[0].k[0];
+  return sum;
+}
 void near(double a, double b) {
   require(std::abs(a - b) < 1e-10, "profile interpolation truth mismatch");
 }
@@ -47,15 +55,67 @@ int main(int argc, char **argv) {
           p.samples.push_back(s);
         }
     auto result = interpolate_profile(p, 20, 4, std::sqrt(10.), 1);
-    near(result[0].plane[0].k[0], std::log(20.) + 4 + std::log(std::sqrt(10.)));
+    near(coefficient(result[0]), std::log(20.) + 4 + std::log(std::sqrt(10.)));
     auto clamped = interpolate_profile(p, 1, 4, .1, 1);
-    near(clamped[0].plane[0].k[0], std::log(10.) + 4);
+    near(coefficient(clamped[0]), std::log(10.) + 4);
     auto missing = interpolate_profile(p, 20, 0, 0, 1);
     require(missing[0].kind == Kind::none,
             "missing aperture invented vignette");
-    near(missing[1].plane[0].k[0], std::log(20.) + 2 + std::log(10.));
+    near(coefficient(missing[1]), std::log(20.) + 2 + std::log(10.));
     auto crop = interpolate_profile(p, 20, 4, 1, 2);
     near(crop[1].plane[0].fx, 2);
+    for (const auto &term : crop[1].terms)
+      near(term.plane[0].fx, 2);
+    // Equivalent physical fields with different normalizations must survive
+    // the actual Prepare interpolation -> frozen transport -> pixel kernel.
+    Profile equivalent;
+    for (int i = 0; i < 2; ++i) {
+      ProfileSample s;
+      s.focal = i ? 40 : 10;
+      s.aperture = 4;
+      s.focus = 10;
+      for (int component : {0, 1, 2}) {
+        auto &m = s.model[component];
+        m.kind = Kind::perspective;
+        m.source = "synthetic:equivalent-field";
+        for (auto &plane : m.plane) {
+          plane.fx = plane.fy = i ? 2 : 1;
+          plane.k[0] = i ? -.8 : -.2;
+        }
+        if (component == 2) {
+          // Green coefficients do not act as additional base distortion.
+          m.plane[1].k[0] = 0;
+          m.plane[2].k[0] = i ? -.4 : -.1;
+        }
+      }
+      equivalent.samples.push_back(s);
+    }
+    const uint32_t w = 65, h = 49;
+    std::vector<float> pixels(size_t(w) * h * 3);
+    for (uint32_t y = 0; y < h; ++y)
+      for (uint32_t x = 0; x < w; ++x)
+        for (int channel = 0; channel < 3; ++channel)
+          pixels[(size_t(y) * w + x) * 3 + channel] = float(x + 2 * y + channel - 30.);
+    for (int component : {0, 1, 2}) {
+      Calibration c;
+      c.collected = true;
+      c.upstream.fill(Upstream::not_reported);
+      auto run = [&](double focal) {
+        c.fallback[component] = interpolate_profile(equivalent, focal, 4, 10, 1)[component];
+        return correct(pixels, w, h, deserialize(serialize(c)), true);
+      };
+      auto left = run(10), right = run(40);
+      for (double focal : {10., 12., 20., 30., 40.}) {
+        auto middle = run(focal);
+        require(middle.pixels.size() == pixels.size(), "equivalent field not applied");
+        for (size_t j = 0; j < pixels.size(); ++j) {
+          require(std::abs(left.pixels[j] - right.pixels[j]) < 1e-5,
+                  "equivalent endpoints disagree");
+          require(std::abs(left.pixels[j] - middle.pixels[j]) < 1e-5,
+                  "interpolation changed an equivalent physical field");
+        }
+      }
+    }
     namespace fs = std::filesystem;
     auto work =
         fs::path(argv[1]) /
@@ -90,6 +150,31 @@ int main(int argc, char **argv) {
     require(conflict.resolve(c, 1, 1.5, reason)[1].kind == Kind::none &&
                 reason == "ambiguous-lcp-match",
             "ambiguous profile arbitrarily selected");
+    auto alias_directory = work / "official-aliases";
+    fs::create_directories(alias_directory);
+    auto alias_xml = document(-.1);
+    auto insert = alias_xml.find("<c:PerspectiveModel");
+    alias_xml.insert(insert,
+        "<c:AlternateLensNames><rdf:Seq><rdf:li>Exact | Art Lens</rdf:li>"
+        "<rdf:li>Second Official Name</rdf:li></rdf:Seq></c:AlternateLensNames>");
+    std::ofstream(alias_directory / "alias.lcp") << alias_xml;
+    c.lens = "Exact | Art Lens";
+    ProfileCatalog alias_catalog({alias_directory});
+    require(alias_catalog.resolve(c, 1, 1.5, reason)[1].kind == Kind::perspective &&
+                reason.find("match=official-alias") != std::string::npos,
+            "declared RDF alias did not match with provenance");
+    c.lens = "Exact";
+    require(alias_catalog.resolve(c, 1, 1.5, reason)[1].kind == Kind::none,
+            "alias was split on a legitimate lens-name pipe");
+    c.lens = "Second Official Name";
+    require(alias_catalog.resolve(c, 1, 1.5, reason)[1].kind == Kind::perspective,
+            "second declared alias omitted");
+    auto conflicting_alias = alias_xml;
+    conflicting_alias.replace(conflicting_alias.find("-0.100000"), 9, "-0.200000");
+    std::ofstream(alias_directory / "other.lcp") << conflicting_alias;
+    ProfileCatalog ambiguous_alias({alias_directory});
+    require(ambiguous_alias.resolve(c, 1, 1.5, reason)[1].kind == Kind::none &&
+                reason == "ambiguous-lcp-match", "alias bypassed ambiguity protection");
     auto invalid = work / "version.xml";
     std::ofstream(invalid) << document(-.1, 99);
     require(read_profile(invalid).unsupported,

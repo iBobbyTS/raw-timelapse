@@ -158,7 +158,7 @@ PreparedFrame read_prepared(const fs::path &context_path);
 // SDK decode of the prepared artifact, then the unchanged fixed Canon CR3
 // calibration when requested. Never invokes the Converter or deletes a file.
 Decoded decode_prepared(const PreparedFrame &, const std::optional<Vec> &wb,
-                        CameraRecipe recipe, bool lens_enabled = false);
+                        CameraRecipe recipe, bool lens_enabled = false, const lens::Policy & = {});
 std::string sha256(const fs::path &);
 void write_png(const fs::path &, uint32_t, uint32_t,
                const std::vector<uint16_t> &);

@@ -298,8 +298,8 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe 
       d.delivery_camera = std::move(recovered.camera);
     }
     auto corrected = lens::correct(d.delivery_camera.empty() ? d.camera : d.delivery_camera,
-                                   d.width, d.height, lens_calibration, lens_request.enabled, cancel);
-    d.lens_correction = lens::report(lens_calibration, corrected, lens_request.enabled);
+                                   d.width, d.height, lens_calibration, lens_request.enabled, cancel, lens_request.policy);
+    d.lens_correction = lens::report(lens_calibration, corrected, lens_request.enabled, lens_request.policy);
     if (!corrected.pixels.empty()) d.delivery_camera = std::move(corrected.pixels);
     Json correction;
     const bool apply_hsm = recipe.correction == ProfileCorrection::hue_sat_map;
