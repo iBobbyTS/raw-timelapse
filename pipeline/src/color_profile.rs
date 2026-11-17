@@ -1444,8 +1444,10 @@ impl ColorProfile {
         out
     }
 
-    /// Compatibility utility for explicit RGB16 ACEScg inputs. The RAW pipeline
-    /// uses convert_f32_frame for every profile.
+    /// Compatibility utility for explicit RGB16 ACEScg inputs, retained for
+    /// the historical golden/reference tests only. The production RAW pipeline
+    /// uses convert_f32_frame_to_yuv10 for every profile; neither this nor
+    /// convert_f32_frame is reachable from the CLI.
     pub fn convert_frame(
         &self,
         rgb48le: &[u8],
