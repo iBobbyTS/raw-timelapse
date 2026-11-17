@@ -1446,6 +1446,8 @@ fn run_profile(root: &Path, input: &Path, tool: &Path, id: &str) -> (Output, Pat
     let mut args = base_args(input, &video, tool);
     args.push("--preview-profile");
     args.push(id);
+    // Profile pixel goldens describe unit reference gain, not the auto default.
+    args.extend(["--log-reference-gain", "1"]);
     (run_cli(&args), directory)
 }
 
@@ -1916,39 +1918,43 @@ fn log_reference_gain_is_finite_positive_for_every_profile() {
 
 #[test]
 fn log_reference_gain_auto_resolves_one_sequence_gain_without_clipping() {
-    let root = test_dir("gain-auto");
-    let input = root.join("material");
-    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
-    let fixtures = root.join("fixtures");
-    fs::create_dir_all(&fixtures).expect("fixtures");
-    let frames = standard_frames(&fixtures);
-    let tool = fake_native_tool(&fixtures, &frames, None, false);
-    let directory = run_directory(&root, "run");
-    let video = video_in(&directory);
-    let mut args = base_args(&input, &video, &tool);
-    args.extend([
-        "--preview-profile", "dji-dlog2-dgamut2",
-        "--log-reference-gain", "auto",
-    ]);
-    let result = run_cli(&args);
-    assert!(result.status.success(), "{}", stderr(&result));
-    let log = read_log(&directory);
-    assert!(
-        log.contains("kind=settings") && log.contains("reference_gain=auto"),
-        "{log}"
-    );
-    assert!(
-        log.contains(
-            "kind=reference_gain requested=auto profile=dji-dlog2-dgamut2 frames=3"
-        ),
-        "{log}"
-    );
-    assert!(log.contains("desired=4.000000000 desired_ev=2.00"), "{log}");
-    assert!(log.contains("limited_by=desired"), "{log}");
-    assert!(log.contains("applied=4.000000000 applied_ev=+2.00"), "{log}");
-    assert!(log.contains("clipped_total=0"), "{log}");
-    assert!(!log.contains("clipped_total=1"), "{log}");
-    let _ = video.metadata().expect("published video");
+    for profile in ["dji-dlog2-dgamut2", "dji-dlog-dgamut"] {
+        let root = test_dir(&format!("gain-auto-{profile}"));
+        let input = root.join("material");
+        make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+        let fixtures = root.join("fixtures");
+        fs::create_dir_all(&fixtures).expect("fixtures");
+        let frames = standard_frames(&fixtures);
+        let tool = fake_native_tool(&fixtures, &frames, None, false);
+        let directory = run_directory(&root, "run");
+        let video = video_in(&directory);
+        let mut args = base_args(&input, &video, &tool);
+        args.extend(["--preview-profile", profile]);
+        if profile == "dji-dlog2-dgamut2" {
+            args.extend(["--log-reference-gain", "auto"]);
+        }
+        let result = run_cli(&args);
+        assert!(result.status.success(), "{}", stderr(&result));
+        let log = read_log(&directory);
+        assert!(
+            log.contains("kind=settings") && log.contains("reference_gain=auto"),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!("kind=reference_gain requested=auto profile={profile} frames=3")),
+            "{log}"
+        );
+        assert!(log.contains("desired=4.000000000 desired_ev=2.00"), "{log}");
+        assert!(log.contains("limited_by=desired"), "{log}");
+        assert!(log.contains("applied=4.000000000 applied_ev=+2.00"), "{log}");
+        assert!(log.contains("clipped_total=0"), "{log}");
+        assert!(!log.contains("clipped_total=1"), "{log}");
+        let _ = video.metadata().expect("published video");
+        if profile == "dji-dlog-dgamut" {
+            assert!(log.contains("recipe_effective=dji-dlog profile_correction=hue-sat-map"), "{log}");
+            assert!(log.contains("output_cat_method=cat02 output_cat_realization=reference"), "{log}");
+        }
+    }
 }
 
 #[test]
@@ -2070,6 +2076,9 @@ fn camera_color_cli_routes_before_prepare_and_keeps_single_extension_policy() {
         (REV3_PROFILE, "DNG", "auto", "generic"),
         (REV_PROFILE, "CR3", "auto", "generic"),
         ("srgb-preview", "CR3", "auto", "generic"),
+        ("dji-dlog-dgamut", "DNG", "auto", "dji-dlog"),
+        ("dji-dlog-dgamut", "DNG", "generic", "generic"),
+        ("dji-dlog2-dgamut2", "DNG", "auto", "generic"),
         (REV3_PROFILE, "CR3", "generic", "generic"),
         (REV3_PROFILE, "CR3", "canon-clog3", "canon-clog3"),
     ] {

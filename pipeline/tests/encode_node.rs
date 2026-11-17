@@ -425,7 +425,8 @@ fn every_profile_encodes_black_grey_and_white_reference_codes() {
         let tool = fake_native_sequence(&fixtures, &[frame], None, false, 192, 48);
         let video = video_for(&root, "run");
         let mut args = base_args(&input, &video, &tool);
-        args.extend(["--strength", "0", "--preview-profile", id]);
+        // These are transfer reference codes, independent of delivery auto gain.
+        args.extend(["--strength", "0", "--preview-profile", id, "--log-reference-gain", "1"]);
         let result = run_cli(&args);
         assert!(result.status.success(), "{id}: {}", stderr(&result));
 

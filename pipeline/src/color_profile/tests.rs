@@ -13,9 +13,13 @@ use crate::json::Json;
 
     #[test]
     fn auto_reference_gain_keeps_the_desired_gain_when_it_fits() {
+        let dlog = lookup("dji-dlog-dgamut").unwrap();
         let dlog2 = lookup("dji-dlog2-dgamut2").unwrap();
         let clog3 = lookup("canon-log3-cinema-gamut-rev-eng-crm-dev").unwrap();
         assert_eq!(dlog2.transfer.desired_auto_reference_gain(), 4.0);
+        assert_eq!(dlog.transfer.desired_auto_reference_gain(), 4.0);
+        assert_eq!(dlog.auto_reference_gain(0.5, -0.001).gain, 4.0);
+        assert_eq!(dlog.auto_reference_gain(0.0, 0.0).gain, 4.0);
         assert_eq!(clog3.transfer.desired_auto_reference_gain(), 8.0);
         // Peaks far inside the domain: the desired gain is used unchanged.
         assert_eq!(dlog2.auto_reference_gain(0.5, -0.001).gain, 4.0);

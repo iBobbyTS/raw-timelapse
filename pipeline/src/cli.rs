@@ -50,8 +50,9 @@ OPTIONS:
                                output pixels and is reported as custom-adaptation
     --camera-color <MODE>      auto|generic|canon-clog3 (default: auto)
     --log-reference-gain <N|auto>
-                               Positive finite output gain, all profiles (default: 1); or auto:
-                               one sequence-wide gain (D-Log 2 aims at +2 EV, other Logs +3 EV)
+                               Positive finite output gain, or auto (D-Log default: auto;
+                               other profiles: 1). Auto aims at 4x for D-Log / D-Log 2,
+                               8x for other Logs, using one sequence-wide gain
                                capped so the scanned sequence peak never clips the Log domain
                                (Log profiles only; costs one extra develop pass over the run)
     --signal-bits <10|12>     Depth of the single YCbCr quantization handoff into the encoder
@@ -807,7 +808,13 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         preview_profile,
         output_transform,
         camera_color: camera_color.unwrap_or(color_profile::CameraColor::Auto),
-        log_reference_gain: log_reference_gain.unwrap_or(ReferenceGain::Fixed(1.0)),
+        log_reference_gain: log_reference_gain.unwrap_or_else(|| {
+            if preview_profile.transfer == color_profile::Transfer::DjiDLog {
+                ReferenceGain::Auto
+            } else {
+                ReferenceGain::Fixed(1.0)
+            }
+        }),
         signal_depth,
         converter,
         converter_timeout,
@@ -1143,6 +1150,21 @@ mod tests {
         assert_eq!(options.log_reference_gain, ReferenceGain::Fixed(2.5));
         assert_eq!(options.log_reference_gain.token(), "2.5");
         let options = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");
+        assert_eq!(options.log_reference_gain, ReferenceGain::Fixed(1.0));
+    }
+
+    #[test]
+    fn original_dlog_defaults_to_auto_gain_and_cat02_with_numeric_overrides() {
+        let args = ["--input", "in", "--output", "out.mov", "--preview-profile", "dji-dlog-dgamut"];
+        let options = parse_run(&args).unwrap();
+        assert_eq!(options.log_reference_gain, ReferenceGain::Auto);
+        assert_eq!(options.output_transform.method, "cat02");
+        let mut explicit = args.to_vec();
+        explicit.extend(["--log-reference-gain", "1", "--output-cat", "bradford"]);
+        let options = parse_run(&explicit).unwrap();
+        assert_eq!(options.log_reference_gain, ReferenceGain::Fixed(1.0));
+        assert_eq!(options.output_transform.method, "bradford");
+        let options = parse_run(&["--input", "in", "--output", "out.mov", "--preview-profile", "dji-dlog2-dgamut2"]).unwrap();
         assert_eq!(options.log_reference_gain, ReferenceGain::Fixed(1.0));
     }
 

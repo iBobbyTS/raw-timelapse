@@ -63,7 +63,7 @@ pub struct OutputCatDefault {
     pub provenance: &'static str,
 }
 
-/// The pre-existing output realization shared by every registered profile: the
+/// The output realization retained by the non-DJI registered profiles: the
 /// published Bradford D60->D65 constant composed exactly as before.
 pub(crate) const PREVIEW_OUTPUT_CAT: OutputCatDefault = OutputCatDefault {
     method: cat::BRADFORD.token,
@@ -72,6 +72,27 @@ pub(crate) const PREVIEW_OUTPUT_CAT: OutputCatDefault = OutputCatDefault {
     provenance: "published Bradford D60(ACES white)->D65 constant already used by the \
                  pipeline; reference chain is AP1/D60 -> XYZ/D60 -> fixed Bradford -> XYZ/D65 -> \
                  the profile's declared target linear matrix, in the historic composition order",
+};
+
+/// Original D-Log default, frozen from the standard full CAT02 derivation:
+/// inverse(D-Gamut->XYZ) * CAT02(ACES white, D65) * AP1->XYZ. It matches the
+/// previously explicit `--output-cat cat02` path, replacing output Bradford.
+pub(crate) const DJI_DLOG_OUTPUT_CAT: OutputCatDefault = OutputCatDefault {
+    method: cat::CAT02.token,
+    adaptation: [
+        [0.9882325471218134, -0.007885454399865766, 0.01675763545162398],
+        [-0.005693191933411961, 0.9986923398294999, 0.0066723722028848576],
+        [0.00035327314234228887, 0.0011239768688093201, 1.0780829488488735],
+    ],
+    composed_override: Some([
+        [1.0113227507798794, -0.07164051412233424, 0.06031776340253864],
+        [-0.021197024649948024, 0.8593593389210054, 0.1618376857018451],
+        [0.009435039242172493, 0.06329003589077266, 0.927274924820115],
+    ]),
+    provenance: "D-Log default: standard CAT02 ACES white/D60->D65, D-Gamut primaries \
+                 from DJI white paper; inverse(target RGB->XYZ) x CAT02 x AP1->XYZ. \
+                 Same colorspace conversion convention as ACES DJI D-Log/D-Gamut CTL; \
+                 this does not claim camera exposure calibration",
 };
 
 /// The D-Log 2 profile's pinned reference realization: the fixed DCTL chain,

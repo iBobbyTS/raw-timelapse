@@ -63,4 +63,22 @@ for fm in (None,fwd):
     run(decorated,extra=['--camera-calibration','canon-normal-white-fixed-v1'],code=2)
     # A specialized request on direct non-Canon DNG cannot silently become generic.
     run(decorated,extra=['--camera-recipe','canon-clog3','--profile-correction','hue-sat-map','--camera-calibration','canon-normal-white-fixed-v1'],code=40)
-print('PASS generic CameraToPCS FM/fallback, profile skips, independent PCS, signed HDR, EV and policy rejection')
+# Original D-Log is a distinct policy tuple: HSM if present, no look/tone/exposure.
+# Compare with the existing standalone HSM implementation, not a duplicated color oracle.
+dlog=['--camera-recipe','dji-dlog','--profile-correction','hue-sat-map']
+base=make_dng(work,'dlog-absent',forward=fwd,w=64,h=64,pixels=[500,400,200]*4096)
+decorated=make_dng(work,'dlog-hsm',forward=fwd,w=64,h=64,pixels=[500,400,200]*4096,
+    hue_sat=hsm,tone=[0,0,.5,.8,1,1],look=hsm,baseline=1.88)
+for source in (base,decorated):
+    md,pd=run(source,extra=dlog)
+    mr,pr=run(source,extra=['--camera-recipe','legacy-test','--profile-correction','hue-sat-map'])
+    assert pd==pr
+    c=md['color'];assert c['recipe_effective']=='dji-dlog'
+    assert c['hue_sat_map_applied']==(source==decorated)
+    assert c['hue_sat_map_status']==('applied' if source==decorated else 'absent')
+    assert not c['tone_curve_applied'] and not c['look_table_applied'] and not c['baseline_exposure_applied']
+    ma,_=run(source,analysis=True,extra=dlog);assert ma['color']==c
+run(decorated,extra=['--camera-recipe','dji-dlog'],code=2)
+run(decorated,extra=dlog+['--camera-calibration','canon-normal-white-fixed-v1'],code=2)
+assert run(decorated,extra=dlog)[1]!=run(decorated)[1]
+print('PASS generic and D-Log CameraToPCS, HSM present/absent, analysis parity, EV and policy rejection')

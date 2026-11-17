@@ -304,14 +304,14 @@ impl Transfer {
         (self.inverse(0.0), self.inverse(1.0))
     }
 
-    /// Desired gain for `--log-reference-gain auto`: two stops on D-Log 2 and
+    /// Desired gain for `--log-reference-gain auto`: two stops on D-Log / D-Log 2 and
     /// three stops on every other camera Log curve. This is a measured user
     /// choice for dark timelapse delivery, not a property of the curve; the
     /// domain bound in `ColorProfile::auto_reference_gain` is what actually
     /// protects highlights.
     pub fn desired_auto_reference_gain(self) -> f64 {
         match self {
-            Self::DjiDLog2 => 4.0,
+            Self::DjiDLog | Self::DjiDLog2 => 4.0,
             _ => 8.0,
         }
     }

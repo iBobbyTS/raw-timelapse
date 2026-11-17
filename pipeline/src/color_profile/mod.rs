@@ -8,10 +8,9 @@
 //!   converted through the staged path
 //!   `AP1/D60 -> XYZ(D60) -> output CAT -> target linear RGB`, where the
 //!   adaptation targets the gamut's own white point;
-//! * one pinned default output CAT realization. The pre-existing profiles keep
-//!   the published Bradford D60->D65 matrix and the historic composition order
-//!   bit-for-bit; a profile may pin a different fixed chain (D-Log 2 pins its
-//!   DCTL AP1->AP0->D-Gamut 2/CAT02 chain). An
+//! * one pinned default output CAT realization. Original D-Log uses standard
+//!   CAT02; D-Log 2 pins its DCTL AP1->AP0->D-Gamut 2/CAT02 chain. Other
+//!   profiles retain published Bradford D60->D65 and historic composition. An
 //!   explicit CLI CAT choice that differs from the profile default uses the
 //!   standard derivation and is reported as `custom-adaptation`;
 //! * an explicit input domain derived from the official inverse curve at signal
@@ -56,7 +55,7 @@ pub use crate::chromatic_adaptation::{CatAlgorithm, CatRegistry};
 pub(crate) use gamut::{
     BT2020_GAMUT, CINEMA_GAMUT, DGAMUT2_GAMUT, DGAMUT_GAMUT, SGAMUT3_CINE_GAMUT, SGAMUT3_GAMUT, SRGB_GAMUT,
 };
-pub(crate) use output_cat::{DJI_DLOG2_OUTPUT_CAT, PREVIEW_OUTPUT_CAT};
+pub(crate) use output_cat::{DJI_DLOG_OUTPUT_CAT, DJI_DLOG2_OUTPUT_CAT, PREVIEW_OUTPUT_CAT};
 #[cfg(test)]
 pub(crate) use gamut::{
     ACES_AP1_TO_AP0, DCTL_CAT02_D65_TO_D60, DCTL_DGAMUT2_TO_XYZ65, DCTL_XYZ60_TO_AP0,
@@ -142,20 +141,21 @@ pub struct ColorProfile {
 pub enum CameraRecipe {
     LegacyInverseCm,
     Generic,
+    DjiDlog,
     CanonClog3,
 }
 impl CameraRecipe {
     pub fn native_token(self) -> &'static str {
         match self {
             Self::LegacyInverseCm => "legacy-inverse-cm",
-            Self::Generic | Self::CanonClog3 => "dng-camera-to-pcs",
+            Self::Generic | Self::DjiDlog | Self::CanonClog3 => "dng-camera-to-pcs",
         }
     }
     pub fn token(self) -> &'static str {
-        match self { Self::LegacyInverseCm => "legacy-test", Self::Generic => "generic", Self::CanonClog3 => "canon-clog3" }
+        match self { Self::LegacyInverseCm => "legacy-test", Self::Generic => "generic", Self::DjiDlog => "dji-dlog", Self::CanonClog3 => "canon-clog3" }
     }
     pub fn correction(self) -> &'static str {
-        if self == Self::CanonClog3 { "hue-sat-map" } else { "none" }
+        if matches!(self, Self::DjiDlog | Self::CanonClog3) { "hue-sat-map" } else { "none" }
     }
     pub fn calibration(self) -> &'static str {
         if self == Self::CanonClog3 { "canon-normal-white-fixed-v1" } else { "none" }
@@ -172,6 +172,7 @@ impl CameraColor {
         match self {
             Self::Generic => Ok(CameraRecipe::Generic),
             Self::Auto if clog3 && all_cr3 => Ok(CameraRecipe::CanonClog3),
+            Self::Auto if profile.transfer == Transfer::DjiDLog => Ok(CameraRecipe::DjiDlog),
             Self::Auto => Ok(CameraRecipe::Generic),
             Self::CanonClog3 if clog3 && all_cr3 => Ok(CameraRecipe::CanonClog3),
             Self::CanonClog3 => Err("--camera-color canon-clog3 requires CLog3 profile and original Canon CR3 photos".into()),
@@ -511,7 +512,7 @@ pub static PROFILES: [ColorProfile; 9] = [
         range_reason: LOG_RANGE_REASON,
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
-        output_cat: PREVIEW_OUTPUT_CAT,
+        output_cat: DJI_DLOG_OUTPUT_CAT,
     },
     ColorProfile {
         id: "dji-dlog2-dgamut2",

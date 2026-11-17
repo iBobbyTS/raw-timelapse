@@ -5,12 +5,24 @@
         for profile in PROFILES.iter() {
             for cr3 in [false, true] {
                 let canon = cr3 && profile.transfer == Transfer::CanonLog3RevEng;
-                assert_eq!(CameraColor::Auto.resolve(profile, cr3).unwrap(), if canon { CameraRecipe::CanonClog3 } else { CameraRecipe::Generic });
+                let expected = if canon { CameraRecipe::CanonClog3 }
+                    else if profile.transfer == Transfer::DjiDLog { CameraRecipe::DjiDlog }
+                    else { CameraRecipe::Generic };
+                assert_eq!(CameraColor::Auto.resolve(profile, cr3).unwrap(), expected);
                 assert_eq!(CameraColor::Generic.resolve(profile, cr3).unwrap(), CameraRecipe::Generic);
                 assert_eq!(CameraColor::CanonClog3.resolve(profile, cr3).is_ok(), canon);
                 assert_eq!(profile.curve_input_scale(), match profile.transfer { Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng => 0.9, _ => 1.0 });
             }
         }
+    }
+    #[test]
+    fn dlog_recipe_applies_only_profile_color_correction() {
+        let recipe = CameraRecipe::DjiDlog;
+        assert_eq!(recipe.native_token(), "dng-camera-to-pcs");
+        assert_eq!(recipe.token(), "dji-dlog");
+        assert_eq!(recipe.correction(), "hue-sat-map");
+        assert_eq!(recipe.calibration(), "none");
+        assert!(!recipe.requires_canon_cr3());
     }
     #[test]
     fn twelve_bit_quantizers_use_h273_scaled_code_points() {

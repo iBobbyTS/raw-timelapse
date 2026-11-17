@@ -109,6 +109,23 @@ use crate::json::Json;
     }
 
     #[test]
+    fn original_dlog_cat02_default_matches_standard_derivation_and_replaces_bradford() {
+        let p = lookup("dji-dlog-dgamut").unwrap();
+        let registry = CatRegistry::standard();
+        let default = p.resolve_output_cat(OutputCatSelection::Profile, &registry).unwrap();
+        let same = p.resolve_output_cat(OutputCatSelection::Method("cat02"), &registry).unwrap();
+        assert_eq!(default.method, "cat02");
+        assert_eq!(default.composed_matrix, same.composed_matrix);
+        assert_eq!(default.realization, OutputCatRealization::Reference);
+        let expected = cat::custom_output_matrix(&cat::CAT02, cat::ACES_WHITE_XY,
+            p.gamut.white_xy, &preview::AP1_D60_TO_XYZ_D60, &p.gamut.rgb_to_xyz).unwrap();
+        assert_matrix_close(default.composed_matrix, expected, 1e-14, "D-Log CAT02");
+        let bradford = p.resolve_output_cat(OutputCatSelection::Method("bradford"), &registry).unwrap();
+        assert_eq!(bradford.realization, OutputCatRealization::CustomAdaptation);
+        assert_ne!(default.composed_matrix, bradford.composed_matrix);
+    }
+
+    #[test]
     fn every_registered_profile_keeps_its_fixed_reference_realization() {
         let registry = CatRegistry::standard();
         for profile in PROFILES.iter() {

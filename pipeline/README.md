@@ -377,7 +377,8 @@ Input development is selected with `--camera-color auto|generic|canon-clog3`
 | selection | resolved input recipe |
 | --- | --- |
 | auto, CLog3 profile, all original inputs CR3 | Canon CLog3; native verifies Canon metadata for every frame |
-| auto, any other profile or non-CR3 inputs | generic |
+| auto, original `dji-dlog-dgamut` profile | dji-dlog (CameraToPCS + embedded HueSatMap when present) |
+| auto, any remaining profile or non-CR3 inputs | generic |
 | generic, any profile | generic |
 | canon-clog3 | requires CLog3 and original Canon CR3; otherwise rejected |
 
@@ -392,17 +393,25 @@ no Canon exposure calibration and reports `uncalibrated`, including when the use
 sets a reference gain. Invalid or singular profile transforms fail explicitly.
 Input D50→D60 adaptation remains Bradford; it is independent of output color.
 
-Only the Canon CLog3 recipe applies the validated profile HueSatMap and original
+The original D-Log recipe applies a valid embedded HueSatMap when present, in
+linear ProPhoto/D50 before output exposure. An absent table is reported and leaves
+the matrix result intact; malformed tables fail rather than silently falling back.
+LookTable, ToneCurve and BaselineExposure stay skipped. It applies no camera exposure
+calibration. Explicit `--camera-color generic` retains the matrix-only input path.
+
+The Canon CLog3 recipe also applies the validated profile HueSatMap and original
 CR3 NormalWhite/fixed 1.8 exposure calibration. CLog2RevEng now uses generic input
 by default: its changed input pixels/measurement are an intentional migration.
-Existing output curves, gamuts, tags and the default Bradford output matrices
-retain their definitions.
+Other output curves, gamuts, tags and default output matrices retain their definitions.
+Original D-Log now defaults to CAT02 (ACES white/D60 to D65), replacing output
+Bradford rather than stacking adaptations. `--output-cat bradford` remains available;
+input D50 to D60 adaptation remains unchanged. D-Log 2 keeps its separate DCTL chain.
 
 The output chromatic adaptation belongs to `OutputProfile`, not to the transfer
 curve or the input CAT. `--output-cat profile` (default) uses the profile's fixed
-reference realization; the pre-existing profiles keep the published Bradford
-D60→D65 matrix and composition order bit-for-bit, while `dji-dlog2-dgamut2`
-pins its own DCTL chain. An explicit
+reference realization: `dji-dlog-dgamut` uses standard CAT02, `dji-dlog2-dgamut2`
+pins its own DCTL chain, and other profiles keep the published Bradford
+D60→D65 matrix and composition order bit-for-bit. An explicit
 `bradford`/`cat02` equal to the profile default is the same idempotent reference
 selection. A different explicit method uses the standard derivation with column
 vectors — `M_out = inverse(M_target_to_XYZ) × CAT × M_AP1_to_XYZ`, where
@@ -458,7 +467,9 @@ that fail or never commit are excluded; an incomplete run publishes no video and
 no clip summary. The clipping counters are not an added per-frame audit file.
 
 `--log-reference-gain N` is a positive finite output gain for every profile,
-default 1. It is applied once before the output transfer function and never enters
+default 1 except original D-Log, which defaults to `auto` with desired gain 4
+(+2 EV). An explicit numeric value, including `1`, overrides this default. The
+resolved gain is applied once before the output transfer function and never enters
 measurement or native EV. The independent `curve_input_scale` is 0.9 for the two
 rev-eng Canon curves and 1 for other profiles; it is a curve input unit conversion,
 not camera calibration. This replaces the historical internal contract field
@@ -471,7 +482,7 @@ the first colour conversion, every frame is developed once more through the exac
 delivery image chain (exposure, resize, colour-boundary crop) and the target-gamut
 linear extremes are reduced with the converter's own arithmetic. The applied gain
 is `min(desired, positive headroom, negative toe)`: the desired brightening is 4
-(+2 EV) for D-Log 2 and 8 (+3 EV) for every other camera Log curve, and the two
+(+2 EV) for D-Log / D-Log 2 and 8 (+3 EV) for every other camera Log curve, and the two
 headroom bounds keep every scanned sample inside the transfer's encodable domain,
 so an auto run reports `clipped_total=0` by construction. Both bounds are upper
 bounds on the gain, so a positive result always exists; an all-black sequence
@@ -485,7 +496,7 @@ the encoded metadata carries the resolved number.
 
 Rust and native must be rebuilt together for `color_contract_version=2` (native
 color algorithm revision 4, output pipeline revision 5). Requests specify
-`--color-contract-version 2 --camera-recipe <generic|canon-clog3>` plus explicit
+`--color-contract-version 2 --camera-recipe <generic|dji-dlog|canon-clog3>` plus explicit
 `--camera-color-method dng-camera-to-pcs`, `--profile-correction <none|hue-sat-map>`
 and `--camera-calibration <none|canon-normal-white-fixed-v1>`. The reader checks
 requested/effective recipe and policies, profile presence/applied/skip states,

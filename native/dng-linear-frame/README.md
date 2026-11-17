@@ -167,6 +167,20 @@ native/build/dng-linear-frame --stdout-frame-f32 input.dng \
   [--white-balance R,G,B] [--exposure-ev EV]
 ```
 
+For the original D-Log product default, use the distinct `dji-dlog` recipe:
+
+```sh
+native/build/dng-linear-frame --stdout-frame-f32 input.dng \
+  --color-contract-version 2 --camera-recipe dji-dlog \
+  --camera-color-method dng-camera-to-pcs \
+  --profile-correction hue-sat-map --camera-calibration none
+```
+
+This applies a valid embedded HueSatMap when present and reports `absent` otherwise.
+It skips LookTable, ToneCurve and BaselineExposure, with no Canon exposure calibration.
+Use the same recipe for measurement. Output CAT02 and auto gain (desired 4) belong
+to the Rust output path, not native input development.
+
 For the Canon CLog3 recipe, using an original Canon CR3 with valid calibration
 metadata:
 
@@ -203,7 +217,7 @@ fallback otherwise, including selected WB/PCS adaptation without another WB or
 CAT. Input D50→D60 remains Bradford. Correction policy `hue-sat-map` explicitly
 applies a present, validated interpolated profile HueSatMap in linear
 ProPhoto/D50 before camera exposure calibration and EV. Generic policy `none`
-skips it. LookTable, ToneCurve and BaselineExposure remain unapplied in both
+skips it; original D-Log policy `hue-sat-map` applies it when present. LookTable, ToneCurve and BaselineExposure remain unapplied in both
 product recipes. Camera `algorithm_revision=4` records HSM dimensions, encoding,
 HDR policy and signed-pixel bypass count in `color.profile_correction` when
 applied (null for generic); matrix metadata describes the pre-HSM transform.

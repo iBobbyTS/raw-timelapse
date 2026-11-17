@@ -599,9 +599,10 @@ int main(int argc, char **argv) {
         throw Error(2, "unknown option: " + a);
     }
     if ((recipe.name == "generic" && (recipe.method != CameraColorMethod::dng_camera_to_pcs || recipe.correction != ProfileCorrection::none || recipe.calibration != CameraCalibration::none)) ||
+        (recipe.name == "dji-dlog" && (recipe.method != CameraColorMethod::dng_camera_to_pcs || recipe.correction != ProfileCorrection::hue_sat_map || recipe.calibration != CameraCalibration::none)) ||
         (recipe.name == "canon-clog3" && (recipe.method != CameraColorMethod::dng_camera_to_pcs || recipe.correction != ProfileCorrection::hue_sat_map || recipe.calibration != CameraCalibration::canon_normal_white_fixed_v1)) ||
         (recipe.name == "legacy-test" && recipe.calibration != CameraCalibration::none) ||
-        (recipe.name != "generic" && recipe.name != "canon-clog3" && recipe.name != "legacy-test"))
+        (recipe.name != "generic" && recipe.name != "dji-dlog" && recipe.name != "canon-clog3" && recipe.name != "legacy-test"))
       throw Error(2, "inconsistent camera recipe policies");
     lens_options.policy=lens_policy;
     // Measurement never consumes invented radiance, regardless of delivery policy.
