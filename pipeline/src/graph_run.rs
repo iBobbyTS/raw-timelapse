@@ -79,7 +79,7 @@ struct Runner<'a, 'b> {
     /// value fixed by `plan_ready` before any colour task is created.
     reference_gain: f64,
     /// Linear stages between develop and colour, replayed by the auto scan.
-    linear_chain: Vec<Kind>,
+    linear_chain: Option<Vec<Kind>>,
     /// Worker count for the auto scan; mirrors the graph's develop concurrency.
     scan_workers: usize,
 }
@@ -128,7 +128,10 @@ impl Runner<'_, '_> {
         r: &PreparedFrame,
     ) -> graph::Result<FrameTask<(f64, f64, u128)>> {
         let develop = self.develop_image_task("scan", id, r, ev)?;
-        let chain = self.linear_chain.clone();
+        let chain = self
+            .linear_chain
+            .clone()
+            .ok_or("graph: auto reference gain scan requires the linear chain")?;
         let matrix = self.context.options.output_transform.composed_matrix;
         Ok(Box::new(move || {
             let mut image = develop()?;
@@ -1077,9 +1080,21 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| Error::new(EXIT_USAGE, "--output has no usable file name"))?
         .to_string();
-    let linear_chain = graph
-        .linear_chain_to_color()
-        .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
+    // The develop->colour replayability constraint exists only for the auto
+    // reference-gain scan. A fixed-gain run accepts any validated graph shape
+    // and never pays the chain walk.
+    let linear_chain = if matches!(
+        context.options.log_reference_gain,
+        crate::cli::ReferenceGain::Auto
+    ) {
+        Some(
+            graph
+                .linear_chain_to_color()
+                .map_err(|e| Error::new(EXIT_VALIDATION, e))?,
+        )
+    } else {
+        None
+    };
     let scan_workers = graph.develop_concurrency();
     let active: proc::ActiveNative = Default::default();
     let mut runner = Runner {
