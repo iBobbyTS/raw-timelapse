@@ -125,16 +125,8 @@ pub fn crop_window(
         high_y,
     })
 }
-/// Resample one interleaved little-endian FP32 RGB frame into new geometry.
-pub fn resize_scene_linear(
-    input: &[u8],
-    width: u32,
-    height: u32,
-    out_width: u32,
-    out_height: u32,
-) -> Result<Vec<u8>, String> {
-    resize_scene_linear_region(input, width, height, out_width, out_height, None)
-}
+/// Resample one interleaved little-endian FP32 RGB frame into new geometry,
+/// optionally restricted to a certified sub-rectangle (`bounds`).
 pub fn resize_scene_linear_region(
     input: &[u8],
     width: u32,
@@ -264,7 +256,7 @@ mod tests {
     fn constant_scene_linear_survives_any_geometry() {
         let source = frame(16, 12, |_, _| [0.18, -0.002, 4.0]);
         for (width, height) in [(8, 6), (32, 24), (7, 5), (16, 12)] {
-            let out = resize_scene_linear(&source, 16, 12, width, height).unwrap();
+            let out = resize_scene_linear_region(&source, 16, 12, width, height, None).unwrap();
             assert_eq!(out.len(), width as usize * height as usize * 12);
             for y in 0..height {
                 for x in 0..width {
@@ -284,7 +276,7 @@ mod tests {
             let value = 0.05 + 0.02 * x as f32;
             [value; 3]
         });
-        let out = resize_scene_linear(&source, 32, 4, 64, 8).unwrap();
+        let out = resize_scene_linear_region(&source, 32, 4, 64, 8, None).unwrap();
         for x in 8..=56 {
             let value = f64::from(pixel(&out, 64, x, 4)[0]);
             let expected = 0.05 + 0.02 * ((x as f64 + 0.5) / 2.0 - 0.5);
@@ -296,7 +288,7 @@ mod tests {
             );
             assert!((value - expected).abs() as f32 * 876.0 < 2.0);
         }
-        let down = resize_scene_linear(&source, 32, 4, 16, 2).unwrap();
+        let down = resize_scene_linear_region(&source, 32, 4, 16, 2, None).unwrap();
         for x in 3..=12 {
             let value = f64::from(pixel(&down, 16, x, 1)[0]);
             let expected = 0.05 + 0.02 * ((x as f64 + 0.5) * 2.0 - 0.5);
@@ -340,8 +332,8 @@ mod tests {
     #[test]
     fn rejects_mismatched_or_degenerate_geometry() {
         let source = frame(4, 3, |_, _| [0.1; 3]);
-        assert!(resize_scene_linear(&source, 4, 3, 0, 3).is_err());
-        assert!(resize_scene_linear(&source, 4, 3, 4, 0).is_err());
-        assert!(resize_scene_linear(&source[..source.len() - 1], 4, 3, 2, 2).is_err());
+        assert!(resize_scene_linear_region(&source, 4, 3, 0, 3, None).is_err());
+        assert!(resize_scene_linear_region(&source, 4, 3, 4, 0, None).is_err());
+        assert!(resize_scene_linear_region(&source[..source.len() - 1], 4, 3, 2, 2, None).is_err());
     }
 }
