@@ -28,6 +28,7 @@
 //! [`crate::preview::ap1_to_linear_srgb_matrix`].
 
 use crate::chromatic_adaptation::{self as cat, D65_WHITE_XY};
+#[cfg(test)]
 use crate::json::Json;
 use crate::preview;
 
@@ -768,7 +769,9 @@ const DCTL_DGAMUT2_TO_XYZ65: [[f64; 3]; 3] = [
 /// chain applies its inverse (XYZ(D60)->XYZ(D65)), as required by
 /// `inverse(M_DG2_AP0) * M_AP1_AP0`; the printed constant itself is preserved
 /// digit for digit and its 4-decimal rounding contributes to the chain's
-/// white-axis residual.
+/// white-axis residual. Compiled for tests only (consumed by the contract
+/// diagnostics); the applied matrix is the pinned composition below.
+#[cfg(test)]
 const DCTL_CAT02_D65_TO_D60: [[f64; 3]; 3] = [
     [1.0120, 0.0080, -0.0158],
     [0.0058, 1.0014, -0.0063],
@@ -776,6 +779,7 @@ const DCTL_CAT02_D65_TO_D60: [[f64; 3]; 3] = [
 ];
 
 /// Pinned DCTL XYZ(D60) -> ACES AP0, copied digit for digit.
+#[cfg(test)]
 const DCTL_XYZ60_TO_AP0: [[f64; 3]; 3] = [
     [1.0498, 0.0, -0.0001],
     [-0.4959, 1.3733, 0.0982],
@@ -785,6 +789,7 @@ const DCTL_XYZ60_TO_AP0: [[f64; 3]; 3] = [
 /// ACES AP1 -> AP0 in f64 from the ACES v1.3 chromaticities (common D60
 /// 0.32168/0.33767), by the normalised-primary-matrix construction. Derived by
 /// the independent oracle (`dlog2_oracle.py`); not the DCTL's rounded XYZ->AP0.
+#[cfg(test)]
 const ACES_AP1_TO_AP0: [[f64; 3]; 3] = [
     [0.6954522413574518, 0.14067869647029416, 0.16386906217225408],
     [0.04479456337203771, 0.8596711184564219, 0.09553431817154041],
@@ -792,6 +797,7 @@ const ACES_AP1_TO_AP0: [[f64; 3]; 3] = [
 ];
 
 /// Pinned DCTL D-Gamut 2 -> ACES AP0: `M_XYZ60_AP0 * M_CAT02_65_60 * M_DG2_XYZ65`.
+#[cfg(test)]
 const DJI_DLOG2_DGAMUT2_TO_AP0: [[f64; 3]; 3] = [
     [0.736958385971, 0.176597444598, 0.08627254501],
     [0.000873985052, 1.07033801293, -0.071242291115],
@@ -977,6 +983,7 @@ impl OutputTransform {
 
 /// Writable backing for conversion. The pipeline supplies the unique Arc that
 /// becomes its RGB24 NdArray, so conversion does not copy a full-frame buffer.
+/// Test-support surface: backs the reference conversions below, not the CLI.
 pub trait FrameOutput {
     fn prepare(&mut self, length: usize) -> Result<&mut [u8], String>;
 }
@@ -1088,6 +1095,7 @@ impl ColorProfile {
         }
         gain
     }
+    /// Test-support predicate consumed by the reference tests.
     pub fn is_rev_eng(&self) -> bool {
         matches!(
             self.transfer,
@@ -1262,7 +1270,8 @@ impl ColorProfile {
     /// Reference 8-bit quantization of signed FP32 AP1 input. Retained for the
     /// historical golden/reference tests; the product encoder node uses
     /// [`Self::convert_f32_frame_to_yuv10`] exclusively, so there is one
-    /// runtime quantization boundary.
+    /// runtime quantization boundary. Test-support surface, consumed by
+    /// `tests/canon_log3.rs`; not reachable from the CLI.
     pub fn convert_f32_frame(
         &self,
         bytes: &[u8],
@@ -1401,8 +1410,8 @@ impl ColorProfile {
     }
 
     /// Quantize one already-encoded target signal triple into the 10-bit
-    /// handoff. Exposed so reference-code tests do not re-implement the
-    /// production quantizer.
+    /// handoff. Test-support surface: exposed so reference-code tests do not
+    /// re-implement the production quantizer; not reachable from the CLI.
     pub fn encode_signal_yuv10(
         &self,
         signal: [f64; 3],
@@ -1436,6 +1445,8 @@ impl ColorProfile {
     }
 
     /// Convert one scene-linear ACEScg AP1/D60 triple to 8-bit target signal.
+    /// Test-support surface for the reference tests; the production pixel path
+    /// is [`Self::convert_f32_frame_to_yuv10`].
     pub fn encode_linear(&self, ap1: [f64; 3]) -> [u8; 3] {
         let target = preview::mat3_vec(&self.composed_matrix(), ap1)
             .map(|v| v * self.curve_input_scale());
@@ -1501,6 +1512,10 @@ impl ColorProfile {
     }
 
     /// The complete per-profile colour contract for one resolved run transform.
+    /// Compiled for tests only: asserted by this module's contract regressions
+    /// and unreachable from the CLI; un-gate deliberately if a runtime consumer
+    /// ever needs it.
+    #[cfg(test)]
     pub fn contract_json(&self, output: &OutputTransform) -> Json {
         debug_assert_eq!(output.profile, self.id);
         let (low, high) = self.transfer.domain();
@@ -1751,6 +1766,7 @@ impl ColorProfile {
     /// field can only be carried by MP4/Matroska `nclx`; MOV `nclc` has no
     /// range field, so the numbers here are a declaration, not a claim that
     /// every container writes them.
+    #[cfg(test)]
     pub fn emitted_tags_json(&self, range: PreviewRange) -> Json {
         Json::obj(vec![
             (
@@ -1772,6 +1788,7 @@ impl ColorProfile {
         ])
     }
 
+    #[cfg(test)]
     fn tag_policy_json(&self) -> Json {
         Json::obj(vec![
             ("mode", Json::Str("per-field".to_string())),
@@ -1801,6 +1818,7 @@ impl ColorProfile {
         ])
     }
 
+    #[cfg(test)]
     fn delivery_background_json(&self) -> Json {
         if self.tag_policy == TagPolicy::SRGB {
             return Json::Array(vec![]);
@@ -1821,6 +1839,7 @@ impl ColorProfile {
     }
 }
 
+#[cfg(test)]
 fn pair_json(pair: [f64; 2]) -> Json {
     Json::Array(pair.iter().map(|value| Json::Float(*value)).collect())
 }
