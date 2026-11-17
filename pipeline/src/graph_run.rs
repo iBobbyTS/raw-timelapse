@@ -135,7 +135,7 @@ impl Runner<'_, '_> {
             .linear_chain
             .clone()
             .ok_or("graph: auto reference gain scan requires the linear chain")?;
-        let matrix = self.context.options.output_transform.composed_matrix;
+        let matrix = self.context.output_color.transform.composed_matrix;
         Ok(Box::new(move || {
             let mut image = develop()?;
             for kind in &chain {
@@ -493,13 +493,13 @@ impl Backend for Runner<'_, '_> {
     }
     fn plan_ready(&mut self, plan: &[Gain], refs: &[PreparedFrame]) -> graph::Result<()> {
         if !matches!(
-            self.context.options.log_reference_gain,
+            self.context.output_color.reference_gain,
             crate::cli::ReferenceGain::Auto
         ) {
             return Ok(());
         }
         let started = Instant::now();
-        let profile = self.context.options.preview_profile;
+        let profile = self.context.output_color.profile;
         let total = refs.len();
         let workers = self.scan_workers.min(total.max(1));
         let next = AtomicUsize::new(0);
@@ -604,8 +604,8 @@ impl Backend for Runner<'_, '_> {
         _: usize,
         mut image: Image,
     ) -> graph::Result<FrameTask<Image>> {
-        let profile = self.context.options.preview_profile;
-        let output_transform = self.context.options.output_transform.clone();
+        let profile = self.context.output_color.profile;
+        let output_transform = self.context.output_color.transform.clone();
         let range = self.encoder_config.effective_range(profile);
         let reference_gain = self.reference_gain;
         if !reference_gain.is_finite() || reference_gain <= 0.0 {
@@ -1048,7 +1048,8 @@ pub fn run(
     (graph, config): (Graph, ResolvedConfig),
 ) -> Result<Output> {
     let explicit_resize = graph.resize_geometry();
-    let range = config.effective_range(context.options.preview_profile);
+    let profile = context.output_color.profile;
+    let range = config.effective_range(profile);
     log.line(&format!(
         "kind=graph source={} nodes={} concurrency={} prepare_batch_size={} prepare_capacity_unit={}",
         match &context.options.graph {
@@ -1080,7 +1081,6 @@ pub fn run(
             None => "source".to_string(),
         }
     ))?;
-    let profile = context.options.preview_profile;
     log.line(&format!(
         "kind=colour profile={} camera_color={} matrix={} primaries={} transfer={} \
          reference_gain={} reference_status=unverified effective_range={} \
@@ -1091,11 +1091,11 @@ pub fn run(
         profile.tag_policy.matrix_token(),
         profile.tag_policy.primaries_token(),
         profile.tag_policy.transfer_token(),
-        context.options.log_reference_gain.token(),
+        context.output_color.reference_gain.token(),
         range.as_str(),
         context.options.camera_color.token(), context.camera_recipe.token(), crate::camera::CAMERA_PROFILE_CORRECTION, context.camera_recipe.calibration(),
         if context.camera_recipe.calibration() != "none" { "pending-native-validation" } else { "uncalibrated" },
-        context.options.output_transform.log_fields()
+        context.output_color.transform.log_fields()
     ))?;
 
     let preflight_started = Instant::now();
@@ -1119,7 +1119,7 @@ pub fn run(
     // reference-gain scan. A fixed-gain run accepts any validated graph shape
     // and never pays the chain walk.
     let linear_chain = if matches!(
-        context.options.log_reference_gain,
+        context.output_color.reference_gain,
         crate::cli::ReferenceGain::Auto
     ) {
         Some(
@@ -1151,7 +1151,7 @@ pub fn run(
             Arc::new(Mutex::new(encoder))
         },
         encoder_inputs: video::EncoderInputs {
-            profile: *context.options.preview_profile,
+            profile: *profile,
             fps: context.options.fps,
             ffmpeg: context.options.ffmpeg.clone(),
             depth: context.options.signal_depth,
@@ -1167,7 +1167,7 @@ pub fn run(
         clipped_high: 0,
         color_channel_samples: 0,
         color_frames: 0,
-        reference_gain: match context.options.log_reference_gain {
+        reference_gain: match context.output_color.reference_gain {
             crate::cli::ReferenceGain::Fixed(gain) => gain,
             crate::cli::ReferenceGain::Auto => f64::NAN,
         },

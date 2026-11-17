@@ -5,6 +5,7 @@ use crate::color_profile;
 use crate::deflicker::ExposureStep;
 use crate::encoder::{self, Container, Patch, RateControl};
 use crate::error::{Error, Result, EXIT_USAGE};
+use crate::output_color::{OutputColor, ResolvedOutputColor, AUTO_LOG};
 use std::path::PathBuf;
 
 pub const DEFAULT_NATIVE_TOOL: &str = "native/build/dng-linear-frame";
@@ -53,7 +54,7 @@ OPTIONS:
     --preview-profile <ID>     Output colour/Log profile (default: srgb-preview)
                                one of: srgb-preview, dji-dlog-dgamut,
                                dji-dlog2-dgamut2,
-                               clog2, clog3, sony-slog3-sgamut3,
+                               auto-log, clog2, clog3, sony-slog3-sgamut3,
                                sony-slog3-sgamut3-cine, nikon-nlog-bt2020
     --output-cat <MODE>        profile|bradford|cat02 (default: profile)
                                profile keeps the selected profile's fixed reference
@@ -376,13 +377,9 @@ pub struct Options {
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
     pub camera_color: CameraColor,
-    /// Frozen output CAT selection/realization resolved at startup; per-pixel
-    /// conversion uses these coefficients.
-    pub output_transform: color_profile::OutputTransform,
-    pub log_reference_gain: ReferenceGain,
+    pub output_color: OutputColor,
     /// Depth of the single YCbCr quantization handoff into the encoder.
     pub signal_depth: color_profile::SignalDepth,
-    pub preview_profile: &'static color_profile::ColorProfile,
     pub converter: Option<String>,
     pub converter_timeout: Option<u64>,
     pub lens: crate::lens::Settings,
@@ -413,7 +410,7 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
     let mut native_tool = PathBuf::from(DEFAULT_NATIVE_TOOL);
     let mut ffmpeg = PathBuf::from(DEFAULT_FFMPEG);
     let mut ffprobe = PathBuf::from(DEFAULT_FFPROBE);
-    let mut preview_profile = color_profile::default_profile();
+    let mut preview_profile = Some(color_profile::default_profile());
     let mut output_cat: Option<color_profile::OutputCatSelection> = None;
     let mut log_reference_gain: Option<ReferenceGain> = None;
     let mut signal_depth = color_profile::SignalDepth::Ten;
@@ -487,19 +484,23 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
             }
             "--preview-profile" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
-                preview_profile = color_profile::lookup(&value).ok_or_else(|| {
-                    Error::new(
-                        EXIT_USAGE,
-                        format!(
-                            "invalid --preview-profile {value:?}: expected one of {}",
-                            color_profile::PROFILES
-                                .iter()
-                                .map(|profile| profile.id)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    )
-                })?;
+                preview_profile = if value == AUTO_LOG {
+                    None
+                } else {
+                    Some(color_profile::lookup(&value).ok_or_else(|| {
+                        Error::new(
+                            EXIT_USAGE,
+                            format!(
+                                "invalid --preview-profile {value:?}: expected one of {AUTO_LOG}, {}",
+                                color_profile::PROFILES
+                                    .iter()
+                                    .map(|profile| profile.id)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        )
+                    })?)
+                };
             }
             "--output-cat" => {
                 if output_cat.is_some() {
@@ -788,13 +789,16 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
         None => (PathBuf::new(), PathBuf::new()),
     };
 
-    if log_reference_gain == Some(ReferenceGain::Auto)
-        && preview_profile.transfer == color_profile::Transfer::Srgb {
-        return Err(Error::new(
-            EXIT_USAGE,
-            "--log-reference-gain auto requires a camera Log profile; srgb-preview has no Log encoding headroom",
-        ));
-    }
+    let cat = output_cat.unwrap_or(color_profile::OutputCatSelection::Profile);
+    let output_color = match preview_profile {
+        Some(profile) => {
+            OutputColor::Explicit(ResolvedOutputColor::new(profile, cat, log_reference_gain)?)
+        }
+        None => OutputColor::AutoLog {
+            cat,
+            gain: log_reference_gain,
+        },
+    };
     encoder.rate = rate;
     if !output_options.is_empty() {
         encoder.options = Some(
@@ -802,11 +806,6 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
                 .map_err(|message| Error::new(EXIT_USAGE, message))?,
         );
     }
-    let output_cat = output_cat.unwrap_or(color_profile::OutputCatSelection::Profile);
-    // Resolve, validate and compose the output CAT once, before any RAW work.
-    let output_transform = preview_profile
-        .resolve_output_cat(output_cat, &color_profile::CatRegistry::standard())
-        .map_err(|message| Error::new(EXIT_USAGE, message))?;
     Ok(Parsed::Run(Options {
         profile_source: None,
         graph,
@@ -819,16 +818,8 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
         native_tool,
         ffmpeg,
         ffprobe,
-        preview_profile,
-        output_transform,
+        output_color,
         camera_color: camera_color.unwrap_or(CameraColor::Auto),
-        log_reference_gain: log_reference_gain.unwrap_or_else(|| {
-            if preview_profile.transfer == color_profile::Transfer::DjiDLog {
-                ReferenceGain::Auto
-            } else {
-                ReferenceGain::Fixed(1.0)
-            }
-        }),
         signal_depth,
         converter,
         converter_timeout,
@@ -1116,6 +1107,13 @@ mod tests {
         }
     }
 
+    fn parse_color(args: &[&str]) -> Result<ResolvedOutputColor> {
+        match parse_run(args)?.output_color {
+            OutputColor::Explicit(color) => Ok(color),
+            OutputColor::AutoLog { .. } => panic!("expected an explicit output colour"),
+        }
+    }
+
     #[test]
     fn signal_bits_accepts_ten_and_twelve_and_rejects_others() {
         let base = ["--input", "in", "--output", "out.mov"];
@@ -1144,42 +1142,42 @@ mod tests {
     }
     #[test]
     fn log_reference_gain_accepts_auto_for_log_profiles() {
-        let options = parse_run(&[
+        let options = parse_color(&[
             "--input", "in", "--output", "out.mov",
             "--preview-profile", "dji-dlog2-dgamut2", "--log-reference-gain", "auto",
         ])
         .expect("parse");
-        assert_eq!(options.log_reference_gain, ReferenceGain::Auto);
-        assert_eq!(options.log_reference_gain.token(), "auto");
+        assert_eq!(options.reference_gain, ReferenceGain::Auto);
+        assert_eq!(options.reference_gain.token(), "auto");
     }
 
     #[test]
     fn log_reference_gain_keeps_numeric_semantics() {
-        let options = parse_run(&[
+        let options = parse_color(&[
             "--input", "in", "--output", "out.mov",
             "--preview-profile", "clog3",
             "--log-reference-gain", "2.5",
         ])
         .expect("parse");
-        assert_eq!(options.log_reference_gain, ReferenceGain::Fixed(2.5));
-        assert_eq!(options.log_reference_gain.token(), "2.5");
-        let options = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");
-        assert_eq!(options.log_reference_gain, ReferenceGain::Fixed(1.0));
+        assert_eq!(options.reference_gain, ReferenceGain::Fixed(2.5));
+        assert_eq!(options.reference_gain.token(), "2.5");
+        let options = parse_color(&["--input", "in", "--output", "out.mov"]).expect("parse");
+        assert_eq!(options.reference_gain, ReferenceGain::Fixed(1.0));
     }
 
     #[test]
     fn original_dlog_defaults_to_auto_gain_and_cat02_with_numeric_overrides() {
         let args = ["--input", "in", "--output", "out.mov", "--preview-profile", "dji-dlog-dgamut"];
-        let options = parse_run(&args).unwrap();
-        assert_eq!(options.log_reference_gain, ReferenceGain::Auto);
-        assert_eq!(options.output_transform.method, "cat02");
+        let options = parse_color(&args).unwrap();
+        assert_eq!(options.reference_gain, ReferenceGain::Auto);
+        assert_eq!(options.transform.method, "cat02");
         let mut explicit = args.to_vec();
         explicit.extend(["--log-reference-gain", "1", "--output-cat", "bradford"]);
-        let options = parse_run(&explicit).unwrap();
-        assert_eq!(options.log_reference_gain, ReferenceGain::Fixed(1.0));
-        assert_eq!(options.output_transform.method, "bradford");
-        let options = parse_run(&["--input", "in", "--output", "out.mov", "--preview-profile", "dji-dlog2-dgamut2"]).unwrap();
-        assert_eq!(options.log_reference_gain, ReferenceGain::Fixed(1.0));
+        let options = parse_color(&explicit).unwrap();
+        assert_eq!(options.reference_gain, ReferenceGain::Fixed(1.0));
+        assert_eq!(options.transform.method, "bradford");
+        let options = parse_color(&["--input", "in", "--output", "out.mov", "--preview-profile", "dji-dlog2-dgamut2"]).unwrap();
+        assert_eq!(options.reference_gain, ReferenceGain::Fixed(1.0));
     }
 
     #[test]
@@ -1492,14 +1490,14 @@ mod tests {
 
     #[test]
     fn parses_preview_profile_and_defaults_to_srgb() {
-        let options = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");
-        assert_eq!(options.preview_profile.id, "srgb-preview");
+        let options = parse_color(&["--input", "in", "--output", "out.mov"]).expect("parse");
+        assert_eq!(options.profile.id, "srgb-preview");
         for id in color_profile::PROFILES.iter().map(|profile| profile.id) {
-            let options = parse_run(&["--input", "in", "--output", "out.mov", "--preview-profile", id])
+            let options = parse_color(&["--input", "in", "--output", "out.mov", "--preview-profile", id])
                 .expect("parse");
-            assert_eq!(options.preview_profile.id, id);
+            assert_eq!(options.profile.id, id);
         }
-        let options = parse_run(&[
+        let options = parse_color(&[
             "--input",
             "in",
             "--output",
@@ -1507,7 +1505,7 @@ mod tests {
             "--preview-profile=nikon-nlog-bt2020",
         ])
         .expect("parse");
-        assert_eq!(options.preview_profile.id, "nikon-nlog-bt2020");
+        assert_eq!(options.profile.id, "nikon-nlog-bt2020");
     }
 
     #[test]
@@ -1553,59 +1551,59 @@ mod tests {
 
     #[test]
     fn parses_output_cat_default_same_value_and_override() {
-        let default = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");
-        assert_eq!(default.output_transform.requested.token(), "profile");
+        let default = parse_color(&["--input", "in", "--output", "out.mov"]).expect("parse");
+        assert_eq!(default.transform.requested.token(), "profile");
         assert_eq!(
-            default.output_transform.realization,
+            default.transform.realization,
             color_profile::OutputCatRealization::Reference
         );
-        assert_eq!(default.output_transform.method, "bradford");
+        assert_eq!(default.transform.method, "bradford");
 
-        let same = parse_run(&[
+        let same = parse_color(&[
             "--input", "in", "--output", "out.mov", "--output-cat", "bradford",
         ])
         .expect("parse");
-        assert_eq!(same.output_transform.requested.token(), "bradford");
+        assert_eq!(same.transform.requested.token(), "bradford");
         assert_eq!(
-            same.output_transform.realization,
+            same.transform.realization,
             color_profile::OutputCatRealization::Reference
         );
         assert_eq!(
-            same.output_transform.fingerprint,
-            default.output_transform.fingerprint,
+            same.transform.fingerprint,
+            default.transform.fingerprint,
             "an explicit same-value selection must keep the fixed reference realization"
         );
         assert_eq!(
-            same.output_transform.composed_matrix,
-            default.output_transform.composed_matrix
+            same.transform.composed_matrix,
+            default.transform.composed_matrix
         );
 
-        let custom = parse_run(&[
+        let custom = parse_color(&[
             "--input", "in", "--output", "out.mov",
             "--preview-profile", "nikon-nlog-bt2020", "--output-cat", "cat02",
         ])
         .expect("parse");
-        assert_eq!(custom.output_transform.requested.token(), "cat02");
-        assert_eq!(custom.output_transform.method, "cat02");
+        assert_eq!(custom.transform.requested.token(), "cat02");
+        assert_eq!(custom.transform.method, "cat02");
         assert_eq!(
-            custom.output_transform.realization,
+            custom.transform.realization,
             color_profile::OutputCatRealization::CustomAdaptation
         );
         assert_ne!(
-            custom.output_transform.fingerprint,
-            custom.preview_profile.default_output_transform().fingerprint
+            custom.transform.fingerprint,
+            custom.profile.default_output_transform().fingerprint
         );
         // Flag order does not matter: the profile is resolved after parsing.
-        let reversed = parse_run(&[
+        let reversed = parse_color(&[
             "--input", "in", "--output", "out.mov",
             "--output-cat", "cat02", "--preview-profile", "nikon-nlog-bt2020",
         ])
         .expect("parse");
         assert_eq!(
-            reversed.output_transform.composed_matrix,
-            custom.output_transform.composed_matrix
+            reversed.transform.composed_matrix,
+            custom.transform.composed_matrix
         );
-        assert_eq!(reversed.output_transform.target_white_xy, [0.3127, 0.3290]);
+        assert_eq!(reversed.transform.target_white_xy, [0.3127, 0.3290]);
     }
 
     #[test]

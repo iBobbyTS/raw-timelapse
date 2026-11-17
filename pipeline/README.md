@@ -329,6 +329,26 @@ depth still quantizes exactly once at the encoder input.
 | `dji-dlog-dgamut` | D-Log / D-Gamut | bt2020nc |
 | `dji-dlog2-dgamut2` | D-Log 2 / D-Gamut 2 (pinned DCTL, CAT02) | bt2020nc |
 
+Set `"output_color": "auto-log"` in the processing profile to select one of
+these profiles for the whole sequence. The pipeline uses ExifTool to read the
+original first file in numeric input order before the encoder preflight. The
+`exiftool` setting also applies when lens correction is off. The selected
+profile supplies its usual CAT and reference-gain defaults. Explicit
+`output_cat` and `log_reference_gain` settings still apply.
+
+| First input camera | Selected `output_color` |
+| --- | --- |
+| Canon R1, R3, R5, R5 Mark II, R5 C, R6 Mark II, R6 Mark III, R6 V, R7, R8, R8 Mark II, C50, C70, C80, C300 Mark II, C300 Mark III, C400, C500 Mark II, C700 (including PL, GS PL, FF and FF PL) | `clog2` |
+| Other Canon cameras | `clog3` |
+| DJI Pocket 4P (`PP-041`) | `dji-dlog2-dgamut2` |
+| Other DJI cameras | `dji-dlog-dgamut` |
+| Nikon | `nikon-nlog-bt2020` |
+| Sony | `sony-slog3-sgamut3` |
+
+The `kind=auto-log` event records the source, make, model and chosen profile.
+An unsupported or missing make, or a missing Canon or DJI model, requires an
+explicit `output_color` setting.
+
 Input development is selected with `camera_color auto|generic|canon-cr3`
 (default `auto`). After the existing single-extension input enumeration:
 

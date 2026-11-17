@@ -14,6 +14,7 @@ mod graph_run;
 mod guard;
 mod lens;
 mod order;
+mod output_color;
 mod proc;
 mod resample;
 mod run_log;
@@ -64,6 +65,7 @@ fn launch(parse: fn(&[String]) -> Result<Parsed>) {
 pub struct RunContext<'a> {
     pub options: &'a Options,
     pub camera_recipe: camera::CameraRecipe,
+    pub output_color: output_color::ResolvedOutputColor,
     /// Run-specific scratch root: converted cache and child transcripts.
     pub scratch: &'a Path,
     pub sources: &'a [SourceFrame],
@@ -183,6 +185,14 @@ fn execute(
     } else {
         println!("deflicker: disabled (single pass, EV 0)");
     }
+
+    proc::require_executable(&options.native_tool, "--dng-linear-frame")?;
+    proc::require_executable(&options.ffmpeg, "--ffmpeg")?;
+    proc::require_executable(&options.ffprobe, "--ffprobe")?;
+
+    let sources = order::enumerate_dng(input)?;
+    let first = sources.first().expect("inventory is nonempty");
+    let output_color = options.output_color.resolve(first, &options.lens.exiftool, log)?;
     log.line(&format!(
         "kind=settings fps={} white_balance={} strength={} period={} brightness={} \
          estimator={} ev_limits={} roi={} exclude_rois={} steps={} reference_gain={} \
@@ -202,15 +212,9 @@ fn execute(
             .join(","),
         deflicker.exclude_rois.len(),
         deflicker.steps.len(),
-        options.log_reference_gain.token(),
+        output_color.reference_gain.token(),
         options.signal_depth.token()
     ))?;
-
-    proc::require_executable(&options.native_tool, "--dng-linear-frame")?;
-    proc::require_executable(&options.ffmpeg, "--ffmpeg")?;
-    proc::require_executable(&options.ffprobe, "--ffprobe")?;
-
-    let sources = order::enumerate_dng(input)?;
     log.line(&format!(
         "kind=inventory frames={} first={} last={}",
         sources.len(),
@@ -231,6 +235,7 @@ fn execute(
         .map_err(|e| error::Error::new(error::EXIT_USAGE, e))?;
     let context = RunContext {
         camera_recipe,
+        output_color,
         options,
         scratch,
         sources: &sources,

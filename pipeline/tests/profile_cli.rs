@@ -3,6 +3,7 @@ mod common;
 use common::{fake_native_tool, ffprobe, make_input, require_ffmpeg, standard_frames, test_dir};
 use rawtl_linear_video::json::Json;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Output};
 
 fn cli(args: &[&str]) -> Output {
@@ -121,4 +122,121 @@ fn custom_profile_delivers_by_its_own_container_beside_input() {
     let log = fs::read_to_string(root.join("sequence.v2.log")).unwrap();
     assert!(log.contains("kind=profile") && log.contains("clog3"));
     assert_eq!(cli(&args).status.code(), Some(12));
+}
+
+#[test]
+fn auto_log_resolves_only_the_first_numeric_source() {
+    require_ffmpeg();
+    let root = test_dir("profile-auto-log");
+    let input = root.join("sequence");
+    make_input(&input, &["IMG_10.DNG", "IMG_2.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).unwrap();
+    let tool = fake_native_tool(&fixtures, &standard_frames(&fixtures), None, false);
+    let exiftool = root.join("exiftool");
+    fs::write(
+        &exiftool,
+        r#"#!/bin/sh
+for source do :; done
+name=${source##*/}
+printf '%s\n' "$name" >> "$(dirname "$0")/metadata-calls"
+case "$name" in
+  IMG_2.DNG) printf '%s\n' '[{"IFD0:Make":"Canon","IFD0:UniqueCameraModel":"Canon EOS R7"}]' ;;
+  *) printf '%s\n' '[{"IFD0:Make":"FUJIFILM","IFD0:Model":"X-T5"}]' ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&exiftool, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut decoded = Vec::new();
+    for (color, video_name) in [("auto-log", "auto.mkv"), ("clog2", "explicit.mkv")] {
+        let settings = Json::obj(vec![
+            ("dng_linear_frame", Json::Str(tool.to_str().unwrap().into())),
+            ("exiftool", Json::Str(exiftool.to_str().unwrap().into())),
+            ("lens_correction", Json::Str("off".into())),
+            ("encoder", Json::Str("ffv1".into())),
+            ("output_color", Json::Str(color.into())),
+            ("output_cat", Json::Str("cat02".into())),
+            ("log_reference_gain", Json::Str("1.25".into())),
+            ("strength", Json::Int(0)),
+        ]);
+        let profile = root.join(format!("{color}.json"));
+        fs::write(
+            &profile,
+            rawtl_linear_video::json::to_pretty_string(&settings),
+        )
+        .unwrap();
+        let video = root.join(video_name);
+        let result = cli(&[
+            "--input",
+            input.to_str().unwrap(),
+            "--profile",
+            profile.to_str().unwrap(),
+            "--output",
+            video.to_str().unwrap(),
+        ]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let log = fs::read_to_string(video.with_extension("log")).unwrap();
+        assert!(log.contains("kind=colour profile=clog2"), "{log}");
+        assert!(log.contains("reference_gain=1.25"), "{log}");
+        if color == "auto-log" {
+            let choice = log
+                .lines()
+                .find(|line| line.contains("kind=auto-log"))
+                .unwrap();
+            assert!(
+                choice.contains("IMG_2.DNG") && choice.ends_with("profile=clog2"),
+                "{choice}"
+            );
+            assert!(log.find("kind=auto-log") < log.find("kind=prepare "));
+        }
+        let frames = Command::new(common::FFMPEG)
+            .args(["-v", "error", "-i"])
+            .arg(&video)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv444p10le", "-"])
+            .output()
+            .unwrap();
+        assert!(
+            frames.status.success(),
+            "{}",
+            String::from_utf8_lossy(&frames.stderr)
+        );
+        assert_eq!(
+            frames.stdout.len(),
+            (2 * common::WIDTH * common::HEIGHT * 6) as usize
+        );
+        decoded.push(frames.stdout);
+    }
+    assert_eq!(decoded[0], decoded[1]);
+    assert_eq!(
+        fs::read_to_string(root.join("metadata-calls")).unwrap(),
+        "IMG_2.DNG\n"
+    );
+
+    let input = root.join("unsupported");
+    make_input(&input, &["IMG_10.DNG"]);
+    let video = root.join("unsupported.mkv");
+    let result = cli(&[
+        "--input",
+        input.to_str().unwrap(),
+        "--profile",
+        root.join("auto-log.json").to_str().unwrap(),
+        "--output",
+        video.to_str().unwrap(),
+    ]);
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(10), "{error}");
+    assert!(
+        error.contains("unsupported camera make") && error.contains("output_color"),
+        "{error}"
+    );
+    assert!(!video.exists());
+    assert!(!fs::read_to_string(video.with_extension("log"))
+        .unwrap()
+        .contains("kind=prepare "));
 }
