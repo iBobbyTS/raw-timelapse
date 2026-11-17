@@ -1,6 +1,6 @@
 # In-run graph
 
-`--graph FILE` reads the same JSON model as `default.json`. A node has a unique
+Internal graph fixtures use the same JSON model as `default.json`. A node has a unique
 `id`, a registered `kind`, named `inputs` pointing to producer IDs, and optional
 `waits` containing `{ "node": "id", "scope": "frame" | "sequence" }`.
 Unknown fields, built-ins, ports, types, undeclared IDs and combined data/event
@@ -29,7 +29,7 @@ Registered kinds and inputs:
 One source, prepare, exposure-table producer, develop, color and encoder are
 required. At most one optional resize node is allowed; it must sit between the
 linear image chain and color, so resampling always happens in scene-linear FP32
-after EV and before the target Log curve. `--resize WxH` on the CLI overrides
+after EV and before the target Log curve. The profile resize setting overrides
 that node's geometry or inserts an equivalent node before color; omitted, the
 source geometry is used unchanged (no implicit scaling). Reference streams can fork and cross repeated sequence barriers;
 references and small measurements may grow with sequence length. Image outputs
@@ -87,7 +87,7 @@ allowlist `-preset -tune -vendor -threads -g -bf -level`. Unknown fields,
 encoders, containers, options, alpha pixel formats, conflicting rate control and
 incompatible encoder/profile/pixel-format combinations are configuration errors
 before any RAW preparation. Resolution priority is built-in default < this
-object < explicit CLI flags; a CLI `encoder` change drops the graph's
+object < profile encoder settings; a profile `encoder` change drops the graph's
 encoder-scoped profile/rate rather than inheriting them across codecs.
 
 The colour node writes planar `yuv444p10le` target signal; that is the single

@@ -11,7 +11,7 @@ fn lens_controls_and_fixed_crop_reach_real_video() {
     let work = common::test_dir("lens-delivery").canonicalize().unwrap();
     let result = std::process::Command::new("/usr/bin/python3")
         .arg(repo.join("pipeline/tests/lens_delivery.py"))
-        .arg(env!("CARGO_BIN_EXE_rawtl-linear-video"))
+        .arg(common::internal_runner())
         .arg(native)
         .arg(&work)
         .output()

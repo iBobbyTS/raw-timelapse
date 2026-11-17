@@ -969,7 +969,7 @@ fn check_output_extension(options: &crate::cli::Options, config: &ResolvedConfig
             EXIT_USAGE,
             format!(
                 "--output {} ends in .{extension}, but the configured container {} writes .{}; \
-                 rename the output file or select a matching --container/--encoder",
+                 rename the output file or select a profile with a matching container",
                 options.video.display(),
                 config.container.as_str(),
                 config.container.extension()
@@ -983,6 +983,12 @@ fn check_output_extension(options: &crate::cli::Options, config: &ResolvedConfig
 /// location. Configuration errors are therefore rejected before the run log,
 /// the scratch directory or any RAW work exists.
 pub fn resolve_configuration(options: &crate::cli::Options) -> Result<(Graph, ResolvedConfig)> {
+    let (graph, config) = resolve_processing(options)?;
+    check_output_extension(options, &config)?;
+    Ok((graph, config))
+}
+
+pub(crate) fn resolve_processing(options: &crate::cli::Options) -> Result<(Graph, ResolvedConfig)> {
     let mut graph =
         if let Some(path) = &options.graph {
             Graph::parse(&fs::read_to_string(path).map_err(|e| {
@@ -1006,7 +1012,6 @@ pub fn resolve_configuration(options: &crate::cli::Options) -> Result<(Graph, Re
         options.signal_depth,
     )
     .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
-    check_output_extension(options, &config)?;
     Ok((graph, config))
 }
 

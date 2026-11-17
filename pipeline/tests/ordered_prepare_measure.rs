@@ -25,7 +25,7 @@ fn real_cli_orders_concurrent_native_stages_and_freezes_source_zero_white_balanc
     let output = std::process::Command::new("/usr/bin/python3")
         .arg(repo.join("tests/ordered_prepare_measure.py"))
         .args([
-            env!("CARGO_BIN_EXE_rawtl-linear-video"),
+            common::internal_runner(),
             tool.to_str().unwrap(),
             root.to_str().unwrap(),
         ])

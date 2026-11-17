@@ -1,6 +1,6 @@
 # Canon R7 CR3 与 Resolve C-Log 2／3 对照
 
-> 当前输入路由已独立于输出：`--camera-color auto` 对原始 Canon CR3 选择 NormalWhite × 固定 1.8 标定，适用于所有 Log 和 sRGB 输出。下文保留当时的 C-Log 2/3 实测与变更记录。见 [CLI 使用说明](../pipeline/README.md)。
+> 当前 Canon 输出 ID 为 `clog2` 和 `clog3`。输入路由已独立于输出：`--camera-color auto` 对原始 Canon CR3 选择 NormalWhite × 固定 1.8 标定，适用于所有 Log 和 sRGB 输出。下文保留当时的 C-Log 2/3 实测与变更记录。见 [CLI 使用说明](../pipeline/README.md)。
 
 2026-11-17。源文件 R7_L2220.CR3；对照为用户本次导出的 `clog2_00086400.tif`、`clog3_00086400.tif`。原始文件保持只读。基线提交 `05f342b`；本次直接修改，无 SFD。
 

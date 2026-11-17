@@ -59,14 +59,14 @@ Sony 模型数学与 LCP 坐标语义参考公开资料：[RawTherapee lens meta
 
 ## 配置
 
-产品 CLI 默认 auto，分项默认 auto、暗角强度默认1、采样默认 quality、画幅默认 preserve：
+内置 profile 默认 auto，分项默认 auto、暗角强度默认1、采样默认 quality、画幅默认 preserve：
 
 
 off 仅关闭本层新增处理，不撤销上游结果。暗角采用 g_effective = g_model^strength；0精确不新增暗角，1完整补偿，不允许超过1。关闭暗角不关闭畸变/CA，上游所有权和未知坐标保护不因开关失效。镜头 report revision=2 逐项记录 requested/status、模型指纹、强度、采样器和实际源域增益范围；消费者核对设置，不接受忽略请求后的通用成功。
 
-可用选项：--lens-correction auto|off、--lens-vignette auto|off、--lens-distortion auto|off、--lens-ca auto|off、--lens-vignette-strength 0..1、--lens-resampling bilinear|quality、--lens-crop preserve|safe（`sequence-safe` 是 `safe` 的历史同义词，行为完全一致）。视频中的 safe 同样整段固定，不逐帧缩放。
+profile 中的镜头设置包括 `lens_correction`、`lens_vignette`、`lens_distortion`、`lens_ca`（均为 auto 或 off），以及 `lens_vignette_strength`（0..1）、`lens_resampling`（bilinear 或 quality）、`lens_crop`（preserve 或 safe）（`sequence-safe` 是 `safe` 的历史同义词，行为完全一致）。视频中的 safe 同样整段固定，不逐帧缩放。
 
-Prepare auto 新增运行依赖 **ExifTool**，默认 /opt/homebrew/bin/exiftool，可用 --exiftool 指定绝对可执行路径。数值采集保留 -n，并另做一次有界命名身份查询，以区分数字 ID、规格和解码后的具体名称。优先明确的厂商/EXIF LensModel；只有规格、Unknown、带 or 的歧义名称和泛称不作为独立型号。来源和两种字段值保留为证据；命名结果仍须精确配置匹配及消歧，不能把有名称直接算作新增支持。调用通过 argv，无 shell，禁用用户 ExifTool config；XML 通过 LibXml2 有界解析，禁用 DTD/外部实体与网络。任一真正消费的单值字段冲突、工具失败、损坏契约都显式失败；非消费字段的合法多值保留为证据。
+Prepare auto 新增运行依赖 **ExifTool**，默认 /opt/homebrew/bin/exiftool，可通过 profile 的 `exiftool` 指定绝对可执行路径。数值采集保留 -n，并另做一次有界命名身份查询，以区分数字 ID、规格和解码后的具体名称。优先明确的厂商/EXIF LensModel；只有规格、Unknown、带 or 的歧义名称和泛称不作为独立型号。来源和两种字段值保留为证据；命名结果仍须精确配置匹配及消歧，不能把有名称直接算作新增支持。调用通过 argv，无 shell，禁用用户 ExifTool config；XML 通过 LibXml2 有界解析，禁用 DTD/外部实体与网络。任一真正消费的单值字段冲突、工具失败、损坏契约都显式失败；非消费字段的合法多值保留为证据。
 
 native 独立诊断默认 off。显式启用时，--prepare / --prepare-batch 负责采集；--stdout-frame-f32 --prepared 只接受 auto/off，不允许把 ExifTool/LCP 路径交给 Develop。analysis 即使收到 auto 也不新增处理。
 

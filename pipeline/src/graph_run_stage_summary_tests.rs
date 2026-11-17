@@ -112,7 +112,7 @@ fn scenario(mode: &str, expected: i32, cause: &str) {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    let cli::Parsed::Run(options) = cli::parse(&args).unwrap() else {
+    let cli::Parsed::Run(options) = cli::parse_settings(&args, true).unwrap() else {
         panic!("run options")
     };
     let mut log = RunLog::create(&log_path, "test").unwrap();

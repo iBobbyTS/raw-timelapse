@@ -62,7 +62,7 @@ def run(profile,mode):
     return result
 
 receipts=[]
-profiles=['srgb-preview','canon-log2-cinema-gamut'] if list(incoming.glob('*.CR3')) else ['srgb-preview']
+profiles=['srgb-preview','clog2'] if list(incoming.glob('*.CR3')) else ['srgb-preview']
 for profile in profiles:
     single=run(profile,'single');batch=run(profile,'batch')
     assert single==batch,profile

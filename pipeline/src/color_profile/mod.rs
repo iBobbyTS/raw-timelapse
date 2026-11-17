@@ -207,11 +207,7 @@ impl ColorProfile {
         }
     }
     pub fn display_name(&self) -> &'static str {
-        match self.id {
-            "canon-log2-cinema-gamut" => "clog2",
-            "canon-log3-cinema-gamut-rev-eng-crm-dev" => "clog3 (rev-eng crm-dev)",
-            _ => self.id,
-        }
+        self.id
     }
 
     /// Resolve the output CAT for this run. The profile's own fixed reference
@@ -429,7 +425,7 @@ pub static PROFILES: [ColorProfile; 8] = [
         output_cat: PREVIEW_OUTPUT_CAT,
     },
     ColorProfile {
-        id: "canon-log2-cinema-gamut",
+        id: "clog2",
         transfer: Transfer::CanonLog2,
         gamut: &CINEMA_GAMUT,
         range: PreviewRange::Pc,
@@ -473,7 +469,7 @@ pub static PROFILES: [ColorProfile; 8] = [
         output_cat: DJI_DLOG2_OUTPUT_CAT,
     },
     ColorProfile {
-        id: "canon-log3-cinema-gamut-rev-eng-crm-dev",
+        id: "clog3",
         transfer: Transfer::CanonLog3RevEng,
         gamut: &CINEMA_GAMUT,
         range: PreviewRange::Pc,

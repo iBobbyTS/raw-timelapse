@@ -1198,7 +1198,7 @@ mod tests {
     #[test]
     fn encoder_arguments_fix_input_geometry_colour_and_one_output() {
         let config = resolve(&Patch::default(), &Patch::default());
-        let profile = lookup("canon-log3-cinema-gamut-rev-eng-crm-dev").unwrap();
+        let profile = lookup("clog3").unwrap();
         let args = config.encoder_args(profile, 6984, 4660, 3, "30/1", SignalDepth::Ten, Path::new("out.mov"));
         assert_eq!(args.iter().filter(|arg| *arg == "-i").count(), 1);
         assert_eq!(args.iter().filter(|arg| *arg == "pipe:0").count(), 1);

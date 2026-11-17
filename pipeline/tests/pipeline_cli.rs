@@ -723,7 +723,7 @@ fn bounded_owned_run(args: &[&str], root: &Path) -> Output {
     use std::time::{Duration, Instant};
     let out = root.join("bounded.stdout");
     let err = root.join("bounded.stderr");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rawtl-linear-video"))
+    let mut child = Command::new(common::internal_runner())
         .args(args)
         .env("FAKE_NATIVE_PIDS", root.join("owned.pids"))
         .stdout(Stdio::from(fs::File::create(&out).unwrap()))
@@ -1464,7 +1464,7 @@ fn preview_profiles_emit_their_declared_colour_contract() {
             "sony.jp",
         ),
         (
-            "canon-log2-cinema-gamut",
+            "clog2",
             "bt2020nc",
             true,
             "unknown",
@@ -1541,7 +1541,7 @@ fn production_ycbcr_quantization_matches_the_standard_derivation() {
     let cases = [
         ("srgb-preview", 0.2126, 0.7152, 0.0722, 1.8556, 1.5748),
         (
-            "canon-log3-cinema-gamut-rev-eng-crm-dev",
+            "clog3",
             0.2627,
             0.6780,
             0.0593,
@@ -1583,7 +1583,7 @@ fn preview_profiles_map_a_known_patch_through_the_encoded_stream() {
         ("srgb-preview", "bt709", "tv", [0, 255, 0]),
         ("sony-slog3-sgamut3", "bt2020", "tv", [59, 147, 20]),
         ("sony-slog3-sgamut3-cine", "bt2020", "tv", [0, 145, 49]),
-        ("canon-log2-cinema-gamut", "bt2020", "tv", [48, 140, 96]),
+        ("clog2", "bt2020", "tv", [48, 140, 96]),
         ("nikon-nlog-bt2020", "bt2020", "tv", [0, 154, 0]),
         ("dji-dlog-dgamut", "bt2020", "tv", [0, 145, 74]),
     ];
@@ -1681,15 +1681,15 @@ fn wrong_ycbcr_matrix_is_rejected_by_the_patch_check() {
     );
 }
 
-const REV_PROFILE: &str = "canon-log2-cinema-gamut";
-const REV3_PROFILE: &str = "canon-log3-cinema-gamut-rev-eng-crm-dev";
+const REV_PROFILE: &str = "clog2";
+const REV3_PROFILE: &str = "clog3";
 
 #[test]
 fn vendor_previews_auto_decode_from_their_own_tags() {
     for (id, expected) in [
         ("sony-slog3-sgamut3", [59u8, 147, 20]),
         ("sony-slog3-sgamut3-cine", [0, 145, 49]),
-        ("canon-log2-cinema-gamut", [48, 140, 96]),
+        ("clog2", [48, 140, 96]),
         (REV3_PROFILE, [39, 135, 77]),
         ("nikon-nlog-bt2020", [0, 154, 0]),
         ("dji-dlog-dgamut", [0, 145, 74]),
@@ -1730,7 +1730,13 @@ fn rejects_unknown_or_empty_preview_profile_with_exit_usage() {
     make_input(&input, &["IMG_1.DNG"]);
     let tool = root.join("unused-native-tool");
     let video = root.join("run").join(VIDEO_NAME);
-    for value in ["no-such-profile", "", "canon-log2-cinema-gamut-rev-eng-crm-dev"] {
+    for value in [
+        "no-such-profile",
+        "",
+        "canon-log2-cinema-gamut",
+        "canon-log2-cinema-gamut-rev-eng-crm-dev",
+        "canon-log3-cinema-gamut-rev-eng-crm-dev",
+    ] {
         let mut args = base_args(&input, &video, &tool);
         args.push("--preview-profile");
         args.push(value);

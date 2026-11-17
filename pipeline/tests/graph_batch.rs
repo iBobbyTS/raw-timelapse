@@ -11,7 +11,7 @@ fn graph_batch_atomicity_identity_mapping_and_joint_cancellation() {
     let work = common::test_dir("graph-batch").canonicalize().unwrap();
     let result = std::process::Command::new("/usr/bin/python3")
         .arg(repo.join("pipeline/tests/graph_batch.py"))
-        .arg(env!("CARGO_BIN_EXE_rawtl-linear-video"))
+        .arg(common::internal_runner())
         .arg(native)
         .arg(&work)
         .output()

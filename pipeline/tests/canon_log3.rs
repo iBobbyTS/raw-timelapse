@@ -9,7 +9,7 @@ use rawtl_linear_video::{
 #[path = "../src/digest.rs"]
 mod digest;
 
-const ID: &str = "canon-log3-cinema-gamut-rev-eng-crm-dev";
+const ID: &str = "clog3";
 
 #[test]
 #[cfg(target_os = "macos")]
@@ -40,7 +40,7 @@ fn production_curve_reproduces_all_589824_original_sdk_codes() {
 #[test]
 fn joins_domain_signed_pixels_and_reference_scale_match_independent_math() {
     let p = lookup(ID).unwrap();
-    assert_eq!(p.display_name(), "clog3 (rev-eng crm-dev)");
+    assert_eq!(p.display_name(), "clog3");
     assert_eq!(p.transfer, Transfer::CanonLog3RevEng);
     let (low, high) = p.transfer.domain();
     assert!((low - -0.07381334162475732).abs() < 1e-14);

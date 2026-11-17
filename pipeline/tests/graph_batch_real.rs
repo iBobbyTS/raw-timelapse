@@ -17,7 +17,7 @@ fn real_graph_batch_and_single_frame_equivalence() {
     let work = common::test_dir("graph-real").canonicalize().unwrap();
     let result = std::process::Command::new("/usr/bin/python3")
         .arg(repo.join("pipeline/tests/graph_batch_real.py"))
-        .arg(env!("CARGO_BIN_EXE_rawtl-linear-video"))
+        .arg(common::internal_runner())
         .arg(native)
         .arg(&work)
         .arg(input)

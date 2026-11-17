@@ -26,7 +26,7 @@ fn twelve_bit_quantizers_use_h273_scaled_code_points() {
 #[test]
 fn curve_input_scale_table_is_explicit_for_every_registered_profile() {
     let expected = |id: &str| {
-        if id.starts_with("canon-log") {
+        if matches!(id, "clog2" | "clog3") {
             0.9
         } else {
             1.0
@@ -43,10 +43,7 @@ fn curve_input_scale_table_is_explicit_for_every_registered_profile() {
 }
 #[test]
 fn curve_input_units_and_user_gain_are_applied_once() {
-    for (id, code) in [
-        ("canon-log2-cinema-gamut", 407u16),
-        ("canon-log3-cinema-gamut-rev-eng-crm-dev", 351u16),
-    ] {
+    for (id, code) in [("clog2", 407u16), ("clog3", 351u16)] {
         let p = lookup(id).unwrap();
         // Independent published/reconstructed 18% reference, full-range 10-bit.
         for (scene, gain) in [(0.2f32, 1.0), (0.1, 2.0), (0.4, 0.5)] {

@@ -5,7 +5,7 @@ frames, convert each source once into a run-local LinearRaw cache, measure and
 solve a best-effort exposure plan in one sequential node, stream each developed
 frame through scene-linear colour conversion into FFmpeg, check the encoded
 file against container metadata (full verification is opt-in via
-`--verify-output`), and publish **one video file and one run log**.
+`verify_output`), and publish **one video file and one run log**.
 
 The deflicker node is enabled by default. There is no report directory, manifest,
 CSV, audit JSON or per-frame log in the product output: the log beside the video
@@ -29,71 +29,31 @@ The binary is `pipeline/target/release/rawtl-linear-video`.
 ## Run
 
 ```sh
-rawtl-linear-video --input <RAW_DIR> --output <VIDEO_FILE> \
-  [--graph <FILE>] [--fps 30] \
-  [--white-balance first-frame|per-frame] \
-  [--dng-linear-frame /abs/path/to/dng-linear-frame] \
-  [--ffmpeg /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg] \
-  [--ffprobe /opt/homebrew/opt/ffmpeg-full/bin/ffprobe] \
-  [--preview-profile <ID>] [--output-cat profile|bradford|cat02] [--log-reference-gain N|auto] \
-  [--signal-bits 10|12] \
-  [--converter "/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter"] \
-  [--converter-timeout 120] \
-  [--strength 1.0] [--period 60] [--brightness smooth|uniform] \
-  [--estimator pairwise|legacy] [--ev-limits none|LOW,HIGH] \
-  [--roi X,Y,W,H] [--exclude-roi X0,Y0,X1,Y1 ...] [--step START:EV ...] \
-  [--encoder prores_ks|libx264|ffv1] [--pix-fmt FMT] [--container mov|mp4|matroska] \
-  [--codec-profile VALUE] [--crf N|--qscale N|--bitrate BPS] \
-  [--output-option K=V ...] [--resize WxH]
+rawtl-linear-video --input /data/banff --profile default
+rawtl-linear-video --input /data/banff --profile /absolute/path/to/profile.json \
+  --output /data/delivery/timelapse.mov
 ```
 
-`--output` names the video file. Its extension must match the resolved container
-(default ProRes 4444 in MOV, so `.mov`). The run log is written beside it with
-the same stem: `--output /data/timelapse.mov` produces `timelapse.mov` and
-`timelapse.log`. Neither file is ever overwritten; a retry with the same name
-exits with the output-guard error.
+Both `--input` (a RAW or DNG sequence directory) and `--profile` are required.
+The sole built-in profile, `default`, renders sRGB at 30 fps, source dimensions
+and ProRes 4444 in MOV. A custom profile is selected by its absolute JSON file
+path and controls the processing and delivery settings.
 
-Defaults:
-
-- `--dng-linear-frame native/build/dng-linear-frame` (pass the matched build
-  path when using a work-directory build)
-- `--ffmpeg` / `--ffprobe` at `/opt/homebrew/opt/ffmpeg-full/bin/`
-- `--preview-profile srgb-preview` — one of `srgb-preview`, `dji-dlog-dgamut`,
-  `dji-dlog2-dgamut2`, `canon-log2-cinema-gamut`, `sony-slog3-sgamut3`,
-  `sony-slog3-sgamut3-cine`, `nikon-nlog-bt2020`,
-  `canon-log3-cinema-gamut-rev-eng-crm-dev`
-- `--output-cat profile` — `profile` keeps the selected profile's own fixed
-  reference chromatic adaptation. `bradford` or `cat02` name a registered
-  algorithm explicitly; the same value as the profile default is idempotent,
-  while a different value changes output pixels and is reported as
-  `custom-adaptation` (never as the profile's reference match)
-- `--fps 30` (rational rates such as `30000/1001` are accepted)
-- `--white-balance first-frame` — the first numerically ordered frame's as-shot
-  neutral is frozen for the sequence; `per-frame` decodes every frame with its
-  own RAW as-shot neutral (see *White balance modes*)
-- `--strength 1.0`, `--period 60`, `--brightness smooth`, `--estimator pairwise`,
-  unbounded EV, full-frame ROI; `--strength 0` disables the analysis node and
-  renders the single pass at 0 EV
-- Default encoder: `prores_ks` profile 4, MOV, `yuv444p10le`, limited range, at
-  the source geometry. The input handoff is the single 10-bit quantization
-  (`--signal-bits`, default `10`). `--signal-bits 12` widens the handoff to
-  12-bit codes (`yuv444p12le`, H.273 256..3760/256..3840 limited-range
-  scaling) for encoders that accept 12-bit input: FFV1 delivers a true 12-bit
-  lossless master; prores_ks encodes from 10-bit input only and rejects the
-  combination up front (use `--signal-bits 10` or `--encoder ffv1`). No
-  lossless claim is made for ProRes in either depth. `--resize` is the only
-  scaling stage and runs in the scene-linear FP32 domain.
+Omit `--output` to write beside the source directory. With the default profile,
+`/data/banff.v2/` produces `/data/banff.v2.mov` and `/data/banff.v2.log`. An
+explicit video path must match the profile's container. Existing videos and
+logs are never overwritten. Use `--help` or `--version` for CLI information.
 
 ## Lens correction
 
-`--lens-correction auto|off` defaults to `auto`. Prepare freezes original calibration,
+`lens_correction auto|off` defaults to `auto`. Prepare freezes original calibration,
 Converter component state and installed LCP parameters; Develop applies only missing
 components through an independent camera-linear module. Supported embedded models
 win over LCP even when identity; already-applied components are never stacked.
 `off` disables only the new module, not corrections baked upstream.
 
 Prepare auto requires ExifTool (default `/opt/homebrew/bin/exiftool`, override with
-`--exiftool /absolute/executable`). Repeatable `--lens-profile-dir /absolute/directory`
+`exiftool /absolute/executable`). The `lens_profile_dirs` list
 replaces default Adobe profile roots. The product still has no Python dependency.
 Each developed frame records `kind=lens` with per-component decisions and fingerprints.
 Output dimensions remain fixed; samples outside the source are black, with no hidden
@@ -113,7 +73,7 @@ consumers default to recovery off for diagnostic development.
 
 ```
 <video file>     the deliverable, published by one rename after a container
-                 metadata check (--verify-output adds frame counting by decode
+                 metadata check (verify_output adds frame counting by decode
                  and a complete decode)
 <stem>.log       the single run log
 ```
@@ -124,7 +84,7 @@ the directory. Nothing else is created there.
 The log is line-oriented; every entry carries `wall=<epoch seconds>` and
 `elapsed=<monotonic seconds>` followed by `kind=...` and bounded fields:
 
-- `run.start`, `settings`, `inventory`, `graph`, `encoder`, `colour`
+- `run.start`, `profile`, `settings`, `inventory`, `graph`, `encoder`, `colour`
 - `prepare`, `measure`, `develop` (frame, EV, applied/own white balance,
   pixel count and digest, duration; prepare timing depends on its mode)
 - `prepare.batch` (batch ID, first/last frame, count, actual ADC calls, conversion,
@@ -160,9 +120,9 @@ A failed run must be re-run from the source. There is no checkpoint, resume or
 automatic recovery, and a new run never picks up an earlier run's cache. A long
 full-resolution sequence needs disk space for the cache peak beside the output.
 
-## Graph
+## Internal processing graph
 
-The product executes one typed DAG (`--graph <file>`, default built-in graph).
+The profile configures one internal typed DAG in the project-defined processing order.
 
 ```text
 source -> convert-cache --prepared references--> measure-solve -> apply-ev
@@ -177,11 +137,11 @@ source -> convert-cache --prepared references--> measure-solve -> apply-ev
   (`dng-linear-frame --prepare-batch`). Each successful batch publishes source-ordered
   references; it can overlap the next batch with measurements of earlier frames.
 - `measure-solve` measures independent frames concurrently, then seals the full
-  frame inventory and publishes one EV table. `--strength 0` replaces it with a zero plan.
+  frame inventory and publishes one EV table. `strength 0` replaces it with a zero plan.
 - `develop` applies the plan EV exactly once and returns owned FP32 pixels; the
   source read is complete before the completion event is emitted.
 - `color` performs the single 4:4:4 quantization handoff (10- or 12-bit by
-  `--signal-bits`); `encode` is the streaming FFmpeg sink.
+  `signal_bits`); `encode` is the streaming FFmpeg sink.
 - `delete` waits for the per-frame develop completion and removes only the
   run-generated cache DNG. Original RAW/DNG sources are never deletion targets.
 
@@ -227,8 +187,8 @@ setting or a fixed speedup guarantee. Colour remains 1 in the measured default;
 custom graphs can set its concurrency independently.
 
 Null, strings, booleans, fractions, out-of-range values and duplicate fields are
-configuration errors. `--strength 0` normalizes a valid solve to zero with
-concurrency 1. CLI resize overrides preserve the existing node's concurrency;
+configuration errors. `strength 0` normalizes a valid solve to zero with
+concurrency 1. Profile resize settings preserve the existing node's concurrency;
 a newly inserted resize uses 1. There is no global threads option or concurrency
 environment variable.
 
@@ -266,7 +226,7 @@ log unknown metrics. Single mode keeps the old per-frame wall-time interpretatio
 `mode`, `duration_scope` and stage `capacity_unit=frames|batch_tasks` distinguish
 these meanings; never sum per-frame batch durations as conversion cost.
 
-`--converter-timeout` remains a total timeout per actual ADC sub-call (default
+`converter_timeout` remains a total timeout per actual ADC sub-call (default
 120 seconds, 1..3600), including a multi-file invocation. It is not multiplied by
 frame count. Filename collisions and argv limits may split a logical batch into
 serial calls; cancellation stops later calls. Each batch has a unique private
@@ -313,11 +273,11 @@ hard error with no video produced.
 
 - `first-frame` (default): the first numerically ordered frame is decoded with
   its own AsShotNeutral (`as-shot`). Its applied triple is passed to every later
-  frame as `--white-balance R,G,B`; each later sidecar must report `override`
+  frame as the native `--white-balance R,G,B` override; each later sidecar must report `override`
   and exactly that triple. The log's `develop` entries show the frozen value and
   `wb_source=override`.
 - `per-frame`: every frame is decoded with its own RAW as-shot neutral and the
-  pipeline passes no `--white-balance` override. Every `develop` entry must show
+  pipeline passes no `white_balance` override. Every `develop` entry must show
   `wb_source=as-shot` with applied equal to the frame's own neutral.
 
 In both modes each frame keeps its own `as_shot_neutral`; a producer that lies
@@ -327,13 +287,13 @@ node measures exposure brightness only and never smooths white balance.
 ## Encoding contract
 
 The encoder receives the planar 4:4:4 target signal from the colour node at the
-run's `--signal-bits` depth (`yuv444p10le` default, `yuv444p12le` with
-`--signal-bits 12`; limited-range 12-bit codes follow H.273's 256..3760
-luma / 256..3840 chroma scaling). Without an explicit `--pix-fmt`, prores_ks
+run's `signal_bits` depth (`yuv444p10le` default, `yuv444p12le` with
+`signal_bits 12`; limited-range 12-bit codes follow H.273's 256..3760
+luma / 256..3840 chroma scaling). Without an explicit `pix_fmt`, prores_ks
 and ffv1 follow the handoff depth; prores_ks + 12 is rejected before any RAW
 work because its encoder input is 10-bit only.
 The FFmpeg argv is fixed by the pipeline (input pipe, frame rate, geometry,
-frame count, colour/range and a single output); `--output-option` accepts only
+frame count, colour/range and a single output); `output_options` accepts only
 the explicitly supported keys (`-preset -tune -vendor -threads -g -bf -level`)
 and foreign inputs such as `-i`, another output, filters or geometry overrides
 are rejected. Unsupported encoder/pixel-format/container combinations and
@@ -344,13 +304,13 @@ Publication is one rename after the output check. By default the check reads
 ffprobe container metadata only: codec/profile/pixel format/geometry/rate,
 per-field colour tags, range where the container can express it, and the frame
 count when the container declares one (MOV/ProRes declares none, so the logged
-count is then the encoder's own). `--verify-output` additionally counts frames
+count is then the encoder's own). `verify_output` additionally counts frames
 by decoding and decodes the entire deliverable to prove it is playable. Check
 failure leaves only the scratch partial and a non-zero exit.
 
 ## Colour/Log profiles
 
-`--preview-profile <ID>` selects the output colour/Log rendering (default
+The profile’s `output_color` field selects the output colour/Log rendering (default
 `srgb-preview`). Canon Cinema Gamut/CLog profiles are signalled per field and are
 never disguised as BT.2020 transfer/primaries. ProRes delivery is limited range
 because MOV `colr/nclc` cannot carry a range field and ProRes decoders assume
@@ -363,13 +323,13 @@ depth still quantizes exactly once at the encoder input.
 | `srgb-preview` | sRGB / Rec.709 | bt709 |
 | `sony-slog3-sgamut3` | S-Log3 / S-Gamut3 | bt2020nc |
 | `sony-slog3-sgamut3-cine` | S-Log3 / S-Gamut3.Cine | bt2020nc |
-| `canon-log2-cinema-gamut` | clog2 / Cinema Gamut | bt2020nc |
-| `canon-log3-cinema-gamut-rev-eng-crm-dev` | clog3 (rev-eng crm-dev) / Cinema Gamut | bt2020nc |
+| `clog2` | clog2 / Cinema Gamut | bt2020nc |
+| `clog3` | clog3 / Cinema Gamut | bt2020nc |
 | `nikon-nlog-bt2020` | N-Log / BT.2020 | bt2020nc |
 | `dji-dlog-dgamut` | D-Log / D-Gamut | bt2020nc |
 | `dji-dlog2-dgamut2` | D-Log 2 / D-Gamut 2 (pinned DCTL, CAT02) | bt2020nc |
 
-Input development is selected with `--camera-color auto|generic|canon-cr3`
+Input development is selected with `camera_color auto|generic|canon-cr3`
 (default `auto`). After the existing single-extension input enumeration:
 
 | selection | resolved input recipe |
@@ -383,7 +343,7 @@ A mixed-extension directory is rejected before recipe selection in every mode.
 The recipe is frozen before prepare and shared by measure and develop. The
 same input and settings produce the same calibrated scene-linear ACEScg frames
 for every output profile, including sRGB. Canon calibration errors fail the run,
-as do mixed camera models in a calibrated sequence. Use `--camera-color generic`
+as do mixed camera models in a calibrated sequence. Use `camera_color generic`
 to keep the uncalibrated SDK scale, including for CR3 workflows that used it
 under non-Canon outputs before this change.
 
@@ -401,19 +361,18 @@ sets a reference gain. Invalid or singular profile transforms fail explicitly.
 Input D50→D60 adaptation remains Bradford; it is independent of output color.
 
 The Canon CR3 input recipe applies original CR3 NormalWhite/fixed 1.8 exposure
-calibration for every output. There is one CLog2 profile: `canon-log2-cinema-gamut`,
-using the published Canon curve (also numerically verified against the recovered SDK
-formula). The former `canon-log2-cinema-gamut-rev-eng-crm-dev` ID is removed.
+calibration for every output. Use `clog2` or `clog3` as the output colour setting. CLog2 uses the published Canon curve, numerically verified
+against the recovered SDK formula.
 Both Canon encodings multiply native scene-linear values by 0.9 exactly once before
-their reflection-domain curve. `--camera-color canon-cr3` explicitly selects the
+their reflection-domain curve. `camera_color canon-cr3` explicitly selects the
 input recipe with any output profile.
 Other output curves, gamuts, tags and default output matrices retain their definitions.
 Original D-Log now defaults to CAT02 (ACES white/D60 to D65), replacing output
-Bradford rather than stacking adaptations. `--output-cat bradford` remains available;
+Bradford rather than stacking adaptations. `output_cat bradford` remains available;
 input D50 to D60 adaptation remains unchanged. D-Log 2 keeps its separate DCTL chain.
 
 The output chromatic adaptation belongs to `OutputProfile`, not to the transfer
-curve or the input CAT. `--output-cat profile` (default) uses the profile's fixed
+curve or the input CAT. `output_cat profile` (default) uses the profile's fixed
 reference realization: `dji-dlog-dgamut` uses standard CAT02, `dji-dlog2-dgamut2`
 pins its own DCTL chain, and other profiles keep the published Bradford
 D60→D65 matrix and composition order bit-for-bit. An explicit
@@ -449,7 +408,7 @@ The default output CAT is the DCTL's real chain, not Bradford:
 DCTL's printed CAT02 D65->D60 constant (XYZ/D60 -> XYZ/D65, as required by
 inverse(M_DG2_AP0) x M_AP1_AP0) -> XYZ/D65 -> D-Gamut 2`. Its three four-decimal
 matrices are used digit for digit and the rounded chain's white-axis residual
-(max 2.5e-4) is preserved, never normalised away. `--output-cat profile` (or `cat02`)
+(max 2.5e-4) is preserved, never normalised away. `output_cat profile` (or `cat02`)
 selects this reference realization; another method derives a
 `custom-adaptation` matrix and does not claim the reference chain. The colour
 contract also exposes the printed `cat02_d65_to_d60`, `xyz60_to_acesap0`,
@@ -471,7 +430,7 @@ three samples per pixel), accumulated from ordered colour commits only. Frames
 that fail or never commit are excluded; an incomplete run publishes no video and
 no clip summary. The clipping counters are not an added per-frame audit file.
 
-`--log-reference-gain N` is a positive finite output gain for every profile,
+`log_reference_gain N` is a positive finite output gain for every profile,
 default 1 except original D-Log, which defaults to `auto` with desired gain 4
 (+2 EV). An explicit numeric value, including `1`, overrides this default. The
 resolved gain is applied once before the output transfer function and never enters
@@ -481,7 +440,7 @@ not camera calibration. This replaces the historical internal contract field
 `native_scene_to_reflection_scale`. Native calibration metadata no longer reports
 `scene_to_reflection` as a camera calibration factor.
 
-`--log-reference-gain auto` (camera Log profiles only; `srgb-preview` is rejected)
+`log_reference_gain auto` (camera Log profiles only; `srgb-preview` is rejected)
 resolves one sequence-wide gain instead. After the exposure plan exists and before
 the first colour conversion, every frame is developed once more through the exact
 delivery image chain (exposure, resize, colour-boundary crop) and the target-gamut

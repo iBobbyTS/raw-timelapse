@@ -15,7 +15,7 @@
 <stem>.log     同名运行日志（唯一日志）
 ```
 
-`--output` 指定视频文件；扩展名必须与解析后的容器一致（默认 `.mov`）。日志与视频
+`--output` 可指定视频文件，扩展名必须与 profile 的容器一致。省略时在输入目录旁追加容器扩展名。日志与视频
 同目录同名：`/data/tl.mov` → `/data/tl.log`。不产生 `logs/` 目录、manifest、CSV、
 审计 JSON 或第二份 encoder 日志。已存在的视频或日志一律拒绝覆盖（退出码 12）。
 
@@ -26,8 +26,7 @@
 
 ## 2. 图模型
 
-一个有向无环数据图，外加只指向已声明节点的完成事件连线。配置为 JSON
-（`--graph <file>`），内建默认图与之同一模型；不引入插件安装器、脚本执行或动态节点。
+一个有向无环数据图，外加只指向已声明节点的完成事件连线。图配置属于项目内部。用户通过 `--profile` 选择完整处理预设。内建图与内部测试图使用同一模型。
 
 - **逐帧执行**：prepare、solve 的测量阶段和图像链
   （develop / identity / exposure / resize / color）共用有界有序执行器，并发计算独立帧。
@@ -59,14 +58,14 @@ source -> convert-cache --prepared references--------------------+
 - `convert-cache`：默认用一个 native 批任务处理最多 32 个源（`--prepare-batch`），
   全批成功后按源序发布轻量引用；下一批转换可与上一批测量重叠。
 - `measure-solve`：可并发逐帧测量（0 EV），按序提交并在完整封口后仅求解一次有限 EV 表。
-  `--strength 0` 时该节点替换为 `zero`，不执行测量。
+  `strength = 0` 时该节点替换为 `zero`，不执行测量。
 - `apply-ev`：按帧读取 EV，二次 develop，EV 恰好应用一次，返回自有 FP32 像素。Develop 内部的[独立镜头校正模块](lens-correction.md)只消费 Prepare 冻结的分项校准，不重新读取 RAW 元数据或查找 LCP，不与高光/颜色配方互相耦合。
-- `color`：唯一的 4:4:4 量化/编码交接点（`--signal-bits 10|12`，默认 10）。
+- `color`：唯一的 4:4:4 量化/编码交接点（`signal_bits` 为 10 或 12，默认 10）。
 - `encode`：FFmpeg 流式 sink；第一帧时启动，序列结束时关闭并校验。
 - `delete-cache`：等待对应帧的 `apply-ev` 完成事件，只删除本 run 生成的缓存 DNG；
   原始 RAW/DNG 不是删除目标（`generated=false` 时为空操作）。
 
-用户图可以插入 identity / exposure / resize 节点、串联另一个 sequential 节点或
+项目内部可以插入 identity / exposure / resize 节点、串联另一个 sequential 节点或
 改变事件依赖；缺节点、端口类型不符、环、非法事件作用域、重复/未声明节点均在
 RAW 处理前报配置错误。
 
@@ -97,7 +96,7 @@ EV/WB、develop 像素摘要和解码后逐帧摘要一致，输出/scratch 在�
 小集 29 帧按相机拆为 19 帧 R7 与 10 帧 R6 II，分别缩放至 696x464 / 600x400，两轮采用
 相反的 1/4/8 顺序。源摘要检查预先读取了文件；未清空系统缓存，后台负载有波动。
 这些值不是测定最优值或固定加速承诺；默认 Color=1，自定义图仍可独立设置其并发度。
-`--strength 0` 把合法 solve 规范化为 zero，同时把并发度变为 1，完全跳过测量。
+`strength = 0` 把合法 solve 规范化为 zero，同时把并发度变为 1，完全跳过测量。
 CLI resize 覆盖保留原节点的并发度，新插入节点为 1。没有全局 --threads 或并发环境变量。
 
 逐帧阶段的容量等于节点并发度 N（prepare 批模式另见下文）：
@@ -203,7 +202,7 @@ stderr 只保留错误与 scratch 保留提示。
 
 ## 6. 编码与颜色
 
-Input development freezes one `--camera-color auto|generic|canon-cr3` recipe
+Input development freezes one `camera_color` (auto, generic, or canon-cr3) recipe
 after single-extension enumeration, before prepare. Both measure (EV=0) and
 develop (solved native EV once) use that recipe and WB policy. Auto selects the
 Canon NormalWhite/fixed 1.8 calibration for original CR3, and generic SDK
@@ -213,16 +212,16 @@ Every mode enforces the single-extension rule. The recipe and native exposure
 calibration are independent of the output profile.
 The color node applies the profile's curve input units (0.9 for Canon Log 2/3
 curves) and the positive finite user reference gain once; neither scale enters
-measurement. `--log-reference-gain auto` resolves the gain once per sequence: the
+measurement. `log_reference_gain` set to `auto` resolves the gain once per sequence: the
 backend's plan hook (Solve or Zero) rescans every frame through the identical
 develop and linear image chain before any colour task exists, and the run log
 gains a `kind=reference_gain` line with the desired/safe/applied values. Native/Rust color contract v2 checks requested/effective policies
 and keeps the existing input Bradford D50→D60 CAT. The output CAT is now part of
-the output profile: `--output-cat profile|bradford|cat02` (default `profile`)
+the output profile: `output_cat` (profile, bradford, or cat02) (default `profile`)
 selects the profile's fixed reference realization or an explicit registered
 method. `dji-dlog2-dgamut2` pins the fixed DCTL AP1→AP0→D-Gamut 2/CAT02 chain
 (three four-decimal matrices used digit-for-digit, white-axis residual kept,
-reported as `cat02`/`reference`); `--output-cat` with a different method derives
+reported as `cat02`/`reference`); `output_cat` with a different method derives
 and reports `custom-adaptation` instead. The pre-existing profiles keep the
 published Bradford D60→D65
 matrix and composition order exactly; an explicit different method is a standard

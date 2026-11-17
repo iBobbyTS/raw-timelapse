@@ -15,7 +15,7 @@ use crate::json::Json;
     fn auto_reference_gain_keeps_the_desired_gain_when_it_fits() {
         let dlog = lookup("dji-dlog-dgamut").unwrap();
         let dlog2 = lookup("dji-dlog2-dgamut2").unwrap();
-        let clog3 = lookup("canon-log3-cinema-gamut-rev-eng-crm-dev").unwrap();
+        let clog3 = lookup("clog3").unwrap();
         assert_eq!(dlog2.transfer.desired_auto_reference_gain(), 4.0);
         assert_eq!(dlog.transfer.desired_auto_reference_gain(), 4.0);
         assert_eq!(dlog.auto_reference_gain(0.5, -0.001).gain, 4.0);
@@ -54,7 +54,7 @@ use crate::json::Json;
 
     #[test]
     fn auto_reference_gain_caps_by_the_negative_toe_bound() {
-        let clog3 = lookup("canon-log3-cinema-gamut-rev-eng-crm-dev").unwrap();
+        let clog3 = lookup("clog3").unwrap();
         let (low, _high) = clog3.transfer.domain();
         let scale = clog3.curve_input_scale();
         assert!(low < 0.0);
@@ -98,7 +98,7 @@ use crate::json::Json;
 
     #[test]
     fn canonical_log2_and_signed_f32_boundary_are_independently_reproduced() {
-        let p = lookup("canon-log2-cinema-gamut").unwrap();
+        let p = lookup("clog2").unwrap();
         assert_eq!(p.display_name(), "clog2");
         assert_eq!(p.transfer, Transfer::CanonLog2);
         assert!(lookup("canon-log2-cinema-gamut-rev-eng-crm-dev").is_none());
@@ -146,7 +146,7 @@ use crate::json::Json;
 
     #[test]
     fn single_log2_curve_matches_the_independently_recovered_sdk_definition() {
-        let published = lookup("canon-log2-cinema-gamut").unwrap();
+        let published = lookup("clog2").unwrap();
         for i in -4096..=65536 {
             let reflection = i as f64 / 1024.0;
             let x = reflection / 0.9;
@@ -212,8 +212,8 @@ use crate::json::Json;
             "srgb-preview",
             "dji-dlog-dgamut",
             "dji-dlog2-dgamut2",
-            "canon-log2-cinema-gamut",
-            "canon-log3-cinema-gamut-rev-eng-crm-dev",
+            "clog2",
+            "clog3",
             "sony-slog3-sgamut3",
             "sony-slog3-sgamut3-cine",
             "nikon-nlog-bt2020",
@@ -313,7 +313,7 @@ use crate::json::Json;
             ("srgb-preview", [198u8, 109, 75]),
             ("sony-slog3-sgamut3", [125, 104, 87]),
             ("sony-slog3-sgamut3-cine", [127, 104, 89]),
-            ("canon-log2-cinema-gamut", [118, 98, 85]),
+            ("clog2", [118, 98, 85]),
             ("nikon-nlog-bt2020", [121, 93, 74]),
             ("dji-dlog-dgamut", [123, 99, 86]),
         ] {
@@ -497,7 +497,7 @@ use crate::json::Json;
 
     #[test]
     fn ten_bit_conversion_counts_both_domain_boundaries_and_rejects_bad_input() {
-        let profile = lookup("canon-log3-cinema-gamut-rev-eng-crm-dev").unwrap();
+        let profile = lookup("clog3").unwrap();
         let mut out = Vec::new();
         let negative: Vec<_> = [-1000f32; 3]
             .into_iter()
@@ -569,7 +569,7 @@ use crate::json::Json;
         }
         // Camera Log curves may legally encode slight negative scene values;
         // Canon Log 2 maps -0.01 to a code below its 0% black code 24.
-        let canon = lookup("canon-log2-cinema-gamut").expect("canon");
+        let canon = lookup("clog2").expect("canon");
         assert!(canon.encode_target_linear([-0.01; 3])[0] < 24);
     }
 

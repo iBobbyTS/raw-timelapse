@@ -13,6 +13,20 @@ pub const DEFAULT_FFPROBE: &str = "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe";
 pub const LEGACY_FPS_PROVENANCE: &str =
     "legacy/python/src/rawtl/cli.py:91 (argparse default Fraction(30))";
 pub const USAGE: &str = "\
+rawtl-linear-video --input <DIR> --profile <default|ABSOLUTE_FILE> [--output <VIDEO_FILE>]
+
+    --input <DIR>          Directory of RAW or DNG frames
+    --profile <PROFILE>    default or the absolute path to a profile JSON file
+    --output <VIDEO_FILE>  Defaults to the input directory name plus the
+                           profile's container extension, beside that directory
+    -h, --help             Print help
+    --version              Print version
+
+The video and its sibling log are never overwritten.
+";
+
+#[cfg(test)]
+pub const INTERNAL_USAGE: &str = "\
 rawtl-linear-video — RAW/DNG frame sequence -> one video file and one run log
 (default: best-effort deflicker, ProRes 4444 at the source geometry)
 
@@ -39,11 +53,8 @@ OPTIONS:
     --preview-profile <ID>     Output colour/Log profile (default: srgb-preview)
                                one of: srgb-preview, dji-dlog-dgamut,
                                dji-dlog2-dgamut2,
-                               canon-log2-cinema-gamut, sony-slog3-sgamut3,
-                               sony-slog3-sgamut3-cine, nikon-nlog-bt2020,
-                               canon-log3-cinema-gamut-rev-eng-crm-dev
-                               Canon names: clog2,
-                               clog3 (rev-eng crm-dev)
+                               clog2, clog3, sony-slog3-sgamut3,
+                               sony-slog3-sgamut3-cine, nikon-nlog-bt2020
     --output-cat <MODE>        profile|bradford|cat02 (default: profile)
                                profile keeps the selected profile's fixed reference
                                adaptation; an explicit different method changes the
@@ -351,6 +362,7 @@ impl ReferenceGain {
 
 #[derive(Debug, Clone)]
 pub struct Options {
+    pub profile_source: Option<String>,
     pub graph: Option<PathBuf>,
     pub input: PathBuf,
     /// The single deliverable video file named by `--output`.
@@ -391,7 +403,7 @@ pub enum Parsed {
     Version,
 }
 
-pub fn parse(args: &[String]) -> Result<Parsed> {
+pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Parsed> {
     let mut graph = None;
     let mut input: Option<PathBuf> = None;
     let mut output: Option<(PathBuf, PathBuf)> = None;
@@ -770,8 +782,11 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     }
 
     let input = input.ok_or_else(|| Error::new(EXIT_USAGE, "--input <DIR> is required"))?;
-    let (video, log) =
-        output.ok_or_else(|| Error::new(EXIT_USAGE, "--output <VIDEO_FILE> is required"))?;
+    let (video, log) = match output {
+        Some(paths) => paths,
+        None if require_output => return Err(Error::new(EXIT_USAGE, "--output <VIDEO_FILE> is required")),
+        None => (PathBuf::new(), PathBuf::new()),
+    };
 
     if log_reference_gain == Some(ReferenceGain::Auto)
         && preview_profile.transfer == color_profile::Transfer::Srgb {
@@ -793,6 +808,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         .resolve_output_cat(output_cat, &color_profile::CatRegistry::standard())
         .map_err(|message| Error::new(EXIT_USAGE, message))?;
     Ok(Parsed::Run(Options {
+        profile_source: None,
         graph,
         input,
         video,
@@ -928,7 +944,7 @@ fn parse_resize(value: &str) -> Result<(u32, u32)> {
     Ok((width, height))
 }
 
-fn take_value(
+pub(crate) fn take_value(
     args: &[String],
     index: &mut usize,
     flag: &str,
@@ -1094,7 +1110,7 @@ mod tests {
 
     fn parse_run(args: &[&str]) -> Result<Options> {
         let owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
-        match parse(&owned)? {
+        match parse_settings(&owned, true)? {
             Parsed::Run(options) => Ok(options),
             Parsed::Help | Parsed::Version => Err(Error::new(EXIT_USAGE, "unexpected mode")),
         }
@@ -1141,7 +1157,7 @@ mod tests {
     fn log_reference_gain_keeps_numeric_semantics() {
         let options = parse_run(&[
             "--input", "in", "--output", "out.mov",
-            "--preview-profile", "canon-log3-cinema-gamut-rev-eng-crm-dev",
+            "--preview-profile", "clog3",
             "--log-reference-gain", "2.5",
         ])
         .expect("parse");
@@ -1257,9 +1273,9 @@ mod tests {
 
         assert_eq!(WhiteBalance::FirstFrame.as_str(), "first-frame");
         assert_eq!(WhiteBalance::PerFrame.as_str(), "per-frame");
-        assert!(USAGE.contains("--white-balance"));
-        assert!(USAGE.contains("first-frame"));
-        assert!(USAGE.contains("per-frame"));
+        assert!(INTERNAL_USAGE.contains("--white-balance"));
+        assert!(INTERNAL_USAGE.contains("first-frame"));
+        assert!(INTERNAL_USAGE.contains("per-frame"));
     }
 
     #[test]
@@ -1500,12 +1516,12 @@ mod tests {
         // leave the CLI documentation behind the registry.
         for profile in color_profile::PROFILES.iter() {
             assert!(
-                USAGE.contains(profile.id),
+                INTERNAL_USAGE.contains(profile.id),
                 "CLI help is missing registered profile {:?}",
                 profile.id
             );
         }
-        assert!(USAGE.contains("--output-cat <MODE>        profile|bradford|cat02"));
+        assert!(INTERNAL_USAGE.contains("--output-cat <MODE>        profile|bradford|cat02"));
     }
 
     #[test]
@@ -1650,9 +1666,9 @@ mod tests {
             ])
         );
         assert_eq!(options.resize, Some((4096, 2734)));
-        assert!(USAGE.contains("--encoder"));
-        assert!(USAGE.contains("--resize"));
-        assert!(USAGE.contains("--output <VIDEO_FILE>"));
+        assert!(INTERNAL_USAGE.contains("--encoder"));
+        assert!(INTERNAL_USAGE.contains("--resize"));
+        assert!(INTERNAL_USAGE.contains("--output <VIDEO_FILE>"));
     }
 
     #[test]
@@ -1663,7 +1679,7 @@ mod tests {
             parse_run(&["--input", "in", "--output", "out.mov", "--verify-output"])
                 .expect("parse");
         assert!(options.verify_output);
-        assert!(USAGE.contains("--verify-output"));
+        assert!(INTERNAL_USAGE.contains("--verify-output"));
         assert!(
             parse_run(&[
                 "--input",

@@ -43,8 +43,31 @@ pub fn require_ffmpeg() {
     );
 }
 
+pub fn internal_runner() -> &'static str {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let executable = Path::new(env!("CARGO_BIN_EXE_rawtl-linear-video"));
+        let build_dir = executable.parent().unwrap();
+        let runner = build_dir.join("examples/internal_runner");
+        if !runner.is_file() {
+            let mut command = Command::new(env!("CARGO"));
+            command
+                .args(["build", "--example", "internal_runner"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .env("CARGO_TARGET_DIR", build_dir.parent().unwrap());
+            if build_dir.ends_with("release") {
+                command.arg("--release");
+            }
+            assert!(command.status().expect("build internal runner").success());
+        }
+        runner
+    })
+    .to_str()
+    .expect("internal runner path is UTF-8")
+}
+
 pub fn run_cli(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rawtl-linear-video"))
+    Command::new(internal_runner())
         .args(args)
         .output()
         .expect("run rawtl-linear-video")
