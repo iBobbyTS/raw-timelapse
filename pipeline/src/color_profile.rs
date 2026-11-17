@@ -1039,8 +1039,18 @@ impl CameraColor {
 }
 impl ColorProfile {
     /// Curve input units, independent of the camera recipe and exposure calibration.
+    /// Exhaustive on purpose: a future rev-eng curve needing the 0.9 reflection
+    /// scale must fail to compile here instead of silently defaulting to 1.0.
     pub fn curve_input_scale(&self) -> f64 {
-        match self.transfer { Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng => 0.9, _ => 1.0 }
+        match self.transfer {
+            Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng => 0.9,
+            Transfer::Srgb
+            | Transfer::SonySLog3
+            | Transfer::CanonLog2
+            | Transfer::NikonNLog
+            | Transfer::DjiDLog
+            | Transfer::DjiDLog2 => 1.0,
+        }
     }
 
     /// One sequence-wide gain for `--log-reference-gain auto`. `max_target`
@@ -2696,6 +2706,24 @@ mod camera_recipe_tests {
                 assert_eq!(CameraColor::CanonClog3.resolve(profile, cr3).is_ok(), canon);
                 assert_eq!(profile.curve_input_scale(), match profile.transfer { Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng => 0.9, _ => 1.0 });
             }
+        }
+    }
+    #[test]
+    fn curve_input_scale_table_is_explicit_for_every_registered_profile() {
+        let expected = |id: &str| {
+            if id.starts_with("canon-log") && id.ends_with("rev-eng-crm-dev") {
+                0.9
+            } else {
+                1.0
+            }
+        };
+        for profile in PROFILES {
+            assert_eq!(
+                profile.curve_input_scale(),
+                expected(profile.id),
+                "profile {}",
+                profile.id
+            );
         }
     }
     #[test]
