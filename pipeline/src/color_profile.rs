@@ -1003,6 +1003,17 @@ impl FrameOutput for std::sync::Arc<[u8]> {
     }
 }
 
+/// Resolved `--log-reference-gain auto` decision: the applied gain plus the
+/// bounds it was derived from and the binding constraint.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoReferenceGain {
+    pub gain: f64,
+    pub desired: f64,
+    pub safe_positive: f64,
+    pub safe_negative: f64,
+    pub limited_by: &'static str,
+}
+
 /// Frozen input development recipe. Legacy is retained only for historical tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraRecipe {
@@ -1066,17 +1077,24 @@ impl ColorProfile {
     /// converter multiplies by `reference_gain * curve_input_scale`. Both
     /// constraints are upper bounds on the gain, so a positive result always
     /// exists for the camera Log curves whose encodable domain straddles zero.
-    /// An all-black scan keeps the desired gain.
-    pub fn auto_reference_gain(&self, max_target: f64, min_target: f64) -> f64 {
+    /// An all-black scan keeps the desired gain. The returned decision carries
+    /// the bounds and the binding constraint so callers log it without
+    /// re-deriving the arithmetic.
+    pub fn auto_reference_gain(&self, max_target: f64, min_target: f64) -> AutoReferenceGain {
         let (low, high) = self.transfer.domain();
         let scale = self.curve_input_scale();
-        let mut gain = self.transfer.desired_auto_reference_gain();
-        if max_target > 0.0 {
-            gain = gain.min(high / (max_target * scale));
-        }
-        if min_target < 0.0 && low < 0.0 {
-            gain = gain.min(low / (min_target * scale));
-        }
+        let desired = self.transfer.desired_auto_reference_gain();
+        let safe_positive = if max_target > 0.0 {
+            high / (max_target * scale)
+        } else {
+            f64::INFINITY
+        };
+        let safe_negative = if min_target < 0.0 && low < 0.0 {
+            low / (min_target * scale)
+        } else {
+            f64::INFINITY
+        };
+        let mut gain = desired.min(safe_positive).min(safe_negative);
         // Rounding guard: delivery multiplies each sample by `gain * scale`
         // once and compares against the domain. Nudge the gain down whole ulps
         // until both extreme products stay inside the encodable domain
@@ -1093,7 +1111,20 @@ impl ColorProfile {
             }
             gain = decremented;
         }
-        gain
+        let limited_by = if gain >= desired {
+            "desired"
+        } else if safe_positive <= safe_negative {
+            "positive-headroom"
+        } else {
+            "negative-toe"
+        };
+        AutoReferenceGain {
+            gain,
+            desired,
+            safe_positive,
+            safe_negative,
+            limited_by,
+        }
     }
     /// Test-support predicate consumed by the reference tests.
     pub fn is_rev_eng(&self) -> bool {
@@ -2002,11 +2033,11 @@ mod tests {
         assert_eq!(dlog2.transfer.desired_auto_reference_gain(), 4.0);
         assert_eq!(clog3.transfer.desired_auto_reference_gain(), 8.0);
         // Peaks far inside the domain: the desired gain is used unchanged.
-        assert_eq!(dlog2.auto_reference_gain(0.5, -0.001), 4.0);
-        assert_eq!(clog3.auto_reference_gain(0.5, -0.001), 8.0);
+        assert_eq!(dlog2.auto_reference_gain(0.5, -0.001).gain, 4.0);
+        assert_eq!(clog3.auto_reference_gain(0.5, -0.001).gain, 8.0);
         // An all-black scan has no binding constraint and keeps the desire.
-        assert_eq!(dlog2.auto_reference_gain(0.0, 0.0), 4.0);
-        assert_eq!(clog3.auto_reference_gain(0.0, 0.0), 8.0);
+        assert_eq!(dlog2.auto_reference_gain(0.0, 0.0).gain, 4.0);
+        assert_eq!(clog3.auto_reference_gain(0.0, 0.0).gain, 8.0);
     }
 
     #[test]
@@ -2015,7 +2046,8 @@ mod tests {
         let (low, high) = dlog2.transfer.domain();
         let scale = dlog2.curve_input_scale();
         for max in [1.0, 47.5, 199.9999, 200.0, 475.0] {
-            let gain = dlog2.auto_reference_gain(max, -1e-6);
+            let decision = dlog2.auto_reference_gain(max, -1e-6);
+            let gain = decision.gain;
             assert!(gain.is_finite() && gain > 0.0);
             assert!(gain <= dlog2.transfer.desired_auto_reference_gain());
             assert!(
@@ -2025,7 +2057,9 @@ mod tests {
             let _ = low;
         }
         // The nominal headroom bound: 475/200 is exactly representable.
-        let gain = dlog2.auto_reference_gain(200.0, -1e-6);
+        let decision = dlog2.auto_reference_gain(200.0, -1e-6);
+        let gain = decision.gain;
+        assert_eq!(decision.limited_by, "positive-headroom");
         assert!((gain - high / 200.0).abs() < 1e-12);
     }
 
@@ -2036,7 +2070,9 @@ mod tests {
         let scale = clog3.curve_input_scale();
         assert!(low < 0.0);
         // A large out-of-gamut negative binds before the positive peak.
-        let gain = clog3.auto_reference_gain(0.5, -0.5);
+        let decision = clog3.auto_reference_gain(0.5, -0.5);
+        let gain = decision.gain;
+        assert_eq!(decision.limited_by, "negative-toe");
         assert!((gain - low / (-0.5 * scale)).abs() < 1e-12);
         assert!(gain < clog3.transfer.desired_auto_reference_gain());
         assert!(-0.5 * (gain * scale) >= low);
@@ -2055,7 +2091,7 @@ mod tests {
                 (120.0, -3.0),
                 (470.0, -40.0),
             ] {
-                let gain = profile.auto_reference_gain(max, min);
+                let gain = profile.auto_reference_gain(max, min).gain;
                 assert!(gain.is_finite() && gain > 0.0, "{}", profile.id);
                 assert!(
                     max * (gain * scale) <= high,

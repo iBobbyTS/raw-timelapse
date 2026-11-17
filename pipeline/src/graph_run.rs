@@ -13,6 +13,7 @@ use rawtl_linear_video::deflicker::estimation::ExposurePlan;
 use rawtl_linear_video::deflicker::measurement::AnalysisSidecar;
 use rawtl_linear_video::deflicker::{estimate_exposure, ExposureConfig, FrameMeasurement};
 use rawtl_linear_video::graph::ordered_frames::FrameTask;
+use rawtl_linear_video::color_profile::AutoReferenceGain;
 use rawtl_linear_video::graph::{self, Backend, Event, Gain, Graph, Kind, Scope};
 use std::collections::BTreeMap;
 use std::fs;
@@ -552,31 +553,19 @@ impl Backend for Runner<'_, '_> {
             min_target = min_target.min(min);
             samples += count;
         }
-        let gain = profile.auto_reference_gain(max_target, min_target);
+        let decision = profile.auto_reference_gain(max_target, min_target);
+        let gain = decision.gain;
         if !gain.is_finite() || gain <= 0.0 {
             return Err("graph: auto reference gain produced a nonpositive gain".into());
         }
         self.reference_gain = gain;
-        let (low, high) = profile.transfer.domain();
-        let scale = profile.curve_input_scale();
-        let desired = profile.transfer.desired_auto_reference_gain();
-        let safe_positive = if max_target > 0.0 {
-            high / (max_target * scale)
-        } else {
-            f64::INFINITY
-        };
-        let safe_negative = if min_target < 0.0 && low < 0.0 {
-            low / (min_target * scale)
-        } else {
-            f64::INFINITY
-        };
-        let limited_by = if gain >= desired {
-            "desired"
-        } else if safe_positive <= safe_negative {
-            "positive-headroom"
-        } else {
-            "negative-toe"
-        };
+        let AutoReferenceGain {
+            desired,
+            safe_positive,
+            safe_negative,
+            limited_by,
+            ..
+        } = decision;
         let written = self.log.line(&format!(
             "kind=reference_gain requested=auto profile={} frames={} channel_samples={} \
              desired={:.9} desired_ev={:.2} safe_positive={:.9} safe_negative={:.9} \
