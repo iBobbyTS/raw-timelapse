@@ -810,6 +810,16 @@ fn signal_bytes(signal: &[u16]) -> std::borrow::Cow<'_, [u8]> {
     }
 }
 
+/// The narrow runtime inputs the encoder node needs, assembled once by the
+/// runner. Encode tasks clone this instead of depending on (and cloning) the
+/// whole CLI options surface.
+#[derive(Clone)]
+pub struct EncoderInputs {
+    pub profile: ColorProfile,
+    pub fps: crate::cli::Fps,
+    pub ffmpeg: std::path::PathBuf,
+}
+
 /// The product encoder node. It accepts owned 10-bit 4:4:4 planes from the
 /// colour node and never re-enters source decoding.
 pub struct GraphEncoder {
@@ -842,7 +852,7 @@ impl GraphEncoder {
 
     pub fn push(
         &mut self,
-        options: &crate::cli::Options,
+        inputs: &EncoderInputs,
         scratch: &Path,
         info: &crate::frame::FrameInfo,
         signal: &[u16],
@@ -866,19 +876,19 @@ impl GraphEncoder {
             }
             let output = scratch.join(&self.output_name);
             let args = self.config.encoder_args(
-                options.preview_profile,
+                &inputs.profile,
                 info.width,
                 info.height,
                 self.frames,
-                &options.fps.arg(),
+                &inputs.fps.arg(),
                 &output,
             );
             let transcript = scratch.join("transcripts/encode.log");
-            self.command = Some(proc::display_command(&options.ffmpeg, &args));
+            self.command = Some(proc::display_command(&inputs.ffmpeg, &args));
             self.output = Some(output);
             self.transcript = Some(transcript.clone());
             self.encoder = Some(StreamingEncoder::spawn(
-                &options.ffmpeg,
+                &inputs.ffmpeg,
                 &args,
                 &transcript,
                 self.active.clone(),

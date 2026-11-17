@@ -62,6 +62,7 @@ struct Runner<'a, 'b> {
     lens_area: Option<[f64;4]>,
     generated_paths: Vec<std::path::PathBuf>,
     encoder: Arc<Mutex<video::GraphEncoder>>,
+    encoder_inputs: video::EncoderInputs,
     active: proc::ActiveNative,
     encoder_config: ResolvedConfig,
     develop_reference: Option<FrameInfo>,
@@ -777,7 +778,7 @@ impl Backend for Runner<'_, '_> {
     }
     fn encode_task(&mut self, _: usize, image: Image) -> graph::Result<FrameTask<Image>> {
         let encoder = self.encoder.clone();
-        let options = self.context.options.clone();
+        let inputs = self.encoder_inputs.clone();
         let scratch = self.context.scratch.to_path_buf();
         let failure = self.worker_failure.clone();
         Ok(Box::new(move || {
@@ -787,7 +788,7 @@ impl Backend for Runner<'_, '_> {
             let mut encoder = encoder.lock().map_err(|_| "encoder writer panicked")?;
             let result = encoder
                 .begin()
-                .and_then(|_| encoder.push(&options, &scratch, &image.info, signal));
+                .and_then(|_| encoder.push(&inputs, &scratch, &image.info, signal));
             if let Err(e) = result {
                 let message = e.message.clone();
                 *failure.lock().unwrap() = Some(e);
@@ -1114,6 +1115,11 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
                 video::GraphEncoder::new(config.clone(), context.sources.len(), &output_name);
             encoder.active = active.clone();
             Arc::new(Mutex::new(encoder))
+        },
+        encoder_inputs: video::EncoderInputs {
+            profile: *context.options.preview_profile,
+            fps: context.options.fps,
+            ffmpeg: context.options.ffmpeg.clone(),
         },
         active,
         encoder_config: config.clone(),
