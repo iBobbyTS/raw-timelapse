@@ -1535,7 +1535,7 @@ fn preview_profiles_emit_their_declared_colour_contract() {
 
 #[test]
 fn production_ycbcr_quantization_matches_the_standard_derivation() {
-    use rawtl_linear_video::color_profile::{lookup, quantize_chroma, quantize_luma};
+    use rawtl_linear_video::color_profile::{lookup, quantize_chroma, quantize_luma, SignalDepth};
     let cases = [
         ("srgb-preview", 0.2126, 0.7152, 0.0722, 1.8556, 1.5748),
         (
@@ -1560,12 +1560,12 @@ fn production_ycbcr_quantization_matches_the_standard_derivation() {
         ] {
             let y = kr * signal[0] + kg * signal[1] + kb * signal[2];
             let expected = [
-                quantize_luma(y, profile.range),
-                quantize_chroma((signal[2] - y) / div_cb, profile.range),
-                quantize_chroma((signal[0] - y) / div_cr, profile.range),
+                quantize_luma(y, profile.range, SignalDepth::Ten),
+                quantize_chroma((signal[2] - y) / div_cb, profile.range, SignalDepth::Ten),
+                quantize_chroma((signal[0] - y) / div_cr, profile.range, SignalDepth::Ten),
             ];
             assert_eq!(
-                profile.encode_signal_yuv10(signal, profile.range).unwrap(),
+                profile.encode_signal_yuv(signal, profile.range, SignalDepth::Ten).unwrap(),
                 expected,
                 "{id} {signal:?}"
             );

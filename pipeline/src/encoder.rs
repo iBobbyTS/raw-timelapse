@@ -6,12 +6,13 @@
 //! the FFmpeg argument vector. Process spawning, preflight execution and output
 //! validation live in the binary.
 //!
-//! The encoder input is always planar 4:4:4 10-bit target signal
-//! (`yuv444p10le`), produced once by [`crate::color_profile::ColorProfile`].
-//! Lower-bit-depth or subsampled codecs are reached by FFmpeg's format adapters
-//! from that same handoff; no second develop/quantization path exists.
+//! The encoder input is always planar 4:4:4 target signal at the run's depth
+//! (10-bit `yuv444p10le` or 12-bit `yuv444p12le`), produced once by
+//! [`crate::color_profile::ColorProfile`]. Lower-bit-depth or subsampled codecs
+//! are reached by FFmpeg's format adapters from that same handoff; no second
+//! develop/quantization path exists.
 
-use crate::color_profile::{ColorProfile, PreviewRange};
+use crate::color_profile::{ColorProfile, PreviewRange, SignalDepth};
 use crate::json::Json;
 
 pub const DEFAULT_ENCODER: &str = "prores_ks";
@@ -19,8 +20,8 @@ pub const DEFAULT_ENCODER: &str = "prores_ks";
 /// typo can never silently select a different encoder or pixel format.
 pub const SUPPORTED_ENCODERS: [&str; 3] = ["prores_ks", "libx264", "ffv1"];
 pub const CONTAINERS: [&str; 3] = ["mov", "mp4", "matroska"];
-/// Input handoff pixel format; the single quantization boundary.
-pub const ENCODER_INPUT_PIX_FMT: &str = "yuv444p10le";
+/// Input handoff pixel format for the run's signal depth; the single
+/// quantization boundary. Use [`SignalDepth::pix_fmt`].
 /// Bounded output-option surface: `-i`, a second output, filters, geometry,
 /// frame rate, codec/pixel-format selection, colour interpretation and log
 /// files are pipeline-owned and therefore not accepted.
@@ -320,7 +321,11 @@ fn preset(encoder: &str) -> Option<Preset> {
 impl ResolvedConfig {
     /// Resolve `built-in < graph node < explicit CLI`. Each named field wins
     /// independently; unnamed fields inherit the next lower layer.
-    pub fn resolve(graph: Option<&Patch>, cli: &Patch) -> Result<Self, String> {
+    pub fn resolve(
+        graph: Option<&Patch>,
+        cli: &Patch,
+        depth: SignalDepth,
+    ) -> Result<Self, String> {
         let graph = graph.unwrap_or(&EMPTY_PATCH);
         // The lower layer's effective encoder includes the built-in default:
         // restating the encoder that is already in effect is not a codec change.
@@ -338,11 +343,22 @@ impl ResolvedConfig {
                 SUPPORTED_ENCODERS.join(", ")
             )
         })?;
+        // When no explicit pixel format was requested, the output format
+        // follows the handoff depth for the 4:4:4 presets (prores_ks, ffv1) so
+        // a 12-bit handoff is encoded, not scaled back down. libx264 keeps its
+        // 8-bit 4:2:0 preset; FFmpeg's adapter converts either depth.
+        let depth_default = if depth == SignalDepth::Twelve
+            && matches!(encoder.as_str(), "prores_ks" | "ffv1")
+        {
+            depth.pix_fmt().to_string()
+        } else {
+            preset.pix_fmt.to_string()
+        };
         let pix_fmt = cli
             .pix_fmt
             .clone()
             .or_else(|| graph.pix_fmt.clone())
-            .unwrap_or_else(|| preset.pix_fmt.to_string());
+            .unwrap_or(depth_default);
         let container = cli
             .container
             .or(graph.container)
@@ -389,6 +405,21 @@ impl ResolvedConfig {
             options,
         };
         config.validate()?;
+        // prores_ks encodes from 10-bit input only (its FFmpeg encoder lists
+        // yuv422p10le/yuv444p10le/yuva444p10le regardless of profile), so a
+        // 12-bit handoff has nowhere to go. Reject before any RAW work unless
+        // the caller explicitly picked a pixel format the encoder accepts.
+        if depth == SignalDepth::Twelve
+            && config.encoder == "prores_ks"
+            && cli.pix_fmt.is_none()
+            && graph.pix_fmt.is_none()
+        {
+            return Err(
+                "--signal-bits 12 cannot reach prores_ks (10-bit encoder input); use \
+                 --signal-bits 10, or --encoder ffv1 for true 12-bit delivery"
+                    .into(),
+            );
+        }
         Ok(config)
     }
 
@@ -581,7 +612,7 @@ impl ResolvedConfig {
 
     /// `setparams` half of the input filter chain, and the pixel-format adapter
     /// when the codec's pixel format is not the 4:4:4 handoff.
-    pub fn filter_chain(&self, profile: &ColorProfile) -> String {
+    pub fn filter_chain(&self, profile: &ColorProfile, depth: SignalDepth) -> String {
         let range = self.effective_range(profile);
         let matrix = profile.scale_filter_token();
         let tags = format!(
@@ -591,7 +622,7 @@ impl ResolvedConfig {
             profile.tag_policy.matrix_token(),
             range.as_str()
         );
-        if self.pix_fmt == ENCODER_INPUT_PIX_FMT {
+        if self.pix_fmt == depth.pix_fmt() {
             tags
         } else {
             format!(
@@ -613,6 +644,7 @@ impl ResolvedConfig {
         height: u32,
         frames: usize,
         fps: &str,
+        depth: SignalDepth,
         output: &std::path::Path,
     ) -> Vec<String> {
         let range = self.effective_range(profile);
@@ -623,7 +655,7 @@ impl ResolvedConfig {
             "-f".into(),
             "rawvideo".into(),
             "-pixel_format".into(),
-            ENCODER_INPUT_PIX_FMT.into(),
+            depth.pix_fmt().into(),
             "-video_size".into(),
             format!("{width}x{height}"),
             "-framerate".into(),
@@ -633,7 +665,7 @@ impl ResolvedConfig {
             "-frames:v".into(),
             frames.to_string(),
             "-vf".into(),
-            self.filter_chain(profile),
+            self.filter_chain(profile, depth),
             "-c:v".into(),
             self.encoder.clone(),
             "-pix_fmt".into(),
@@ -818,8 +850,65 @@ mod tests {
     use crate::color_profile::lookup;
     use std::path::Path;
 
+    #[test]
+    fn twelve_bit_handoff_threads_the_depth_through_the_ffmpeg_argv() {
+        let cli = Patch {
+            encoder: Some("ffv1".into()),
+            ..Default::default()
+        };
+        let config = ResolvedConfig::resolve(None, &cli, SignalDepth::Twelve).unwrap();
+        // The output format follows the handoff depth without an explicit
+        // --pix-fmt, so the argv feeds 12-bit words straight into the encoder.
+        assert_eq!(config.pix_fmt, "yuv444p12le");
+        let profile = lookup("dji-dlog2-dgamut2").unwrap();
+        let args = config.encoder_args(profile, 16, 12, 1, "30/1", SignalDepth::Twelve, Path::new("out.mkv"));
+        let input_format = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .find(|(key, _)| key.as_str() == "-pixel_format")
+            .map(|(_, value)| value.as_str())
+            .expect("rawvideo input format");
+        assert_eq!(input_format, "yuv444p12le");
+        let output_format = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .find(|(key, _)| key.as_str() == "-pix_fmt")
+            .map(|(_, value)| value.as_str())
+            .expect("encoder output format");
+        assert_eq!(output_format, "yuv444p12le");
+        // Matching depths mean no scale adapter: the filter chain only tags.
+        let vf = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .find(|(key, _)| key.as_str() == "-vf")
+            .map(|(_, value)| value.as_str())
+            .expect("filter chain");
+        assert!(!vf.contains("scale="), "unexpected adapter: {vf}");
+        assert!(vf.contains("setparams="), "missing colour tags: {vf}");
+    }
+
+    #[test]
+    fn signal_bits_twelve_is_rejected_for_prores_unless_a_format_is_explicit() {
+        let error = ResolvedConfig::resolve(None, &Patch::default(), SignalDepth::Twelve).unwrap_err();
+        assert!(
+            error.contains("--signal-bits 12 cannot reach prores_ks"),
+            "{error}"
+        );
+        // An explicit encoder-accepted format keeps the combination legal: the
+        // scale adapter then downconverts the 12-bit handoff at the encoder input.
+        let cli = Patch {
+            pix_fmt: Some("yuv444p10le".into()),
+            ..Default::default()
+        };
+        let config = ResolvedConfig::resolve(None, &cli, SignalDepth::Twelve).unwrap();
+        assert_eq!(config.pix_fmt, "yuv444p10le");
+        let profile = lookup("srgb-preview").unwrap();
+        let vf = config.filter_chain(profile, SignalDepth::Twelve);
+        assert!(vf.starts_with("scale="), "expected an adapter: {vf}");
+    }
+
     fn resolve(graph: &Patch, cli: &Patch) -> ResolvedConfig {
-        ResolvedConfig::resolve(Some(graph), cli).expect("resolve")
+        ResolvedConfig::resolve(Some(graph), cli, SignalDepth::Ten).expect("resolve")
     }
 
     #[test]
@@ -851,7 +940,7 @@ mod tests {
             rate: Some(RateControl::Crf(20)),
             options: Some(vec![("-preset".into(), "slow".into())]),
         };
-        let config = ResolvedConfig::resolve(Some(&graph), &Patch::default()).unwrap();
+        let config = ResolvedConfig::resolve(Some(&graph), &Patch::default(), SignalDepth::Ten).unwrap();
         assert_eq!(config.encoder, "libx264");
         assert_eq!(config.rate, Some(RateControl::Crf(20)));
         assert_eq!(config.output_name(), "output.mp4");
@@ -864,7 +953,7 @@ mod tests {
         };
         // CLI names encoder/container; the graph still supplies the pixel
         // format and options that the CLI did not name.
-        let merged = ResolvedConfig::resolve(Some(&graph), &cli).unwrap();
+        let merged = ResolvedConfig::resolve(Some(&graph), &cli, SignalDepth::Ten).unwrap();
         assert_eq!(merged.encoder, "ffv1");
         assert_eq!(merged.container, Container::Matroska);
         assert_eq!(merged.pix_fmt, "yuv420p");
@@ -883,7 +972,7 @@ mod tests {
             options: Some(vec![("-preset".into(), "medium".into())]),
             ..Default::default()
         };
-        let config = ResolvedConfig::resolve(Some(&graph), &cli).unwrap();
+        let config = ResolvedConfig::resolve(Some(&graph), &cli, SignalDepth::Ten).unwrap();
         assert_eq!(config.pix_fmt, "yuv420p");
         assert_eq!(config.container, Container::Mp4);
         assert_eq!(config.codec_profile.as_deref(), Some("high"));
@@ -944,7 +1033,7 @@ mod tests {
                 "lossless",
             ),
         ] {
-            let error = ResolvedConfig::resolve(Some(&graph), &cli).unwrap_err();
+            let error = ResolvedConfig::resolve(Some(&graph), &cli, SignalDepth::Ten).unwrap_err();
             assert!(error.contains(marker), "{error}");
         }
     }
@@ -1008,7 +1097,7 @@ mod tests {
             profile: Some("high444".into()),
             ..Default::default()
         };
-        let config = ResolvedConfig::resolve(None, &cli).unwrap();
+        let config = ResolvedConfig::resolve(None, &cli, SignalDepth::Ten).unwrap();
         assert_eq!(config.decoder_pix_fmts(PreviewRange::Tv), vec!["yuv444p10le"]);
 
         let cli = Patch {
@@ -1016,7 +1105,7 @@ mod tests {
             pix_fmt: Some("yuv420p".into()),
             ..Default::default()
         };
-        let config = ResolvedConfig::resolve(None, &cli).unwrap();
+        let config = ResolvedConfig::resolve(None, &cli, SignalDepth::Ten).unwrap();
         assert_eq!(config.decoder_pix_fmts(PreviewRange::Tv), vec!["yuv420p"]);
         assert_eq!(
             config.decoder_pix_fmts(PreviewRange::Pc),
@@ -1029,7 +1118,7 @@ mod tests {
             profile: Some("high422".into()),
             ..Default::default()
         };
-        let config = ResolvedConfig::resolve(None, &cli).unwrap();
+        let config = ResolvedConfig::resolve(None, &cli, SignalDepth::Ten).unwrap();
         assert_eq!(config.decoder_pix_fmts(PreviewRange::Pc), vec!["yuv422p10le"]);
     }
 
@@ -1043,7 +1132,7 @@ mod tests {
             encoder: Some("prores_ks".into()),
             ..Default::default()
         };
-        let config = ResolvedConfig::resolve(Some(&graph), &cli).unwrap();
+        let config = ResolvedConfig::resolve(Some(&graph), &cli, SignalDepth::Ten).unwrap();
         assert_eq!(config.encoder, "prores_ks");
         assert_eq!(config.codec_profile.as_deref(), Some("5"));
 
@@ -1059,7 +1148,7 @@ mod tests {
             },
             Patch::default(),
         ] {
-            let config = ResolvedConfig::resolve(Some(&graph), &cli).unwrap();
+            let config = ResolvedConfig::resolve(Some(&graph), &cli, SignalDepth::Ten).unwrap();
             assert_eq!(config.codec_profile.as_deref(), Some("hq"));
             assert_eq!(config.pix_fmt, "yuv422p10le");
         }
@@ -1069,7 +1158,7 @@ mod tests {
             encoder: Some("ffv1".into()),
             ..Default::default()
         };
-        let config = ResolvedConfig::resolve(Some(&graph), &cli).unwrap();
+        let config = ResolvedConfig::resolve(Some(&graph), &cli, SignalDepth::Ten).unwrap();
         assert_eq!(config.codec_profile, None);
         assert_eq!(config.encoder, "ffv1");
     }
@@ -1110,7 +1199,7 @@ mod tests {
     fn encoder_arguments_fix_input_geometry_colour_and_one_output() {
         let config = resolve(&Patch::default(), &Patch::default());
         let profile = lookup("canon-log3-cinema-gamut-rev-eng-crm-dev").unwrap();
-        let args = config.encoder_args(profile, 6984, 4660, 3, "30/1", Path::new("out.mov"));
+        let args = config.encoder_args(profile, 6984, 4660, 3, "30/1", SignalDepth::Ten, Path::new("out.mov"));
         assert_eq!(args.iter().filter(|arg| *arg == "-i").count(), 1);
         assert_eq!(args.iter().filter(|arg| *arg == "pipe:0").count(), 1);
         assert!(args.contains(&"rawvideo".into()));
@@ -1131,7 +1220,7 @@ mod tests {
         // One output: the last argument, preceded by the configured muxer.
         assert_eq!(args.last().map(String::as_str), Some("out.mov"));
         assert_eq!(args[args.len() - 2], "mov");
-        let filter = config.filter_chain(profile);
+        let filter = config.filter_chain(profile, SignalDepth::Ten);
         assert!(filter.starts_with("setparams="), "{filter}");
         assert!(filter.contains("colorspace=bt2020nc"));
         assert!(filter.contains("range=tv"));
@@ -1149,13 +1238,14 @@ mod tests {
                 encoder: Some("libx264".into()),
                 ..Default::default()
             },
+            SignalDepth::Ten,
         )
         .unwrap();
         let profile = lookup("sony-slog3-sgamut3").unwrap();
-        let filter = config.filter_chain(profile);
+        let filter = config.filter_chain(profile, SignalDepth::Ten);
         assert!(filter.starts_with("scale=in_range=pc:in_color_matrix=bt2020:out_range=pc:out_color_matrix=bt2020,"));
         assert!(filter.contains("range=pc"));
-        let args = config.encoder_args(profile, 16, 12, 1, "30/1", Path::new("out.mp4"));
+        let args = config.encoder_args(profile, 16, 12, 1, "30/1", SignalDepth::Ten, Path::new("out.mp4"));
         assert!(args.contains(&"yuv420p".into()));
         assert!(args.contains(&"-crf".into()));
         assert_eq!(config.effective_range(profile), PreviewRange::Pc);

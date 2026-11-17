@@ -44,11 +44,51 @@ pub enum PreviewRange {
     Pc,
 }
 
-/// The encoder input handoff is a single 10-bit 4:4:4 YCbCr quantization. Both
-/// ProRes and lower-bit-depth codecs start from this same buffer; FFmpeg only
-/// subsamples/reduces it, never re-develops the RAW.
-pub const SIGNAL_BITS: u32 = 10;
-pub const SIGNAL_MAX: u16 = 1023;
+/// The encoder input handoff is a single 4:4:4 YCbCr quantization at one of
+/// two depths. Both ProRes and lower-bit-depth codecs start from this same
+/// buffer; FFmpeg only subsamples/reduces it, never re-develops the RAW.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalDepth {
+    Ten,
+    Twelve,
+}
+
+impl SignalDepth {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Ten => "10",
+            Self::Twelve => "12",
+        }
+    }
+    pub fn bits(self) -> u32 {
+        match self {
+            Self::Ten => 10,
+            Self::Twelve => 12,
+        }
+    }
+    /// Largest representable code (the full-range peak).
+    pub fn max(self) -> u16 {
+        match self {
+            Self::Ten => 1023,
+            Self::Twelve => 4095,
+        }
+    }
+    /// The planar 4:4:4 little-endian rawvideo pixel format FFmpeg receives.
+    /// Every sample is one u16 word with the code in the low bits.
+    pub fn pix_fmt(self) -> &'static str {
+        match self {
+            Self::Ten => "yuv444p10le",
+            Self::Twelve => "yuv444p12le",
+        }
+    }
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "10" => Ok(Self::Ten),
+            "12" => Ok(Self::Twelve),
+            _ => Err(format!("invalid --signal-bits {value:?}: expected 10 or 12")),
+        }
+    }
+}
 
 impl PreviewRange {
     pub fn as_str(self) -> &'static str {
@@ -100,21 +140,27 @@ impl YcbcrCoding {
     }
 }
 
-/// 10-bit luma code for a normalized target signal. Limited range is
-/// `64 + 876*signal` (H.273 10-bit video range); full range is `1023*signal`.
-pub fn quantize_luma(signal: f64, range: PreviewRange) -> u16 {
+/// Luma code for a normalized target signal. Limited range follows H.273
+/// (10-bit `64 + 876*signal`, 12-bit `256 + 3504*signal`); full range is
+/// `max*signal`.
+pub fn quantize_luma(signal: f64, range: PreviewRange, depth: SignalDepth) -> u16 {
     let value = signal.clamp(0.0, 1.0);
-    let code = match range {
-        PreviewRange::Tv => 64.0 + 876.0 * value,
-        PreviewRange::Pc => 1023.0 * value,
+    let (low, excursion) = match (range, depth) {
+        (PreviewRange::Tv, SignalDepth::Ten) => (64.0, 876.0),
+        (PreviewRange::Tv, SignalDepth::Twelve) => (256.0, 3504.0),
+        (PreviewRange::Pc, SignalDepth::Ten) => (0.0, 1023.0),
+        (PreviewRange::Pc, SignalDepth::Twelve) => (0.0, 4095.0),
     };
-    code.round().clamp(0.0, f64::from(SIGNAL_MAX)) as u16
+    (low + excursion * value)
+        .round()
+        .clamp(0.0, f64::from(depth.max())) as u16
 }
 
-/// 10-bit chroma code for a non-constant-luminance Cb/Cr value in [-0.5, 0.5].
-/// Limited range is `512 + 896*value` (64..960); full range centres on the
-/// 10-bit midpoint.
-pub fn quantize_chroma(value: f64, range: PreviewRange) -> u16 {
+/// Chroma code for a non-constant-luminance Cb/Cr value in [-0.5, 0.5].
+/// Limited range follows H.273 (10-bit `512 + 896*value` i.e. 64..960;
+/// 12-bit `2048 + 3584*value` i.e. 256..3840); full range centres on the
+/// depth midpoint.
+pub fn quantize_chroma(value: f64, range: PreviewRange, depth: SignalDepth) -> u16 {
     // Snap numerical noise on the neutral axis so a mathematically neutral
     // pixel always codes as 512, not 511/512 depending on the sign of a
     // sub-code matrix residual. 1e-7 is four orders below one 10-bit code.
@@ -123,11 +169,15 @@ pub fn quantize_chroma(value: f64, range: PreviewRange) -> u16 {
     } else {
         value.clamp(-0.5, 0.5)
     };
-    let code = match range {
-        PreviewRange::Tv => 512.0 + 896.0 * value,
-        PreviewRange::Pc => 511.5 + 1023.0 * value,
+    let (mid, excursion) = match (range, depth) {
+        (PreviewRange::Tv, SignalDepth::Ten) => (512.0, 896.0),
+        (PreviewRange::Tv, SignalDepth::Twelve) => (2048.0, 3584.0),
+        (PreviewRange::Pc, SignalDepth::Ten) => (511.5, 1023.0),
+        (PreviewRange::Pc, SignalDepth::Twelve) => (2047.5, 4095.0),
     };
-    code.round().clamp(0.0, f64::from(SIGNAL_MAX)) as u16
+    (mid + excursion * value)
+        .round()
+        .clamp(0.0, f64::from(depth.max())) as u16
 }
 
 /// Accurate per-field H.273 code points; 2 means unspecified, not a fallback
@@ -1300,7 +1350,7 @@ impl ColorProfile {
     }
     /// Reference 8-bit quantization of signed FP32 AP1 input. Retained for the
     /// historical golden/reference tests; the product encoder node uses
-    /// [`Self::convert_f32_frame_to_yuv10`] exclusively, so there is one
+    /// [`Self::convert_f32_frame_to_yuv`] exclusively, so there is one
     /// runtime quantization boundary. Test-support surface, consumed by
     /// `tests/canon_log3.rs`; not reachable from the CLI.
     pub fn convert_f32_frame(
@@ -1368,7 +1418,7 @@ impl ColorProfile {
     /// this profile; the resolved `output` transform supplies the frozen CAT and
     /// gamut composition chosen for the run. The quantizer below is the only
     /// place 10-bit codes appear.
-    pub fn convert_f32_frame_to_yuv10(
+    pub fn convert_f32_frame_to_yuv(
         &self,
         output: &OutputTransform,
         bytes: &[u8],
@@ -1376,6 +1426,7 @@ impl ColorProfile {
         height: usize,
         reference_gain: f64,
         range: PreviewRange,
+        depth: SignalDepth,
         out: &mut Vec<u16>,
     ) -> Result<[usize; 2], String> {
         if output.profile != self.id {
@@ -1433,9 +1484,9 @@ impl ColorProfile {
             let luma = kr * signal[0] + kg * signal[1] + kb * signal[2];
             let cb = (signal[2] - luma) / div_cb;
             let cr = (signal[0] - luma) / div_cr;
-            out[index] = quantize_luma(luma, range);
-            out[pixels + index] = quantize_chroma(cb, range);
-            out[2 * pixels + index] = quantize_chroma(cr, range);
+            out[index] = quantize_luma(luma, range, depth);
+            out[pixels + index] = quantize_chroma(cb, range, depth);
+            out[2 * pixels + index] = quantize_chroma(cr, range, depth);
         }
         Ok(clipped)
     }
@@ -1443,18 +1494,19 @@ impl ColorProfile {
     /// Quantize one already-encoded target signal triple into the 10-bit
     /// handoff. Test-support surface: exposed so reference-code tests do not
     /// re-implement the production quantizer; not reachable from the CLI.
-    pub fn encode_signal_yuv10(
+    pub fn encode_signal_yuv(
         &self,
         signal: [f64; 3],
         range: PreviewRange,
+        depth: SignalDepth,
     ) -> Result<[u16; 3], String> {
         let coding = self.ycbcr_coding()?;
         let (kr, kg, kb, div_cb, div_cr) = coding.coefficients();
         let luma = kr * signal[0] + kg * signal[1] + kb * signal[2];
         Ok([
-            quantize_luma(luma, range),
-            quantize_chroma((signal[2] - luma) / div_cb, range),
-            quantize_chroma((signal[0] - luma) / div_cr, range),
+            quantize_luma(luma, range, depth),
+            quantize_chroma((signal[2] - luma) / div_cb, range, depth),
+            quantize_chroma((signal[0] - luma) / div_cr, range, depth),
         ])
     }
 
@@ -1477,7 +1529,7 @@ impl ColorProfile {
 
     /// Convert one scene-linear ACEScg AP1/D60 triple to 8-bit target signal.
     /// Test-support surface for the reference tests; the production pixel path
-    /// is [`Self::convert_f32_frame_to_yuv10`].
+    /// is [`Self::convert_f32_frame_to_yuv`].
     pub fn encode_linear(&self, ap1: [f64; 3]) -> [u8; 3] {
         let target = preview::mat3_vec(&self.composed_matrix(), ap1)
             .map(|v| v * self.curve_input_scale());
@@ -1498,7 +1550,7 @@ impl ColorProfile {
 
     /// Compatibility utility for explicit RGB16 ACEScg inputs, retained for
     /// the historical golden/reference tests only. The production RAW pipeline
-    /// uses convert_f32_frame_to_yuv10 for every profile; neither this nor
+    /// uses convert_f32_frame_to_yuv for every profile; neither this nor
     /// convert_f32_frame is reachable from the CLI.
     pub fn convert_frame(
         &self,
@@ -1728,7 +1780,7 @@ impl ColorProfile {
             (
                 "quantization",
                 Json::obj(vec![
-                    ("bits", Json::Int(f64::from(SIGNAL_BITS) as i64)),
+                    ("bits", Json::Int(i64::from(SignalDepth::Ten.bits()))),
                     (
                         "handoff",
                         Json::Str("planar yuv444p10le target signal; the single quantization boundary before FFmpeg".to_string()),
@@ -2409,18 +2461,18 @@ mod tests {
         // "quantize to RGB8, then wrap in a 10-bit codec" implementation.
         let low = 0.5;
         let high = low + 1.0 / 876.0;
-        assert_eq!(quantize_luma(low, PreviewRange::Tv) + 1, quantize_luma(high, PreviewRange::Tv));
+        assert_eq!(quantize_luma(low, PreviewRange::Tv, SignalDepth::Ten) + 1, quantize_luma(high, PreviewRange::Tv, SignalDepth::Ten));
         assert_eq!(quantize_signal(low), quantize_signal(high));
-        assert_eq!(quantize_luma(0.0, PreviewRange::Tv), 64);
-        assert_eq!(quantize_luma(1.0, PreviewRange::Tv), 940);
-        assert_eq!(quantize_luma(0.0, PreviewRange::Pc), 0);
-        assert_eq!(quantize_luma(1.0, PreviewRange::Pc), 1023);
-        assert_eq!(quantize_chroma(-0.5, PreviewRange::Tv), 64);
-        assert_eq!(quantize_chroma(0.0, PreviewRange::Tv), 512);
-        assert_eq!(quantize_chroma(0.5, PreviewRange::Tv), 960);
-        assert_eq!(quantize_chroma(0.0, PreviewRange::Pc), 512);
-        assert_eq!(quantize_chroma(-0.5, PreviewRange::Pc), 0);
-        assert_eq!(quantize_chroma(0.5, PreviewRange::Pc), 1023);
+        assert_eq!(quantize_luma(0.0, PreviewRange::Tv, SignalDepth::Ten), 64);
+        assert_eq!(quantize_luma(1.0, PreviewRange::Tv, SignalDepth::Ten), 940);
+        assert_eq!(quantize_luma(0.0, PreviewRange::Pc, SignalDepth::Ten), 0);
+        assert_eq!(quantize_luma(1.0, PreviewRange::Pc, SignalDepth::Ten), 1023);
+        assert_eq!(quantize_chroma(-0.5, PreviewRange::Tv, SignalDepth::Ten), 64);
+        assert_eq!(quantize_chroma(0.0, PreviewRange::Tv, SignalDepth::Ten), 512);
+        assert_eq!(quantize_chroma(0.5, PreviewRange::Tv, SignalDepth::Ten), 960);
+        assert_eq!(quantize_chroma(0.0, PreviewRange::Pc, SignalDepth::Ten), 512);
+        assert_eq!(quantize_chroma(-0.5, PreviewRange::Pc, SignalDepth::Ten), 0);
+        assert_eq!(quantize_chroma(0.5, PreviewRange::Pc, SignalDepth::Ten), 1023);
     }
 
     #[test]
@@ -2432,7 +2484,7 @@ mod tests {
                 .collect();
             let mut out = Vec::new();
             let clipped = profile
-                .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, 1.0, profile.range, &mut out)
+                .convert_f32_frame_to_yuv(&profile.default_output_transform(), &bytes, 1, 1, 1.0, profile.range, SignalDepth::Ten, &mut out)
                 .unwrap();
             assert_eq!(clipped, [0, 0], "{}", profile.id);
             assert_eq!(out.len(), 3);
@@ -2452,7 +2504,7 @@ mod tests {
             if profile.id == "dji-dlog2-dgamut2" {
                 continue;
             }
-            let expected = profile.encode_signal_yuv10([signal; 3], profile.range).unwrap();
+            let expected = profile.encode_signal_yuv([signal; 3], profile.range, SignalDepth::Ten).unwrap();
             assert_eq!(&out[..], &expected, "{}", profile.id);
         }
     }
@@ -2476,18 +2528,18 @@ mod tests {
                 .collect();
             let mut out = Vec::new();
             profile
-                .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, 1.0, profile.range, &mut out)
+                .convert_f32_frame_to_yuv(&profile.default_output_transform(), &bytes, 1, 1, 1.0, profile.range, SignalDepth::Ten, &mut out)
                 .unwrap();
-            assert_eq!(out[0], quantize_luma(luma, profile.range), "{}", profile.id);
+            assert_eq!(out[0], quantize_luma(luma, profile.range, SignalDepth::Ten), "{}", profile.id);
             assert_eq!(
                 out[1],
-                quantize_chroma((signal[2] - luma) / div_cb, profile.range),
+                quantize_chroma((signal[2] - luma) / div_cb, profile.range, SignalDepth::Ten),
                 "{}",
                 profile.id
             );
             assert_eq!(
                 out[2],
-                quantize_chroma((signal[0] - luma) / div_cr, profile.range),
+                quantize_chroma((signal[0] - luma) / div_cr, profile.range, SignalDepth::Ten),
                 "{}",
                 profile.id
             );
@@ -2505,12 +2557,12 @@ mod tests {
             .flat_map(f32::to_le_bytes)
             .collect();
         let counts = profile
-            .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &negative, 1, 1, 1.0, profile.range, &mut out)
+            .convert_f32_frame_to_yuv(&profile.default_output_transform(), &negative, 1, 1, 1.0, profile.range, SignalDepth::Ten, &mut out)
             .unwrap();
         assert!(counts[0] > 0 && counts[1] == 0);
         assert_eq!(
             out,
-            vec![quantize_luma(0.0, profile.range), 512, 512],
+            vec![quantize_luma(0.0, profile.range, SignalDepth::Ten), 512, 512],
             "{}",
             profile.id
         );
@@ -2519,30 +2571,30 @@ mod tests {
             .flat_map(f32::to_le_bytes)
             .collect();
         let counts = profile
-            .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &highlight, 1, 1, 1.0, profile.range, &mut out)
+            .convert_f32_frame_to_yuv(&profile.default_output_transform(), &highlight, 1, 1, 1.0, profile.range, SignalDepth::Ten, &mut out)
             .unwrap();
         assert!(counts[1] > 0 && counts[0] == 0);
         assert_eq!(
             out,
-            vec![quantize_luma(1.0, profile.range), 512, 512],
+            vec![quantize_luma(1.0, profile.range, SignalDepth::Ten), 512, 512],
             "{}",
             profile.id
         );
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let bytes: Vec<_> = [bad; 3].into_iter().flat_map(f32::to_le_bytes).collect();
             assert!(profile
-                .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, 1.0, profile.range, &mut out)
+                .convert_f32_frame_to_yuv(&profile.default_output_transform(), &bytes, 1, 1, 1.0, profile.range, SignalDepth::Ten, &mut out)
                 .is_err());
         }
         assert!(profile
-            .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &negative[..11], 1, 1, 1.0, profile.range, &mut out)
+            .convert_f32_frame_to_yuv(&profile.default_output_transform(), &negative[..11], 1, 1, 1.0, profile.range, SignalDepth::Ten, &mut out)
             .is_err());
         assert!(profile
-            .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &negative, 1, 1, 0.0, profile.range, &mut out)
+            .convert_f32_frame_to_yuv(&profile.default_output_transform(), &negative, 1, 1, 0.0, profile.range, SignalDepth::Ten, &mut out)
             .is_err());
         let srgb = lookup("srgb-preview").unwrap();
         assert!(srgb
-            .convert_f32_frame_to_yuv10(&srgb.default_output_transform(), &negative, 1, 1, 2.0, PreviewRange::Tv, &mut out)
+            .convert_f32_frame_to_yuv(&srgb.default_output_transform(), &negative, 1, 1, 2.0, PreviewRange::Tv, SignalDepth::Ten, &mut out)
             .is_ok());
     }
 
@@ -2625,7 +2677,7 @@ mod tests {
             ));
             assert_eq!(
                 quantization.get("bits").and_then(Json::as_u64),
-                Some(u64::from(SIGNAL_BITS))
+                Some(u64::from(SignalDepth::Ten.bits()))
             );
             assert_eq!(
                 quantization.get("handoff").and_then(Json::as_str),
@@ -2726,11 +2778,11 @@ mod delivered_range_tests {
         );
         let mut limited = Vec::new();
         profile
-            .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, 1.0, PreviewRange::Tv, &mut limited)
+            .convert_f32_frame_to_yuv(&profile.default_output_transform(), &bytes, 1, 1, 1.0, PreviewRange::Tv, SignalDepth::Ten, &mut limited)
             .unwrap();
         let mut full = Vec::new();
         profile
-            .convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, 1.0, PreviewRange::Pc, &mut full)
+            .convert_f32_frame_to_yuv(&profile.default_output_transform(), &bytes, 1, 1, 1.0, PreviewRange::Pc, SignalDepth::Ten, &mut full)
             .unwrap();
         // Y=64+876*Y', Cb/Cr=512+896*Cb/Cr for the delivered (limited) range.
         let y = 0.2627 * signal[0] + 0.6780 * signal[1] + 0.0593 * signal[2];
@@ -2764,6 +2816,29 @@ mod camera_recipe_tests {
         }
     }
     #[test]
+    fn twelve_bit_quantizers_use_h273_scaled_code_points() {
+        let d = SignalDepth::Twelve;
+        // Limited-range luma: 256 + 3504*v over H.273's 256..3760.
+        assert_eq!(quantize_luma(0.0, PreviewRange::Tv, d), 256);
+        assert_eq!(quantize_luma(1.0, PreviewRange::Tv, d), 3760);
+        // Full-range luma peaks at 4095.
+        assert_eq!(quantize_luma(1.0, PreviewRange::Pc, d), 4095);
+        assert_eq!(quantize_luma(0.0, PreviewRange::Pc, d), 0);
+        // Neutral chroma sits at the 12-bit limited-range centre 2048;
+        // extremes reach 256..3840 (2048 +/- 1792).
+        assert_eq!(quantize_chroma(0.0, PreviewRange::Tv, d), 2048);
+        assert_eq!(quantize_chroma(0.5, PreviewRange::Tv, d), 3840);
+        assert_eq!(quantize_chroma(-0.5, PreviewRange::Tv, d), 256);
+        // Full-range chroma centres on 2047.5; +/-0.5 reaches exactly 4095/0
+        // (the 10-bit path behaves identically: 511.5 +/- 511.5).
+        assert_eq!(quantize_chroma(0.0, PreviewRange::Pc, d), 2048);
+        assert_eq!(quantize_chroma(0.5, PreviewRange::Pc, d), 4095);
+        assert_eq!(quantize_chroma(-0.5, PreviewRange::Pc, d), 0);
+        // Clamping beyond the normalized signal domain stays inside the codes.
+        assert_eq!(quantize_luma(2.0, PreviewRange::Tv, d), 3760);
+        assert_eq!(quantize_chroma(0.9, PreviewRange::Pc, d), 4095);
+    }
+    #[test]
     fn curve_input_scale_table_is_explicit_for_every_registered_profile() {
         let expected = |id: &str| {
             if id.starts_with("canon-log") && id.ends_with("rev-eng-crm-dev") {
@@ -2790,7 +2865,7 @@ mod camera_recipe_tests {
             for (scene, gain) in [(0.2f32, 1.0), (0.1, 2.0), (0.4, 0.5)] {
                 let bytes: Vec<_> = [scene; 3].into_iter().flat_map(f32::to_le_bytes).collect();
                 let mut out = Vec::new();
-                p.convert_f32_frame_to_yuv10(&p.default_output_transform(), &bytes, 1, 1, gain, PreviewRange::Pc, &mut out).unwrap();
+                p.convert_f32_frame_to_yuv(&p.default_output_transform(), &bytes, 1, 1, gain, PreviewRange::Pc, SignalDepth::Ten, &mut out).unwrap();
                 assert_eq!(out, [code, 512, 512], "{id} scene={scene} gain={gain}");
             }
         }
@@ -2801,11 +2876,11 @@ mod camera_recipe_tests {
         for profile in PROFILES.iter() {
             for gain in [0.5, 1.0, 2.0] {
                 profile.convert_f32_frame(&bytes, 1, 1, gain, &mut Vec::new()).unwrap();
-                profile.convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, gain, PreviewRange::Pc, &mut Vec::new()).unwrap();
+                profile.convert_f32_frame_to_yuv(&profile.default_output_transform(), &bytes, 1, 1, gain, PreviewRange::Pc, SignalDepth::Ten, &mut Vec::new()).unwrap();
             }
             for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
                 assert!(profile.convert_f32_frame(&bytes, 1, 1, bad, &mut Vec::new()).is_err());
-                assert!(profile.convert_f32_frame_to_yuv10(&profile.default_output_transform(), &bytes, 1, 1, bad, PreviewRange::Pc, &mut Vec::new()).is_err());
+                assert!(profile.convert_f32_frame_to_yuv(&profile.default_output_transform(), &bytes, 1, 1, bad, PreviewRange::Pc, SignalDepth::Ten, &mut Vec::new()).is_err());
             }
         }
     }
@@ -3102,7 +3177,7 @@ mod output_cat_tests {
         let convert = |output: &OutputTransform| {
             let mut out = Vec::new();
             profile
-                .convert_f32_frame_to_yuv10(output, &bytes, 1, 1, 1.0, profile.range, &mut out)
+                .convert_f32_frame_to_yuv(output, &bytes, 1, 1, 1.0, profile.range, SignalDepth::Ten, &mut out)
                 .unwrap();
             out
         };
@@ -3129,7 +3204,7 @@ mod output_cat_tests {
         let other = lookup("sony-slog3-sgamut3").unwrap().default_output_transform();
         let mut out = Vec::new();
         assert!(profile
-            .convert_f32_frame_to_yuv10(&other, &bytes, 1, 1, 1.0, profile.range, &mut out)
+            .convert_f32_frame_to_yuv(&other, &bytes, 1, 1, 1.0, profile.range, SignalDepth::Ten, &mut out)
             .is_err());
     }
 
@@ -3654,7 +3729,7 @@ mod output_cat_tests {
             .flat_map(f32::to_le_bytes)
             .collect();
         let counts = profile
-            .convert_f32_frame_to_yuv10(&output, &low_bytes, 1, 1, 1.0, PreviewRange::Pc, &mut codes)
+            .convert_f32_frame_to_yuv(&output, &low_bytes, 1, 1, 1.0, PreviewRange::Pc, SignalDepth::Ten, &mut codes)
             .unwrap();
         assert_eq!(counts, [3, 0]);
         assert_eq!(codes[0], 0, "clipped-low luma is the signal-domain zero");
@@ -3665,7 +3740,7 @@ mod output_cat_tests {
             .flat_map(f32::to_le_bytes)
             .collect();
         let counts = profile
-            .convert_f32_frame_to_yuv10(&output, &high_bytes, 1, 1, 1.0, PreviewRange::Pc, &mut codes)
+            .convert_f32_frame_to_yuv(&output, &high_bytes, 1, 1, 1.0, PreviewRange::Pc, SignalDepth::Ten, &mut codes)
             .unwrap();
         assert_eq!(counts, [0, 3]);
         assert_eq!(codes[0], 1023);

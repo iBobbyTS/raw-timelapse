@@ -61,7 +61,7 @@ source -> convert-cache --prepared references--------------------+
 - `measure-solve`：可并发逐帧测量（0 EV），按序提交并在完整封口后仅求解一次有限 EV 表。
   `--strength 0` 时该节点替换为 `zero`，不执行测量。
 - `apply-ev`：按帧读取 EV，二次 develop，EV 恰好应用一次，返回自有 FP32 像素。Develop 内部的[独立镜头校正模块](lens-correction.md)只消费 Prepare 冻结的分项校准，不重新读取 RAW 元数据或查找 LCP，不与高光/颜色配方互相耦合。
-- `color`：唯一的 10-bit 4:4:4 量化/编码交接点。
+- `color`：唯一的 4:4:4 量化/编码交接点（`--signal-bits 10|12`，默认 10）。
 - `encode`：FFmpeg 流式 sink；第一帧时启动，序列结束时关闭并校验。
 - `delete-cache`：等待对应帧的 `apply-ev` 完成事件，只删除本 run 生成的缓存 DNG；
   原始 RAW/DNG 不是删除目标（`generated=false` 时为空操作）。
@@ -230,7 +230,7 @@ nor measure/develop parameters change with the output CAT. See the current CLI
 contract in `pipeline/README.md` for routing and migration details.
 
 
-- 内建默认：`prores_ks` profile 4 / MOV / `yuv444p10le` / limited range / 源几何。
+- 内建默认：`prores_ks` profile 4 / MOV / `yuv444p10le` / limited range / 源几何；`--signal-bits 12` 将交接量化拓宽为 12-bit（`yuv444p12le`，H.273 的 256..3760/256..3840 limited 码位；ffv1 直出真 12-bit 母版，prores_ks 编码输入仅 10-bit、组合在 RAW 处理前即被拒绝）。
 - 图节点可配置 encoder/container/pix_fmt/profile/rate/options；显式 CLI 覆盖图配置，
   内建默认最低。冲突或不支持组合在 RAW 处理前报错，不静默替换。
 - 通用输出选项不得引入 `-i`、第二个输出、覆盖几何/fps/滤镜或颜色解释；这些由管线

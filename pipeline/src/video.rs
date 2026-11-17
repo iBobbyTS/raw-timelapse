@@ -818,6 +818,7 @@ pub struct EncoderInputs {
     pub profile: ColorProfile,
     pub fps: crate::cli::Fps,
     pub ffmpeg: std::path::PathBuf,
+    pub depth: crate::color_profile::SignalDepth,
 }
 
 /// The product encoder node. It accepts owned 10-bit 4:4:4 planes from the
@@ -863,10 +864,11 @@ impl GraphEncoder {
             return Err(Error::new(
                 EXIT_PREVIEW,
                 format!(
-                    "encoder input has {} samples, expected {expected} for {}x{} 4:4:4 10-bit",
+                    "encoder input has {} samples, expected {expected} for {}x{} 4:4:4 {}-bit signal",
                     signal.len(),
                     info.width,
-                    info.height
+                    info.height,
+                    inputs.depth.token()
                 ),
             ));
         }
@@ -881,6 +883,7 @@ impl GraphEncoder {
                 info.height,
                 self.frames,
                 &inputs.fps.arg(),
+                inputs.depth,
                 &output,
             );
             let transcript = scratch.join("transcripts/encode.log");
@@ -901,8 +904,9 @@ impl GraphEncoder {
                 "encoder failed while a graph image was active",
             ));
         }
-        // `yuv444p10le` is 16-bit little-endian words with the code in the low
-        // ten bits; the buffer is produced by the colour node.
+        // The handoff pixel format (e.g. `yuv444p10le`) is 16-bit little-endian
+        // words with the code in the low bits; the buffer is produced by the
+        // colour node at the run's signal depth.
         // FFmpeg's -frames:v may finish successfully before explicit end().
         // Mark the final transfer before writing; a premature close during the
         // write is still an error (broken pipe), and output validation remains
@@ -1126,7 +1130,9 @@ mod output_verify_tests {
 
     fn scene(name: &str, frames: Option<u64>) -> (Harness, ResolvedConfig, &'static ColorProfile) {
         let harness = Harness::new(name);
-        let config = ResolvedConfig::resolve(None, &Patch::default()).unwrap();
+        let config =
+            ResolvedConfig::resolve(None, &Patch::default(), crate::color_profile::SignalDepth::Ten)
+                .unwrap();
         let profile = crate::color_profile::default_profile();
         let _ = frames;
         (harness, config, profile)

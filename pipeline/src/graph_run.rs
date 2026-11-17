@@ -33,7 +33,8 @@ pub struct Output {
 }
 
 /// One image travelling the stream chain. The colour node replaces scene-linear
-/// FP32 with the single 10-bit 4:4:4 encoder handoff; resize and explicit
+/// FP32 with the single 4:4:4 encoder handoff (10- or 12-bit signal depth);
+/// resize and explicit
 /// exposure only accept the linear form.
 enum Pixels {
     Linear(Arc<[u8]>),
@@ -610,6 +611,7 @@ impl Backend for Runner<'_, '_> {
         if !reference_gain.is_finite() || reference_gain <= 0.0 {
             return Err("graph: reference gain was not resolved before colour".into());
         }
+        let depth = self.encoder_inputs.depth;
         Ok(Box::new(move || {
             image.crop_record=None;
             match kind {
@@ -620,13 +622,14 @@ impl Backend for Runner<'_, '_> {
                     };
                     let mut signal = Vec::new();
                     image.clips = profile
-                        .convert_f32_frame_to_yuv10(
+                        .convert_f32_frame_to_yuv(
                             &output_transform,
                             pixels,
                             image.info.width as usize,
                             image.info.height as usize,
                             reference_gain,
                             range,
+                            depth,
                             &mut signal,
                         )
                         .map_err(|e| e.to_string())?;
@@ -772,7 +775,7 @@ impl Backend for Runner<'_, '_> {
         let failure = self.worker_failure.clone();
         Ok(Box::new(move || {
             let Pixels::Target(signal) = &image.pixels else {
-                return Err("graph: encoder requires the 10-bit target signal".into());
+                return Err("graph: encoder requires the target signal planes".into());
             };
             let mut encoder = encoder.lock().map_err(|_| "encoder writer panicked")?;
             let result = encoder
@@ -997,8 +1000,12 @@ pub fn resolve_configuration(options: &crate::cli::Options) -> Result<(Graph, Re
             .apply_resize(width, height)
             .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
     }
-    let config = ResolvedConfig::resolve(graph.encoder_patch(), &options.encoder)
-        .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
+    let config = ResolvedConfig::resolve(
+        graph.encoder_patch(),
+        &options.encoder,
+        options.signal_depth,
+    )
+    .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
     check_output_extension(options, &config)?;
     Ok((graph, config))
 }
@@ -1109,6 +1116,7 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
             profile: *context.options.preview_profile,
             fps: context.options.fps,
             ffmpeg: context.options.ffmpeg.clone(),
+            depth: context.options.signal_depth,
         },
         active,
         encoder_config: config.clone(),

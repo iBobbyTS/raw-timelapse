@@ -36,6 +36,7 @@ rawtl-linear-video --input <RAW_DIR> --output <VIDEO_FILE> \
   [--ffmpeg /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg] \
   [--ffprobe /opt/homebrew/opt/ffmpeg-full/bin/ffprobe] \
   [--preview-profile <ID>] [--output-cat profile|bradford|cat02] [--log-reference-gain N|auto] \
+  [--signal-bits 10|12] \
   [--converter "/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter"] \
   [--converter-timeout 120] \
   [--strength 1.0] [--period 60] [--brightness smooth|uniform] \
@@ -75,9 +76,14 @@ Defaults:
   unbounded EV, full-frame ROI; `--strength 0` disables the analysis node and
   renders the single pass at 0 EV
 - Default encoder: `prores_ks` profile 4, MOV, `yuv444p10le`, limited range, at
-  the source geometry. ProRes reports 12-bit decode depth; the input handoff is
-  10-bit and no lossless claim is made. `--resize` is the only scaling stage and
-  runs in the scene-linear FP32 domain.
+  the source geometry. The input handoff is the single 10-bit quantization
+  (`--signal-bits`, default `10`). `--signal-bits 12` widens the handoff to
+  12-bit codes (`yuv444p12le`, H.273 256..3760/256..3840 limited-range
+  scaling) for encoders that accept 12-bit input: FFV1 delivers a true 12-bit
+  lossless master; prores_ks encodes from 10-bit input only and rejects the
+  combination up front (use `--signal-bits 10` or `--encoder ffv1`). No
+  lossless claim is made for ProRes in either depth. `--resize` is the only
+  scaling stage and runs in the scene-linear FP32 domain.
 
 ## Lens correction
 
@@ -175,8 +181,8 @@ source -> convert-cache --prepared references--> measure-solve -> apply-ev
   frame inventory and publishes one EV table. `--strength 0` replaces it with a zero plan.
 - `develop` applies the plan EV exactly once and returns owned FP32 pixels; the
   source read is complete before the completion event is emitted.
-- `color` performs the single 10-bit 4:4:4 quantization handoff; `encode` is the
-  streaming FFmpeg sink.
+- `color` performs the single 4:4:4 quantization handoff (10- or 12-bit by
+  `--signal-bits`); `encode` is the streaming FFmpeg sink.
 - `delete` waits for the per-frame develop completion and removes only the
   run-generated cache DNG. Original RAW/DNG sources are never deletion targets.
 
@@ -321,7 +327,12 @@ node measures exposure brightness only and never smooths white balance.
 
 ## Encoding contract
 
-The encoder receives planar 10-bit 4:4:4 (`yuv444p10le`) from the colour node.
+The encoder receives the planar 4:4:4 target signal from the colour node at the
+run's `--signal-bits` depth (`yuv444p10le` default, `yuv444p12le` with
+`--signal-bits 12`; limited-range 12-bit codes follow H.273's 256..3760
+luma / 256..3840 chroma scaling). Without an explicit `--pix-fmt`, prores_ks
+and ffv1 follow the handoff depth; prores_ks + 12 is rejected before any RAW
+work because its encoder input is 10-bit only.
 The FFmpeg argv is fixed by the pipeline (input pipe, frame rate, geometry,
 frame count, colour/range and a single output); `--output-option` accepts only
 the explicitly supported keys (`-preset -tune -vendor -threads -g -bf -level`)
@@ -345,8 +356,8 @@ failure leaves only the scratch partial and a non-zero exit.
 never disguised as BT.2020 transfer/primaries. ProRes delivery is limited range
 because MOV `colr/nclc` cannot carry a range field and ProRes decoders assume
 video range; other encoders are validated against the configured pixel format
-and range. No tone or gamut mapping and no dither are applied; 10-bit handoff
-still quantizes once at the encoder input.
+and range. No tone or gamut mapping and no dither are applied; either handoff
+depth still quantizes exactly once at the encoder input.
 
 | id | transfer / gamut | YCbCr matrix |
 | --- | --- | --- |

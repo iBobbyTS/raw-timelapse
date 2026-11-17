@@ -54,6 +54,8 @@ OPTIONS:
                                one sequence-wide gain (D-Log 2 aims at +2 EV, other Logs +3 EV)
                                capped so the scanned sequence peak never clips the Log domain
                                (Log profiles only; costs one extra develop pass over the run)
+    --signal-bits <10|12>     Depth of the single YCbCr quantization handoff into the encoder
+                               (default: 10; 12 matches ProRes 4444's decode depth, finer codes)
     --encoder <NAME>           prores_ks | libx264 | ffv1 (default: prores_ks)
     --pix-fmt <FMT>            Encoder pixel format (default: yuv444p10le; libx264: yuv420p)
     --container <NAME>         mov | mp4 | matroska (default: mov; libx264: mp4; ffv1: matroska)
@@ -363,6 +365,8 @@ pub struct Options {
     /// conversion uses these coefficients.
     pub output_transform: color_profile::OutputTransform,
     pub log_reference_gain: ReferenceGain,
+    /// Depth of the single YCbCr quantization handoff into the encoder.
+    pub signal_depth: color_profile::SignalDepth,
     pub preview_profile: &'static color_profile::ColorProfile,
     pub converter: Option<String>,
     pub converter_timeout: Option<u64>,
@@ -397,6 +401,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut preview_profile = color_profile::default_profile();
     let mut output_cat: Option<color_profile::OutputCatSelection> = None;
     let mut log_reference_gain: Option<ReferenceGain> = None;
+    let mut signal_depth = color_profile::SignalDepth::Ten;
     let mut camera_color = None;
     let mut converter: Option<String> = None;
     let mut converter_timeout: Option<u64> = None;
@@ -521,6 +526,11 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
             "--log-reference-gain" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
                 log_reference_gain = Some(ReferenceGain::parse(&value)?);
+            }
+            "--signal-bits" => {
+                let value = take_value(args, &mut index, flag, inline_value)?;
+                signal_depth =
+                    color_profile::SignalDepth::parse(&value).map_err(|e| Error::new(EXIT_USAGE, e))?;
             }
             "--graph" => {
                 graph = Some(PathBuf::from(take_value(
@@ -798,6 +808,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         output_transform,
         camera_color: camera_color.unwrap_or(color_profile::CameraColor::Auto),
         log_reference_gain: log_reference_gain.unwrap_or(ReferenceGain::Fixed(1.0)),
+        signal_depth,
         converter,
         converter_timeout,
         lens,
@@ -1084,6 +1095,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn signal_bits_accepts_ten_and_twelve_and_rejects_others() {
+        let base = ["--input", "in", "--output", "out.mov"];
+        assert_eq!(
+            parse_run(&base).unwrap().signal_depth,
+            color_profile::SignalDepth::Ten
+        );
+        assert_eq!(
+            parse_run(&[base.as_slice(), &["--signal-bits", "12"]].concat())
+                .unwrap()
+                .signal_depth,
+            color_profile::SignalDepth::Twelve
+        );
+        assert_eq!(
+            parse_run(&[base.as_slice(), &["--signal-bits", "10"]].concat())
+                .unwrap()
+                .signal_depth,
+            color_profile::SignalDepth::Ten
+        );
+        for bad in ["9", "16", "twelve", ""] {
+            assert!(
+                parse_run(&[base.as_slice(), &["--signal-bits", bad]].concat()).is_err(),
+                "token {bad:?} must be rejected"
+            );
+        }
+    }
     #[test]
     fn log_reference_gain_accepts_auto_for_log_profiles() {
         let options = parse_run(&[

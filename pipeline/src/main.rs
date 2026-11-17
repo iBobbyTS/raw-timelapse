@@ -180,7 +180,8 @@ fn execute(
     }
     log.line(&format!(
         "kind=settings fps={} white_balance={} strength={} period={} brightness={} \
-         estimator={} ev_limits={} roi={} exclude_rois={} steps={} reference_gain={}",
+         estimator={} ev_limits={} roi={} exclude_rois={} steps={} reference_gain={} \
+         signal_bits={}",
         options.fps.arg(),
         options.white_balance.as_str(),
         deflicker.strength,
@@ -196,7 +197,8 @@ fn execute(
             .join(","),
         deflicker.exclude_rois.len(),
         deflicker.steps.len(),
-        options.log_reference_gain.token()
+        options.log_reference_gain.token(),
+        options.signal_depth.token()
     ))?;
 
     proc::require_executable(&options.native_tool, "--dng-linear-frame")?;
