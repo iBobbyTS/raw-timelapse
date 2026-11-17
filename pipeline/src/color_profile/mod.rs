@@ -136,48 +136,6 @@ pub struct ColorProfile {
     pub output_cat: OutputCatDefault,
 }
 
-/// Intrinsic camera-profile correction, independent of recipe and output encoding.
-pub const CAMERA_PROFILE_CORRECTION: &str = "hue-sat-map";
-
-/// Frozen input development recipe. Legacy is retained only for historical tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CameraRecipe {
-    LegacyInverseCm,
-    Generic,
-    CanonCr3,
-}
-impl CameraRecipe {
-    pub fn native_token(self) -> &'static str {
-        match self {
-            Self::LegacyInverseCm => "legacy-inverse-cm",
-            Self::Generic | Self::CanonCr3 => "dng-camera-to-pcs",
-        }
-    }
-    pub fn token(self) -> &'static str {
-        match self { Self::LegacyInverseCm => "legacy-test", Self::Generic => "generic", Self::CanonCr3 => "canon-cr3" }
-    }
-    pub fn calibration(self) -> &'static str {
-        if self == Self::CanonCr3 { "canon-normal-white-fixed-v1" } else { "none" }
-    }
-    pub fn requires_canon_cr3(self) -> bool { self == Self::CanonCr3 }
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CameraColor { Auto, Generic, CanonCr3 }
-impl CameraColor {
-    pub fn token(self) -> &'static str { match self { Self::Auto => "auto", Self::Generic => "generic", Self::CanonCr3 => "canon-cr3" } }
-    /// Called after the existing single-extension enumeration, before prepare.
-    pub fn resolve(self, profile: &ColorProfile, all_cr3: bool) -> Result<CameraRecipe, String> {
-        let canon_log = profile.is_canon_log();
-        match self {
-            Self::Generic => Ok(CameraRecipe::Generic),
-            Self::Auto if canon_log && all_cr3 => Ok(CameraRecipe::CanonCr3),
-            Self::Auto => Ok(CameraRecipe::Generic),
-            Self::CanonCr3 if canon_log && all_cr3 => Ok(CameraRecipe::CanonCr3),
-            Self::CanonCr3 => Err("--camera-color canon-cr3 requires Canon Log 2/3 profile and original Canon CR3 photos".into()),
-        }
-    }
-}
-
 impl ColorProfile {
     /// Curve input units, independent of the camera recipe and exposure calibration.
     /// Exhaustive on purpose: a future Canon curve needing the 0.9 reflection
@@ -247,13 +205,6 @@ impl ColorProfile {
             safe_negative,
             limited_by,
         }
-    }
-    /// Both Canon Log encodings share scene/reflection units and the CR3 calibration route.
-    pub fn is_canon_log(&self) -> bool {
-        matches!(
-            self.transfer,
-            Transfer::CanonLog2 | Transfer::CanonLog3RevEng
-        )
     }
     pub fn display_name(&self) -> &'static str {
         match self.id {
@@ -543,7 +494,7 @@ pub fn lookup(id: &str) -> Option<&'static ColorProfile> {
 }
 
 #[cfg(test)]
-mod camera_recipe_tests;
+mod delivery_contract_tests;
 #[cfg(test)]
 mod delivered_range_tests;
 #[cfg(test)]

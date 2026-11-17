@@ -2055,6 +2055,10 @@ fn real_cr3_small_sequence_delivers_one_video_and_one_log() {
     assert_eq!(log_kind(&log, "prepare").len(), 3);
     assert_eq!(log_kind(&log, "develop").len(), 3);
     assert_eq!(log_kind(&log, "delete").len(), 3);
+    let colour = log_kind(&log, "camera.colour");
+    assert_eq!(colour.len(), 1, "{log}");
+    assert!(colour[0].contains("recipe_effective=canon-cr3"), "{log}");
+    assert!(colour[0].contains("calibration=canon-normal-white-fixed-v1"), "{log}");
     let probe = ffprobe(&video_in(&directory));
     for expected in ["codec_name=prores", "profile=4444", "nb_read_frames=3"] {
         assert!(probe.contains(expected), "{probe}");
@@ -2075,7 +2079,11 @@ fn camera_color_cli_routes_before_prepare_and_keeps_single_extension_policy() {
         (REV3_PROFILE, "CR3", "auto", "canon-cr3"),
         (REV3_PROFILE, "DNG", "auto", "generic"),
         (REV_PROFILE, "CR3", "auto", "canon-cr3"),
-        ("srgb-preview", "CR3", "auto", "generic"),
+        ("srgb-preview", "CR3", "auto", "canon-cr3"),
+        ("srgb-preview", "CR3", "canon-cr3", "canon-cr3"),
+        ("srgb-preview", "CR3", "generic", "generic"),
+        ("dji-dlog-dgamut", "CR3", "auto", "canon-cr3"),
+        ("dji-dlog2-dgamut2", "cr3", "auto", "canon-cr3"),
         ("dji-dlog-dgamut", "DNG", "auto", "generic"),
         ("dji-dlog-dgamut", "DNG", "generic", "generic"),
         ("dji-dlog2-dgamut2", "DNG", "auto", "generic"),
@@ -2095,7 +2103,14 @@ fn camera_color_cli_routes_before_prepare_and_keeps_single_extension_policy() {
         let log=read_log(&directory);
         assert!(log.contains(&format!("camera_color_requested={selection} recipe_effective={recipe}")),"{log}");
         assert!(log.contains("hue_sat_map=applied"), "{log}");
-        if recipe=="generic" { assert!(log.contains("calibration_status=uncalibrated"),"{log}"); }
+        let camera = log_kind(&log, "camera.colour");
+        assert_eq!(camera.len(), 1, "{log}");
+        let calibration = if recipe == "canon-cr3" {
+            "calibration=canon-normal-white-fixed-v1 calibration_status=calibrated"
+        } else {
+            "calibration=none calibration_status=uncalibrated"
+        };
+        assert!(camera[0].contains(calibration), "{log}");
     }
     for selection in ["auto","generic","canon-cr3"] {
         let root=test_dir(&format!("mixed-recipe-{selection}"));
@@ -2109,7 +2124,7 @@ fn camera_color_cli_routes_before_prepare_and_keeps_single_extension_policy() {
         assert!(!video.exists());
     }
     for extra in [vec!["--camera-color",""], vec!["--camera-color","bogus"],vec!["--camera-color"],
-        vec!["--camera-color","auto","--camera-color","generic"],vec!["--camera-color","canon-cr3"]] {
+        vec!["--camera-color","auto","--camera-color","generic"]] {
         let mut args=vec!["--input","/tmp","--output","/tmp/unused.mov"];
         args.extend(extra);let result=run_cli(&args);
         assert_eq!(result.status.code(),Some(2),"{}",stderr(&result));
@@ -2117,8 +2132,12 @@ fn camera_color_cli_routes_before_prepare_and_keeps_single_extension_policy() {
     let (root,input,tool)=profile_material_for_extension("recipe-canon-dng-reject",[1800;3],"DNG");
     let directory=run_directory(&root,"run");let video=video_in(&directory);
     let mut args=base_args(&input,&video,&tool);
-    args.extend(["--preview-profile",REV3_PROFILE,"--camera-color","canon-cr3"]);
-    let result=run_cli(&args);assert_eq!(result.status.code(),Some(2),"{}",stderr(&result));assert!(!video.exists());
+    args.extend(["--camera-color","canon-cr3"]);
+    let result = run_cli(&args);
+    assert_eq!(result.status.code(), Some(2), "{}", stderr(&result));
+    assert!(stderr(&result).contains("requires original Canon CR3 photos"));
+    assert!(log_kind(&read_log(&directory), "prepare").is_empty());
+    assert!(!video.exists());
 }
 
 #[test]

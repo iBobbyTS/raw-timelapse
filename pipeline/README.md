@@ -374,14 +374,18 @@ Input development is selected with `--camera-color auto|generic|canon-cr3`
 
 | selection | resolved input recipe |
 | --- | --- |
-| auto, Canon Log 2/3 profile, all original inputs CR3 | Canon CR3; native verifies Canon metadata for every frame |
-| auto, any remaining profile or non-CR3 inputs | generic |
-| generic, any profile | generic |
-| canon-cr3 | requires Canon Log 2/3 and original Canon CR3; otherwise rejected |
+| auto, original CR3 sequence | Canon CR3; native verifies Canon identity and calibration metadata for every frame |
+| auto, other input formats | generic |
+| generic | generic for any supported input |
+| canon-cr3 | requires an original Canon CR3 sequence |
 
 A mixed-extension directory is rejected before recipe selection in every mode.
-The recipe is frozen before prepare and shared by measure and develop. A failed
-Canon request never retries as generic; Canon sequences still reject mixed models.
+The recipe is frozen before prepare and shared by measure and develop. The
+same input and settings produce the same calibrated scene-linear ACEScg frames
+for every output profile, including sRGB. Canon calibration errors fail the run,
+as do mixed camera models in a calibrated sequence. Use `--camera-color generic`
+to keep the uncalibrated SDK scale, including for CR3 workflows that used it
+under non-Canon outputs before this change.
 
 All development uses the selected camera profile's valid embedded HueSatMap when
 present, in linear ProPhoto/D50 before scene exposure. HSM is independent of output
@@ -396,13 +400,13 @@ no Canon exposure calibration and reports `uncalibrated`, including when the use
 sets a reference gain. Invalid or singular profile transforms fail explicitly.
 Input D50→D60 adaptation remains Bradford; it is independent of output color.
 
-The Canon CR3 recipe applies original CR3 NormalWhite/fixed 1.8 exposure calibration
-for both Canon Log 2 and Log 3. There is one CLog2 profile: `canon-log2-cinema-gamut`,
+The Canon CR3 input recipe applies original CR3 NormalWhite/fixed 1.8 exposure
+calibration for every output. There is one CLog2 profile: `canon-log2-cinema-gamut`,
 using the published Canon curve (also numerically verified against the recovered SDK
 formula). The former `canon-log2-cinema-gamut-rev-eng-crm-dev` ID is removed.
 Both Canon encodings multiply native scene-linear values by 0.9 exactly once before
-their reflection-domain curve; changing Log encoding does not change CR3 development.
-The explicit calibration selector is now `--camera-color canon-cr3`.
+their reflection-domain curve. `--camera-color canon-cr3` explicitly selects the
+input recipe with any output profile.
 Other output curves, gamuts, tags and default output matrices retain their definitions.
 Original D-Log now defaults to CAT02 (ACES white/D60 to D65), replacing output
 Bradford rather than stacking adaptations. `--output-cat bradford` remains available;

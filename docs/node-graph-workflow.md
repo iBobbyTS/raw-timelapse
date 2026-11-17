@@ -203,13 +203,15 @@ stderr 只保留错误与 scratch 保留提示。
 
 ## 6. 编码与颜色
 
-Input development now freezes one `--camera-color auto|generic|canon-clog3` recipe
-after the existing single-extension enumeration, before prepare. Both measure
-(EV=0) and develop (solved native EV once) use that recipe and WB policy. Auto
-selects Canon calibration only for CLog3 with original CR3 inputs; every other
-combination uses generic SDK CameraToPCS without profile HueSatMap/look/tone or
-BaselineExposure. Explicit generic does not bypass mixed-extension rejection.
-The color node applies the profile's curve input units (0.9 for the rev-eng Canon
+Input development freezes one `--camera-color auto|generic|canon-cr3` recipe
+after single-extension enumeration, before prepare. Both measure (EV=0) and
+develop (solved native EV once) use that recipe and WB policy. Auto selects the
+Canon NormalWhite/fixed 1.8 calibration for original CR3, and generic SDK
+CameraToPCS without calibration for other inputs. Both apply a valid profile
+HueSatMap when present, and skip LookTable, ToneCurve and BaselineExposure.
+Every mode enforces the single-extension rule. The recipe and native exposure
+calibration are independent of the output profile.
+The color node applies the profile's curve input units (0.9 for Canon Log 2/3
 curves) and the positive finite user reference gain once; neither scale enters
 measurement. `--log-reference-gain auto` resolves the gain once per sequence: the
 backend's plan hook (Solve or Zero) rescans every frame through the identical

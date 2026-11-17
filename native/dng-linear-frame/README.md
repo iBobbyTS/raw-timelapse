@@ -186,10 +186,10 @@ native/build/dng-linear-frame --stdout-frame-f32 input.CR3 \
 ```
 
 These are complete policy tuples; do not mix their recipe/calibration
-values. The Rust CLI resolves the recipe before prepare and restricts Canon
-selection to Canon Log 2/3 output profiles and original CR3 inputs. Native validates
-the tuple and the original Canon identity/calibration evidence; a failure does
-not retry as generic. Use the same policy arguments with `--stdout-analysis`.
+values. The Rust CLI resolves the recipe from the original inputs before prepare,
+independently of output encoding. Native validates the tuple and the original
+Canon identity and calibration evidence; a failure stops the run. Use the same
+policy arguments with `--stdout-analysis`.
 The native standalone default remains the historical `legacy-test` recipe with
 `legacy-inverse-cm` and calibration `none`; it also applies present HSM. Changing
 `--camera-color-method` does not enable exposure calibration.

@@ -1,5 +1,6 @@
 //! Command-line parsing for `rawtl-linear-video`.
 
+use crate::camera::CameraColor;
 use crate::color_profile;
 use crate::deflicker::ExposureStep;
 use crate::encoder::{self, Container, Patch, RateControl};
@@ -48,6 +49,8 @@ OPTIONS:
                                adaptation; an explicit different method changes the
                                output pixels and is reported as custom-adaptation
     --camera-color <MODE>      auto|generic|canon-cr3 (default: auto)
+                               auto selects Canon exposure calibration for original CR3,
+                               generic keeps the uncalibrated SDK scene-linear scale
     --log-reference-gain <N|auto>
                                Positive finite output gain, or auto (D-Log default: auto;
                                other profiles: 1). Auto aims at 4x for D-Log / D-Log 2,
@@ -360,7 +363,7 @@ pub struct Options {
     pub native_tool: PathBuf,
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
-    pub camera_color: color_profile::CameraColor,
+    pub camera_color: CameraColor,
     /// Frozen output CAT selection/realization resolved at startup; per-pixel
     /// conversion uses these coefficients.
     pub output_transform: color_profile::OutputTransform,
@@ -517,9 +520,9 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 if camera_color.is_some() { return Err(Error::new(EXIT_USAGE, "duplicate --camera-color")); }
                 let value = take_value(args, &mut index, flag, inline_value)?;
                 camera_color = Some(match value.as_str() {
-                    "auto" => color_profile::CameraColor::Auto,
-                    "generic" => color_profile::CameraColor::Generic,
-                    "canon-cr3" => color_profile::CameraColor::CanonCr3,
+                    "auto" => CameraColor::Auto,
+                    "generic" => CameraColor::Generic,
+                    "canon-cr3" => CameraColor::CanonCr3,
                     _ => return Err(Error::new(EXIT_USAGE, "invalid --camera-color: expected auto|generic|canon-cr3")),
                 });
             }
@@ -770,10 +773,6 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let (video, log) =
         output.ok_or_else(|| Error::new(EXIT_USAGE, "--output <VIDEO_FILE> is required"))?;
 
-    if camera_color == Some(color_profile::CameraColor::CanonCr3)
-        && !preview_profile.is_canon_log() {
-        return Err(Error::new(EXIT_USAGE, "--camera-color canon-cr3 requires a Canon Log 2/3 profile"));
-    }
     if log_reference_gain == Some(ReferenceGain::Auto)
         && preview_profile.transfer == color_profile::Transfer::Srgb {
         return Err(Error::new(
@@ -806,7 +805,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         ffprobe,
         preview_profile,
         output_transform,
-        camera_color: camera_color.unwrap_or(color_profile::CameraColor::Auto),
+        camera_color: camera_color.unwrap_or(CameraColor::Auto),
         log_reference_gain: log_reference_gain.unwrap_or_else(|| {
             if preview_profile.transfer == color_profile::Transfer::DjiDLog {
                 ReferenceGain::Auto

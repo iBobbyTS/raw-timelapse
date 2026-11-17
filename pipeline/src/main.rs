@@ -22,6 +22,7 @@ mod video;
 // The binary and the library compile the same source files. Re-exporting the
 // library modules keeps a single nominal `Json`/`deflicker`/colour-profile type
 // across the engine and the process orchestration.
+pub use rawtl_linear_video::camera;
 pub use rawtl_linear_video::color_profile;
 pub use rawtl_linear_video::deflicker;
 pub use rawtl_linear_video::encoder;
@@ -62,7 +63,7 @@ fn main() {
 
 pub struct RunContext<'a> {
     pub options: &'a Options,
-    pub camera_recipe: color_profile::CameraRecipe,
+    pub camera_recipe: camera::CameraRecipe,
     /// Run-specific scratch root: converted cache and child transcripts.
     pub scratch: &'a Path,
     pub sources: &'a [SourceFrame],
@@ -217,8 +218,12 @@ fn execute(
         println!("  {:>3}. {}", index + 1, source.name);
     }
 
-    let camera_recipe = options.camera_color.resolve(options.preview_profile,
-        sources.iter().all(|s| s.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("cr3"))))
+    let all_cr3 = sources
+        .iter()
+        .all(|source| source.path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cr3")));
+    let camera_recipe = options
+        .camera_color
+        .resolve(all_cr3)
         .map_err(|e| error::Error::new(error::EXIT_USAGE, e))?;
     let context = RunContext {
         camera_recipe,

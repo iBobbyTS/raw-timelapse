@@ -239,10 +239,10 @@ if mode.startswith('late:'):
             assert_eq!(frame.as_shot_neutral, single.as_shot_neutral);
             assert_eq!(frame.capture_time, single.capture_time);
             for method in [
-                crate::color_profile::CameraRecipe::LegacyInverseCm,
-                crate::color_profile::CameraRecipe::CanonCr3,
+                crate::camera::CameraRecipe::LegacyInverseCm,
+                crate::camera::CameraRecipe::CanonCr3,
             ] {
-                if method == crate::color_profile::CameraRecipe::CanonCr3
+                if method == crate::camera::CameraRecipe::CanonCr3
                     && frame.route != PreparedRoute::VendorRaw
                 {
                     continue;
@@ -346,7 +346,7 @@ if mode.startswith('late:'):
                 None,
                 &PreparedSettings {
                     lens: Default::default(),
-                    camera_recipe: crate::color_profile::CameraRecipe::LegacyInverseCm,
+                    camera_recipe: crate::camera::CameraRecipe::LegacyInverseCm,
                 },
                 &dir.join("after-delete.log"),
             )
@@ -364,7 +364,7 @@ if mode.startswith('late:'):
         let tool = PathBuf::from(std::env::var_os("RAWTL_NATIVE_TOOL").expect("RAWTL_NATIVE_TOOL"));
         let settings = PreparedSettings {
             lens: Default::default(),
-            camera_recipe: crate::color_profile::CameraRecipe::LegacyInverseCm,
+            camera_recipe: crate::camera::CameraRecipe::LegacyInverseCm,
         };
         for name in ["context-nul.ctx", "record-nul.ctx"] {
             let error = PreparedFrame::load(&root.join(name)).expect_err("forged NUL must be rejected");

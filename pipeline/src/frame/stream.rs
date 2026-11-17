@@ -180,7 +180,7 @@ impl Drop for NativeStream {
 }
 
 pub(crate) struct NativeRun {
-    pub(crate) method: crate::color_profile::CameraRecipe,
+    pub(crate) method: crate::camera::CameraRecipe,
     pub(crate) lens: crate::lens::Settings,
     pub(crate) log: PathBuf,
     pub(crate) analysis_roi: Option<[f64; 4]>,

@@ -37,7 +37,7 @@ fn valid_fixed_calibration(color: &Json) -> bool {
 
 pub(crate) fn validate_sidecar_contracts(
     sidecar: &Json,
-    method: &crate::color_profile::CameraRecipe,
+    method: &crate::camera::CameraRecipe,
     pixels: bool,
     lens_mode: crate::lens::Mode,
     lens_policy: crate::lens::Policy,
@@ -47,7 +47,7 @@ pub(crate) fn validate_sidecar_contracts(
     } else if lens_mode == crate::lens::Mode::Auto {
         return Err(failure("missing lens correction contract"));
     }
-    if pixels && *method != crate::color_profile::CameraRecipe::LegacyInverseCm {
+    if pixels && *method != crate::camera::CameraRecipe::LegacyInverseCm {
         let recovery = sidecar.get("highlight_recovery")
             .ok_or_else(|| failure("missing highlight recovery contract"))?;
         if recovery.get("revision").and_then(Json::as_u64) != Some(1)
@@ -108,7 +108,7 @@ pub(crate) fn validate_sidecar_contracts(
         };
         let calibration = color.get("exposure_calibration");
         if !eq("recipe_requested", method.token()) || !eq("recipe_effective", method.token())
-            || !eq("profile_correction_requested", crate::color_profile::CAMERA_PROFILE_CORRECTION) || !eq("profile_correction_effective", crate::color_profile::CAMERA_PROFILE_CORRECTION)
+            || !eq("profile_correction_requested", crate::camera::CAMERA_PROFILE_CORRECTION) || !eq("profile_correction_effective", crate::camera::CAMERA_PROFILE_CORRECTION)
             || !eq("camera_calibration_requested", method.calibration()) || !eq("camera_calibration_effective", method.calibration())
             || color.get("algorithm_revision").and_then(Json::as_u64) != Some(4)
             || !valid_matrix("xyz_d50_to_acescg") || !valid_matrix("sdk_normalized_pcs_to_camera")
@@ -130,7 +130,7 @@ pub(crate) fn validate_sidecar_contracts(
         if sidecar.get("color_contract_version").and_then(Json::as_u64) != Some(2)
             || color.get("method_requested").and_then(Json::as_str)
                 != Some(method.native_token())
-            || !(if *method != crate::color_profile::CameraRecipe::LegacyInverseCm {
+            || !(if *method != crate::camera::CameraRecipe::LegacyInverseCm {
                 matches!(
                     effective,
                     Some("dng-camera-to-pcs-forward-matrix" | "dng-camera-to-pcs-inverse-fallback")

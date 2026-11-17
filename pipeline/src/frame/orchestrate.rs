@@ -131,7 +131,7 @@ fn produce_inner(
                                 .as_ref()
                                 .and_then(|c| c.get("camera_model"))
                     {
-                        return Err(failure("rev-eng Canon Log rejects mixed camera models"));
+                        return Err(failure("Canon CR3 development rejects mixed camera models"));
                     }
                     if info.width != first.width || info.height != first.height {
                         return Err(failure(format!(
@@ -210,7 +210,7 @@ pub struct PrepareSettings<'a> {
 /// Prepared-frame consumer settings. No Converter options exist here on
 /// purpose: a prepared context already records its conversion provenance.
 pub struct PreparedSettings {
-    pub camera_recipe: crate::color_profile::CameraRecipe,
+    pub camera_recipe: crate::camera::CameraRecipe,
     pub lens: crate::lens::Settings,
 }
 
@@ -635,7 +635,7 @@ fn frame_args(
             .and_then(|e| e.to_str())
             .is_none_or(|e| !e.eq_ignore_ascii_case("cr3"))
     {
-        return Err(failure("rev-eng Canon Log requires Canon CR3 photos"));
+        return Err(failure("Canon CR3 development requires original Canon CR3 photos"));
     }
     match input {
         #[cfg(test)]
@@ -665,7 +665,7 @@ fn frame_args(
         "--camera-recipe".into(), run.method.token().into(),
         "--camera-calibration".into(), run.method.calibration().into(),
         "--highlight-recovery".into(),
-        if pixels && run.method != crate::color_profile::CameraRecipe::LegacyInverseCm { "on" } else { "off" }.into(),
+        if pixels && run.method != crate::camera::CameraRecipe::LegacyInverseCm { "on" } else { "off" }.into(),
     ]);
     lens_policy.args(lens_mode, &mut args);
     if let Some(wb) = override_wb {

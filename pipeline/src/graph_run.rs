@@ -685,7 +685,7 @@ impl Backend for Runner<'_, '_> {
                             .and_then(|c| c.get("camera_model"))
                 })
             {
-                return Err("rev-eng Canon Log rejects mixed camera models".into());
+                return Err("Canon CR3 development rejects mixed camera models".into());
             }
 
             if id == 0 {
@@ -1055,7 +1055,7 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         profile.tag_policy.transfer_token(),
         context.options.log_reference_gain.token(),
         range.as_str(),
-        context.options.camera_color.token(), context.camera_recipe.token(), crate::color_profile::CAMERA_PROFILE_CORRECTION, context.camera_recipe.calibration(),
+        context.options.camera_color.token(), context.camera_recipe.token(), crate::camera::CAMERA_PROFILE_CORRECTION, context.camera_recipe.calibration(),
         if context.camera_recipe.calibration() != "none" { "pending-native-validation" } else { "uncalibrated" },
         context.options.output_transform.log_fields()
     ))?;

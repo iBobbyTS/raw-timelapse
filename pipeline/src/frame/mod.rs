@@ -77,7 +77,7 @@ pub struct FrameSequence {
 /// consumes `PreparedFrame` through `prepare`/`analyze_prepared`/`develop` only.
 #[cfg(test)]
 pub struct ProduceConfig<'a> {
-    pub camera_recipe: crate::color_profile::CameraRecipe,
+    pub camera_recipe: crate::camera::CameraRecipe,
     pub logs_dir: &'a Path,
     pub exposure_ev: Option<f64>,
     pub analysis_roi: Option<[f64; 4]>,

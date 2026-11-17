@@ -1024,7 +1024,6 @@ use crate::json::Json;
         let profile = lookup(DLOG2_PROFILE).unwrap();
         assert_eq!(profile.transfer.name(), "DJI D-Log 2");
         assert_eq!(profile.curve_input_scale(), 1.0);
-        assert!(!profile.is_canon_log());
         // The new profile has an independent identity from the original D-Log
         // profile: different transfer, gamut, reference chain and codes.
         assert_ne!(Transfer::DjiDLog2, Transfer::DjiDLog);

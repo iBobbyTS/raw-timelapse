@@ -94,7 +94,7 @@ use std::path::{Path, PathBuf};
     fn prepared_settings() -> PreparedSettings {
         PreparedSettings {
             lens: Default::default(),
-            camera_recipe: crate::color_profile::CameraRecipe::Generic,
+            camera_recipe: crate::camera::CameraRecipe::Generic,
         }
     }
 
@@ -200,7 +200,7 @@ use std::path::{Path, PathBuf};
         let tool = PathBuf::from(std::env::var_os("RAWTL_NATIVE_TOOL").expect("matched native"));
         let source = SourceFrame { name: source_path.file_name().unwrap().to_string_lossy().into(), path: source_path, key: Vec::new() };
         let prepared = prepare_one(&dir, &tool, &source, "generic");
-        let settings = PreparedSettings { lens: Default::default(), camera_recipe: crate::color_profile::CameraRecipe::Generic };
+        let settings = PreparedSettings { lens: Default::default(), camera_recipe: crate::camera::CameraRecipe::Generic };
         let wb = Some([0.6050808314, 1.0, 0.4825046041]);
         let analysis = analyze_prepared(&tool, &prepared, wb, Some(0.0), None, &settings, &dir.join("analysis.log")).unwrap();
         let mut reference: Vec<f32> = Vec::new();
@@ -247,7 +247,7 @@ use std::path::{Path, PathBuf};
         let logs = dir.join("canon-logs");
         let settings = PreparedSettings {
             lens: Default::default(),
-            camera_recipe: crate::color_profile::CameraRecipe::CanonCr3,
+            camera_recipe: crate::camera::CameraRecipe::CanonCr3,
         };
         let info = analyze_prepared(&tool, &prepared, None, Some(0.0), None, &settings, &logs.join("frame_000001.log"))
             .expect("canon analyze");
@@ -273,7 +273,7 @@ use std::path::{Path, PathBuf};
         let error = analyze_prepared(&tool, &dng_prepared, None, None, None, &settings, &logs.join("frame_000001.log"))
             .expect_err("Canon method requires CR3");
         assert!(
-            error.message.contains("requires Canon CR3"),
+            error.message.contains("requires original Canon CR3"),
             "{}",
             error.message
         );
@@ -285,7 +285,7 @@ use std::path::{Path, PathBuf};
         let source = source_frame(&dir, "IMG_1.DNG");
         let base = fake_tool(&dir, &[FRAME_1], "");
         let prepared = prepare_one(&dir, &base, &source, "base");
-        let settings = PreparedSettings { lens: Default::default(), camera_recipe: crate::color_profile::CameraRecipe::Generic };
+        let settings = PreparedSettings { lens: Default::default(), camera_recipe: crate::camera::CameraRecipe::Generic };
         let analysis = analyze_prepared(&base, &prepared, None, Some(0.), None, &settings, &dir.join("analysis.log")).unwrap();
         assert_eq!(analysis.highlight_recovery.as_ref().and_then(|r| r.get("requested")).and_then(Json::as_bool), Some(false));
         for defect in ["highlight-missing", "highlight-disabled", "highlight-version", "highlight-status"] {
@@ -507,7 +507,7 @@ use std::path::{Path, PathBuf};
         let legacy_logs = work.join("legacy-logs");
         let settings = PreparedSettings {
             lens: Default::default(),
-            camera_recipe: crate::color_profile::CameraRecipe::CanonCr3,
+            camera_recipe: crate::camera::CameraRecipe::CanonCr3,
         };
         let sources: Vec<SourceFrame> = materials
             .iter()
@@ -554,7 +554,7 @@ use std::path::{Path, PathBuf};
             .expect("prepare analysis");
         let first_wb = first.applied_wb;
         let legacy_config = ProduceConfig {
-            camera_recipe: crate::color_profile::CameraRecipe::CanonCr3,
+            camera_recipe: crate::camera::CameraRecipe::CanonCr3,
             logs_dir: &legacy_logs,
             exposure_ev: None,
             analysis_roi: None,

@@ -1,6 +1,6 @@
 # Canon CR3 固定曝光标定
 
-> 2026-11-17 当前合同：C-Log 2 已收敛为唯一 `canon-log2-cinema-gamut`，采用官方曲线并经恢复的 SDK 公式交叉验证；旧 `canon-log2-cinema-gamut-rev-eng-crm-dev` ID 已移除。原始 Canon CR3 在 C-Log 2/3 下均自动使用 `canon-cr3` NormalWhite × 固定 1.8 标定；两种曲线均在输出边界乘 0.9 一次。HSM 是所有输出共用的固有显影步骤。下文旧路由说明仅作历史证据，当前使用说明见 [pipeline README](../pipeline/README.md)，新实测见 [Canon / Resolve 对照](canon-resolve-comparison.md)。
+> 2026-11-17 当前合同：C-Log 2 已收敛为唯一 `canon-log2-cinema-gamut`，采用官方曲线并经恢复的 SDK 公式交叉验证；旧 `canon-log2-cinema-gamut-rev-eng-crm-dev` ID 已移除。原始 Canon CR3 由 `--camera-color auto` 选择 `canon-cr3` NormalWhite × 固定 1.8 输入标定，适用于所有输出；两种曲线均在输出边界乘 0.9 一次。HSM 是所有输出共用的固有显影步骤。下文旧路由说明仅作历史证据，当前使用说明见 [pipeline README](../pipeline/README.md)，新实测见 [Canon / Resolve 对照](canon-resolve-comparison.md)。
 
 
 > Current migration (generic-color-dlog2 / S01): `--camera-color auto` selects the
