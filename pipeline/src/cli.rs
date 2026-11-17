@@ -68,7 +68,8 @@ OPTIONS:
     --lens-vignette <MODE>     auto | off (default: auto), likewise --lens-distortion / --lens-ca
     --lens-vignette-strength N Exposure-domain strength 0..1 (default: 1)
     --lens-resampling <MODE>   bilinear | quality (default: quality; quality costs more per frame)
-    --lens-crop <MODE>         preserve | safe | sequence-safe (default: preserve; safe is fixed over video)
+    --lens-crop <MODE>         preserve | safe (default: preserve; safe is fixed over video;
+                               sequence-safe is an accepted legacy alias of safe)
     --exiftool <PATH>          Read-only Prepare metadata tool (default: /opt/homebrew/bin/exiftool)
     --lens-profile-dir <DIR>   Installed LCP root, repeatable; replaces default Adobe roots
     --converter <PATH>         Adobe DNG Converter override passed to the native tool
@@ -547,7 +548,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
             }
             "--lens-crop" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
-                lens.crop = match value.as_str() {"preserve"=>crate::lens::Crop::Preserve,"safe"=>crate::lens::Crop::Safe,"sequence-safe"=>crate::lens::Crop::SequenceSafe,_=>return Err(Error::new(EXIT_USAGE,"lens crop expects preserve, safe or sequence-safe"))};
+                lens.crop = match value.as_str() {"preserve"=>crate::lens::Crop::Preserve,"safe"|"sequence-safe"=>crate::lens::Crop::Safe,_=>return Err(Error::new(EXIT_USAGE,"lens crop expects preserve or safe (sequence-safe is a legacy alias of safe)"))};
             }
             "--lens-correction" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
@@ -1239,6 +1240,10 @@ mod tests {
         assert_eq!(options.lens.policy.vignette_strength,0.5);
         assert_eq!(options.lens.policy.sampling,crate::lens::Sampling::Quality);
         assert!(options.lens.crop.is_safe());
+        for spelling in ["safe", "sequence-safe"] {
+            let alias = parse_run(&["--input", "in", "--output", "out.mov", "--lens-crop", spelling]).unwrap();
+            assert_eq!(alias.lens.crop, crate::lens::Crop::Safe, "spelling {spelling:?}");
+        }
         for (flag,value) in [("--lens-vignette-strength","NaN"),("--lens-vignette-strength","-0.1"),("--lens-vignette-strength","1.1"),("--lens-ca","on"),("--lens-resampling","unknown"),("--lens-crop","per-frame")] {
             assert!(parse_run(&["--input","in","--output","out.mov",flag,value]).is_err());
         }

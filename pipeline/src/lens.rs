@@ -31,12 +31,14 @@ impl Sampling {
         }
     }
 }
+/// `safe` and the legacy `sequence-safe` spelling are one behaviour: the
+/// whole sequence shares one fixed safe rectangle (their historical
+/// per-frame/sequence distinction collapsed when the crop became fixed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Crop {
     #[default]
     Preserve,
     Safe,
-    SequenceSafe,
 }
 impl Crop {
     pub fn is_safe(self) -> bool {
