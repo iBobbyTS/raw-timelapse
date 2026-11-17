@@ -1,10 +1,7 @@
 //! Streaming encoder node, generic output validation and publication.
 //!
-//! The graph hands this module owned 10-bit 4:4:4 target-signal planes from the
-//! colour node. One FFmpeg process receives them as `yuv444p10le`; codec
-//! configuration, format adaptation and the single quantization boundary are
-//! owned by [`crate::encoder`] and [`crate::color_profile`]. There is no
-//! second, 8-bit develop path.
+//! The graph hands this module the target colour signal. The streaming node
+//! packs it into the selected rawvideo layout and writes it to FFmpeg.
 
 use crate::cli::Fps;
 use crate::color_profile::ColorProfile;
@@ -372,7 +369,7 @@ pub fn validate_output(
         return Err(Error::new(EXIT_PREVIEW, message));
     }
     let probe = probe_stream(ffprobe, file, verify == OutputVerify::Full)?;
-    if probe.codec_name != config.codec_name() {
+    if config.codec_name() != "unknown" && probe.codec_name != config.codec_name() {
         return Err(Error::new(
             EXIT_PREVIEW,
             format!(
@@ -384,7 +381,7 @@ pub fn validate_output(
         ));
     }
     let accepted = config.decoder_pix_fmts(range);
-    if !accepted.contains(&probe.pix_fmt.as_str()) {
+    if !accepted.is_empty() && !accepted.contains(&probe.pix_fmt.as_str()) {
         return Err(Error::new(
             EXIT_PREVIEW,
             format!(
@@ -393,15 +390,7 @@ pub fn validate_output(
             ),
         ));
     }
-    if config.encoder == "prores_ks" {
-        // ffprobe reports ProRes profiles by name; the configured value may be
-        // the numeric profile or the name.
-        let expected = config.probe_profile().ok_or_else(|| {
-            Error::new(
-                EXIT_PREVIEW,
-                format!("invalid ProRes profile {:?}", config.codec_profile),
-            )
-        })?;
+    if let Some(expected) = config.probe_profile() {
         if !probe.profile.eq_ignore_ascii_case(expected) {
             return Err(Error::new(
                 EXIT_PREVIEW,
@@ -451,23 +440,25 @@ pub fn validate_output(
     }
 
     // Validate every accurate field; unknown Log transfer/primaries stay unknown.
+    let rgb = config.export_output_rgb();
     for (field, expected, observed) in [
         (
             "color_space",
-            profile.tag_policy.matrix_token(),
+            rgb.map(|rgb| if rgb { "gbr" } else { profile.tag_policy.matrix_token() }),
             &probe.color_space,
         ),
         (
             "color_primaries",
-            profile.tag_policy.primaries_token(),
+            Some(profile.tag_policy.primaries_token()),
             &probe.color_primaries,
         ),
         (
             "color_transfer",
-            profile.tag_policy.transfer_token(),
+            Some(profile.tag_policy.transfer_token()),
             &probe.color_transfer,
         ),
     ] {
+        let Some(expected) = expected else { continue };
         let matches = observed == expected
             || (expected == "unknown"
                 && matches!(
@@ -484,7 +475,7 @@ pub fn validate_output(
     let range_matches = probe.color_range == expected_range
         || (!config.writes_range_tag()
             && matches!(probe.color_range.as_str(), "" | "unknown" | "unspecified"));
-    if !range_matches {
+    if rgb.is_some() && !range_matches {
         return Err(Error::new(
             EXIT_PREVIEW,
             format!(
@@ -520,6 +511,15 @@ pub fn validate_output(
         }
     }
     Ok(probe)
+}
+
+pub fn available_hardware_profiles(ffmpeg: &Path) -> Result<Vec<rawtl_linear_video::export::ExportProfile>> {
+    rawtl_linear_video::export::hardware_profiles(|args| {
+        proc::run_capture(ffmpeg, args, EXIT_USAGE_FOR_PREFLIGHT)
+            .map(|result| (result.status.success(), format!("{}\n{}", result.stdout, result.stderr)))
+            .map_err(|error| error.message)
+    })
+    .map_err(|message| Error::new(EXIT_USAGE_FOR_PREFLIGHT, message))
 }
 
 /// Ask FFmpeg which pixel formats an encoder declares. This is the encoder's
@@ -585,7 +585,12 @@ pub fn preflight(
             return Err(Error::new(EXIT_USAGE_FOR_PREFLIGHT, message));
         }
     }
-    if let Some(formats) = supported_encoder_pixel_formats(ffmpeg, &config.encoder)? {
+    let declared_formats = if config.export().is_none() {
+        supported_encoder_pixel_formats(ffmpeg, &config.encoder)?
+    } else {
+        None
+    };
+    if let Some(formats) = declared_formats {
         if !formats.iter().any(|format| format == &config.pix_fmt) {
             return Err(Error::new(
                 EXIT_USAGE_FOR_PREFLIGHT,
@@ -598,7 +603,9 @@ pub fn preflight(
             ));
         }
     }
-    let geometry = explicit_geometry.unwrap_or((32, 32));
+    let geometry = explicit_geometry.unwrap_or_else(|| {
+        if config.export().is_some() { (640, 480) } else { (32, 32) }
+    });
     let output = scratch.join(format!("preflight.{}", config.container.extension()));
     let _ = fs::remove_file(&output);
     let args = config.preflight_args(profile, geometry, &fps.arg(), &output);
@@ -699,7 +706,7 @@ impl StreamingEncoder {
         self.input.take();
         let status = self.process.finish(abort);
         self.process
-            .note(&format!("pixel bytes (yuv444p10le): {}", self.bytes));
+            .note(&format!("pixel bytes sent to FFmpeg: {}", self.bytes));
         status
     }
 }
@@ -821,8 +828,12 @@ pub struct EncoderInputs {
     pub depth: crate::color_profile::SignalDepth,
 }
 
-/// The product encoder node. It accepts owned 10-bit 4:4:4 planes from the
-/// colour node and never re-enters source decoding.
+pub enum EncodeFrame<'a> {
+    Legacy(&'a [u16]),
+    TargetRgb(&'a [[f32; 3]]),
+}
+
+/// The streaming encode node packs target colour and writes it to FFmpeg.
 pub struct GraphEncoder {
     config: ResolvedConfig,
     frames: usize,
@@ -856,26 +867,34 @@ impl GraphEncoder {
         inputs: &EncoderInputs,
         scratch: &Path,
         info: &crate::frame::FrameInfo,
-        signal: &[u16],
+        frame: EncodeFrame<'_>,
     ) -> Result<()> {
         proc::check_stop()?;
-        let expected = info.width as usize * info.height as usize * 3;
-        if signal.len() != expected {
-            return Err(Error::new(
-                EXIT_PREVIEW,
-                format!(
-                    "encoder input has {} samples, expected {expected} for {}x{} 4:4:4 {}-bit signal",
-                    signal.len(),
-                    info.width,
-                    info.height,
-                    inputs.depth.token()
-                ),
-            ));
-        }
         if self.encoder.is_none() {
             if let Err(message) = self.config.validate_geometry(info.width, info.height) {
                 return Err(Error::new(EXIT_USAGE_FOR_PREFLIGHT, message));
             }
+        }
+        use std::borrow::Cow;
+        let bytes = match (self.config.export(), frame) {
+            (Some(export), EncodeFrame::TargetRgb(rgb)) => Cow::Owned(export.input.pack(
+                rgb, info.width, info.height, self.config.effective_range(&inputs.profile),
+                inputs.profile.ycbcr_coding().map_err(|err| Error::new(EXIT_PREVIEW, err))?,
+            ).map_err(|err| Error::new(EXIT_PREVIEW, err))?),
+            (None, EncodeFrame::Legacy(signal)) => {
+                let expected = (info.width as usize).checked_mul(info.height as usize)
+                    .and_then(|pixels| pixels.checked_mul(3));
+                if expected != Some(signal.len()) {
+                    return Err(Error::new(EXIT_PREVIEW, format!(
+                        "encoder input has {} samples, incompatible with {}x{} 4:4:4 {}-bit signal",
+                        signal.len(), info.width, info.height, inputs.depth.token()
+                    )));
+                }
+                signal_bytes(signal)
+            }
+            _ => return Err(Error::new(EXIT_PREVIEW, "encoder received the wrong target colour representation")),
+        };
+        if self.encoder.is_none() {
             let output = scratch.join(&self.output_name);
             let args = self.config.encoder_args(
                 &inputs.profile,
@@ -904,9 +923,6 @@ impl GraphEncoder {
                 "encoder failed while a graph image was active",
             ));
         }
-        // The handoff pixel format (e.g. `yuv444p10le`) is 16-bit little-endian
-        // words with the code in the low bits; the buffer is produced by the
-        // colour node at the run's signal depth.
         // FFmpeg's -frames:v may finish successfully before explicit end().
         // Mark the final transfer before writing; a premature close during the
         // write is still an error (broken pipe), and output validation remains
@@ -916,7 +932,6 @@ impl GraphEncoder {
                 .final_input
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        let bytes = signal_bytes(signal);
         encoder
             .input
             .as_mut()

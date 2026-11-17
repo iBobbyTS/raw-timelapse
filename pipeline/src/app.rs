@@ -90,7 +90,7 @@ fn run(options: &Options) -> Result<()> {
     guard::ensure_outside_input(&input, &[&video, &log_path])?;
     // Configuration failures must not create a directory, log, scratch or
     // output.
-    graph_run::resolve_configuration(options)?;
+    let graph_config = graph_run::resolve_configuration(options)?;
     guard::prepare_parent(&video)?;
     video = guard::canonical_artifact(&video)?;
     log_path = guard::canonical_artifact(&log_path)?;
@@ -108,7 +108,7 @@ fn run(options: &Options) -> Result<()> {
             return Err(err);
         }
     };
-    let outcome = execute(options, &input, &video, &scratch, started, &mut log);
+    let outcome = execute(options, &input, &video, &scratch, started, &mut log, graph_config);
     if let Err(err) = outcome {
         let retained = scratch_has_content(&scratch);
         if retained {
@@ -143,6 +143,7 @@ fn execute(
     scratch: &Path,
     started: Instant,
     log: &mut RunLog,
+    graph_config: (rawtl_linear_video::graph::Graph, encoder::ResolvedConfig),
 ) -> Result<()> {
     log.line(&format!(
         "kind=run.start input={} video={} log={} scratch={}",
@@ -235,7 +236,7 @@ fn execute(
         sources: &sources,
         started,
     };
-    let result = graph_run::run(&context, log)?;
+    let result = graph_run::run(&context, log, graph_config)?;
     print_sequence_summary(&result.sequence, options.white_balance);
 
     let stage = &result.stage;

@@ -49,7 +49,8 @@ pub fn internal_runner() -> &'static str {
         let executable = Path::new(env!("CARGO_BIN_EXE_rawtl-linear-video"));
         let build_dir = executable.parent().unwrap();
         let runner = build_dir.join("examples/internal_runner");
-        if !runner.is_file() {
+        let modified_at = |path: &Path| fs::metadata(path).and_then(|m| m.modified()).ok();
+        if modified_at(&runner) < modified_at(executable) || !runner.is_file() {
             let mut command = Command::new(env!("CARGO"));
             command
                 .args(["build", "--example", "internal_runner"])

@@ -41,6 +41,7 @@ mod output_cat;
 mod test_contracts;
 mod transfer;
 
+pub(crate) use coding::YcbcrQuantizer;
 pub use coding::{
     quantize_chroma, quantize_luma, quantize_signal, AutoReferenceGain, FrameOutput,
     PreviewRange, ReferenceCode, SignalDepth, TagPolicy, YcbcrCoding,

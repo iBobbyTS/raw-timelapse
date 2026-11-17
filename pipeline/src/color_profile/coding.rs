@@ -9,9 +9,8 @@ pub enum PreviewRange {
     Pc,
 }
 
-/// The encoder input handoff is a single 4:4:4 YCbCr quantization at one of
-/// two depths. Both ProRes and lower-bit-depth codecs start from this same
-/// buffer; FFmpeg only subsamples/reduces it, never re-develops the RAW.
+/// Depth of the legacy 4:4:4 YCbCr handoff. Export profiles specify their own
+/// pipe format independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalDepth {
     Ten,
@@ -109,16 +108,7 @@ impl YcbcrCoding {
 /// (10-bit `64 + 876*signal`, 12-bit `256 + 3504*signal`); full range is
 /// `max*signal`.
 pub fn quantize_luma(signal: f64, range: PreviewRange, depth: SignalDepth) -> u16 {
-    let value = signal.clamp(0.0, 1.0);
-    let (low, excursion) = match (range, depth) {
-        (PreviewRange::Tv, SignalDepth::Ten) => (64.0, 876.0),
-        (PreviewRange::Tv, SignalDepth::Twelve) => (256.0, 3504.0),
-        (PreviewRange::Pc, SignalDepth::Ten) => (0.0, 1023.0),
-        (PreviewRange::Pc, SignalDepth::Twelve) => (0.0, 4095.0),
-    };
-    (low + excursion * value)
-        .round()
-        .clamp(0.0, f64::from(depth.max())) as u16
+    YcbcrQuantizer::new(range, depth.bits()).luma(signal)
 }
 
 /// Chroma code for a non-constant-luminance Cb/Cr value in [-0.5, 0.5].
@@ -126,23 +116,40 @@ pub fn quantize_luma(signal: f64, range: PreviewRange, depth: SignalDepth) -> u1
 /// 12-bit `2048 + 3584*value` i.e. 256..3840); full range centres on the
 /// depth midpoint.
 pub fn quantize_chroma(value: f64, range: PreviewRange, depth: SignalDepth) -> u16 {
-    // Snap numerical noise on the neutral axis so a mathematically neutral
-    // pixel always codes as 512, not 511/512 depending on the sign of a
-    // sub-code matrix residual. 1e-7 is four orders below one 10-bit code.
-    let value = if value.abs() < 1e-7 {
-        0.0
-    } else {
-        value.clamp(-0.5, 0.5)
-    };
-    let (mid, excursion) = match (range, depth) {
-        (PreviewRange::Tv, SignalDepth::Ten) => (512.0, 896.0),
-        (PreviewRange::Tv, SignalDepth::Twelve) => (2048.0, 3584.0),
-        (PreviewRange::Pc, SignalDepth::Ten) => (511.5, 1023.0),
-        (PreviewRange::Pc, SignalDepth::Twelve) => (2047.5, 4095.0),
-    };
-    (mid + excursion * value)
-        .round()
-        .clamp(0.0, f64::from(depth.max())) as u16
+    YcbcrQuantizer::new(range, depth.bits()).chroma(value)
+}
+
+pub(crate) struct YcbcrQuantizer {
+    black: f64,
+    luma_extent: f64,
+    neutral: f64,
+    chroma_extent: f64,
+    max: f64,
+}
+
+impl YcbcrQuantizer {
+    pub(crate) fn new(range: PreviewRange, bits: u32) -> Self {
+        let max = f64::from((1u32 << bits) - 1);
+        let scale = f64::from(1u32 << (bits - 8));
+        let (black, luma_extent, neutral, chroma_extent) = match range {
+            PreviewRange::Tv => (16.0 * scale, 219.0 * scale, 128.0 * scale, 224.0 * scale),
+            PreviewRange::Pc => (0.0, max, max / 2.0, max),
+        };
+        Self { black, luma_extent, neutral, chroma_extent, max }
+    }
+
+    pub(crate) fn luma(&self, value: f64) -> u16 {
+        (self.black + self.luma_extent * value.clamp(0.0, 1.0))
+            .round().clamp(0.0, self.max) as u16
+    }
+
+    pub(crate) fn chroma(&self, value: f64) -> u16 {
+        // Ignore matrix residuals around neutral, especially where full
+        // range's exact center is half way between two codes.
+        let value = if value.abs() < 1e-7 { 0.0 } else { value.clamp(-0.5, 0.5) };
+        (self.neutral + self.chroma_extent * value)
+            .round().clamp(0.0, self.max) as u16
+    }
 }
 
 /// Accurate per-field H.273 code points; 2 means unspecified, not a fallback

@@ -1,7 +1,7 @@
 //! Product adapters for the typed graph. Numerical estimation and prepared
 //! contexts remain their accepted producers; this module owns scheduling I/O,
 //! the run-log events and the encoder/validation handoff.
-use crate::encoder::ResolvedConfig;
+use crate::encoder::{Container, ResolvedConfig};
 use crate::error::{Error, Result, EXIT_FRAME, EXIT_PREVIEW, EXIT_USAGE, EXIT_VALIDATION};
 use crate::frame::{
     self, FrameInfo, FrameSequence, PrepareSettings, PreparedFrame, PreparedSettings,
@@ -14,6 +14,7 @@ use rawtl_linear_video::deflicker::measurement::AnalysisSidecar;
 use rawtl_linear_video::deflicker::{estimate_exposure, ExposureConfig, FrameMeasurement};
 use rawtl_linear_video::graph::ordered_frames::FrameTask;
 use rawtl_linear_video::color_profile::AutoReferenceGain;
+use rawtl_linear_video::export::{ExportProfile, Selection};
 use rawtl_linear_video::graph::{self, Backend, Event, Gain, Graph, Kind, Scope};
 use std::collections::BTreeMap;
 use std::fs;
@@ -32,13 +33,12 @@ pub struct Output {
     pub stage: EncodedStage,
 }
 
-/// One image travelling the stream chain. The colour node replaces scene-linear
-/// FP32 with the single 4:4:4 encoder handoff (10- or 12-bit signal depth);
-/// resize and explicit
-/// exposure only accept the linear form.
+/// Resize and exposure consume scene-linear frames. Colour produces either
+/// the legacy quantized signal or unquantized RGB for an export profile.
 enum Pixels {
     Linear(Arc<[u8]>),
     Target(Vec<u16>),
+    ExportRgb(Vec<[f32; 3]>),
 }
 
 struct Image {
@@ -612,6 +612,7 @@ impl Backend for Runner<'_, '_> {
             return Err("graph: reference gain was not resolved before colour".into());
         }
         let depth = self.encoder_inputs.depth;
+        let export = self.encoder_config.export().is_some();
         Ok(Box::new(move || {
             image.crop_record=None;
             match kind {
@@ -620,20 +621,28 @@ impl Backend for Runner<'_, '_> {
                     let Pixels::Linear(pixels) = &image.pixels else {
                         return Err("graph: colour conversion requires scene-linear pixels".into());
                     };
-                    let mut signal = Vec::new();
-                    image.clips = profile
-                        .convert_f32_frame_to_yuv(
+                    let width = image.info.width as usize;
+                    let height = image.info.height as usize;
+                    if export {
+                        let (signal, clips) = profile.convert_f32_frame_to_target_rgb(
+                            &output_transform, pixels, width, height, reference_gain,
+                        )?;
+                        image.clips = clips;
+                        image.pixels = Pixels::ExportRgb(signal);
+                    } else {
+                        let mut signal = Vec::new();
+                        image.clips = profile.convert_f32_frame_to_yuv(
                             &output_transform,
                             pixels,
-                            image.info.width as usize,
-                            image.info.height as usize,
+                            width,
+                            height,
                             reference_gain,
                             range,
                             depth,
                             &mut signal,
-                        )
-                        .map_err(|e| e.to_string())?;
-                    image.pixels = Pixels::Target(signal);
+                        )?;
+                        image.pixels = Pixels::Target(signal);
+                    }
                 }
                 _ => apply_linear_transform(kind, &mut image)?,
             }
@@ -774,13 +783,15 @@ impl Backend for Runner<'_, '_> {
         let scratch = self.context.scratch.to_path_buf();
         let failure = self.worker_failure.clone();
         Ok(Box::new(move || {
-            let Pixels::Target(signal) = &image.pixels else {
-                return Err("graph: encoder requires the target signal planes".into());
+            let frame = match &image.pixels {
+                Pixels::Target(signal) => video::EncodeFrame::Legacy(signal),
+                Pixels::ExportRgb(signal) => video::EncodeFrame::TargetRgb(signal),
+                _ => return Err("graph: encoder requires the target color signal".into()),
             };
             let mut encoder = encoder.lock().map_err(|_| "encoder writer panicked")?;
             let result = encoder
                 .begin()
-                .and_then(|_| encoder.push(&inputs, &scratch, &image.info, signal));
+                .and_then(|_| encoder.push(&inputs, &scratch, &image.info, frame));
             if let Err(e) = result {
                 let message = e.message.clone();
                 *failure.lock().unwrap() = Some(e);
@@ -1006,17 +1017,36 @@ pub(crate) fn resolve_processing(options: &crate::cli::Options) -> Result<(Graph
             .apply_resize(width, height)
             .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
     }
-    let config = ResolvedConfig::resolve(
-        graph.encoder_patch(),
-        &options.encoder,
-        options.signal_depth,
-    )
-    .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
+    let patch = graph.encoder_patch();
+    let config = match patch.and_then(|patch| patch.export.as_ref()) {
+        Some(selection) => {
+            let export = match selection {
+                Selection::Manual(profile) => profile.clone(),
+                Selection::Named(name) => match ExportProfile::software(name) {
+                    Some(profile) => profile,
+                    None => video::available_hardware_profiles(&options.ffmpeg)?
+                        .into_iter().find(|profile| profile.name == *name)
+                        .ok_or_else(|| Error::new(
+                            EXIT_VALIDATION, format!("unknown or unavailable export profile {name:?}"),
+                        ))?,
+                },
+            };
+            let container = options.encoder.container
+                .or_else(|| patch.and_then(|patch| patch.container))
+                .unwrap_or(Container::Mov);
+            ResolvedConfig::from_export(export, container)
+        }
+        None => ResolvedConfig::resolve(patch, &options.encoder, options.signal_depth)
+            .map_err(|e| Error::new(EXIT_VALIDATION, e))?,
+    };
     Ok((graph, config))
 }
 
-pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
-    let (graph, config) = resolve_configuration(context.options)?;
+pub fn run(
+    context: &RunContext<'_>,
+    log: &mut RunLog,
+    (graph, config): (Graph, ResolvedConfig),
+) -> Result<Output> {
     let explicit_resize = graph.resize_geometry();
     let range = config.effective_range(context.options.preview_profile);
     log.line(&format!(
@@ -1035,6 +1065,9 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         graph.prepare_batch_size(),
         if graph.prepare_batch_size() > 1 { "batch_tasks" } else { "frames" }
     ))?;
+    if let Some(export) = config.export() {
+        log.line(&format!("kind=export profile={} input_format={}", quote(&export.name), export.input.name()))?;
+    }
     log.line(&format!(
         "kind=encoder encoder={} container={} pix_fmt={} profile={} range={} geometry={}",
         config.encoder,

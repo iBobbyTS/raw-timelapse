@@ -72,7 +72,7 @@ No interrupted frame is completed or final video published. Cache/partial paths
 and process exits remain in the existing logs. Host SIGKILL/crash recovery and
 arbitrary descendant recovery are outside the contract.
 
-The encode node carries an optional bounded `encoder` object:
+The encode node can use the legacy bounded `encoder` object:
 
 ```json
 {"id":"encode","kind":"encode","inputs":{"image":"color"},
@@ -90,9 +90,33 @@ before any RAW preparation. Resolution priority is built-in default < this
 object < profile encoder settings; a profile `encoder` change drops the graph's
 encoder-scoped profile/rate rather than inheriting them across codecs.
 
-The colour node writes planar `yuv444p10le` target signal; that is the single
-quantization boundary. FFmpeg only subsamples/reduces it for a configured codec.
-The delivered range follows the encoder node (ProRes is limited range because
-MOV `colr` is `nclc`; MP4/Matroska express the profile range). Product report and
-CLI/log migration are separate owners; the graph never invokes the old
-whole-source encoder orchestration.
+With legacy settings, the colour node writes planar 10- or 12-bit 4:4:4.
+The existing FFmpeg command adapts that signal for the selected codec.
+
+Internal graphs can select an export profile through the same encode node:
+
+```json
+{"encoder":{"export_profile":"x265-12bit-444","container":"mov"}}
+```
+
+Named profiles are `x265-12bit-444`, `x265-10bit-422`, `x265-8bit-420`,
+`dnxhr-sq`, `dnxhr-444`, `prores-422` and `prores-4444`. Hardware profiles
+are named after the FFmpeg encoder, for example `hevc_videotoolbox`. The
+export module lists and probes H.264 and HEVC encoders on the configured
+FFmpeg executable at runtime. Each working hardware encoder gets one profile.
+
+An internal caller can also supply the input format and FFmpeg encoding
+arguments directly:
+
+```json
+{"encoder":{"input_format":"gbrp16le","container":"matroska",
+            "ffmpeg_args":["-c:v","ffv1","-pix_fmt","gbrp16le","-level","3"]}}
+```
+
+The export node receives unquantized target RGB and packs the declared
+rawvideo format. The supported inputs are `yuv420p`, `yuv422p` and `yuv444p`
+plus their `10le` and `12le` variants, and `gbrp`, `gbrp10le`, `gbrp12le`
+and `gbrp16le`. `input_format` describes the pipe. FFmpeg's optional
+`-pix_fmt` controls its encoded output. The graph owns the source, frame count,
+geometry, frame rate, colour tags and destination. The run log records the
+resolved export profile and pipe format.

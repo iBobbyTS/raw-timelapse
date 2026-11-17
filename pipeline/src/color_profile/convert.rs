@@ -1,15 +1,13 @@
 //! Per-pixel conversion from scene-linear AP1 into the profile signal coding.
 
 use crate::preview;
-use super::coding::{quantize_chroma, quantize_luma, quantize_signal, FrameOutput, PreviewRange, SignalDepth, YcbcrCoding};
+use super::coding::{quantize_chroma, quantize_luma, quantize_signal, FrameOutput, PreviewRange, SignalDepth, YcbcrCoding, YcbcrQuantizer};
 use super::output_cat::OutputTransform;
 use super::ColorProfile;
 
 impl ColorProfile {
     /// Reference 8-bit quantization of signed FP32 AP1 input. Retained for the
-    /// historical golden/reference tests; the product encoder node uses
-    /// [`Self::convert_f32_frame_to_yuv`] exclusively, so there is one
-    /// runtime quantization boundary. Test-support surface, consumed by
+    /// historical golden/reference tests. Test-support surface, consumed by
     /// `tests/canon_log3.rs`; not reachable from the CLI.
     pub fn convert_f32_frame(
         &self,
@@ -68,14 +66,11 @@ impl ColorProfile {
         })
     }
 
-    /// Signed FP32 AP1/D60 (native EV already applied) to the single encoder
-    /// handoff: planar `yuv444p10le` target signal (Y, Cb, Cr planes).
+    /// Signed FP32 AP1/D60 (native EV already applied) to the legacy encoder
+    /// handoff: planar 10- or 12-bit target signal (Y, Cb, Cr planes).
     ///
-    /// This is the one quantization boundary for every preset. The transfer
-    /// curve, gamut matrix, reference scale and range convention all come from
-    /// this profile; the resolved `output` transform supplies the frozen CAT and
-    /// gamut composition chosen for the run. The quantizer below is the only
-    /// place 10-bit codes appear.
+    /// The transfer, reference scale and range come from this profile. The
+    /// resolved `output` transform supplies the run's CAT and gamut matrix.
     pub fn convert_f32_frame_to_yuv(
         &self,
         output: &OutputTransform,
@@ -87,30 +82,57 @@ impl ColorProfile {
         depth: SignalDepth,
         out: &mut Vec<u16>,
     ) -> Result<[usize; 2], String> {
+        let pixels = frame_pixels(bytes, width, height)?;
+        let (kr, kg, kb, div_cb, div_cr) = self.ycbcr_coding()?.coefficients();
+        let quantizer = YcbcrQuantizer::new(range, depth.bits());
+        out.resize(pixels * 3, 0);
+        self.visit_target_rgb(output, bytes, reference_gain, |index, signal| {
+            let luma = kr * signal[0] + kg * signal[1] + kb * signal[2];
+            let cb = (signal[2] - luma) / div_cb;
+            let cr = (signal[0] - luma) / div_cr;
+            out[index] = quantizer.luma(luma);
+            out[pixels + index] = quantizer.chroma(cb);
+            out[2 * pixels + index] = quantizer.chroma(cr);
+        })
+    }
+
+    /// Target-gamut, transferred RGB for export profiles. Quantization and
+    /// chroma sampling take place when the export node writes the pipe.
+    pub fn convert_f32_frame_to_target_rgb(
+        &self,
+        output: &OutputTransform,
+        bytes: &[u8],
+        width: usize,
+        height: usize,
+        reference_gain: f64,
+    ) -> Result<(Vec<[f32; 3]>, [usize; 2]), String> {
+        let pixels = frame_pixels(bytes, width, height)?;
+        let mut target = Vec::with_capacity(pixels);
+        let clipped = self.visit_target_rgb(output, bytes, reference_gain, |_, signal| {
+            target.push(signal.map(|channel| channel as f32));
+        })?;
+        Ok((target, clipped))
+    }
+
+    fn visit_target_rgb(
+        &self,
+        output: &OutputTransform,
+        bytes: &[u8],
+        reference_gain: f64,
+        mut visit: impl FnMut(usize, [f64; 3]),
+    ) -> Result<[usize; 2], String> {
         if output.profile != self.id {
             return Err(format!(
                 "output transform profile {:?} does not match {:?}",
                 output.profile, self.id
             ));
         }
-        if !reference_gain.is_finite()
-            || reference_gain <= 0.0
-        {
+        if !reference_gain.is_finite() || reference_gain <= 0.0 {
             return Err("invalid FP32 profile/reference gain".into());
         }
-        let pixels = width
-            .checked_mul(height)
-            .ok_or("FP32 geometry overflow")?;
-        let samples = pixels.checked_mul(3).ok_or("FP32 geometry overflow")?;
-        if samples.checked_mul(4) != Some(bytes.len()) {
-            return Err("FP32 length mismatch".into());
-        }
-        let coding = self.ycbcr_coding()?;
-        let (kr, kg, kb, div_cb, div_cr) = coding.coefficients();
         let matrix = output.composed_matrix;
         let (low, high) = self.transfer.domain();
         let scale = reference_gain * self.curve_input_scale();
-        out.resize(samples, 0);
         let mut clipped = [0usize; 2];
         for (index, src) in bytes.chunks_exact(12).enumerate() {
             let mut ap1 = [0.0; 3];
@@ -139,12 +161,7 @@ impl ColorProfile {
             if signal.iter().any(|value| !value.is_finite()) {
                 return Err("nonfinite target signal".into());
             }
-            let luma = kr * signal[0] + kg * signal[1] + kb * signal[2];
-            let cb = (signal[2] - luma) / div_cb;
-            let cr = (signal[0] - luma) / div_cr;
-            out[index] = quantize_luma(luma, range, depth);
-            out[pixels + index] = quantize_chroma(cb, range, depth);
-            out[2 * pixels + index] = quantize_chroma(cr, range, depth);
+            visit(index, signal);
         }
         Ok(clipped)
     }
@@ -207,9 +224,7 @@ impl ColorProfile {
     }
 
     /// Compatibility utility for explicit RGB16 ACEScg inputs, retained for
-    /// the historical golden/reference tests only. The production RAW pipeline
-    /// uses convert_f32_frame_to_yuv for every profile; neither this nor
-    /// convert_f32_frame is reachable from the CLI.
+    /// the historical golden/reference tests only.
     pub fn convert_frame(
         &self,
         rgb48le: &[u8],
@@ -251,4 +266,14 @@ impl ColorProfile {
         }
         Ok(())
     }
+}
+
+
+fn frame_pixels(bytes: &[u8], width: usize, height: usize) -> Result<usize, String> {
+    let pixels = width.checked_mul(height).ok_or("FP32 geometry overflow")?;
+    let length = pixels.checked_mul(12).ok_or("FP32 geometry overflow")?;
+    if length != bytes.len() {
+        return Err("FP32 length mismatch".into());
+    }
+    Ok(pixels)
 }

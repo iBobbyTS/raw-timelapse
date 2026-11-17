@@ -1,18 +1,12 @@
-//! Encoder configuration shared by the graph's encode node, the CLI and the
-//! FFmpeg input adapter.
+//! Resolve the encode node's legacy settings and export profiles, and build
+//! the FFmpeg commands used for preflight and streaming.
 //!
-//! The module is pure: it resolves built-in defaults, graph-node configuration
-//! and explicit CLI overrides, validates the bounded option surface and builds
-//! the FFmpeg argument vector. Process spawning, preflight execution and output
-//! validation live in the binary.
-//!
-//! The encoder input is always planar 4:4:4 target signal at the run's depth
-//! (10-bit `yuv444p10le` or 12-bit `yuv444p12le`), produced once by
-//! [`crate::color_profile::ColorProfile`]. Lower-bit-depth or subsampled codecs
-//! are reached by FFmpeg's format adapters from that same handoff; no second
-//! develop/quantization path exists.
+//! Process spawning, hardware probing, preflight execution and output
+//! validation live in the binary. The legacy path keeps its planar 10-/12-bit
+//! 4:4:4 handoff; export profiles specify their own rawvideo format.
 
 use crate::color_profile::{ColorProfile, PreviewRange, SignalDepth};
+use crate::export::{ExportProfile, InputFormat, Selection};
 use crate::json::Json;
 
 pub const DEFAULT_ENCODER: &str = "prores_ks";
@@ -105,6 +99,7 @@ impl RateControl {
 /// lower-priority layer, so priority is `built-in < graph node < explicit CLI`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Patch {
+    pub export: Option<Selection>,
     pub encoder: Option<String>,
     pub pix_fmt: Option<String>,
     pub container: Option<Container>,
@@ -116,7 +111,8 @@ pub struct Patch {
 
 impl Patch {
     pub fn is_empty(&self) -> bool {
-        self.encoder.is_none()
+        self.export.is_none()
+            && self.encoder.is_none()
             && self.pix_fmt.is_none()
             && self.container.is_none()
             && self.profile.is_none()
@@ -132,12 +128,20 @@ impl Patch {
         };
         let mut patch = Patch::default();
         let mut rate: Option<RateControl> = None;
+        let mut export_name = None;
+        let mut input_format = None;
+        let mut ffmpeg_args = None;
         let mut seen = std::collections::BTreeSet::new();
         for (key, value) in entries {
             if !seen.insert(key.as_str()) {
                 return Err(format!("graph: duplicate encoder field {key}"));
             }
             match key.as_str() {
+                "export_profile" => export_name = Some(nonempty_string(value, key)?),
+                "input_format" => {
+                    input_format = Some(InputFormat::parse(&nonempty_string(value, key)?)?)
+                }
+                "ffmpeg_args" => ffmpeg_args = Some(string_array(value, key)?),
                 "encoder" => patch.encoder = Some(nonempty_string(value, "encoder")?),
                 "pix_fmt" => patch.pix_fmt = Some(nonempty_string(value, "pix_fmt")?),
                 "container" => {
@@ -164,26 +168,41 @@ impl Patch {
                     });
                 }
                 "options" => {
-                    let tokens = value
-                        .as_array()
-                        .ok_or("graph: encoder options must be an array")?;
-                    let tokens: Vec<String> = tokens
-                        .iter()
-                        .map(|token| {
-                            token
-                                .as_str()
-                                .map(str::to_string)
-                                .ok_or_else(|| "graph: encoder options must be strings".to_string())
-                        })
-                        .collect::<Result<_, _>>()?;
-                    patch.options = Some(parse_output_options(&tokens)?);
+                    patch.options = Some(parse_output_options(&string_array(value, key)?)?);
                 }
                 other => return Err(format!("graph: unknown encoder field {other}")),
             }
         }
         patch.rate = rate;
+        patch.export = match (export_name, input_format, ffmpeg_args) {
+            (Some(name), None, None) => Some(Selection::Named(name)),
+            (None, Some(format), Some(args)) => {
+                Some(Selection::Manual(ExportProfile::manual(format, args)?))
+            }
+            (None, None, None) => None,
+            (Some(_), _, _) => return Err("graph: export_profile already defines input_format and ffmpeg_args".into()),
+            _ => return Err("graph: manual export requires both input_format and ffmpeg_args".into()),
+        };
+        if patch.export.is_some()
+            && (patch.encoder.is_some() || patch.pix_fmt.is_some() || patch.profile.is_some()
+                || patch.rate.is_some() || patch.options.is_some())
+        {
+            return Err("graph: export profiles and manual FFmpeg arguments replace legacy encoder options".into());
+        }
         Ok(patch)
     }
+}
+
+fn string_array(value: &Json, field: &str) -> Result<Vec<String>, String> {
+    value
+        .as_array()
+        .ok_or_else(|| format!("graph: encoder {field} must be an array"))?
+        .iter()
+        .map(|token| {
+            token.as_str().map(str::to_owned)
+                .ok_or_else(|| format!("graph: encoder {field} must contain only strings"))
+        })
+        .collect()
 }
 
 fn nonempty_string(value: &Json, field: &str) -> Result<String, String> {
@@ -285,6 +304,7 @@ pub struct ResolvedConfig {
     pub codec_profile: Option<String>,
     pub rate: Option<RateControl>,
     pub options: Vec<(String, String)>,
+    export: Option<ExportProfile>,
 }
 
 struct Preset {
@@ -319,6 +339,22 @@ fn preset(encoder: &str) -> Option<Preset> {
 }
 
 impl ResolvedConfig {
+    pub fn from_export(export: ExportProfile, container: Container) -> Self {
+        Self {
+            encoder: export.encoder.clone(),
+            pix_fmt: export.decoder_or_encoder_format().unwrap_or("auto").into(),
+            container,
+            codec_profile: export.decoded_profile.map(str::to_owned),
+            rate: None,
+            options: Vec::new(),
+            export: Some(export),
+        }
+    }
+
+    pub fn export(&self) -> Option<&ExportProfile> {
+        self.export.as_ref()
+    }
+
     /// Resolve `built-in < graph node < explicit CLI`. Each named field wins
     /// independently; unnamed fields inherit the next lower layer.
     pub fn resolve(
@@ -327,6 +363,9 @@ impl ResolvedConfig {
         depth: SignalDepth,
     ) -> Result<Self, String> {
         let graph = graph.unwrap_or(&EMPTY_PATCH);
+        if graph.export.is_some() || cli.export.is_some() {
+            return Err("resolve the export profile before building the encoder configuration".into());
+        }
         // The lower layer's effective encoder includes the built-in default:
         // restating the encoder that is already in effect is not a codec change.
         let lower_encoder = graph
@@ -403,6 +442,7 @@ impl ResolvedConfig {
             codec_profile,
             rate,
             options,
+            export: None,
         };
         config.validate()?;
         // prores_ks encodes from 10-bit input only (its FFmpeg encoder lists
@@ -498,6 +538,9 @@ impl ResolvedConfig {
     }
 
     pub fn codec_name(&self) -> &'static str {
+        if let Some(export) = &self.export {
+            return export.codec.unwrap_or("unknown");
+        }
         match self.encoder.as_str() {
             "prores_ks" => "prores",
             "libx264" => "h264",
@@ -508,6 +551,9 @@ impl ResolvedConfig {
 
     /// ffprobe's ProRes profile label for the configured profile value.
     pub fn probe_profile(&self) -> Option<&'static str> {
+        if let Some(export) = &self.export {
+            return export.decoded_profile;
+        }
         if self.encoder != "prores_ks" {
             return None;
         }
@@ -533,6 +579,9 @@ impl ResolvedConfig {
 
     /// Decoder pixel formats ffprobe may report for this encoder/container.
     pub fn decoder_pix_fmts(&self, range: PreviewRange) -> Vec<&str> {
+        if self.export.as_ref().is_some_and(|export| export.decoded_format.is_none()) {
+            return vec![];
+        }
         match self.encoder.as_str() {
             "prores_ks" => {
                 if self.pix_fmt.contains("444") {
@@ -541,7 +590,7 @@ impl ResolvedConfig {
                     vec!["yuv422p12le", "yuv422p10le"]
                 }
             }
-            "libx264" => {
+            _ if matches!(self.codec_name(), "h264" | "hevc") => {
                 // The encoder preserves the configured depth/subsampling; an
                 // 8-bit full-range stream may decode under the legacy yuvj*
                 // alias. Keep configured-format validation, not a fixed 4:2:0.
@@ -572,12 +621,12 @@ impl ResolvedConfig {
         self.container.media_type()
     }
 
-    /// The actual signal range written to the encoder. ProRes is delivered
-    /// limited-range: MOV `colr` is `nclc`, which cannot carry a range field,
-    /// and ProRes decoders assume video range, so signalling full range is not
-    /// expressible and would desynchronize the tag from the signal.
+    /// RGB is full range. ProRes and DNxHR use video range to match decoder
+    /// conventions, including MOV with legacy `nclc` metadata.
     pub fn effective_range(&self, profile: &ColorProfile) -> PreviewRange {
-        if self.encoder == "prores_ks" {
+        if self.export_output_rgb() == Some(true) {
+            PreviewRange::Pc
+        } else if matches!(self.encoder.as_str(), "prores_ks" | "prores" | "prores_aw" | "dnxhd") {
             PreviewRange::Tv
         } else {
             profile.range
@@ -586,20 +635,44 @@ impl ResolvedConfig {
 
     /// Whether the container/encoder combination writes an explicit range tag.
     pub fn writes_range_tag(&self) -> bool {
-        self.encoder != "prores_ks"
+        !matches!(self.encoder.as_str(), "prores_ks" | "prores" | "prores_aw" | "dnxhd")
+    }
+
+    /// Whether an explicitly selected encoder output format is RGB.
+    pub fn export_output_rgb(&self) -> Option<bool> {
+        match &self.export {
+            None => Some(false),
+            Some(export) => export.encoder_format.as_deref().map(|format| {
+                ["gbr", "rgb", "bgr", "argb", "abgr", "x2rgb", "x2bgr"]
+                    .iter().any(|prefix| format.starts_with(prefix))
+            }),
+        }
     }
 
     /// 4:2:0 formats need even width and height; 4:2:2 needs even width. Other
     /// formats (including 4:4:4 ProRes) accept odd dimensions.
     pub fn validate_geometry(&self, width: u32, height: u32) -> Result<(), String> {
+        if let Some(export) = &self.export {
+            export.input.validate_geometry(width, height)?;
+        }
         if width == 0 || height == 0 {
             return Err(format!("invalid output geometry {width}x{height}"));
         }
+        let semiplanar_420 = self.export.is_some()
+            && ["nv12", "nv21", "p010", "p012", "p016"]
+                .iter()
+                .any(|format| self.pix_fmt.starts_with(format));
+        let semiplanar_422 = self.export.is_some()
+            && ["p210", "p212", "p216"]
+                .iter()
+                .any(|format| self.pix_fmt.starts_with(format));
         let even_width = self.pix_fmt.contains("420")
             || self.pix_fmt.contains("422")
             || self.pix_fmt.contains("411")
-            || self.pix_fmt.contains("410");
-        let even_height = self.pix_fmt.contains("420") || self.pix_fmt.contains("440");
+            || self.pix_fmt.contains("410")
+            || semiplanar_420
+            || semiplanar_422;
+        let even_height = self.pix_fmt.contains("420") || self.pix_fmt.contains("440") || semiplanar_420;
         if (even_width && width % 2 != 0) || (even_height && height % 2 != 0) {
             return Err(format!(
                 "pixel format {:?} cannot encode {}x{}: chroma subsampling requires even \
@@ -647,6 +720,9 @@ impl ResolvedConfig {
         depth: SignalDepth,
         output: &std::path::Path,
     ) -> Vec<String> {
+        if self.export.is_some() {
+            return self.export_args(profile, (width, height), fps, frames, output, false);
+        }
         let range = self.effective_range(profile);
         let mut args = vec![
             "-hide_banner".into(),
@@ -707,6 +783,9 @@ impl ResolvedConfig {
         fps: &str,
         output: &std::path::Path,
     ) -> Vec<String> {
+        if self.export.is_some() {
+            return self.export_args(profile, geometry, fps, 1, output, true);
+        }
         let (width, height) = geometry;
         let range = self.effective_range(profile);
         let mut args = vec![
@@ -765,6 +844,79 @@ impl ResolvedConfig {
                 .map(|rate| format!(" {}({})", rate.key(), rate.args().join(" ")))
                 .unwrap_or_default()
         )
+    }
+
+    fn export_args(
+        &self,
+        profile: &ColorProfile,
+        (width, height): (u32, u32),
+        fps: &str,
+        frames: usize,
+        output: &std::path::Path,
+        preflight: bool,
+    ) -> Vec<String> {
+        let export = self.export.as_ref().unwrap();
+        let mut args = vec![
+            "-hide_banner".into(), "-nostdin".into(), "-v".into(),
+            if preflight { "warning" } else { "error" }.into(),
+            "-abort_on".into(), "empty_output".into(),
+        ];
+        args.extend(export.device_args.iter().cloned());
+        if preflight {
+            args.extend([
+                "-f".into(), "lavfi".into(), "-i".into(),
+                format!("color=c=black:s={width}x{height}:r={fps},format={}", export.input.name()),
+            ]);
+        } else {
+            args.extend([
+                "-f".into(), "rawvideo".into(), "-pixel_format".into(), export.input.name().into(),
+                "-video_size".into(), format!("{width}x{height}"),
+                "-framerate".into(), fps.into(), "-i".into(), "pipe:0".into(),
+            ]);
+        }
+        args.extend(["-frames:v".into(), frames.to_string(),
+            "-vf".into(), self.export_filter(profile, export)]);
+        if export.input.is_subsampled() && export.decoder_or_encoder_format() == Some(export.input.name()) {
+            args.extend(["-chroma_sample_location".into(), "center".into()]);
+        }
+        args.extend(export.args.iter().cloned());
+        let rgb = self.export_output_rgb();
+        if let Some(rgb) = rgb {
+            args.extend([
+                "-colorspace".into(), if rgb { "rgb" } else { profile.tag_policy.matrix_token() }.into(),
+                "-color_range".into(), self.effective_range(profile).as_str().into(),
+            ]);
+        }
+        args.extend([
+            "-color_primaries".into(), profile.tag_policy.primaries_token().into(),
+            "-color_trc".into(), profile.tag_policy.transfer_token().into(),
+        ]);
+        if self.container.writes_movflags() {
+            args.extend(["-movflags".into(), "+faststart+write_colr".into()]);
+        }
+        args.extend(["-f".into(), self.container.ffmpeg_name().into(), output.display().to_string()]);
+        args
+    }
+
+    fn export_filter(&self, profile: &ColorProfile, export: &ExportProfile) -> String {
+        let range = self.effective_range(profile).as_str();
+        let rgb_input = export.input.is_rgb();
+        let input_range = if rgb_input { "pc" } else { range };
+        let input_matrix = if rgb_input { "gbr" } else { profile.tag_policy.matrix_token() };
+        let mut filter = format!(
+            "setparams=color_primaries={}:color_trc={}:colorspace={input_matrix}:range={input_range}",
+            profile.tag_policy.primaries_token(), profile.tag_policy.transfer_token(),
+        );
+        if let Some(hardware) = export.hardware_filter() {
+            filter.push(',');
+            filter.push_str(&hardware);
+        } else if export.encoder_format.as_deref() != Some(export.input.name()) {
+            let matrix = profile.scale_filter_token();
+            filter.push_str(&format!(
+                ",scale=in_range={input_range}:in_color_matrix={matrix}:out_range={range}:out_color_matrix={matrix}",
+            ));
+        }
+        filter
     }
 }
 
@@ -836,6 +988,7 @@ fn parse_prores_profile(value: &str) -> Result<u32, String> {
 }
 
 static EMPTY_PATCH: Patch = Patch {
+    export: None,
     encoder: None,
     pix_fmt: None,
     container: None,
@@ -933,6 +1086,7 @@ mod tests {
     #[test]
     fn explicit_cli_fields_override_the_graph_node_per_field() {
         let graph = Patch {
+            export: None,
             encoder: Some("libx264".into()),
             pix_fmt: Some("yuv420p".into()),
             container: Some(Container::Mp4),

@@ -140,7 +140,8 @@ fn scenario(mode: &str, expected: i32, cause: &str) {
             attempted.store(true, Ordering::SeqCst);
         }
     });
-    let error = crate::execute(&options, &input, &video, &scratch, Instant::now(), &mut log)
+    let config = crate::graph_run::resolve_configuration(&options).unwrap();
+    let error = crate::execute(&options, &input, &video, &scratch, Instant::now(), &mut log, config)
         .expect_err("summary failure or selected graph failure must prevent publication");
     assert!(
         failed.load(Ordering::SeqCst),
