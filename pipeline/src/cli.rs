@@ -40,15 +40,14 @@ OPTIONS:
                                dji-dlog2-dgamut2,
                                canon-log2-cinema-gamut, sony-slog3-sgamut3,
                                sony-slog3-sgamut3-cine, nikon-nlog-bt2020,
-                               canon-log2-cinema-gamut-rev-eng-crm-dev,
                                canon-log3-cinema-gamut-rev-eng-crm-dev
-                               Canon names: clog2(white paper), clog2(rev-eng crm-dev),
+                               Canon names: clog2,
                                clog3 (rev-eng crm-dev)
     --output-cat <MODE>        profile|bradford|cat02 (default: profile)
                                profile keeps the selected profile's fixed reference
                                adaptation; an explicit different method changes the
                                output pixels and is reported as custom-adaptation
-    --camera-color <MODE>      auto|generic|canon-clog3 (default: auto)
+    --camera-color <MODE>      auto|generic|canon-cr3 (default: auto)
     --log-reference-gain <N|auto>
                                Positive finite output gain, or auto (D-Log default: auto;
                                other profiles: 1). Auto aims at 4x for D-Log / D-Log 2,
@@ -520,8 +519,8 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 camera_color = Some(match value.as_str() {
                     "auto" => color_profile::CameraColor::Auto,
                     "generic" => color_profile::CameraColor::Generic,
-                    "canon-clog3" => color_profile::CameraColor::CanonClog3,
-                    _ => return Err(Error::new(EXIT_USAGE, "invalid --camera-color: expected auto|generic|canon-clog3")),
+                    "canon-cr3" => color_profile::CameraColor::CanonCr3,
+                    _ => return Err(Error::new(EXIT_USAGE, "invalid --camera-color: expected auto|generic|canon-cr3")),
                 });
             }
             "--log-reference-gain" => {
@@ -771,9 +770,9 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let (video, log) =
         output.ok_or_else(|| Error::new(EXIT_USAGE, "--output <VIDEO_FILE> is required"))?;
 
-    if camera_color == Some(color_profile::CameraColor::CanonClog3)
-        && preview_profile.transfer != color_profile::Transfer::CanonLog3RevEng {
-        return Err(Error::new(EXIT_USAGE, "--camera-color canon-clog3 requires the CLog3 profile"));
+    if camera_color == Some(color_profile::CameraColor::CanonCr3)
+        && !preview_profile.is_canon_log() {
+        return Err(Error::new(EXIT_USAGE, "--camera-color canon-cr3 requires a Canon Log 2/3 profile"));
     }
     if log_reference_gain == Some(ReferenceGain::Auto)
         && preview_profile.transfer == color_profile::Transfer::Srgb {

@@ -15,7 +15,6 @@ pub enum Transfer {
     SonySLog3,
     /// Canon Log 2.
     CanonLog2,
-    CanonLog2RevEng,
     /// Recovered CRD three-segment Canon Log 3.
     CanonLog3RevEng,
     /// Nikon N-Log.
@@ -49,7 +48,6 @@ const DJI_DLOG2_UPPER_SCALE: f64 = DJI_DLOG2_H / DJI_DLOG2_TWO_POW_A_MINUS_1;
 impl Transfer {
     pub fn name(self) -> &'static str {
         match self {
-            Transfer::CanonLog2RevEng => "Canon Log 2 (rev-eng crm-dev)",
             Transfer::CanonLog3RevEng => "Canon Log 3 (rev-eng crm-dev)",
             Transfer::Srgb => "IEC 61966-2-1 sRGB OETF",
             Transfer::SonySLog3 => "Sony S-Log3",
@@ -63,7 +61,6 @@ impl Transfer {
     pub fn formula(self) -> &'static str {
         match self {
             Transfer::CanonLog3RevEng => "x=reflection/0.9; if x < -0.014: L=-0.42889912*ln(1-14.98325*x)/ln(10)+0.07623209; else if x < 0.014: L=2.3069815*x+0.073059361; else: L=0.42889912*ln(1+14.98325*x)/ln(10)+0.069886632; y=(L*56064+4096)/65472",
-            Transfer::CanonLog2RevEng => "x=reflection/0.9; L=sign(x)*0.122411586*ln(1+87.09937546*abs(x))+0.035388128; y=(L*56064+4096)/65472",
             Transfer::Srgb => "if x <= 0.0031308: y = 12.92*x; else y = 1.055*x^(1/2.4) - 0.055",
             Transfer::SonySLog3 => {
                 "if x >= 0.01125: y = (420 + log10((x+0.01)/(0.18+0.01))*261.5)/1023; \
@@ -95,9 +92,6 @@ impl Transfer {
             Transfer::CanonLog3RevEng => {
                 "Cinema RAW Development reconstructed continuous Log3 (camera-profile calibrated CR3 adaptation)"
             }
-            Transfer::CanonLog2RevEng => {
-                "Cinema RAW Development reconstructed continuous Log2 (camera-profile calibrated CR3 adaptation)"
-            }
             Transfer::Srgb => "IEC 61966-2-1:1999",
             Transfer::SonySLog3 => "Technical Summary for S-Gamut3.Cine/S-Log3 and S-Gamut3/S-Log3",
             Transfer::CanonLog2 => {
@@ -113,7 +107,7 @@ impl Transfer {
 
     pub fn version(self) -> &'static str {
         match self {
-            Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng => {
+            Transfer::CanonLog3RevEng => {
                 "CRD 2.15.10.1 / CrmSdk 2.11.0.27; rawtl revision 1"
             }
             Transfer::Srgb => "1999",
@@ -130,7 +124,6 @@ impl Transfer {
 
     pub fn url(self) -> &'static str {
         match self {
-            Transfer::CanonLog2RevEng => "docs/canon-log2-rev-eng.md",
             Transfer::CanonLog3RevEng => "docs/canon-log3-rev-eng.md",
             Transfer::Srgb => "https://webstore.iec.ch/publication/6169",
             Transfer::SonySLog3 => {
@@ -138,8 +131,8 @@ impl Transfer {
                  TechnicalSummary_for-S-Gamut3Cine_S-Gamut3_S-Log3_V1_00.pdf"
             }
             Transfer::CanonLog2 => {
-                "https://downloads.canon.com/nw/learn/white-papers/cinema-eos/\
-                 white-paper-canon-log-gamma-curves.pdf"
+                "https://downloads.canon.com/nw/pdfs/camcorders/whitepapers/\
+                 canon-log-gamma-curves-white-paper.pdf"
             }
             Transfer::NikonNLog => {
                 "http://download.nikonimglib.com/archive3/hDCmK00m9JDI03RPruD74xpoU905/\
@@ -171,11 +164,6 @@ impl Transfer {
                 } else {
                     (1.0 + 14.98325 * x).ln() * 0.42889912 / std::f64::consts::LN_10 + 0.069886632
                 };
-                (l * 56064.0 + 4096.0) / 65472.0
-            }
-            Transfer::CanonLog2RevEng => {
-                let x = value / 0.9;
-                let l = x.signum() * 0.122411586 * (87.09937546 * x.abs()).ln_1p() + 0.035388128;
                 (l * 56064.0 + 4096.0) / 65472.0
             }
             Transfer::Srgb => preview::srgb_oetf(value),
@@ -247,10 +235,6 @@ impl Transfer {
                 };
                 0.9 * x
             }
-            Transfer::CanonLog2RevEng => {
-                let l = (signal * 65472.0 - 4096.0) / 56064.0 - 0.035388128;
-                0.9 * l.signum() * (l.abs() / 0.122411586).exp_m1() / 87.09937546
-            }
             Transfer::Srgb => preview::srgb_eotf(signal),
             Transfer::SonySLog3 => {
                 if signal >= 171.2102946929 / 1023.0 {
@@ -318,7 +302,6 @@ impl Transfer {
 
     pub fn references(self) -> &'static [ReferenceCode] {
         match self {
-            Transfer::CanonLog2RevEng => &CANON_REFERENCES,
             Transfer::CanonLog3RevEng => &CANON_LOG3_REFERENCES,
             Transfer::Srgb => &SRGB_REFERENCES,
             Transfer::SonySLog3 => &SONY_REFERENCES,
@@ -333,7 +316,6 @@ impl Transfer {
     pub fn reference_basis(self) -> &'static str {
         match self {
             Transfer::CanonLog3RevEng => "independently reconstructed CRD Log3 curve; 589824 SDK forward LUT entries plus the effective 65536-entry output LUT matched exactly",
-            Transfer::CanonLog2RevEng => "independently reconstructed CRD continuous curve; Canon appendix gray codes cross-check",
             Transfer::Srgb => "existing IEC 61966-2-1 8-bit reference value for 18% grey",
             Transfer::SonySLog3 => {
                 "published 10-bit code values in the Sony technical summary appendix"

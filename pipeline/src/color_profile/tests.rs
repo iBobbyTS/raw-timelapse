@@ -97,14 +97,11 @@ use crate::json::Json;
     }
 
     #[test]
-    fn rev_eng_curve_and_signed_f32_boundary_are_independently_reproduced() {
-        let p = lookup("canon-log2-cinema-gamut-rev-eng-crm-dev").unwrap();
-        assert_eq!(p.display_name(), "clog2(rev-eng crm-dev)");
-        assert_eq!(
-            lookup("canon-log2-cinema-gamut").unwrap().display_name(),
-            "clog2(white paper)"
-        );
-        assert_ne!(p.transfer, Transfer::CanonLog2);
+    fn canonical_log2_and_signed_f32_boundary_are_independently_reproduced() {
+        let p = lookup("canon-log2-cinema-gamut").unwrap();
+        assert_eq!(p.display_name(), "clog2");
+        assert_eq!(p.transfer, Transfer::CanonLog2);
+        assert!(lookup("canon-log2-cinema-gamut-rev-eng-crm-dev").is_none());
         let contract = p.contract_json(&p.default_output_transform());
         let input = contract
             .get("input_domain")
@@ -132,7 +129,7 @@ use crate::json::Json;
         let bytes: Vec<_> = ap1.into_iter().flat_map(f32::to_le_bytes).collect();
         let mut output = vec![];
         p.convert_f32_frame(&bytes, 1, 1, 1.0, &mut output).unwrap();
-        assert_eq!(output, vec![37, 120, 87]); // independent scene -> reflection (.9) -> CRD Log2
+        assert_eq!(output, vec![37, 120, 87]); // independent scene -> reflection (.9) -> Canon Log2
         let expected = p.encode_linear(ap1.map(|x| x as f64));
         assert_eq!(output, expected);
         assert_ne!(output, p.encode_linear([0., 0.5, 0.05]));
@@ -145,6 +142,20 @@ use crate::json::Json;
             let bytes: Vec<_> = [bad; 3].into_iter().flat_map(f32::to_le_bytes).collect();
             assert!(p.convert_f32_frame(&bytes, 1, 1, 1., &mut output).is_err());
         }
+    }
+
+    #[test]
+    fn single_log2_curve_matches_the_independently_recovered_sdk_definition() {
+        let published = lookup("canon-log2-cinema-gamut").unwrap();
+        for i in -4096..=65536 {
+            let reflection = i as f64 / 1024.0;
+            let x = reflection / 0.9;
+            let l = x.signum() * 0.122411586 * (87.09937546 * x.abs()).ln_1p()
+                + 0.035388128;
+            let sdk_signal = (l * 56064.0 + 4096.0) / 65472.0;
+            assert!((published.transfer.forward(reflection) - sdk_signal).abs() < 1e-8);
+        }
+        assert_eq!(PROFILES.iter().filter(|p| p.transfer == Transfer::CanonLog2).count(), 1);
     }
 
     #[test]
@@ -169,8 +180,8 @@ use crate::json::Json;
                 "{}",
                 p.id
             );
-            if p.transfer == Transfer::CanonLog2 || p.transfer == Transfer::CanonLog2RevEng {
-                assert_eq!(out, if p.is_rev_eng() { [37, 120, 87] } else { [38, 122, 90] }, "independent Canon negative-AP1 vector");
+            if p.transfer == Transfer::CanonLog2 {
+                assert_eq!(out, [37, 120, 87], "independent Canon negative-AP1 vector");
             }
             let bytes: Vec<_> = [8f32; 3].into_iter().flat_map(f32::to_le_bytes).collect();
             p.convert_f32_frame(&bytes, 1, 1, 1., &mut out).unwrap();
@@ -194,15 +205,14 @@ use crate::json::Json;
     }
 
     #[test]
-    fn registry_has_nine_profiles_and_srgb_default() {
-        assert_eq!(PROFILES.len(), 9);
+    fn registry_has_eight_profiles_and_srgb_default() {
+        assert_eq!(PROFILES.len(), 8);
         assert_eq!(default_profile().id, "srgb-preview");
         for id in [
             "srgb-preview",
             "dji-dlog-dgamut",
             "dji-dlog2-dgamut2",
             "canon-log2-cinema-gamut",
-            "canon-log2-cinema-gamut-rev-eng-crm-dev",
             "canon-log3-cinema-gamut-rev-eng-crm-dev",
             "sony-slog3-sgamut3",
             "sony-slog3-sgamut3-cine",
@@ -303,7 +313,7 @@ use crate::json::Json;
             ("srgb-preview", [198u8, 109, 75]),
             ("sony-slog3-sgamut3", [125, 104, 87]),
             ("sony-slog3-sgamut3-cine", [127, 104, 89]),
-            ("canon-log2-cinema-gamut", [120, 101, 88]),
+            ("canon-log2-cinema-gamut", [118, 98, 85]),
             ("nikon-nlog-bt2020", [121, 93, 74]),
             ("dji-dlog-dgamut", [123, 99, 86]),
         ] {

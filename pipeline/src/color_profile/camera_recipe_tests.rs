@@ -4,14 +4,14 @@
     fn selection_table_and_curve_units_are_independent() {
         for profile in PROFILES.iter() {
             for cr3 in [false, true] {
-                let canon = cr3 && profile.transfer == Transfer::CanonLog3RevEng;
-                let expected = if canon { CameraRecipe::CanonClog3 }
+                let canon = cr3 && profile.is_canon_log();
+                let expected = if canon { CameraRecipe::CanonCr3 }
                     else { CameraRecipe::Generic };
                 assert_eq!(CameraColor::Auto.resolve(profile, cr3).unwrap(), expected);
                 assert_eq!(CAMERA_PROFILE_CORRECTION, "hue-sat-map");
                 assert_eq!(CameraColor::Generic.resolve(profile, cr3).unwrap(), CameraRecipe::Generic);
-                assert_eq!(CameraColor::CanonClog3.resolve(profile, cr3).is_ok(), canon);
-                assert_eq!(profile.curve_input_scale(), match profile.transfer { Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng => 0.9, _ => 1.0 });
+                assert_eq!(CameraColor::CanonCr3.resolve(profile, cr3).is_ok(), canon);
+                assert_eq!(profile.curve_input_scale(), match profile.transfer { Transfer::CanonLog2 | Transfer::CanonLog3RevEng => 0.9, _ => 1.0 });
             }
         }
     }
@@ -50,7 +50,7 @@
     #[test]
     fn curve_input_scale_table_is_explicit_for_every_registered_profile() {
         let expected = |id: &str| {
-            if id.starts_with("canon-log") && id.ends_with("rev-eng-crm-dev") {
+            if id.starts_with("canon-log") {
                 0.9
             } else {
                 1.0
@@ -67,7 +67,7 @@
     }
     #[test]
     fn curve_input_units_and_user_gain_are_applied_once() {
-        for (id, code) in [("canon-log2-cinema-gamut-rev-eng-crm-dev", 407u16),
+        for (id, code) in [("canon-log2-cinema-gamut", 407u16),
                            ("canon-log3-cinema-gamut-rev-eng-crm-dev", 351u16)] {
             let p = lookup(id).unwrap();
             // Independent published/reconstructed 18% reference, full-range 10-bit.

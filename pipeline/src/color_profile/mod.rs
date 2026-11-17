@@ -144,50 +144,49 @@ pub const CAMERA_PROFILE_CORRECTION: &str = "hue-sat-map";
 pub enum CameraRecipe {
     LegacyInverseCm,
     Generic,
-    CanonClog3,
+    CanonCr3,
 }
 impl CameraRecipe {
     pub fn native_token(self) -> &'static str {
         match self {
             Self::LegacyInverseCm => "legacy-inverse-cm",
-            Self::Generic | Self::CanonClog3 => "dng-camera-to-pcs",
+            Self::Generic | Self::CanonCr3 => "dng-camera-to-pcs",
         }
     }
     pub fn token(self) -> &'static str {
-        match self { Self::LegacyInverseCm => "legacy-test", Self::Generic => "generic", Self::CanonClog3 => "canon-clog3" }
+        match self { Self::LegacyInverseCm => "legacy-test", Self::Generic => "generic", Self::CanonCr3 => "canon-cr3" }
     }
     pub fn calibration(self) -> &'static str {
-        if self == Self::CanonClog3 { "canon-normal-white-fixed-v1" } else { "none" }
+        if self == Self::CanonCr3 { "canon-normal-white-fixed-v1" } else { "none" }
     }
-    pub fn requires_canon_cr3(self) -> bool { self == Self::CanonClog3 }
+    pub fn requires_canon_cr3(self) -> bool { self == Self::CanonCr3 }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CameraColor { Auto, Generic, CanonClog3 }
+pub enum CameraColor { Auto, Generic, CanonCr3 }
 impl CameraColor {
-    pub fn token(self) -> &'static str { match self { Self::Auto => "auto", Self::Generic => "generic", Self::CanonClog3 => "canon-clog3" } }
+    pub fn token(self) -> &'static str { match self { Self::Auto => "auto", Self::Generic => "generic", Self::CanonCr3 => "canon-cr3" } }
     /// Called after the existing single-extension enumeration, before prepare.
     pub fn resolve(self, profile: &ColorProfile, all_cr3: bool) -> Result<CameraRecipe, String> {
-        let clog3 = profile.transfer == Transfer::CanonLog3RevEng;
+        let canon_log = profile.is_canon_log();
         match self {
             Self::Generic => Ok(CameraRecipe::Generic),
-            Self::Auto if clog3 && all_cr3 => Ok(CameraRecipe::CanonClog3),
+            Self::Auto if canon_log && all_cr3 => Ok(CameraRecipe::CanonCr3),
             Self::Auto => Ok(CameraRecipe::Generic),
-            Self::CanonClog3 if clog3 && all_cr3 => Ok(CameraRecipe::CanonClog3),
-            Self::CanonClog3 => Err("--camera-color canon-clog3 requires CLog3 profile and original Canon CR3 photos".into()),
+            Self::CanonCr3 if canon_log && all_cr3 => Ok(CameraRecipe::CanonCr3),
+            Self::CanonCr3 => Err("--camera-color canon-cr3 requires Canon Log 2/3 profile and original Canon CR3 photos".into()),
         }
     }
 }
 
 impl ColorProfile {
     /// Curve input units, independent of the camera recipe and exposure calibration.
-    /// Exhaustive on purpose: a future rev-eng curve needing the 0.9 reflection
+    /// Exhaustive on purpose: a future Canon curve needing the 0.9 reflection
     /// scale must fail to compile here instead of silently defaulting to 1.0.
     pub fn curve_input_scale(&self) -> f64 {
         match self.transfer {
-            Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng => 0.9,
+            Transfer::CanonLog2 | Transfer::CanonLog3RevEng => 0.9,
             Transfer::Srgb
             | Transfer::SonySLog3
-            | Transfer::CanonLog2
             | Transfer::NikonNLog
             | Transfer::DjiDLog
             | Transfer::DjiDLog2 => 1.0,
@@ -249,17 +248,16 @@ impl ColorProfile {
             limited_by,
         }
     }
-    /// Test-support predicate consumed by the reference tests.
-    pub fn is_rev_eng(&self) -> bool {
+    /// Both Canon Log encodings share scene/reflection units and the CR3 calibration route.
+    pub fn is_canon_log(&self) -> bool {
         matches!(
             self.transfer,
-            Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng
+            Transfer::CanonLog2 | Transfer::CanonLog3RevEng
         )
     }
     pub fn display_name(&self) -> &'static str {
         match self.id {
-            "canon-log2-cinema-gamut" => "clog2(white paper)",
-            "canon-log2-cinema-gamut-rev-eng-crm-dev" => "clog2(rev-eng crm-dev)",
+            "canon-log2-cinema-gamut" => "clog2",
             "canon-log3-cinema-gamut-rev-eng-crm-dev" => "clog3 (rev-eng crm-dev)",
             _ => self.id,
         }
@@ -445,7 +443,7 @@ pub(crate) const LOG_RANGE_REASON: &str = "Rawtl full-range (pc) delivery conven
      (https://nps.nikonimaging.com/technical_info/technical_solutions/z9_tips/3d_lut/); \
      the transfer's code domain alone does not determine the delivery range.";
 
-pub static PROFILES: [ColorProfile; 9] = [
+pub static PROFILES: [ColorProfile; 8] = [
     ColorProfile {
         id: "srgb-preview",
         transfer: Transfer::Srgb,
@@ -522,17 +520,6 @@ pub static PROFILES: [ColorProfile; 9] = [
         ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
         tag_policy: TagPolicy::VENDOR_LOG,
         output_cat: DJI_DLOG2_OUTPUT_CAT,
-    },
-    ColorProfile {
-        id: "canon-log2-cinema-gamut-rev-eng-crm-dev",
-        transfer: Transfer::CanonLog2RevEng,
-        gamut: &CINEMA_GAMUT,
-        range: PreviewRange::Pc,
-        ycbcr_matrix: "bt2020nc",
-        range_reason: LOG_RANGE_REASON,
-        ycbcr_reason: BT2020_NCL_CONTAINER_REASON,
-        tag_policy: TagPolicy::VENDOR_LOG,
-        output_cat: PREVIEW_OUTPUT_CAT,
     },
     ColorProfile {
         id: "canon-log3-cinema-gamut-rev-eng-crm-dev",

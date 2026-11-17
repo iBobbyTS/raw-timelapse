@@ -1681,7 +1681,7 @@ fn wrong_ycbcr_matrix_is_rejected_by_the_patch_check() {
     );
 }
 
-const REV_PROFILE: &str = "canon-log2-cinema-gamut-rev-eng-crm-dev";
+const REV_PROFILE: &str = "canon-log2-cinema-gamut";
 const REV3_PROFILE: &str = "canon-log3-cinema-gamut-rev-eng-crm-dev";
 
 #[test]
@@ -1730,7 +1730,7 @@ fn rejects_unknown_or_empty_preview_profile_with_exit_usage() {
     make_input(&input, &["IMG_1.DNG"]);
     let tool = root.join("unused-native-tool");
     let video = root.join("run").join(VIDEO_NAME);
-    for value in ["no-such-profile", ""] {
+    for value in ["no-such-profile", "", "canon-log2-cinema-gamut-rev-eng-crm-dev"] {
         let mut args = base_args(&input, &video, &tool);
         args.push("--preview-profile");
         args.push(value);
@@ -2072,15 +2072,17 @@ fn real_cr3_small_sequence_delivers_one_video_and_one_log() {
 #[test]
 fn camera_color_cli_routes_before_prepare_and_keeps_single_extension_policy() {
     for (id, ext, selection, recipe) in [
-        (REV3_PROFILE, "CR3", "auto", "canon-clog3"),
+        (REV3_PROFILE, "CR3", "auto", "canon-cr3"),
         (REV3_PROFILE, "DNG", "auto", "generic"),
-        (REV_PROFILE, "CR3", "auto", "generic"),
+        (REV_PROFILE, "CR3", "auto", "canon-cr3"),
         ("srgb-preview", "CR3", "auto", "generic"),
         ("dji-dlog-dgamut", "DNG", "auto", "generic"),
         ("dji-dlog-dgamut", "DNG", "generic", "generic"),
         ("dji-dlog2-dgamut2", "DNG", "auto", "generic"),
         (REV3_PROFILE, "CR3", "generic", "generic"),
-        (REV3_PROFILE, "CR3", "canon-clog3", "canon-clog3"),
+        (REV3_PROFILE, "CR3", "canon-cr3", "canon-cr3"),
+        (REV_PROFILE, "CR3", "canon-cr3", "canon-cr3"),
+        (REV_PROFILE, "DNG", "auto", "generic"),
     ] {
         let (root,input,tool) = profile_material_for_extension(&format!("recipe-{id}-{ext}-{selection}"), [1800;3], ext);
         append_config(&root.join("fixtures"), "rev_defect=valid-hsm");
@@ -2095,7 +2097,7 @@ fn camera_color_cli_routes_before_prepare_and_keeps_single_extension_policy() {
         assert!(log.contains("hue_sat_map=applied"), "{log}");
         if recipe=="generic" { assert!(log.contains("calibration_status=uncalibrated"),"{log}"); }
     }
-    for selection in ["auto","generic","canon-clog3"] {
+    for selection in ["auto","generic","canon-cr3"] {
         let root=test_dir(&format!("mixed-recipe-{selection}"));
         let input=root.join("material");make_input(&input,&["IMG_1.CR3","IMG_2.DNG"]);
         let fixtures=root.join("fixtures");fs::create_dir_all(&fixtures).unwrap();
@@ -2107,7 +2109,7 @@ fn camera_color_cli_routes_before_prepare_and_keeps_single_extension_policy() {
         assert!(!video.exists());
     }
     for extra in [vec!["--camera-color",""], vec!["--camera-color","bogus"],vec!["--camera-color"],
-        vec!["--camera-color","auto","--camera-color","generic"],vec!["--camera-color","canon-clog3"]] {
+        vec!["--camera-color","auto","--camera-color","generic"],vec!["--camera-color","canon-cr3"]] {
         let mut args=vec!["--input","/tmp","--output","/tmp/unused.mov"];
         args.extend(extra);let result=run_cli(&args);
         assert_eq!(result.status.code(),Some(2),"{}",stderr(&result));
@@ -2115,7 +2117,7 @@ fn camera_color_cli_routes_before_prepare_and_keeps_single_extension_policy() {
     let (root,input,tool)=profile_material_for_extension("recipe-canon-dng-reject",[1800;3],"DNG");
     let directory=run_directory(&root,"run");let video=video_in(&directory);
     let mut args=base_args(&input,&video,&tool);
-    args.extend(["--preview-profile",REV3_PROFILE,"--camera-color","canon-clog3"]);
+    args.extend(["--preview-profile",REV3_PROFILE,"--camera-color","canon-cr3"]);
     let result=run_cli(&args);assert_eq!(result.status.code(),Some(2),"{}",stderr(&result));assert!(!video.exists());
 }
 
@@ -2124,7 +2126,7 @@ fn camera_color_v2_defects_are_rejected_without_publication() {
     for (recipe, defect) in [
         ("generic","contract-v1"),("generic","recipe-lie"),("generic","missing-policy"),
         ("generic","generic-calibrated"),("generic","phantom-hsm"),("generic","skipped-hsm"),("generic","baseline"),("generic","missing-cat"),
-        ("canon-clog3","canon-generic"),
+        ("canon-cr3","canon-generic"),
     ] {
         let (root,input,tool)=profile_material_for_extension(&format!("v2-{recipe}-{defect}"),[1800;3],"CR3");
         append_config(&root.join("fixtures"),&format!("rev_defect={defect}"));

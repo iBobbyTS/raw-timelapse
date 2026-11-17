@@ -240,9 +240,9 @@ if mode.startswith('late:'):
             assert_eq!(frame.capture_time, single.capture_time);
             for method in [
                 crate::color_profile::CameraRecipe::LegacyInverseCm,
-                crate::color_profile::CameraRecipe::CanonClog3,
+                crate::color_profile::CameraRecipe::CanonCr3,
             ] {
-                if method == crate::color_profile::CameraRecipe::CanonClog3
+                if method == crate::color_profile::CameraRecipe::CanonCr3
                     && frame.route != PreparedRoute::VendorRaw
                 {
                     continue;

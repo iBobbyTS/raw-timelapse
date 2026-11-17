@@ -174,12 +174,12 @@ independent of output Log/preview encoding. There is no disable option;
 ToneCurve and BaselineExposure remain skipped. Measurement uses the same rule.
 Output CAT and reference gain belong to the Rust output path.
 
-For the Canon CLog3 recipe, using an original Canon CR3 with valid calibration
+For the Canon CR3 recipe, using an original Canon CR3 with valid calibration
 metadata:
 
 ```sh
 native/build/dng-linear-frame --stdout-frame-f32 input.CR3 \
-  --color-contract-version 2 --camera-recipe canon-clog3 \
+  --color-contract-version 2 --camera-recipe canon-cr3 \
   --camera-color-method dng-camera-to-pcs \
   --camera-calibration canon-normal-white-fixed-v1 \
   [--white-balance R,G,B] [--exposure-ev EV]
@@ -187,7 +187,7 @@ native/build/dng-linear-frame --stdout-frame-f32 input.CR3 \
 
 These are complete policy tuples; do not mix their recipe/calibration
 values. The Rust CLI resolves the recipe before prepare and restricts Canon
-selection to the CLog3 output profile and original CR3 inputs. Native validates
+selection to Canon Log 2/3 output profiles and original CR3 inputs. Native validates
 the tuple and the original Canon identity/calibration evidence; a failure does
 not retry as generic. Use the same policy arguments with `--stdout-analysis`.
 The native standalone default remains the historical `legacy-test` recipe with
@@ -300,8 +300,8 @@ native/build/dng-linear-frame --stdout-frame-f32 --prepared frame.context \
   [--white-balance R,G,B] [--exposure-ev EV]
 ```
 
-For Canon CLog3 consumers, replace the complete generic tuple in **both** calls
-with the Canon tuple above (`canon-clog3`, `dng-camera-to-pcs`, `hue-sat-map`,
+For Canon Log 2/3 consumers, replace the complete generic tuple in **both** calls
+with the Canon tuple above (`canon-cr3`, `dng-camera-to-pcs`,
 `canon-normal-white-fixed-v1`, contract version 2). The context must identify an
 original Canon CR3 with valid calibration evidence. Prepare records identity and
 conversion provenance, not a recipe: callers freeze and pass the same recipe/WB
@@ -612,10 +612,10 @@ in `docs/migration-log.md`.
 
 Only explicit camera calibration policy `canon-normal-white-fixed-v1` invokes
 LibRaw metadata reading (`brew install libraw`); pixel decode remains ADC + DNG
-SDK. In the product this policy belongs only to the Canon CLog3 recipe. Original
+SDK. In the product this policy belongs only to the Canon CR3 recipe. Original
 CR3 NormalWhite endpoint scaling and fixed scene gain 1.8 apply before native
 EV. Generic remains uncalibrated. Rust's separate `curve_input_scale=0.9` for the
-two rev-eng Canon output curves is a curve-unit conversion, not camera
+Canon Log 2/3 output curves is a curve-unit conversion, not camera
 calibration. No automatic tone or BaselineExposure is applied. See the
 [current product contract](../../pipeline/README.md) and the
 [historical calibration evidence](../../docs/canon-fixed-calibration.md).

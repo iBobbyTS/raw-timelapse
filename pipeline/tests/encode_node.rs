@@ -367,7 +367,7 @@ fn every_profile_encodes_black_grey_and_white_reference_codes() {
         "sony-slog3-sgamut3",
         "sony-slog3-sgamut3-cine",
         "canon-log2-cinema-gamut",
-        "canon-log2-cinema-gamut-rev-eng-crm-dev",
+        "canon-log2-cinema-gamut",
         "canon-log3-cinema-gamut-rev-eng-crm-dev",
         "nikon-nlog-bt2020",
         "dji-dlog-dgamut",

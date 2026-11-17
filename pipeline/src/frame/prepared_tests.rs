@@ -247,7 +247,7 @@ use std::path::{Path, PathBuf};
         let logs = dir.join("canon-logs");
         let settings = PreparedSettings {
             lens: Default::default(),
-            camera_recipe: crate::color_profile::CameraRecipe::CanonClog3,
+            camera_recipe: crate::color_profile::CameraRecipe::CanonCr3,
         };
         let info = analyze_prepared(&tool, &prepared, None, Some(0.0), None, &settings, &logs.join("frame_000001.log"))
             .expect("canon analyze");
@@ -507,7 +507,7 @@ use std::path::{Path, PathBuf};
         let legacy_logs = work.join("legacy-logs");
         let settings = PreparedSettings {
             lens: Default::default(),
-            camera_recipe: crate::color_profile::CameraRecipe::CanonClog3,
+            camera_recipe: crate::color_profile::CameraRecipe::CanonCr3,
         };
         let sources: Vec<SourceFrame> = materials
             .iter()
@@ -554,7 +554,7 @@ use std::path::{Path, PathBuf};
             .expect("prepare analysis");
         let first_wb = first.applied_wb;
         let legacy_config = ProduceConfig {
-            camera_recipe: crate::color_profile::CameraRecipe::CanonClog3,
+            camera_recipe: crate::color_profile::CameraRecipe::CanonCr3,
             logs_dir: &legacy_logs,
             exposure_ev: None,
             analysis_roi: None,

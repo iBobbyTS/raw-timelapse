@@ -118,7 +118,7 @@ for index, source in enumerate(selected):
 # Phase 2: consumers. The first frame uses its as-shot neutral; the second
 # repeats it with a frozen override (the product's default) plus an explicit
 # custom override, so both WB paths are covered on a real conversion.
-method = ["--color-contract-version", "2", "--camera-recipe", "canon-clog3",
+method = ["--color-contract-version", "2", "--camera-recipe", "canon-cr3",
           "--camera-color-method", "dng-camera-to-pcs",
           "--camera-calibration", "canon-normal-white-fixed-v1"]
 first_meta = json.loads(records(stream(

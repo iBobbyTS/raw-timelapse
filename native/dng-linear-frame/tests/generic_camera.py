@@ -63,7 +63,7 @@ for fm in (None,fwd):
     run(decorated,extra=['--color-contract-version','1'],code=2)
     run(decorated,extra=['--camera-calibration','canon-normal-white-fixed-v1'],code=2)
     # A specialized request on direct non-Canon DNG cannot silently become generic.
-    run(decorated,extra=['--camera-recipe','canon-clog3','--camera-calibration','canon-normal-white-fixed-v1'],code=40)
+    run(decorated,extra=['--camera-recipe','canon-cr3','--camera-calibration','canon-normal-white-fixed-v1'],code=40)
 # HSM is intrinsic to every development recipe, independent of output encoding.
 # A positive fixture must change pixels; absence must leave the matrix result intact.
 for fm in (None,fwd):

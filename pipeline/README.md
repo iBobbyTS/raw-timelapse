@@ -61,7 +61,6 @@ Defaults:
 - `--preview-profile srgb-preview` — one of `srgb-preview`, `dji-dlog-dgamut`,
   `dji-dlog2-dgamut2`, `canon-log2-cinema-gamut`, `sony-slog3-sgamut3`,
   `sony-slog3-sgamut3-cine`, `nikon-nlog-bt2020`,
-  `canon-log2-cinema-gamut-rev-eng-crm-dev`,
   `canon-log3-cinema-gamut-rev-eng-crm-dev`
 - `--output-cat profile` — `profile` keeps the selected profile's own fixed
   reference chromatic adaptation. `bradford` or `cat02` name a registered
@@ -364,22 +363,21 @@ depth still quantizes exactly once at the encoder input.
 | `srgb-preview` | sRGB / Rec.709 | bt709 |
 | `sony-slog3-sgamut3` | S-Log3 / S-Gamut3 | bt2020nc |
 | `sony-slog3-sgamut3-cine` | S-Log3 / S-Gamut3.Cine | bt2020nc |
-| `canon-log2-cinema-gamut` | clog2 (white paper) / Cinema Gamut | bt2020nc |
-| `canon-log2-cinema-gamut-rev-eng-crm-dev` | clog2 (rev-eng crm-dev) / Cinema Gamut | bt2020nc |
+| `canon-log2-cinema-gamut` | clog2 / Cinema Gamut | bt2020nc |
 | `canon-log3-cinema-gamut-rev-eng-crm-dev` | clog3 (rev-eng crm-dev) / Cinema Gamut | bt2020nc |
 | `nikon-nlog-bt2020` | N-Log / BT.2020 | bt2020nc |
 | `dji-dlog-dgamut` | D-Log / D-Gamut | bt2020nc |
 | `dji-dlog2-dgamut2` | D-Log 2 / D-Gamut 2 (pinned DCTL, CAT02) | bt2020nc |
 
-Input development is selected with `--camera-color auto|generic|canon-clog3`
+Input development is selected with `--camera-color auto|generic|canon-cr3`
 (default `auto`). After the existing single-extension input enumeration:
 
 | selection | resolved input recipe |
 | --- | --- |
-| auto, CLog3 profile, all original inputs CR3 | Canon CLog3; native verifies Canon metadata for every frame |
+| auto, Canon Log 2/3 profile, all original inputs CR3 | Canon CR3; native verifies Canon metadata for every frame |
 | auto, any remaining profile or non-CR3 inputs | generic |
 | generic, any profile | generic |
-| canon-clog3 | requires CLog3 and original Canon CR3; otherwise rejected |
+| canon-cr3 | requires Canon Log 2/3 and original Canon CR3; otherwise rejected |
 
 A mixed-extension directory is rejected before recipe selection in every mode.
 The recipe is frozen before prepare and shared by measure and develop. A failed
@@ -398,9 +396,13 @@ no Canon exposure calibration and reports `uncalibrated`, including when the use
 sets a reference gain. Invalid or singular profile transforms fail explicitly.
 Input D50→D60 adaptation remains Bradford; it is independent of output color.
 
-The Canon CLog3 recipe also applies the validated profile HueSatMap and original
-CR3 NormalWhite/fixed 1.8 exposure calibration. CLog2RevEng now uses generic input
-by default: its changed input pixels/measurement are an intentional migration.
+The Canon CR3 recipe applies original CR3 NormalWhite/fixed 1.8 exposure calibration
+for both Canon Log 2 and Log 3. There is one CLog2 profile: `canon-log2-cinema-gamut`,
+using the published Canon curve (also numerically verified against the recovered SDK
+formula). The former `canon-log2-cinema-gamut-rev-eng-crm-dev` ID is removed.
+Both Canon encodings multiply native scene-linear values by 0.9 exactly once before
+their reflection-domain curve; changing Log encoding does not change CR3 development.
+The explicit calibration selector is now `--camera-color canon-cr3`.
 Other output curves, gamuts, tags and default output matrices retain their definitions.
 Original D-Log now defaults to CAT02 (ACES white/D60 to D65), replacing output
 Bradford rather than stacking adaptations. `--output-cat bradford` remains available;
@@ -470,7 +472,7 @@ default 1 except original D-Log, which defaults to `auto` with desired gain 4
 (+2 EV). An explicit numeric value, including `1`, overrides this default. The
 resolved gain is applied once before the output transfer function and never enters
 measurement or native EV. The independent `curve_input_scale` is 0.9 for the two
-rev-eng Canon curves and 1 for other profiles; it is a curve input unit conversion,
+Canon Log 2/3 curves and 1 for other profiles; it is a curve input unit conversion,
 not camera calibration. This replaces the historical internal contract field
 `native_scene_to_reflection_scale`. Native calibration metadata no longer reports
 `scene_to_reflection` as a camera calibration factor.
@@ -495,7 +497,7 @@ the encoded metadata carries the resolved number.
 
 Rust and native must be rebuilt together for `color_contract_version=2` (native
 color algorithm revision 4, output pipeline revision 5). Requests specify
-`--color-contract-version 2 --camera-recipe <generic|canon-clog3>` plus explicit
+`--color-contract-version 2 --camera-recipe <generic|canon-cr3>` plus explicit
 `--camera-color-method dng-camera-to-pcs`
 and `--camera-calibration <none|canon-normal-white-fixed-v1>`. The reader checks
 requested/effective recipe and policies, profile presence/applied/skip states,

@@ -360,13 +360,13 @@ fn run() -> Result<(), (i32, String)> {
         } else { contract };
         let contract = match defect {
             Some("contract-v1") => contract.replace("\"color_contract_version\":2", "\"color_contract_version\":1"),
-            Some("recipe-lie") => contract.replace("\"recipe_effective\":\"generic\"", "\"recipe_effective\":\"canon-clog3\""),
+            Some("recipe-lie") => contract.replace("\"recipe_effective\":\"generic\"", "\"recipe_effective\":\"canon-cr3\""),
             Some("missing-policy") => contract.replace("\"profile_correction_effective\":", "\"omitted_policy\":"),
             Some("generic-calibrated") => contract.replace("\"applied\":false", "\"applied\":true"),
             Some("phantom-hsm") => contract.replace("\"hue_sat_map_applied\":false", "\"hue_sat_map_applied\":true"),
             Some("baseline") => contract.replace("\"baseline_exposure_applied\":false", "\"baseline_exposure_applied\":true"),
             Some("missing-cat") => contract.replace("\"cat\":", "\"omitted_cat\":"),
-            Some("canon-generic") => contract.replace("\"recipe_effective\":\"canon-clog3\"", "\"recipe_effective\":\"generic\""),
+            Some("canon-generic") => contract.replace("\"recipe_effective\":\"canon-cr3\"", "\"recipe_effective\":\"generic\""),
             _ => contract,
         };
         if defect != Some("missing-contract") {
