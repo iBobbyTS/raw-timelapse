@@ -16,6 +16,8 @@ use rawtl_linear_video::graph::ordered_frames::FrameTask;
 use rawtl_linear_video::graph::{self, Backend, Event, Gain, Graph, Kind, Scope};
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::Instant;
@@ -73,6 +75,13 @@ struct Runner<'a, 'b> {
     clipped_high: usize,
     color_channel_samples: usize,
     color_frames: usize,
+    /// Resolved delivery reference gain: the numeric CLI value, or the auto
+    /// value fixed by `plan_ready` before any colour task is created.
+    reference_gain: f64,
+    /// Linear stages between develop and colour, replayed by the auto scan.
+    linear_chain: Vec<Kind>,
+    /// Worker count for the auto scan; mirrors the graph's develop concurrency.
+    scan_workers: usize,
 }
 fn frame_failure(id: usize, total: usize, name: &str, message: &str) -> String {
     format!(
@@ -111,6 +120,102 @@ impl Runner<'_, '_> {
             lens: self.context.options.lens.clone(),
             camera_recipe: self.context.camera_recipe,
         }
+    }
+    fn scan_task(
+        &self,
+        ev: f64,
+        id: usize,
+        r: &PreparedFrame,
+    ) -> graph::Result<FrameTask<(f64, f64, u128)>> {
+        let develop = self.develop_image_task("scan", id, r, ev)?;
+        let chain = self.linear_chain.clone();
+        let matrix = self.context.options.output_transform.composed_matrix;
+        Ok(Box::new(move || {
+            let mut image = develop()?;
+            for kind in &chain {
+                apply_linear_transform(*kind, &mut image)?;
+            }
+            apply_color_crop(&mut image)?;
+            let Pixels::Linear(pixels) = &image.pixels else {
+                return Err("graph: scan requires scene-linear pixels".into());
+            };
+            let mut max = f64::NEG_INFINITY;
+            let mut min = f64::INFINITY;
+            for src in pixels.chunks_exact(12) {
+                let mut ap1 = [0.0f64; 3];
+                for channel in 0..3 {
+                    ap1[channel] =
+                        f32::from_le_bytes(src[channel * 4..channel * 4 + 4].try_into().unwrap())
+                            as f64;
+                    if !ap1[channel].is_finite() {
+                        return Err("nonfinite FP32 sample".into());
+                    }
+                }
+                let target = rawtl_linear_video::chromatic_adaptation::mat3_vec(&matrix, ap1);
+                if !target.iter().all(|value| value.is_finite()) {
+                    return Err("nonfinite target color".into());
+                }
+                max = max.max(target[0]).max(target[1]).max(target[2]);
+                min = min.min(target[0]).min(target[1]).min(target[2]);
+            }
+            let count = (pixels.len() / 4) as u128;
+            Ok((max, min, count))
+        }))
+    }
+
+    /// Build one native develop task for `stage`: "develop" is the delivery
+    /// path, "scan" the auto-reference-gain pre-pass over identical inputs
+    /// (only the transcript location differs, never the pixels).
+    fn develop_image_task(
+        &self,
+        stage: &str,
+        id: usize,
+        r: &PreparedFrame,
+        ev: f64,
+    ) -> graph::Result<FrameTask<Image>> {
+        let log = self.transcript(stage, id);
+        let tool = self.context.options.native_tool.clone();
+        let prepared = r.clone();
+        let wb = self.wb(id);
+        let settings = self.settings();
+        let crop=if self.context.options.lens.crop.is_safe() {
+            if self.capture_times.len()!=self.context.sources.len() {return Err("graph: sequence crop requires the complete prepared inventory".into());}
+            Some(self.lens_area.ok_or("graph: missing common sequence lens area")?)
+        } else {None};
+        let total = self.context.sources.len();
+        let active = self.active.clone();
+        if id > 0 && self.context.options.white_balance.freezes_reference() && wb.is_none() {
+            return Err("graph: reference WB is not committed".into());
+        }
+        Ok(Box::new(move || {
+            let mut pixels = None;
+            let info = frame::develop_prepared_at(
+                &tool,
+                &prepared,
+                wb,
+                ev,
+                &settings,
+                id,
+                total,
+                &log,
+                active,
+                &mut |info, native| {
+                    if let Some(area)=prepared.lens_valid_area {
+                        if area.bounds!=[0.,0.,1.,1.]&&(area.width!=info.width||area.height!=info.height) {return Err(Error::new(EXIT_FRAME,"lens valid-area geometry differs from delivery"));}
+                    }
+                    pixels = Some(native.pixels(info.width, info.height)?);
+                    Ok(())
+                },
+            )
+            .map_err(|e| frame_failure(id, total, &prepared.source_name, &e.message))?;
+            Ok(Image {
+                info,
+                pixels: Pixels::Linear(pixels.ok_or("graph: develop returned no owned pixels")?),
+                clips: [0, 0],
+                crop,
+                crop_record: None,
+            })
+        }))
     }
 }
 impl Backend for Runner<'_, '_> {
@@ -380,56 +485,125 @@ impl Backend for Runner<'_, '_> {
         self.result(written)?;
         Ok(gains)
     }
+    fn plan_ready(&mut self, plan: &[Gain], refs: &[PreparedFrame]) -> graph::Result<()> {
+        if !matches!(
+            self.context.options.log_reference_gain,
+            crate::cli::ReferenceGain::Auto
+        ) {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let profile = self.context.options.preview_profile;
+        let total = refs.len();
+        let workers = self.scan_workers.min(total.max(1));
+        let next = AtomicUsize::new(0);
+        let abort = AtomicBool::new(false);
+        let (tx, rx) = mpsc::channel::<(usize, std::result::Result<(f64, f64, u128), String>)>();
+        // Build every scan task on the coordinator first: the boxed tasks are
+        // Send + 'static, so workers never borrow the (non-Sync) runner; the
+        // develop guards already ran during prepare/measure commits.
+        let mut tasks: Vec<Option<FrameTask<(f64, f64, u128)>>> = Vec::with_capacity(total);
+        for id in 0..total {
+            tasks.push(Some(self.scan_task(plan[id].ev, id, &refs[id])?));
+        }
+        let queue = Mutex::new(tasks);
+        {
+            std::thread::scope(|scope| {
+                let next = &next;
+                let abort = &abort;
+                let queue = &queue;
+                for _ in 0..workers {
+                    let tx = tx.clone();
+                    scope.spawn(move || loop {
+                        if abort.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let id = next.fetch_add(1, Ordering::Relaxed);
+                        if id >= total {
+                            break;
+                        }
+                        let task = queue.lock().unwrap()[id]
+                            .take()
+                            .expect("graph: auto reference gain scan task taken twice");
+                        let result = task().map_err(|e| e.to_string());
+                        if result.is_err() {
+                            abort.store(true, Ordering::Relaxed);
+                        }
+                        if tx.send((id, result)).is_err() {
+                            break;
+                        }
+                    });
+                }
+            });
+        }
+        drop(tx);
+        let mut max_target = f64::NEG_INFINITY;
+        let mut min_target = f64::INFINITY;
+        let mut samples: u128 = 0;
+        for (id, result) in rx {
+            let (max, min, count) = result.map_err(|e| {
+                format!("graph: auto reference gain scan failed on frame {}: {e}", id + 1)
+            })?;
+            max_target = max_target.max(max);
+            min_target = min_target.min(min);
+            samples += count;
+        }
+        let gain = profile.auto_reference_gain(max_target, min_target);
+        if !gain.is_finite() || gain <= 0.0 {
+            return Err("graph: auto reference gain produced a nonpositive gain".into());
+        }
+        self.reference_gain = gain;
+        let (low, high) = profile.transfer.domain();
+        let scale = profile.curve_input_scale();
+        let desired = profile.transfer.desired_auto_reference_gain();
+        let safe_positive = if max_target > 0.0 {
+            high / (max_target * scale)
+        } else {
+            f64::INFINITY
+        };
+        let safe_negative = if min_target < 0.0 && low < 0.0 {
+            low / (min_target * scale)
+        } else {
+            f64::INFINITY
+        };
+        let limited_by = if gain >= desired {
+            "desired"
+        } else if safe_positive <= safe_negative {
+            "positive-headroom"
+        } else {
+            "negative-toe"
+        };
+        let written = self.log.line(&format!(
+            "kind=reference_gain requested=auto profile={} frames={} channel_samples={} \
+             desired={:.9} desired_ev={:.2} safe_positive={:.9} safe_negative={:.9} \
+             max_target_linear={:.9} min_target_linear={:.9} applied={:.9} applied_ev={:+.2} \
+             limited_by={} duration={:.3}",
+            profile.id,
+            total,
+            samples,
+            desired,
+            desired.log2(),
+            safe_positive,
+            safe_negative,
+            max_target,
+            min_target,
+            gain,
+            gain.log2(),
+            limited_by,
+            started.elapsed().as_secs_f64(),
+        ));
+        self.result(written)
+    }
+
     fn develop_task(
         &mut self,
         id: usize,
         r: &PreparedFrame,
         ev: f64,
     ) -> graph::Result<FrameTask<Image>> {
-        let log = self.transcript("develop", id);
-        let tool = self.context.options.native_tool.clone();
-        let prepared = r.clone();
-        let wb = self.wb(id);
-        let settings = self.settings();
-        let crop=if self.context.options.lens.crop.is_safe() {
-            if self.capture_times.len()!=self.context.sources.len() {return Err("graph: sequence crop requires the complete prepared inventory".into());}
-            Some(self.lens_area.ok_or("graph: missing common sequence lens area")?)
-        } else {None};
-        let total = self.context.sources.len();
-        let active = self.active.clone();
-        if id > 0 && self.context.options.white_balance.freezes_reference() && wb.is_none() {
-            return Err("graph: reference WB is not committed".into());
-        }
-        Ok(Box::new(move || {
-            let mut pixels = None;
-            let info = frame::develop_prepared_at(
-                &tool,
-                &prepared,
-                wb,
-                ev,
-                &settings,
-                id,
-                total,
-                &log,
-                active,
-                &mut |info, native| {
-                    if let Some(area)=prepared.lens_valid_area {
-                        if area.bounds!=[0.,0.,1.,1.]&&(area.width!=info.width||area.height!=info.height) {return Err(Error::new(EXIT_FRAME,"lens valid-area geometry differs from delivery"));}
-                    }
-                    pixels = Some(native.pixels(info.width, info.height)?);
-                    Ok(())
-                },
-            )
-            .map_err(|e| frame_failure(id, total, &prepared.source_name, &e.message))?;
-            Ok(Image {
-                info,
-                pixels: Pixels::Linear(pixels.ok_or("graph: develop returned no owned pixels")?),
-                clips: [0, 0],
-                crop,
-                crop_record: None,
-            })
-        }))
+        self.develop_image_task("develop", id, r, ev)
     }
+
     fn image_task(
         &mut self,
         kind: Kind,
@@ -439,57 +613,15 @@ impl Backend for Runner<'_, '_> {
         let profile = self.context.options.preview_profile;
         let output_transform = self.context.options.output_transform.clone();
         let range = self.encoder_config.effective_range(profile);
-        let reference_gain = self.context.options.log_reference_gain;
+        let reference_gain = self.reference_gain;
+        if !reference_gain.is_finite() || reference_gain <= 0.0 {
+            return Err("graph: reference gain was not resolved before colour".into());
+        }
         Ok(Box::new(move || {
             image.crop_record=None;
             match kind {
-                Kind::Identity => (),
-                Kind::Exposure(ev) => {
-                    let Pixels::Linear(pixels) = &mut image.pixels else {
-                        return Err("graph: exposure requires scene-linear pixels".into());
-                    };
-                    let gain = ev.exp2();
-                    for p in Arc::make_mut(pixels).chunks_exact_mut(4) {
-                        let value =
-                            (f32::from_le_bytes(p.try_into().unwrap()) as f64 * gain) as f32;
-                        if !value.is_finite() {
-                            return Err("graph: exposure overflow".into());
-                        }
-                        p.copy_from_slice(&value.to_le_bytes());
-                    }
-                    image.info.pixels_sha256 = Some(crate::digest::sha256(pixels));
-                    image.info.exposure_ev += ev;
-                }
-                Kind::Resize { width, height } => {
-                    let Pixels::Linear(pixels) = &image.pixels else {
-                        return Err(
-                            "graph: resize requires scene-linear pixels before colour".into()
-                        );
-                    };
-                    let bounds=image.crop.take();
-                    if let Some(area)=bounds {image.crop_record=Some(crate::resample::crop_window(image.info.width,image.info.height,width,height,area)?);}
-                    let resized = crate::resample::resize_scene_linear_region(
-                        pixels,
-                        image.info.width,
-                        image.info.height,
-                        width,
-                        height,
-                        bounds,
-                    )
-                    .map_err(|e| format!("graph: resize: {e}"))?;
-                    image.info.pixels_sha256 = Some(crate::digest::sha256(&resized));
-                    image.pixels = Pixels::Linear(Arc::from(resized));
-                    image.info.width = width;
-                    image.info.height = height;
-                }
                 Kind::Color => {
-                    if let Some(area)=image.crop.take() {
-                        let Pixels::Linear(pixels)=&image.pixels else {return Err("graph: lens crop requires linear pixels".into());};
-                        image.crop_record=Some(crate::resample::crop_window(image.info.width,image.info.height,image.info.width,image.info.height,area)?);
-                        let cropped=crate::resample::resize_scene_linear_region(pixels,image.info.width,image.info.height,image.info.width,image.info.height,Some(area))?;
-                        image.info.pixels_sha256=Some(crate::digest::sha256(&cropped));
-                        image.pixels=Pixels::Linear(Arc::from(cropped));
-                    }
+                    apply_color_crop(&mut image)?;
                     let Pixels::Linear(pixels) = &image.pixels else {
                         return Err("graph: colour conversion requires scene-linear pixels".into());
                     };
@@ -507,7 +639,7 @@ impl Backend for Runner<'_, '_> {
                         .map_err(|e| e.to_string())?;
                     image.pixels = Pixels::Target(signal);
                 }
-                _ => return Err("graph: unsupported image task".into()),
+                _ => apply_linear_transform(kind, &mut image)?,
             }
             Ok(image)
         }))
@@ -731,6 +863,68 @@ impl Backend for Runner<'_, '_> {
 
 /// Native diagnostics are a timing observation, separate from the success
 /// protocol. Missing diagnostics from a custom tool are reported as unknown.
+/// Apply one linear image transformation in place. Shared by the delivery
+/// image chain and the auto-reference-gain scan so both see identical
+/// pixels for the same frame and exposure plan.
+fn apply_linear_transform(kind: Kind, image: &mut Image) -> graph::Result<()> {
+    match kind {
+        Kind::Identity => (),
+        Kind::Exposure(ev) => {
+            let Pixels::Linear(pixels) = &mut image.pixels else {
+                return Err("graph: exposure requires scene-linear pixels".into());
+            };
+            let gain = ev.exp2();
+            for p in Arc::make_mut(pixels).chunks_exact_mut(4) {
+                let value =
+                    (f32::from_le_bytes(p.try_into().unwrap()) as f64 * gain) as f32;
+                if !value.is_finite() {
+                    return Err("graph: exposure overflow".into());
+                }
+                p.copy_from_slice(&value.to_le_bytes());
+            }
+            image.info.pixels_sha256 = Some(crate::digest::sha256(pixels));
+            image.info.exposure_ev += ev;
+        }
+        Kind::Resize { width, height } => {
+            let Pixels::Linear(pixels) = &image.pixels else {
+                return Err(
+                    "graph: resize requires scene-linear pixels before colour".into()
+                );
+            };
+            let bounds=image.crop.take();
+            if let Some(area)=bounds {image.crop_record=Some(crate::resample::crop_window(image.info.width,image.info.height,width,height,area)?);}
+            let resized = crate::resample::resize_scene_linear_region(
+                pixels,
+                image.info.width,
+                image.info.height,
+                width,
+                height,
+                bounds,
+            )
+            .map_err(|e| format!("graph: resize: {e}"))?;
+            image.info.pixels_sha256 = Some(crate::digest::sha256(&resized));
+            image.pixels = Pixels::Linear(Arc::from(resized));
+            image.info.width = width;
+            image.info.height = height;
+        }
+        _ => return Err("graph: unsupported linear image task".into()),
+    }
+    Ok(())
+}
+
+/// Lens safe-crop applied at the colour boundary. The auto-reference-gain
+/// scan replays this so the scanned extremes match the converter input.
+fn apply_color_crop(image: &mut Image) -> graph::Result<()> {
+    if let Some(area)=image.crop.take() {
+        let Pixels::Linear(pixels)=&image.pixels else {return Err("graph: lens crop requires linear pixels".into());};
+        image.crop_record=Some(crate::resample::crop_window(image.info.width,image.info.height,image.info.width,image.info.height,area)?);
+        let cropped=crate::resample::resize_scene_linear_region(pixels,image.info.width,image.info.height,image.info.width,image.info.height,Some(area))?;
+        image.info.pixels_sha256=Some(crate::digest::sha256(&cropped));
+        image.pixels=Pixels::Linear(Arc::from(cropped));
+    }
+    Ok(())
+}
+
 fn batch_diagnostics(path: &std::path::Path) -> graph::Result<String> {
     let text = fs::read_to_string(path).map_err(|e| format!("batch transcript: {e}"))?;
     let mut calls = 0usize;
@@ -859,7 +1053,7 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         profile.tag_policy.matrix_token(),
         profile.tag_policy.primaries_token(),
         profile.tag_policy.transfer_token(),
-        context.options.log_reference_gain,
+        context.options.log_reference_gain.token(),
         range.as_str(),
         context.options.camera_color.token(), context.camera_recipe.token(), context.camera_recipe.correction(), context.camera_recipe.calibration(),
         if context.camera_recipe.calibration() != "none" { "pending-native-validation" } else { "uncalibrated" },
@@ -883,6 +1077,10 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| Error::new(EXIT_USAGE, "--output has no usable file name"))?
         .to_string();
+    let linear_chain = graph
+        .linear_chain_to_color()
+        .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
+    let scan_workers = graph.develop_concurrency();
     let active: proc::ActiveNative = Default::default();
     let mut runner = Runner {
         context,
@@ -913,6 +1111,12 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         clipped_high: 0,
         color_channel_samples: 0,
         color_frames: 0,
+        reference_gain: match context.options.log_reference_gain {
+            crate::cli::ReferenceGain::Fixed(gain) => gain,
+            crate::cli::ReferenceGain::Auto => f64::NAN,
+        },
+        linear_chain,
+        scan_workers,
     };
     let graph_started = Instant::now();
     let result = graph::execute(&graph, context.sources.len(), &mut runner);
@@ -1016,7 +1220,7 @@ pub fn run(context: &RunContext<'_>, log: &mut RunLog) -> Result<Output> {
         probe.frames.unwrap_or(sequence.frames.len() as u64),
         "graph streaming encoder",
         profile,
-        context.options.log_reference_gain,
+        runner.reference_gain,
     )
     .map_err(|e| Error::new(EXIT_VALIDATION, e.to_string()))?;
     // The graph owns cache deletion. Files that a custom graph did not delete

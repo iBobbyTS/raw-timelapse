@@ -211,7 +211,10 @@ combination uses generic SDK CameraToPCS without profile HueSatMap/look/tone or
 BaselineExposure. Explicit generic does not bypass mixed-extension rejection.
 The color node applies the profile's curve input units (0.9 for the rev-eng Canon
 curves) and the positive finite user reference gain once; neither scale enters
-measurement. Native/Rust color contract v2 checks requested/effective policies
+measurement. `--log-reference-gain auto` resolves the gain once per sequence: the
+backend's plan hook (Solve or Zero) rescans every frame through the identical
+develop and linear image chain before any colour task exists, and the run log
+gains a `kind=reference_gain` line with the desired/safe/applied values. Native/Rust color contract v2 checks requested/effective policies
 and keeps the existing input Bradford D50→D60 CAT. The output CAT is now part of
 the output profile: `--output-cat profile|bradford|cat02` (default `profile`)
 selects the profile's fixed reference realization or an explicit registered

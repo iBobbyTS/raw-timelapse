@@ -319,6 +319,51 @@ impl Graph {
         }
     }
 
+    /// Linear image transformations between develop and colour, in application
+    /// order. `--log-reference-gain auto` replays exactly these stages while
+    /// scanning so the scanned extremes match the colour node's input
+    /// bit-for-bit. Every valid graph reaches colour through this chain.
+    pub fn linear_chain_to_color(&self) -> Result<Vec<Kind>> {
+        let color = self
+            .nodes
+            .iter()
+            .position(|node| node.kind == Kind::Color)
+            .ok_or("graph: missing colour node")?;
+        let mut chain = Vec::new();
+        let mut current = *self.nodes[color]
+            .inputs
+            .get("image")
+            .ok_or("graph: colour node has no image input")?;
+        loop {
+            match self.nodes[current].kind {
+                Kind::Develop => break,
+                Kind::Identity | Kind::Exposure(_) | Kind::Resize { .. } => {
+                    chain.push(self.nodes[current].kind);
+                    current = *self.nodes[current]
+                        .inputs
+                        .get("image")
+                        .ok_or("graph: image node has no image input")?;
+                }
+                other => {
+                    return Err(format!(
+                        "graph: auto reference gain cannot replay {other:?} between develop and colour"
+                    ));
+                }
+            }
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
+    /// Concurrency of the (first) develop node; the auto reference-gain scan
+    /// mirrors it so the pre-pass develops at the graph's own pace.
+    pub fn develop_concurrency(&self) -> usize {
+        self.nodes
+            .iter()
+            .find(|node| node.kind == Kind::Develop)
+            .map_or(1, |node| node.concurrency)
+    }
+
     /// Encoder configuration declared by the single encode node, when present.
     pub fn encoder_patch(&self) -> Option<&EncoderPatch> {
         self.nodes.iter().find_map(|node| node.encoder.as_ref())
@@ -667,6 +712,13 @@ pub trait Backend {
         elapsed: Duration,
     ) -> Result<()>;
     fn solve(&mut self) -> Result<Vec<Gain>>;
+    /// Fired once when the sealed exposure plan is complete (Solve or Zero),
+    /// before any develop task is released. `refs` is the full prepared
+    /// inventory in frame order; implementations may develop frames here to
+    /// resolve a sequence-wide parameter.
+    fn plan_ready(&mut self, _plan: &[Gain], _refs: &[Self::Reference]) -> Result<()> {
+        Ok(())
+    }
     fn develop_task(
         &mut self,
         id: usize,
@@ -1139,6 +1191,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                                     "graph: malformed exposure plan identity/order/gain".into()
                                 );
                             }
+                            b.plan_ready(&plan, &states[p].refs)?;
                             states[i].plan = Some(Arc::new(plan));
                             close = true;
                         }

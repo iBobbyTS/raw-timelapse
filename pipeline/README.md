@@ -35,7 +35,7 @@ rawtl-linear-video --input <RAW_DIR> --output <VIDEO_FILE> \
   [--dng-linear-frame /abs/path/to/dng-linear-frame] \
   [--ffmpeg /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg] \
   [--ffprobe /opt/homebrew/opt/ffmpeg-full/bin/ffprobe] \
-  [--preview-profile <ID>] [--output-cat profile|bradford|cat02] [--log-reference-gain N] \
+  [--preview-profile <ID>] [--output-cat profile|bradford|cat02] [--log-reference-gain N|auto] \
   [--converter "/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter"] \
   [--converter-timeout 120] \
   [--strength 1.0] [--period 60] [--brightness smooth|uniform] \
@@ -453,6 +453,24 @@ rev-eng Canon curves and 1 for other profiles; it is a curve input unit conversi
 not camera calibration. This replaces the historical internal contract field
 `native_scene_to_reflection_scale`. Native calibration metadata no longer reports
 `scene_to_reflection` as a camera calibration factor.
+
+`--log-reference-gain auto` (camera Log profiles only; `srgb-preview` is rejected)
+resolves one sequence-wide gain instead. After the exposure plan exists and before
+the first colour conversion, every frame is developed once more through the exact
+delivery image chain (exposure, resize, colour-boundary crop) and the target-gamut
+linear extremes are reduced with the converter's own arithmetic. The applied gain
+is `min(desired, positive headroom, negative toe)`: the desired brightening is 4
+(+2 EV) for D-Log 2 and 8 (+3 EV) for every other camera Log curve, and the two
+headroom bounds keep every scanned sample inside the transfer's encodable domain,
+so an auto run reports `clipped_total=0` by construction. Both bounds are upper
+bounds on the gain, so a positive result always exists; an all-black sequence
+keeps the desired gain. The cost is one extra develop pass over the sequence
+(transcripts under the `scan` stage; scratch lifetime unchanged). One
+`kind=reference_gain` run-log line records requested/desired/safe bounds, the
+applied gain and EV, `limited_by` (`desired`, `positive-headroom` or
+`negative-toe`), scanned sample count and duration. The gain is a delivery
+parameter like the numeric form: it never enters measurement or native EV, and
+the encoded metadata carries the resolved number.
 
 Rust and native must be rebuilt together for `color_contract_version=2` (native
 color algorithm revision 4, output pipeline revision 5). Requests specify

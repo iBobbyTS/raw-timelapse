@@ -49,7 +49,11 @@ OPTIONS:
                                adaptation; an explicit different method changes the
                                output pixels and is reported as custom-adaptation
     --camera-color <MODE>      auto|generic|canon-clog3 (default: auto)
-    --log-reference-gain <N>   Positive finite output reference gain, all profiles (default: 1)
+    --log-reference-gain <N|auto>
+                               Positive finite output gain, all profiles (default: 1); or auto:
+                               one sequence-wide gain (D-Log 2 aims at +2 EV, other Logs +3 EV)
+                               capped so the scanned sequence peak never clips the Log domain
+                               (Log profiles only; costs one extra develop pass over the run)
     --encoder <NAME>           prores_ks | libx264 | ffv1 (default: prores_ks)
     --pix-fmt <FMT>            Encoder pixel format (default: yuv444p10le; libx264: yuv420p)
     --container <NAME>         mov | mp4 | matroska (default: mov; libx264: mp4; ffv1: matroska)
@@ -302,6 +306,43 @@ impl DeflickerConfig {
     }
 }
 
+/// Delivery reference gain selection. `Fixed` keeps the historical numeric
+/// contract; `Auto` resolves to one sequence-wide gain after the exposure
+/// plan exists, before the first colour conversion.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReferenceGain {
+    Auto,
+    Fixed(f64),
+}
+
+impl ReferenceGain {
+    /// Parse the `--log-reference-gain` value: `auto` or a positive finite
+    /// number. Profile-domain rejection happens once the profile is known.
+    fn parse(value: &str) -> Result<Self> {
+        if value == "auto" {
+            return Ok(Self::Auto);
+        }
+        let gain: f64 = value
+            .parse()
+            .map_err(|_| Error::new(EXIT_USAGE, "invalid --log-reference-gain"))?;
+        if !gain.is_finite() || gain <= 0.0 {
+            return Err(Error::new(
+                EXIT_USAGE,
+                "--log-reference-gain must be positive and finite",
+            ));
+        }
+        Ok(Self::Fixed(gain))
+    }
+
+    /// Run-log token: `auto` or the number, matching historical f64 Display.
+    pub fn token(&self) -> String {
+        match self {
+            Self::Auto => "auto".to_string(),
+            Self::Fixed(gain) => gain.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub graph: Option<PathBuf>,
@@ -320,7 +361,7 @@ pub struct Options {
     /// Frozen output CAT selection/realization resolved at startup; per-pixel
     /// conversion uses these coefficients.
     pub output_transform: color_profile::OutputTransform,
-    pub log_reference_gain: f64,
+    pub log_reference_gain: ReferenceGain,
     pub preview_profile: &'static color_profile::ColorProfile,
     pub converter: Option<String>,
     pub converter_timeout: Option<u64>,
@@ -354,7 +395,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut ffprobe = PathBuf::from(DEFAULT_FFPROBE);
     let mut preview_profile = color_profile::default_profile();
     let mut output_cat: Option<color_profile::OutputCatSelection> = None;
-    let mut log_reference_gain: Option<f64> = None;
+    let mut log_reference_gain: Option<ReferenceGain> = None;
     let mut camera_color = None;
     let mut converter: Option<String> = None;
     let mut converter_timeout: Option<u64> = None;
@@ -478,16 +519,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
             }
             "--log-reference-gain" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
-                let gain: f64 = value
-                    .parse()
-                    .map_err(|_| Error::new(EXIT_USAGE, "invalid --log-reference-gain"))?;
-                if !gain.is_finite() || gain <= 0.0 {
-                    return Err(Error::new(
-                        EXIT_USAGE,
-                        "--log-reference-gain must be positive and finite",
-                    ));
-                }
-                log_reference_gain = Some(gain);
+                log_reference_gain = Some(ReferenceGain::parse(&value)?);
             }
             "--graph" => {
                 graph = Some(PathBuf::from(take_value(
@@ -731,6 +763,13 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         && preview_profile.transfer != color_profile::Transfer::CanonLog3RevEng {
         return Err(Error::new(EXIT_USAGE, "--camera-color canon-clog3 requires the CLog3 profile"));
     }
+    if log_reference_gain == Some(ReferenceGain::Auto)
+        && preview_profile.transfer == color_profile::Transfer::Srgb {
+        return Err(Error::new(
+            EXIT_USAGE,
+            "--log-reference-gain auto requires a camera Log profile; srgb-preview has no Log encoding headroom",
+        ));
+    }
     encoder.rate = rate;
     if !output_options.is_empty() {
         encoder.options = Some(
@@ -757,7 +796,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         preview_profile,
         output_transform,
         camera_color: camera_color.unwrap_or(color_profile::CameraColor::Auto),
-        log_reference_gain: log_reference_gain.unwrap_or(1.0),
+        log_reference_gain: log_reference_gain.unwrap_or(ReferenceGain::Fixed(1.0)),
         converter,
         converter_timeout,
         lens,
@@ -1044,6 +1083,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn log_reference_gain_accepts_auto_for_log_profiles() {
+        let options = parse_run(&[
+            "--input", "in", "--output", "out.mov",
+            "--preview-profile", "dji-dlog2-dgamut2", "--log-reference-gain", "auto",
+        ])
+        .expect("parse");
+        assert_eq!(options.log_reference_gain, ReferenceGain::Auto);
+        assert_eq!(options.log_reference_gain.token(), "auto");
+    }
+
+    #[test]
+    fn log_reference_gain_keeps_numeric_semantics() {
+        let options = parse_run(&[
+            "--input", "in", "--output", "out.mov",
+            "--preview-profile", "canon-log3-cinema-gamut-rev-eng-crm-dev",
+            "--log-reference-gain", "2.5",
+        ])
+        .expect("parse");
+        assert_eq!(options.log_reference_gain, ReferenceGain::Fixed(2.5));
+        assert_eq!(options.log_reference_gain.token(), "2.5");
+        let options = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");
+        assert_eq!(options.log_reference_gain, ReferenceGain::Fixed(1.0));
+    }
+
+    #[test]
+    fn log_reference_gain_auto_is_rejected_for_srgb_preview() {
+        let error = parse_run(&[
+            "--input", "in", "--output", "out.mov",
+            "--preview-profile", "srgb-preview", "--log-reference-gain", "auto",
+        ])
+        .expect_err("srgb rejects auto");
+        assert!(error.message.contains("auto requires a camera Log profile"));
+    }
+
+    #[test]
+    fn log_reference_gain_auto_rejects_malformed_tokens() {
+        for value in ["AUTO", "auto=1", "auto ", "1auto"] {
+            let error = parse_run(&[
+                "--input", "in", "--output", "out.mov",
+                "--preview-profile", "dji-dlog2-dgamut2",
+                "--log-reference-gain", value,
+            ])
+            .expect_err("malformed token");
+            assert!(error.message.contains("--log-reference-gain"));
+        }
+    }
     #[test]
     fn default_fps_is_legacy_thirty() {
         let options = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");

@@ -506,6 +506,18 @@ impl Transfer {
         (self.inverse(0.0), self.inverse(1.0))
     }
 
+    /// Desired gain for `--log-reference-gain auto`: two stops on D-Log 2 and
+    /// three stops on every other camera Log curve. This is a measured user
+    /// choice for dark timelapse delivery, not a property of the curve; the
+    /// domain bound in `ColorProfile::auto_reference_gain` is what actually
+    /// protects highlights.
+    pub fn desired_auto_reference_gain(self) -> f64 {
+        match self {
+            Self::DjiDLog2 => 4.0,
+            _ => 8.0,
+        }
+    }
+
     pub fn references(self) -> &'static [ReferenceCode] {
         match self {
             Transfer::CanonLog2RevEng => &CANON_REFERENCES,
@@ -1034,6 +1046,42 @@ impl ColorProfile {
     /// Curve input units, independent of the camera recipe and exposure calibration.
     pub fn curve_input_scale(&self) -> f64 {
         match self.transfer { Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng => 0.9, _ => 1.0 }
+    }
+
+    /// One sequence-wide gain for `--log-reference-gain auto`. `max_target`
+    /// and `min_target` are the extremes of the composed output matrix over
+    /// every scanned sample, in the same pre-scale units the delivery
+    /// converter multiplies by `reference_gain * curve_input_scale`. Both
+    /// constraints are upper bounds on the gain, so a positive result always
+    /// exists for the camera Log curves whose encodable domain straddles zero.
+    /// An all-black scan keeps the desired gain.
+    pub fn auto_reference_gain(&self, max_target: f64, min_target: f64) -> f64 {
+        let (low, high) = self.transfer.domain();
+        let scale = self.curve_input_scale();
+        let mut gain = self.transfer.desired_auto_reference_gain();
+        if max_target > 0.0 {
+            gain = gain.min(high / (max_target * scale));
+        }
+        if min_target < 0.0 && low < 0.0 {
+            gain = gain.min(low / (min_target * scale));
+        }
+        // Rounding guard: delivery multiplies each sample by `gain * scale`
+        // once and compares against the domain. Nudge the gain down whole ulps
+        // until both extreme products stay inside the encodable domain
+        // bit-for-bit; when the desired gain already fits this never runs.
+        for _ in 0..4 {
+            let positive_ok = max_target <= 0.0 || max_target * (gain * scale) <= high;
+            let negative_ok = min_target >= 0.0 || low >= 0.0 || min_target * (gain * scale) >= low;
+            if positive_ok && negative_ok {
+                break;
+            }
+            let decremented = f64::from_bits(gain.to_bits() - 1);
+            if decremented <= 0.0 || !decremented.is_finite() || decremented >= gain {
+                break;
+            }
+            gain = decremented;
+        }
+        gain
     }
     pub fn is_rev_eng(&self) -> bool {
         matches!(
@@ -1929,6 +1977,87 @@ mod tests {
 
     fn close(a: f64, b: f64, tolerance: f64) -> bool {
         (a - b).abs() <= tolerance
+    }
+
+    // -----------------------------------------------------------------------
+    // `--log-reference-gain auto`: desired brightening capped by the
+    // transfer's encodable domain, in the exact arithmetic delivery uses.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn auto_reference_gain_keeps_the_desired_gain_when_it_fits() {
+        let dlog2 = lookup("dji-dlog2-dgamut2").unwrap();
+        let clog3 = lookup("canon-log3-cinema-gamut-rev-eng-crm-dev").unwrap();
+        assert_eq!(dlog2.transfer.desired_auto_reference_gain(), 4.0);
+        assert_eq!(clog3.transfer.desired_auto_reference_gain(), 8.0);
+        // Peaks far inside the domain: the desired gain is used unchanged.
+        assert_eq!(dlog2.auto_reference_gain(0.5, -0.001), 4.0);
+        assert_eq!(clog3.auto_reference_gain(0.5, -0.001), 8.0);
+        // An all-black scan has no binding constraint and keeps the desire.
+        assert_eq!(dlog2.auto_reference_gain(0.0, 0.0), 4.0);
+        assert_eq!(clog3.auto_reference_gain(0.0, 0.0), 8.0);
+    }
+
+    #[test]
+    fn auto_reference_gain_caps_by_the_positive_domain_bound() {
+        let dlog2 = lookup("dji-dlog2-dgamut2").unwrap();
+        let (low, high) = dlog2.transfer.domain();
+        let scale = dlog2.curve_input_scale();
+        for max in [1.0, 47.5, 199.9999, 200.0, 475.0] {
+            let gain = dlog2.auto_reference_gain(max, -1e-6);
+            assert!(gain.is_finite() && gain > 0.0);
+            assert!(gain <= dlog2.transfer.desired_auto_reference_gain());
+            assert!(
+                max * (gain * scale) <= high,
+                "max {max} still exceeds the domain at gain {gain}"
+            );
+            let _ = low;
+        }
+        // The nominal headroom bound: 475/200 is exactly representable.
+        let gain = dlog2.auto_reference_gain(200.0, -1e-6);
+        assert!((gain - high / 200.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn auto_reference_gain_caps_by_the_negative_toe_bound() {
+        let clog3 = lookup("canon-log3-cinema-gamut-rev-eng-crm-dev").unwrap();
+        let (low, _high) = clog3.transfer.domain();
+        let scale = clog3.curve_input_scale();
+        assert!(low < 0.0);
+        // A large out-of-gamut negative binds before the positive peak.
+        let gain = clog3.auto_reference_gain(0.5, -0.5);
+        assert!((gain - low / (-0.5 * scale)).abs() < 1e-12);
+        assert!(gain < clog3.transfer.desired_auto_reference_gain());
+        assert!(-0.5 * (gain * scale) >= low);
+    }
+
+    #[test]
+    fn auto_reference_gain_never_pushes_any_log_outside_its_domain() {
+        for profile in PROFILES.iter().filter(|p| p.transfer != Transfer::Srgb) {
+            let (low, high) = profile.transfer.domain();
+            let scale = profile.curve_input_scale();
+            assert!(low < 0.0 && high > 0.0, "{}", profile.id);
+            for (max, min) in [
+                (0.05, -0.02),
+                (1.0, -0.5),
+                (7.3, -0.004),
+                (120.0, -3.0),
+                (470.0, -40.0),
+            ] {
+                let gain = profile.auto_reference_gain(max, min);
+                assert!(gain.is_finite() && gain > 0.0, "{}", profile.id);
+                assert!(
+                    max * (gain * scale) <= high,
+                    "{} positive clip at ({max}, {min})",
+                    profile.id
+                );
+                assert!(
+                    min * (gain * scale) >= low,
+                    "{} negative clip at ({max}, {min})",
+                    profile.id
+                );
+            }
+        }
     }
 
     #[test]

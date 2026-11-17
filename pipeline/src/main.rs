@@ -196,7 +196,7 @@ fn execute(
             .join(","),
         deflicker.exclude_rois.len(),
         deflicker.steps.len(),
-        options.log_reference_gain
+        options.log_reference_gain.token()
     ))?;
 
     proc::require_executable(&options.native_tool, "--dng-linear-frame")?;

@@ -21,6 +21,8 @@ struct Fake {
     batch_completion: Option<std::sync::mpsc::Receiver<usize>>,
     slow_measure: Option<std::sync::mpsc::Receiver<()>>,
     plan_defect: Option<&'static str>,
+    plan_ready_calls: usize,
+    developed: bool,
 }
 impl Backend for Fake {
     type Reference = String;
@@ -175,7 +177,15 @@ impl Backend for Fake {
         }
         Ok(plan)
     }
+    fn plan_ready(&mut self, plan: &[Gain], refs: &[String]) -> Result<()> {
+        self.plan_ready_calls += 1;
+        // The auto reference-gain scan depends on firing before any develop.
+        assert!(!self.developed);
+        assert_eq!(plan.len(), refs.len());
+        Ok(())
+    }
     fn develop_task(&mut self, id: usize, _: &String, ev: f64) -> Result<FrameTask<Vec<f32>>> {
+        self.developed = true;
         assert!(self
             .events
             .iter()
@@ -382,6 +392,24 @@ fn sealed_solver_owned_pixels_and_delete_before_sink_read() {
                     .unwrap()
         );
     }
+}
+#[test]
+fn plan_ready_fires_once_before_any_develop_task() {
+    let mut fake = Fake::default();
+    execute(&Graph::default_graph(true), 3, &mut fake).unwrap();
+    assert_eq!(fake.plan_ready_calls, 1);
+    assert!(fake.developed);
+}
+
+#[test]
+fn plan_ready_fires_for_the_zero_plan_too() {
+    let mut fake = Fake {
+        zero: true,
+        ..Default::default()
+    };
+    execute(&Graph::default_graph(false), 3, &mut fake).unwrap();
+    assert_eq!(fake.plan_ready_calls, 1);
+    assert!(fake.developed);
 }
 #[test]
 fn strength_zero_is_explicit_and_skips_measurement() {

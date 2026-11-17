@@ -1915,6 +1915,65 @@ fn log_reference_gain_is_finite_positive_for_every_profile() {
 }
 
 #[test]
+fn log_reference_gain_auto_resolves_one_sequence_gain_without_clipping() {
+    let root = test_dir("gain-auto");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_tool(&fixtures, &frames, None, false);
+    let directory = run_directory(&root, "run");
+    let video = video_in(&directory);
+    let mut args = base_args(&input, &video, &tool);
+    args.extend([
+        "--preview-profile", "dji-dlog2-dgamut2",
+        "--log-reference-gain", "auto",
+    ]);
+    let result = run_cli(&args);
+    assert!(result.status.success(), "{}", stderr(&result));
+    let log = read_log(&directory);
+    assert!(
+        log.contains("kind=settings") && log.contains("reference_gain=auto"),
+        "{log}"
+    );
+    assert!(
+        log.contains(
+            "kind=reference_gain requested=auto profile=dji-dlog2-dgamut2 frames=3"
+        ),
+        "{log}"
+    );
+    assert!(log.contains("desired=4.000000000 desired_ev=2.00"), "{log}");
+    assert!(log.contains("limited_by=desired"), "{log}");
+    assert!(log.contains("applied=4.000000000 applied_ev=+2.00"), "{log}");
+    assert!(log.contains("clipped_total=0"), "{log}");
+    assert!(!log.contains("clipped_total=1"), "{log}");
+    let _ = video.metadata().expect("published video");
+}
+
+#[test]
+fn log_reference_gain_auto_is_rejected_for_srgb_preview() {
+    let root = test_dir("gain-auto-srgb");
+    let input = root.join("material");
+    make_input(&input, &["IMG_1.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).expect("fixtures");
+    let frames = standard_frames(&fixtures);
+    let tool = fake_native_tool(&fixtures, &frames, None, false);
+    let directory = run_directory(&root, "run");
+    let video = video_in(&directory);
+    let mut args = base_args(&input, &video, &tool);
+    args.extend(["--log-reference-gain", "auto"]);
+    let result = run_cli(&args);
+    assert_eq!(result.status.code(), Some(2), "{}", stderr(&result));
+    assert!(
+        stderr(&result).contains("auto requires a camera Log profile"),
+        "{}",
+        stderr(&result)
+    );
+    assert!(!video_in(&directory).exists());
+}
+#[test]
 fn rational_fps_is_honoured_by_the_encoder_and_the_log() {
     let root = test_dir("fps-rational");
     let input = root.join("material");
