@@ -57,11 +57,6 @@ impl PreviewRange {
         }
     }
 
-    /// `ffmpeg` `scale`/`setparams` token.
-    pub fn filter_token(self) -> &'static str {
-        self.as_str()
-    }
-
 }
 
 /// YCbCr coding matrix applied to the already-transferred target signal.
@@ -1491,21 +1486,6 @@ impl ColorProfile {
             }
         }
         Ok(())
-    }
-
-    /// `-vf` colour conversion half of the preview filter chain (without the
-    /// optional lanczos resize prefix).
-    pub fn color_filter(&self) -> String {
-        format!(
-            "scale=out_color_matrix={}:out_range={},\
-             setparams=color_primaries={}:color_trc={}:colorspace={}:range={}",
-            self.scale_filter_token(),
-            self.range.filter_token(),
-            self.tag_policy.primaries_token(),
-            self.tag_policy.transfer_token(),
-            self.tag_policy.matrix_token(),
-            self.range.filter_token()
-        )
     }
 
     /// The complete per-profile colour contract for one resolved run transform.
