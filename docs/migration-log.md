@@ -615,3 +615,19 @@ native 新增回归覆盖：非 TIFF 输入与 TIFF 无 DNGVersion（CR2/NEF/ARW
 - 验证：重写后 `cargo test --manifest-path pipeline/Cargo.toml` 与 legacy
   `pytest -q`（去掉 golden 用例后）均须退出码 0；日志存
   `.agent-work/tmp/git-slim-20261116/`。
+
+## 2026-11-16 — legacy/ 从 main 完整退役（用户决策）
+
+- 决策：用户确认把 legacy 文件夹从 main 历史完整删除；python-prototype 分支已
+  清理垃圾（.DS_Store ×4、.build/ 元数据）后强推远端归档
+  （origin/python-prototype @583020e），本地分支已删除。
+- 据此以 git filter-repo 从 main 全部历史移除 legacy/。V4 权威的唯一载体自此是
+  远端 python-prototype 分支（原始 Python 项目完整历史，根级布局）；本地冻结
+  venv（legacy/python/.venv，136MB）随之删除，需要时在 python-prototype 分支
+  检出后 `uv sync --extra test` 重建。
+- 影响：仅含 legacy/ 路径的提交（如 T00 冻结提交）被整体裁剪出历史；上文 T00
+  章节保留为历史叙述，其引用的 legacy 路径不再存在于 main；legacy pytest 套件
+  移至 python-prototype 分支运行。
+- 备份：本次重写前状态存
+  `.agent-work/tmp/git-slim-20261116/pre-phase2-all.bundle`（本地，不入库）。
+- 验证：树差异仅 legacy/*；Rust 构建输入零变化（cargo check 通过）。
