@@ -596,3 +596,22 @@ native 新增回归覆盖：非 TIFF 输入与 TIFF 无 DNGVersion（CR2/NEF/ARW
   `cargo build --release` 退出码 0（`repair-release-build.*`）。修复前失败日志见
   `prerepair-dangling-integration.*`、`prerepair-dangling-units.*`、
   `prerepair-custom-cache.*`。未覆盖项与上条相同。
+
+## 2026-11-16 — real-material golden fixture 集退役与 git 瘦身（用户决策）
+
+- 决策：用户确认给 git 瘦身，不保留 reference-video.mp4，只保留有用的代码。据此退役
+  `legacy/python/tests/fixtures/real-material/` 全部 48 个文件（约 37MB，其中
+  reference-video.mp4 30.8MB，占 pack 82%）以及仅为其完整性守护而存在的
+  `legacy/python/tests/test_golden_fixtures.py`（5 用例）。
+- 依据：该集唯一消费者是上述测试；当前 Rust 套件不消费任何 legacy fixture
+  （deflicker 移植自带独立 golden，位于 `pipeline/src/deflicker/fixtures/`，
+  继续保留）。legacy V4 源码继续原样冻结为迁移对拍权威；
+  `tools/generate_golden_fixtures.py` 保留为再生成入口（需原始 RAW 素材，
+  命令行见 T00）。本节是对 T00 『golden 入库』决定的显式退役，其余冻结条款不变。
+- 历史重写：本提交之后以 git filter-repo 从全部历史清除该目录（否则 blob 永留
+  pack）。重写使本文件早前章节引用的旧提交哈希（如 936135d、b7a0564 等）不再
+  存在于新 lineage；重写前全量备份（全部引用 + fixture 原件）：
+  `.agent-work/tmp/git-slim-20261116/pre-slim-all.bundle`（本地，不入库）。
+- 验证：重写后 `cargo test --manifest-path pipeline/Cargo.toml` 与 legacy
+  `pytest -q`（去掉 golden 用例后）均须退出码 0；日志存
+  `.agent-work/tmp/git-slim-20261116/`。
