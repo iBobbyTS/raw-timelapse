@@ -1951,7 +1951,7 @@ fn log_reference_gain_auto_resolves_one_sequence_gain_without_clipping() {
         assert!(!log.contains("clipped_total=1"), "{log}");
         let _ = video.metadata().expect("published video");
         if profile == "dji-dlog-dgamut" {
-            assert!(log.contains("recipe_effective=dji-dlog profile_correction=hue-sat-map"), "{log}");
+            assert!(log.contains("recipe_effective=generic profile_correction=hue-sat-map"), "{log}");
             assert!(log.contains("output_cat_method=cat02 output_cat_realization=reference"), "{log}");
         }
     }
@@ -2076,13 +2076,14 @@ fn camera_color_cli_routes_before_prepare_and_keeps_single_extension_policy() {
         (REV3_PROFILE, "DNG", "auto", "generic"),
         (REV_PROFILE, "CR3", "auto", "generic"),
         ("srgb-preview", "CR3", "auto", "generic"),
-        ("dji-dlog-dgamut", "DNG", "auto", "dji-dlog"),
+        ("dji-dlog-dgamut", "DNG", "auto", "generic"),
         ("dji-dlog-dgamut", "DNG", "generic", "generic"),
         ("dji-dlog2-dgamut2", "DNG", "auto", "generic"),
         (REV3_PROFILE, "CR3", "generic", "generic"),
         (REV3_PROFILE, "CR3", "canon-clog3", "canon-clog3"),
     ] {
         let (root,input,tool) = profile_material_for_extension(&format!("recipe-{id}-{ext}-{selection}"), [1800;3], ext);
+        append_config(&root.join("fixtures"), "rev_defect=valid-hsm");
         let directory = run_directory(&root,"run");
         let video = video_in(&directory);
         let mut args = base_args(&input,&video,&tool);
@@ -2091,6 +2092,7 @@ fn camera_color_cli_routes_before_prepare_and_keeps_single_extension_policy() {
         assert!(result.status.success(),"{}",stderr(&result));
         let log=read_log(&directory);
         assert!(log.contains(&format!("camera_color_requested={selection} recipe_effective={recipe}")),"{log}");
+        assert!(log.contains("hue_sat_map=applied"), "{log}");
         if recipe=="generic" { assert!(log.contains("calibration_status=uncalibrated"),"{log}"); }
     }
     for selection in ["auto","generic","canon-clog3"] {
@@ -2121,7 +2123,7 @@ fn camera_color_cli_routes_before_prepare_and_keeps_single_extension_policy() {
 fn camera_color_v2_defects_are_rejected_without_publication() {
     for (recipe, defect) in [
         ("generic","contract-v1"),("generic","recipe-lie"),("generic","missing-policy"),
-        ("generic","generic-calibrated"),("generic","generic-hsm"),("generic","baseline"),("generic","missing-cat"),
+        ("generic","generic-calibrated"),("generic","phantom-hsm"),("generic","skipped-hsm"),("generic","baseline"),("generic","missing-cat"),
         ("canon-clog3","canon-generic"),
     ] {
         let (root,input,tool)=profile_material_for_extension(&format!("v2-{recipe}-{defect}"),[1800;3],"CR3");

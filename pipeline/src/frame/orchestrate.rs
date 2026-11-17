@@ -439,7 +439,7 @@ fn query_lens_area(tool:&Path,prepared:&mut PreparedFrame,settings:&crate::lens:
     let log=prepared.context.with_extension("lens-area.log");
     let mut args=vec!["--lens-valid-area".into(),"--prepared".into(),prepared.context.display().to_string(),
         "--camera-recipe".into(),"generic".into(),"--camera-color-method".into(),"dng-camera-to-pcs".into(),
-        "--profile-correction".into(),"none".into(),"--camera-calibration".into(),"none".into(),"--highlight-recovery".into(),"off".into()];
+        "--camera-calibration".into(),"none".into(),"--highlight-recovery".into(),"off".into()];
     settings.policy.args(settings.mode,&mut args);
     let captured=proc::run_capture_active(tool,&args,EXIT_FRAME,&log,active)?;
     write_prepare_log(&log,tool,&args,&captured)?;
@@ -663,7 +663,6 @@ fn frame_args(
         run.method.native_token().into(),
         "--color-contract-version".into(), "2".into(),
         "--camera-recipe".into(), run.method.token().into(),
-        "--profile-correction".into(), run.method.correction().into(),
         "--camera-calibration".into(), run.method.calibration().into(),
         "--highlight-recovery".into(),
         if pixels && run.method != crate::color_profile::CameraRecipe::LegacyInverseCm { "on" } else { "off" }.into(),

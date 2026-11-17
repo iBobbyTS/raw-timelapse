@@ -353,12 +353,17 @@ fn run() -> Result<(), (i32, String)> {
         } else {
             contract
         };
+        let contract = if defect == Some("valid-hsm") {
+            contract.replace("\"hue_sat_map_present\":false", "\"hue_sat_map_present\":true")
+                .replace("\"hue_sat_map_applied\":false", "\"hue_sat_map_applied\":true")
+                .replace("\"hue_sat_map_status\":\"absent\"", "\"hue_sat_map_status\":\"applied\"")
+        } else { contract };
         let contract = match defect {
             Some("contract-v1") => contract.replace("\"color_contract_version\":2", "\"color_contract_version\":1"),
             Some("recipe-lie") => contract.replace("\"recipe_effective\":\"generic\"", "\"recipe_effective\":\"canon-clog3\""),
             Some("missing-policy") => contract.replace("\"profile_correction_effective\":", "\"omitted_policy\":"),
             Some("generic-calibrated") => contract.replace("\"applied\":false", "\"applied\":true"),
-            Some("generic-hsm") => contract.replace("\"hue_sat_map_applied\":false", "\"hue_sat_map_applied\":true"),
+            Some("phantom-hsm") => contract.replace("\"hue_sat_map_applied\":false", "\"hue_sat_map_applied\":true"),
             Some("baseline") => contract.replace("\"baseline_exposure_applied\":false", "\"baseline_exposure_applied\":true"),
             Some("missing-cat") => contract.replace("\"cat\":", "\"omitted_cat\":"),
             Some("canon-generic") => contract.replace("\"recipe_effective\":\"canon-clog3\"", "\"recipe_effective\":\"generic\""),
@@ -759,7 +764,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
             no_png: false,
             stdout_mode: None,
             camera_method: "legacy-inverse-cm".to_string(),
-            recipe: "legacy-test".into(), correction: "none".into(), calibration: "none".into(),
+            recipe: "legacy-test".into(), correction: "hue-sat-map".into(), calibration: "none".into(),
             highlight_recovery: false,
             lens_auto: false,
             lens_components:[true;3],lens_strength:1.0,lens_sampling:"bilinear".into(),
@@ -802,7 +807,7 @@ fn parse_args() -> Result<Options, (i32, String)> {
     };
     let mut camera_method = "legacy-inverse-cm".to_string();
     let mut recipe = "legacy-test".to_string();
-    let mut correction = "none".to_string();
+    let correction = "hue-sat-map".to_string();
     let mut calibration = "none".to_string();
     let mut highlight_recovery = false;
     let mut lens_auto = false;
@@ -818,7 +823,6 @@ fn parse_args() -> Result<Options, (i32, String)> {
     while index < args.len() {
         match args[index].as_str() {
             "--camera-recipe" => { recipe = value(&args, &mut index)?; index += 1; }
-            "--profile-correction" => { correction = value(&args, &mut index)?; index += 1; }
             "--camera-calibration" => { calibration = value(&args, &mut index)?; index += 1; }
             "--highlight-recovery" => { highlight_recovery = value(&args, &mut index)? == "on"; index += 1; }
             "--lens-vignette" | "--lens-distortion" | "--lens-ca" => {let component=match args[index].as_str(){"--lens-vignette"=>0,"--lens-distortion"=>1,_=>2};lens_components[component]=value(&args,&mut index)?=="auto";index+=1;}

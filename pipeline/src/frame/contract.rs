@@ -108,12 +108,12 @@ pub(crate) fn validate_sidecar_contracts(
         };
         let calibration = color.get("exposure_calibration");
         if !eq("recipe_requested", method.token()) || !eq("recipe_effective", method.token())
-            || !eq("profile_correction_requested", method.correction()) || !eq("profile_correction_effective", method.correction())
+            || !eq("profile_correction_requested", crate::color_profile::CAMERA_PROFILE_CORRECTION) || !eq("profile_correction_effective", crate::color_profile::CAMERA_PROFILE_CORRECTION)
             || !eq("camera_calibration_requested", method.calibration()) || !eq("camera_calibration_effective", method.calibration())
             || color.get("algorithm_revision").and_then(Json::as_u64) != Some(4)
             || !valid_matrix("xyz_d50_to_acescg") || !valid_matrix("sdk_normalized_pcs_to_camera")
             || !eq("cat", "linear Bradford D50->D60; AP1 inverse primaries matrix")
-            || !valid_presence("hue_sat_map_present", "hue_sat_map_applied", "hue_sat_map_status", method.correction() == "hue-sat-map")
+            || !valid_presence("hue_sat_map_present", "hue_sat_map_applied", "hue_sat_map_status", true)
             || !valid_presence("look_table_present", "look_table_applied", "look_table_status", false)
             || !valid_presence("tone_curve_present", "tone_curve_applied", "tone_curve_status", false)
             || flag("baseline_exposure_applied") != Some(false) || !eq("baseline_exposure_status", "skipped")

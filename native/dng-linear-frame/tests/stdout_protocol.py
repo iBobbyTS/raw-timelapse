@@ -262,7 +262,7 @@ pp_inv=inv(pp)
 hsm=([2,2,1],[0,1.2,1]*4)
 fwd=[.7977,.1352,.0313,.2880,.7119,.0001,0,0,.8249]
 def calibrated_stream(f,method='dng-camera-to-pcs',ev='0'):
-    r=stream([exe,'--stdout-frame-f32',f,'--camera-color-method',method,'--profile-correction',('hue-sat-map' if method=='dng-camera-to-pcs' else 'none'),'--exposure-ev',ev])
+    r=stream([exe,'--stdout-frame-f32',f,'--camera-color-method',method,'--exposure-ev',ev])
     rr=records(b'RAWTLST1'+r.stdout[8:]);return json.loads(rr[0][1]),struct.unpack('<3f',rr[2][1][:12])
 def transform(m,v):return [sum(float(x)*float(y) for x,y in zip(row,v)) for row in m]
 for camera in ([121,400,289],[605,1000,482]):
@@ -283,11 +283,11 @@ for camera in ([121,400,289],[605,1000,482]):
     _,gained=calibrated_stream(f,ev='4.25')
     for a,b in zip(gained,expected):assert abs(a-b*2**4.25)<4e-6,(gained,expected)
     assert max(gained)>4
-    # Legacy profiles deliberately keep their historical matrix-only path.
+    # The historical inverse-matrix diagnostic also cannot opt out of HSM.
     plain=make_dng(work,'hsm-control-'+str(camera[0]),w=64,h=64,pixels=camera*4096,forward=fwd)
     _,legacy_hsm=calibrated_stream(f,method='legacy-inverse-cm')
     _,legacy_plain=calibrated_stream(plain,method='legacy-inverse-cm')
-    assert legacy_hsm==legacy_plain
+    assert legacy_hsm!=legacy_plain
 
 # Applying the same 2.5D profile to 2x-brighter camera data remains homogeneous,
 # including values above 1 in ProPhoto (the bare SDK HSV kernel would clip V).
@@ -323,7 +323,7 @@ print('PASS: HueSatMap ValueScale >1 retains calibrated HDR values',flush=True)
 
 # Deflicker photometry must observe the same calibrated scene as the final
 # frame, while retaining the uncalibrated camera-domain saturation mask.
-a=stream([exe,'--stdout-analysis',f,'--camera-color-method','dng-camera-to-pcs','--profile-correction','hue-sat-map','--exposure-ev','0.5'])
+a=stream([exe,'--stdout-analysis',f,'--camera-color-method','dng-camera-to-pcs','--exposure-ev','0.5'])
 rr=records(a.stdout);am=json.loads(rr[0][1]);analysis=json.loads(rr[1][1])
 assert am['color']==meta['color']
 weights=analysis['analysis']['luma_weights']

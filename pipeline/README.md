@@ -108,7 +108,7 @@ matrices, profile correction and EV; measurement remains observation-only.
 No new graph node is introduced. The same-stem log reports `kind=highlight`,
 including unsupported decoder endpoint semantics rather than claiming recovery.
 See [algorithm and limits](../docs/raw-highlight-recovery.md). Native standalone
-consumers default to recovery off for matrix-only diagnostics.
+consumers default to recovery off for diagnostic development.
 
 ## Output
 
@@ -377,7 +377,6 @@ Input development is selected with `--camera-color auto|generic|canon-clog3`
 | selection | resolved input recipe |
 | --- | --- |
 | auto, CLog3 profile, all original inputs CR3 | Canon CLog3; native verifies Canon metadata for every frame |
-| auto, original `dji-dlog-dgamut` profile | dji-dlog (CameraToPCS + embedded HueSatMap when present) |
 | auto, any remaining profile or non-CR3 inputs | generic |
 | generic, any profile | generic |
 | canon-clog3 | requires CLog3 and original Canon CR3; otherwise rejected |
@@ -386,18 +385,18 @@ A mixed-extension directory is rejected before recipe selection in every mode.
 The recipe is frozen before prepare and shared by measure and develop. A failed
 Canon request never retries as generic; Canon sequences still reject mixed models.
 
+All development uses the selected camera profile's valid embedded HueSatMap when
+present, in linear ProPhoto/D50 before scene exposure. HSM is independent of output
+Log/preview profiles and camera recipe selection, with no disable option. Absence
+leaves the matrix result intact; malformed tables fail rather than silently falling
+back. Measure, scan and delivery share this rule. LookTable, ToneCurve and
+BaselineExposure remain skipped.
+
 Generic development uses SDK CameraToPCS (ForwardMatrix when present, SDK inverse
-ColorMatrix fallback otherwise), with the selected WB already included. It skips
-and reports profile HueSatMap, LookTable, ToneCurve and BaselineExposure. It applies
+ColorMatrix fallback otherwise), with the selected WB already included. It applies
 no Canon exposure calibration and reports `uncalibrated`, including when the user
 sets a reference gain. Invalid or singular profile transforms fail explicitly.
 Input D50→D60 adaptation remains Bradford; it is independent of output color.
-
-The original D-Log recipe applies a valid embedded HueSatMap when present, in
-linear ProPhoto/D50 before output exposure. An absent table is reported and leaves
-the matrix result intact; malformed tables fail rather than silently falling back.
-LookTable, ToneCurve and BaselineExposure stay skipped. It applies no camera exposure
-calibration. Explicit `--camera-color generic` retains the matrix-only input path.
 
 The Canon CLog3 recipe also applies the validated profile HueSatMap and original
 CR3 NormalWhite/fixed 1.8 exposure calibration. CLog2RevEng now uses generic input
@@ -496,8 +495,8 @@ the encoded metadata carries the resolved number.
 
 Rust and native must be rebuilt together for `color_contract_version=2` (native
 color algorithm revision 4, output pipeline revision 5). Requests specify
-`--color-contract-version 2 --camera-recipe <generic|dji-dlog|canon-clog3>` plus explicit
-`--camera-color-method dng-camera-to-pcs`, `--profile-correction <none|hue-sat-map>`
+`--color-contract-version 2 --camera-recipe <generic|canon-clog3>` plus explicit
+`--camera-color-method dng-camera-to-pcs`
 and `--camera-calibration <none|canon-normal-white-fixed-v1>`. The reader checks
 requested/effective recipe and policies, profile presence/applied/skip states,
 input CAT and matrices, calibration evidence, source/prepared identity, WB, EV,

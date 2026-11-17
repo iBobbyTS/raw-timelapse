@@ -302,14 +302,13 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe 
     d.lens_correction = lens::report(lens_calibration, corrected, lens_request.enabled, lens_request.policy);
     if (!corrected.pixels.empty()) d.delivery_camera = std::move(corrected.pixels);
     Json correction;
-    const bool apply_hsm = recipe.correction == ProfileCorrection::hue_sat_map;
-    if (apply_hsm && !pcs) throw Error(40, "profile correction requires CameraToPCS");
-    if (apply_hsm && profile.HasHueSatDeltas())
+    // HSM is intrinsic to the selected camera profile; no opt-out.
+    if (profile.HasHueSatDeltas())
       correction = calibrate_profile(d, profile, white, host);
-    const char *correction_policy = recipe.correction == ProfileCorrection::none ? "none" : "hue-sat-map";
+    const char *correction_policy = "hue-sat-map";
     const char *calibration_policy = recipe.calibration == CameraCalibration::none ? "none" : "canon-normal-white-fixed-v1";
     d.color = Json{
-        {"method", pcs ? "DNG SDK CameraToPCS; explicit profile correction policy" : "DNG Ch6 no-ForwardMatrix; inverse(SDK normalized AB*CC*CM*MapWhiteMatrix(D50,selectedWhite))"},
+        {"method", pcs ? "DNG SDK CameraToPCS; intrinsic profile HueSatMap" : "DNG Ch6 no-ForwardMatrix; inverse(SDK normalized AB*CC*CM*MapWhiteMatrix(D50,selectedWhite))"},
         {"selected_white_xy", std::vector<Json>{white.x, white.y}},
         {"profile_index", 0},
         {"profile_name", profile.Name().Get()},
@@ -348,14 +347,14 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe 
         {"hue_sat_map_present", profile.HasHueSatDeltas()},
         {"look_table_present", profile.HasLookTable()},
         {"tone_curve_present", profile.ToneCurve().IsValid()},
-        {"hue_sat_map_applied", apply_hsm && profile.HasHueSatDeltas()}, {"look_table_applied", false},
+        {"hue_sat_map_applied", profile.HasHueSatDeltas()}, {"look_table_applied", false},
         {"tone_curve_applied", false}, {"baseline_exposure_applied", false},
         {"forward_matrix_used", pcs && fm},
         {"matrix_scope", "camera_to_* matrices describe the pre-HueSatMap transform"},
         {"profile_correction", correction},
         {"baseline_exposure_ev", baseline},
         {"baseline_exposure_status", "skipped"},
-        {"hue_sat_map_status", profile.HasHueSatDeltas() ? (apply_hsm ? "applied" : "skipped") : "absent"},
+        {"hue_sat_map_status", profile.HasHueSatDeltas() ? "applied" : "absent"},
         {"look_table_status", profile.HasLookTable() ? "skipped" : "absent"},
         {"tone_curve_status", profile.ToneCurve().IsValid() ? "skipped" : "absent"},
         {"recipe_requested", recipe.name},

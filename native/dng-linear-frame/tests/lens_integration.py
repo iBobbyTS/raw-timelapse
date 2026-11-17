@@ -95,9 +95,9 @@ ap1=primary_matrix([(.713,.293),(.165,.830),(.128,.044)],D60)
 prophoto=primary_matrix([(.7347,.2653),(.1596,.8404),(.0366,.0001)],D50)
 ap1_to_prophoto=[[float(v) for v in row] for row in mm(inv(prophoto),mm(cat(D60,D50),ap1))]
 for mode in ["auto","off"]:
- matrix_args=["--camera-color-method","dng-camera-to-pcs","--camera-recipe","legacy-test","--profile-correction","none"]
- _,matrix=stream(hsm_context,mode,extra=matrix_args)
- _,hsm=stream(hsm_context,mode,extra=[*matrix_args,"--profile-correction","hue-sat-map"])
+ matrix_args=["--camera-color-method","dng-camera-to-pcs","--camera-recipe","generic"]
+ _,matrix=stream(context,mode,extra=matrix_args)
+ _,hsm=stream(hsm_context,mode,extra=matrix_args)
  m=struct.unpack("<"+"f"*(len(matrix[4])//4),matrix[4]); h=struct.unpack("<"+"f"*(len(hsm[4])//4),hsm[4])
  for i in range(0,len(m),3):
   rgb_p=[sum(a*b for a,b in zip(row,m[i:i+3])) for row in ap1_to_prophoto]

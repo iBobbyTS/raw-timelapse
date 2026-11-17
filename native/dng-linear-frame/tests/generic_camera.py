@@ -1,9 +1,9 @@
-"""Controlled SDK CameraToPCS matrix-only recipe and independent PCS oracle."""
+"""Controlled SDK CameraToPCS profile development and independent PCS oracle."""
 import hashlib,json,pathlib,struct,subprocess,sys
 from dng_fixture import make_dng
 from reference_color import reference, matrix, inv, mm, mv, cat, D50, D60, xy, D
 exe,work=map(pathlib.Path,sys.argv[1:]);exe=exe.resolve();work.mkdir(parents=True,exist_ok=True)
-args=['--color-contract-version','2','--camera-recipe','generic','--camera-color-method','dng-camera-to-pcs','--profile-correction','none','--camera-calibration','none']
+args=['--color-contract-version','2','--camera-recipe','generic','--camera-color-method','dng-camera-to-pcs','--camera-calibration','none']
 def run(f,ev=0,analysis=False,extra=(),code=0):
     cmd=[str(exe),'--stdout-analysis' if analysis else '--stdout-frame-f32',str(f),*args,'--exposure-ev',str(ev),*extra]
     r=subprocess.run(cmd,capture_output=True)
@@ -29,12 +29,13 @@ for fm in (None,fwd):
     base=make_dng(work,label,forward=fm,w=64,h=64,pixels=[0,1000,0]*4096,model='NonCanon Test')
     decorated=make_dng(work,label+'-profile',forward=fm,w=64,h=64,pixels=[0,1000,0]*4096,model='NonCanon Test',hue_sat=hsm,tone=[0,0,.5,.8,1,1],look=hsm,baseline=1.88)
     m,p=run(base);m2,p2=run(decorated)
-    assert p==p2  # HueSatMap, look, tone and baseline must not affect generic pixels.
+    assert p==p2  # This signed ProPhoto fixture bypasses HSV; positive pixels tested below.
     c=m2['color'];assert c['recipe_requested']==c['recipe_effective']=='generic'
-    assert c['profile_correction_requested']==c['profile_correction_effective']=='none'
+    assert c['profile_correction_requested']==c['profile_correction_effective']=='hue-sat-map'
     assert c['camera_calibration_requested']==c['camera_calibration_effective']=='none'
     assert not c['exposure_calibration']['applied'] and c['exposure_calibration']['status']=='uncalibrated'
-    for field in ('hue_sat_map','look_table','tone_curve'):
+    assert c['hue_sat_map_applied'] and c['hue_sat_map_status']=='applied'
+    for field in ('look_table','tone_curve'):
         assert c[field+'_present'] and not c[field+'_applied'] and c[field+'_status']=='skipped'
     assert c['baseline_exposure_ev']==1.88 and not c['baseline_exposure_applied']
     # Independent Decimal no-FM reference; FM branch uses D50-normalized FM,
@@ -54,7 +55,7 @@ for fm in (None,fwd):
     for ev in (-2,2,5):
         me,pe=run(decorated,ev)
         assert me['color']==m2['color']
-        for a,b in zip(pe[:3],p[:3]):assert abs(a-b*2**ev)<2e-6*max(1,abs(a))
+        for a,b in zip(pe[:3],p2[:3]):assert abs(a-b*2**ev)<2e-6*max(1,abs(a))
     assert max(run(decorated,5)[1][:3])>1
     if fm is None:assert min(p[:3])<0
     ma,an=run(decorated,analysis=True);assert ma['color']==m2['color']
@@ -62,23 +63,28 @@ for fm in (None,fwd):
     run(decorated,extra=['--color-contract-version','1'],code=2)
     run(decorated,extra=['--camera-calibration','canon-normal-white-fixed-v1'],code=2)
     # A specialized request on direct non-Canon DNG cannot silently become generic.
-    run(decorated,extra=['--camera-recipe','canon-clog3','--profile-correction','hue-sat-map','--camera-calibration','canon-normal-white-fixed-v1'],code=40)
-# Original D-Log is a distinct policy tuple: HSM if present, no look/tone/exposure.
-# Compare with the existing standalone HSM implementation, not a duplicated color oracle.
-dlog=['--camera-recipe','dji-dlog','--profile-correction','hue-sat-map']
-base=make_dng(work,'dlog-absent',forward=fwd,w=64,h=64,pixels=[500,400,200]*4096)
-decorated=make_dng(work,'dlog-hsm',forward=fwd,w=64,h=64,pixels=[500,400,200]*4096,
-    hue_sat=hsm,tone=[0,0,.5,.8,1,1],look=hsm,baseline=1.88)
-for source in (base,decorated):
-    md,pd=run(source,extra=dlog)
-    mr,pr=run(source,extra=['--camera-recipe','legacy-test','--profile-correction','hue-sat-map'])
-    assert pd==pr
-    c=md['color'];assert c['recipe_effective']=='dji-dlog'
-    assert c['hue_sat_map_applied']==(source==decorated)
-    assert c['hue_sat_map_status']==('applied' if source==decorated else 'absent')
-    assert not c['tone_curve_applied'] and not c['look_table_applied'] and not c['baseline_exposure_applied']
-    ma,_=run(source,analysis=True,extra=dlog);assert ma['color']==c
-run(decorated,extra=['--camera-recipe','dji-dlog'],code=2)
-run(decorated,extra=dlog+['--camera-calibration','canon-normal-white-fixed-v1'],code=2)
-assert run(decorated,extra=dlog)[1]!=run(decorated)[1]
-print('PASS generic and D-Log CameraToPCS, HSM present/absent, analysis parity, EV and policy rejection')
+    run(decorated,extra=['--camera-recipe','canon-clog3','--camera-calibration','canon-normal-white-fixed-v1'],code=40)
+# HSM is intrinsic to every development recipe, independent of output encoding.
+# A positive fixture must change pixels; absence must leave the matrix result intact.
+for fm in (None,fwd):
+    label='positive-fallback' if fm is None else 'positive-fm'
+    base=make_dng(work,label,forward=fm,w=64,h=64,pixels=[500,400,200]*4096)
+    decorated=make_dng(work,label+'-hsm',forward=fm,w=64,h=64,pixels=[500,400,200]*4096,
+        hue_sat=hsm,tone=[0,0,.5,.8,1,1],look=hsm,baseline=1.88)
+    for source in (base,decorated):
+        md,pd=run(source)
+        c=md['color'];assert c['recipe_effective']=='generic'
+        assert c['profile_correction_effective']=='hue-sat-map'
+        assert c['hue_sat_map_applied']==(source==decorated)
+        assert c['hue_sat_map_status']==('applied' if source==decorated else 'absent')
+        assert not c['tone_curve_applied'] and not c['look_table_applied'] and not c['baseline_exposure_applied']
+        ma,_=run(source,analysis=True);assert ma['color']==c
+        me,pe=run(source,2)
+        assert me['color']==c
+        assert all(abs(a-b*4)<2e-6*max(1,abs(a)) for a,b in zip(pe,pd))
+    assert run(decorated)[1]!=run(base)[1]
+    # No opt-out or obsolete output-specific recipe is accepted.
+    for policy in ('none','hue-sat-map'):
+        run(decorated,extra=['--profile-correction',policy],code=2)
+    run(decorated,extra=['--camera-recipe','dji-dlog'],code=2)
+print('PASS universal HSM present/absent, FM/fallback, analysis parity, EV and policy rejection')

@@ -136,26 +136,25 @@ pub struct ColorProfile {
     pub output_cat: OutputCatDefault,
 }
 
+/// Intrinsic camera-profile correction, independent of recipe and output encoding.
+pub const CAMERA_PROFILE_CORRECTION: &str = "hue-sat-map";
+
 /// Frozen input development recipe. Legacy is retained only for historical tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraRecipe {
     LegacyInverseCm,
     Generic,
-    DjiDlog,
     CanonClog3,
 }
 impl CameraRecipe {
     pub fn native_token(self) -> &'static str {
         match self {
             Self::LegacyInverseCm => "legacy-inverse-cm",
-            Self::Generic | Self::DjiDlog | Self::CanonClog3 => "dng-camera-to-pcs",
+            Self::Generic | Self::CanonClog3 => "dng-camera-to-pcs",
         }
     }
     pub fn token(self) -> &'static str {
-        match self { Self::LegacyInverseCm => "legacy-test", Self::Generic => "generic", Self::DjiDlog => "dji-dlog", Self::CanonClog3 => "canon-clog3" }
-    }
-    pub fn correction(self) -> &'static str {
-        if matches!(self, Self::DjiDlog | Self::CanonClog3) { "hue-sat-map" } else { "none" }
+        match self { Self::LegacyInverseCm => "legacy-test", Self::Generic => "generic", Self::CanonClog3 => "canon-clog3" }
     }
     pub fn calibration(self) -> &'static str {
         if self == Self::CanonClog3 { "canon-normal-white-fixed-v1" } else { "none" }
@@ -172,7 +171,6 @@ impl CameraColor {
         match self {
             Self::Generic => Ok(CameraRecipe::Generic),
             Self::Auto if clog3 && all_cr3 => Ok(CameraRecipe::CanonClog3),
-            Self::Auto if profile.transfer == Transfer::DjiDLog => Ok(CameraRecipe::DjiDlog),
             Self::Auto => Ok(CameraRecipe::Generic),
             Self::CanonClog3 if clog3 && all_cr3 => Ok(CameraRecipe::CanonClog3),
             Self::CanonClog3 => Err("--camera-color canon-clog3 requires CLog3 profile and original Canon CR3 photos".into()),

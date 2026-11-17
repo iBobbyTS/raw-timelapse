@@ -2,7 +2,7 @@
 import hashlib,json,pathlib,struct,subprocess,sys
 from dng_fixture import make_dng
 exe,work=map(pathlib.Path,sys.argv[1:]);exe=exe.resolve();work.mkdir(parents=True,exist_ok=True)
-args=['--color-contract-version','2','--camera-recipe','generic','--camera-color-method','dng-camera-to-pcs','--profile-correction','none','--camera-calibration','none']
+args=['--color-contract-version','2','--camera-recipe','generic','--camera-color-method','dng-camera-to-pcs','--camera-calibration','none']
 logs=[]
 def run(source,enabled='on',mode='--stdout-frame-f32',ev=0,extra=(),expected=0):
     cmd=[str(exe),mode,str(source),*args,'--highlight-recovery',enabled,'--exposure-ev',str(ev),*extra]
@@ -25,7 +25,7 @@ for correction in (False,True):
     label='hsm' if correction else 'matrix'
     f=make_dng(work,label,white=10000,w=64,h=64,pixels=base,neutral=[.5,1,.7],hue_sat=hsm if correction else None)
     t=make_dng(work,label+'-truth',white=10000,w=64,h=64,pixels=truth,neutral=[.5,1,.7],hue_sat=hsm if correction else None)
-    extra=['--camera-recipe','legacy-test','--profile-correction','hue-sat-map'] if correction else []
+    extra=[]
     on,pr=run(f,extra=extra);off,po=run(f,'off',extra=extra);_,pt=run(t,'off',ev=1,extra=extra)
     assert on['highlight_recovery']['status']=='processed' and on['highlight_recovery']['affected_pixels']==256
     a,b,c=values(pr),values(po),values(pt);assert a!=b

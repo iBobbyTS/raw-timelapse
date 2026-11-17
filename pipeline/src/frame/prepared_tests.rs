@@ -219,7 +219,8 @@ use std::path::{Path, PathBuf};
         }
         for name in ["analysis.log", "develop-0.log", "develop--2.log", "develop-2.log"] {
             let text=fs::read_to_string(dir.join(name)).unwrap();
-            for expected in ["--camera-recipe generic", "--camera-color-method dng-camera-to-pcs", "--profile-correction none", "--camera-calibration none", "--color-contract-version 2"] { assert!(text.contains(expected), "{text}"); }
+            assert!(!text.contains("--profile-correction"), "{text}");
+            for expected in ["--camera-recipe generic", "--camera-color-method dng-camera-to-pcs", "--camera-calibration none", "--color-contract-version 2"] { assert!(text.contains(expected), "{text}"); }
             assert!(!text.contains("reference-gain"));
         }
     }

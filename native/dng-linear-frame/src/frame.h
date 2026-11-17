@@ -65,11 +65,9 @@ struct Decoded {
   Json exposure_calibration = Json{{"applied", false}, {"method", "none"}, {"status", "uncalibrated"}};
 };
 enum class CameraColorMethod { legacy_inverse_cm, dng_camera_to_pcs };
-enum class ProfileCorrection { none, hue_sat_map };
 enum class CameraCalibration { none, canon_normal_white_fixed_v1 };
 struct CameraRecipe {
   CameraColorMethod method = CameraColorMethod::legacy_inverse_cm;
-  ProfileCorrection correction = ProfileCorrection::none;
   CameraCalibration calibration = CameraCalibration::none;
   std::string name = "legacy-test";
   bool highlight_recovery = false;

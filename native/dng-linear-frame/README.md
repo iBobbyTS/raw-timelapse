@@ -157,29 +157,22 @@ observations; float/opcode endpoint limitations are reported, never guessed.
 See the [algorithm, ownership and limits](../../docs/raw-highlight-recovery.md).
 
 The pipeline uses signed-float mode for every profile and explicitly selects its
-input recipe. For generic matrix-only development:
+input recipe. For generic development:
 
 ```sh
 native/build/dng-linear-frame --stdout-frame-f32 input.dng \
   --color-contract-version 2 --camera-recipe generic \
   --camera-color-method dng-camera-to-pcs \
-  --profile-correction none --camera-calibration none \
+  --camera-calibration none \
   [--white-balance R,G,B] [--exposure-ev EV]
 ```
 
-For the original D-Log product default, use the distinct `dji-dlog` recipe:
-
-```sh
-native/build/dng-linear-frame --stdout-frame-f32 input.dng \
-  --color-contract-version 2 --camera-recipe dji-dlog \
-  --camera-color-method dng-camera-to-pcs \
-  --profile-correction hue-sat-map --camera-calibration none
-```
-
-This applies a valid embedded HueSatMap when present and reports `absent` otherwise.
-It skips LookTable, ToneCurve and BaselineExposure, with no Canon exposure calibration.
-Use the same recipe for measurement. Output CAT02 and auto gain (desired 4) belong
-to the Rust output path, not native input development.
+Every development recipe applies a valid embedded HueSatMap when present and
+reports `absent` otherwise. HSM is intrinsic to the selected camera profile,
+independent of output Log/preview encoding. There is no disable option;
+`--profile-correction` and the old `dji-dlog` recipe are rejected. LookTable,
+ToneCurve and BaselineExposure remain skipped. Measurement uses the same rule.
+Output CAT and reference gain belong to the Rust output path.
 
 For the Canon CLog3 recipe, using an original Canon CR3 with valid calibration
 metadata:
@@ -188,19 +181,18 @@ metadata:
 native/build/dng-linear-frame --stdout-frame-f32 input.CR3 \
   --color-contract-version 2 --camera-recipe canon-clog3 \
   --camera-color-method dng-camera-to-pcs \
-  --profile-correction hue-sat-map \
   --camera-calibration canon-normal-white-fixed-v1 \
   [--white-balance R,G,B] [--exposure-ev EV]
 ```
 
-These are complete policy tuples; do not mix their recipe/correction/calibration
+These are complete policy tuples; do not mix their recipe/calibration
 values. The Rust CLI resolves the recipe before prepare and restricts Canon
 selection to the CLog3 output profile and original CR3 inputs. Native validates
 the tuple and the original Canon identity/calibration evidence; a failure does
 not retry as generic. Use the same policy arguments with `--stdout-analysis`.
 The native standalone default remains the historical `legacy-test` recipe with
-`legacy-inverse-cm`, correction `none` and calibration `none`; changing only
-`--camera-color-method` does **not** enable profile correction or calibration.
+`legacy-inverse-cm` and calibration `none`; it also applies present HSM. Changing
+`--camera-color-method` does not enable exposure calibration.
 
 FP32 mode emits `RAWTLST2`, ordered 0x01/0x03/0x04 records, IEEE binary32 LE HWC
 AP1/D60 (12 bytes/pixel), with `space=AP1/D60`, `transfer=linear`,
@@ -214,13 +206,12 @@ both report color contract version 2; Rust/native must be upgraded together.
 
 SDK CameraToPCS uses ForwardMatrix when present or the SDK inverse-ColorMatrix
 fallback otherwise, including selected WB/PCS adaptation without another WB or
-CAT. Input D50→D60 remains Bradford. Correction policy `hue-sat-map` explicitly
-applies a present, validated interpolated profile HueSatMap in linear
-ProPhoto/D50 before camera exposure calibration and EV. Generic policy `none`
-skips it; original D-Log policy `hue-sat-map` applies it when present. LookTable, ToneCurve and BaselineExposure remain unapplied in both
-product recipes. Camera `algorithm_revision=4` records HSM dimensions, encoding,
+CAT. Input D50→D60 remains Bradford. The selected profile's validated, white-balance-interpolated HueSatMap is
+always applied when present, in linear ProPhoto/D50 before camera exposure
+calibration and EV. LookTable, ToneCurve and BaselineExposure remain unapplied.
+Camera `algorithm_revision=4` records HSM dimensions, encoding,
 HDR policy and signed-pixel bypass count in `color.profile_correction` when
-applied (null for generic); matrix metadata describes the pre-HSM transform.
+applied (null when absent); matrix metadata describes the pre-HSM transform.
 
 The `color` object makes requested versus effective processing checkable:
 
@@ -234,8 +225,8 @@ The `color` object makes requested versus effective processing checkable:
   with no table present and `hue_sat_map_applied=false`.
 - Each of `hue_sat_map`, `look_table` and `tone_curve` has `_present`, `_applied`
   and `_status` fields. Status is `absent` when missing, `skipped` when present
-  but disabled, or `applied` when correction actually ran. Generic reports
-  present profile data as skipped. Look/tone never report applied.
+  but intentionally omitted (LookTable/ToneCurve), or `applied` when correction
+  actually ran. Present valid HSM always reports applied. Look/tone never report applied.
 - `baseline_exposure_ev` reports the source value;
   `baseline_exposure_applied=false`, `baseline_exposure_status=skipped`.
 - Generic `exposure_calibration` is
@@ -300,12 +291,12 @@ native/build/dng-linear-frame --prepare source.CR3 \
 native/build/dng-linear-frame --stdout-analysis --prepared frame.context \
   --color-contract-version 2 --camera-recipe generic \
   --camera-color-method dng-camera-to-pcs \
-  --profile-correction none --camera-calibration none \
+  --camera-calibration none \
   [--white-balance R,G,B] [--exposure-ev EV] [--analysis-roi X,Y,W,H]
 native/build/dng-linear-frame --stdout-frame-f32 --prepared frame.context \
   --color-contract-version 2 --camera-recipe generic \
   --camera-color-method dng-camera-to-pcs \
-  --profile-correction none --camera-calibration none \
+  --camera-calibration none \
   [--white-balance R,G,B] [--exposure-ev EV]
 ```
 

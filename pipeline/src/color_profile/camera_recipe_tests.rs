@@ -6,9 +6,9 @@
             for cr3 in [false, true] {
                 let canon = cr3 && profile.transfer == Transfer::CanonLog3RevEng;
                 let expected = if canon { CameraRecipe::CanonClog3 }
-                    else if profile.transfer == Transfer::DjiDLog { CameraRecipe::DjiDlog }
                     else { CameraRecipe::Generic };
                 assert_eq!(CameraColor::Auto.resolve(profile, cr3).unwrap(), expected);
+                assert_eq!(CAMERA_PROFILE_CORRECTION, "hue-sat-map");
                 assert_eq!(CameraColor::Generic.resolve(profile, cr3).unwrap(), CameraRecipe::Generic);
                 assert_eq!(CameraColor::CanonClog3.resolve(profile, cr3).is_ok(), canon);
                 assert_eq!(profile.curve_input_scale(), match profile.transfer { Transfer::CanonLog2RevEng | Transfer::CanonLog3RevEng => 0.9, _ => 1.0 });
@@ -16,11 +16,11 @@
         }
     }
     #[test]
-    fn dlog_recipe_applies_only_profile_color_correction() {
-        let recipe = CameraRecipe::DjiDlog;
+    fn generic_recipe_applies_profile_color_correction() {
+        let recipe = CameraRecipe::Generic;
         assert_eq!(recipe.native_token(), "dng-camera-to-pcs");
-        assert_eq!(recipe.token(), "dji-dlog");
-        assert_eq!(recipe.correction(), "hue-sat-map");
+        assert_eq!(recipe.token(), "generic");
+        assert_eq!(CAMERA_PROFILE_CORRECTION, "hue-sat-map");
         assert_eq!(recipe.calibration(), "none");
         assert!(!recipe.requires_canon_cr3());
     }

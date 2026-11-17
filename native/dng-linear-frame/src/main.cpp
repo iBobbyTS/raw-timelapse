@@ -567,10 +567,6 @@ int main(int argc, char **argv) {
         recipe.name = value;
       } else if (a == "--color-contract-version") {
         if (value != "2") throw Error(2, "color contract requires matched version 2 tools");
-      } else if (a == "--profile-correction") {
-        if (value == "none") recipe.correction = ProfileCorrection::none;
-        else if (value == "hue-sat-map") recipe.correction = ProfileCorrection::hue_sat_map;
-        else throw Error(2, "unknown profile correction policy");
       } else if (a == "--camera-calibration") {
         if (value == "none") recipe.calibration = CameraCalibration::none;
         else if (value == "canon-normal-white-fixed-v1") recipe.calibration = CameraCalibration::canon_normal_white_fixed_v1;
@@ -598,11 +594,10 @@ int main(int argc, char **argv) {
       } else
         throw Error(2, "unknown option: " + a);
     }
-    if ((recipe.name == "generic" && (recipe.method != CameraColorMethod::dng_camera_to_pcs || recipe.correction != ProfileCorrection::none || recipe.calibration != CameraCalibration::none)) ||
-        (recipe.name == "dji-dlog" && (recipe.method != CameraColorMethod::dng_camera_to_pcs || recipe.correction != ProfileCorrection::hue_sat_map || recipe.calibration != CameraCalibration::none)) ||
-        (recipe.name == "canon-clog3" && (recipe.method != CameraColorMethod::dng_camera_to_pcs || recipe.correction != ProfileCorrection::hue_sat_map || recipe.calibration != CameraCalibration::canon_normal_white_fixed_v1)) ||
+    if ((recipe.name == "generic" && (recipe.method != CameraColorMethod::dng_camera_to_pcs || recipe.calibration != CameraCalibration::none)) ||
+        (recipe.name == "canon-clog3" && (recipe.method != CameraColorMethod::dng_camera_to_pcs || recipe.calibration != CameraCalibration::canon_normal_white_fixed_v1)) ||
         (recipe.name == "legacy-test" && recipe.calibration != CameraCalibration::none) ||
-        (recipe.name != "generic" && recipe.name != "dji-dlog" && recipe.name != "canon-clog3" && recipe.name != "legacy-test"))
+        (recipe.name != "generic" && recipe.name != "canon-clog3" && recipe.name != "legacy-test"))
       throw Error(2, "inconsistent camera recipe policies");
     lens_options.policy=lens_policy;
     // Measurement never consumes invented radiance, regardless of delivery policy.
