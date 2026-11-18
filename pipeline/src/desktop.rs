@@ -9,6 +9,7 @@ use crate::lens;
 use crate::order::SourceFrame;
 use crate::output_color::{self, ResolvedOutputColor, AUTO_LOG};
 use crate::proc;
+use rawtl_linear_video::export::SOFTWARE_PROFILES;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -253,6 +254,12 @@ impl Worker {
                             .collect(),
                     ),
                 ),
+                (
+                    "export_presets",
+                    Json::Array(
+                        SOFTWARE_PROFILES.into_iter().map(|name| Json::Str(name.into())).collect(),
+                    ),
+                ),
             ])),
             "open" => self.open(required_text(request, "path")?),
             "close" => {
@@ -348,6 +355,22 @@ fn required_text<'a>(value: &'a Json, key: &str) -> Result<&'a str> {
 
 pub fn serve() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, ffmpeg] = arguments.as_slice() {
+        if flag == "--hardware-presets" {
+            let profiles = crate::video::available_hardware_profiles(Path::new(ffmpeg))?;
+            let result = profiles
+                .into_iter()
+                .map(|profile| {
+                    Json::obj(vec![
+                        ("id", Json::Str(profile.name)),
+                        ("bits", Json::Int(i64::from(profile.input.bits()))),
+                    ])
+                })
+                .collect();
+            println!("{}", json::to_pretty_string(&Json::Array(result)));
+            return Ok(());
+        }
+    }
     let [root, native, exiftool, converter] = arguments.as_slice() else {
         return Err(usage(
             "桌面预览进程需要工作目录、显影工具、ExifTool 和 Converter 路径",

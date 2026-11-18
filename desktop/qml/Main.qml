@@ -444,6 +444,19 @@ ApplicationWindow {
                 }
                 Label {
                     Layout.topMargin: 4
+                    text: qsTr("编码")
+                }
+                ComboBox {
+                    objectName: "exportPreset"
+                    Layout.fillWidth: true
+                    enabled: window.workspace.exportPresets.length > 0
+                    model: window.workspace.exportPresets
+                    currentIndex: window.workspace.exportPresetIndex
+                    Accessible.name: qsTr("编码")
+                    onActivated: index => window.workspace.selectExportPreset(index)
+                }
+                Label {
+                    Layout.topMargin: 4
                     text: qsTr("输出帧率")
                 }
                 RowLayout {

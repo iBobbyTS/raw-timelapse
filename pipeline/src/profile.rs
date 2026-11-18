@@ -130,8 +130,8 @@ fn load(source: &str) -> std::result::Result<Vec<String>, String> {
                 settings.push(format!("--preview-profile={value}"))
             }
             (
-                "white_balance" | "output_cat" | "camera_color" | "encoder" | "pix_fmt"
-                | "container" | "codec_profile" | "resize" | "lens_correction" | "lens_vignette"
+                "white_balance" | "output_cat" | "camera_color" | "export_profile" | "encoder"
+                | "pix_fmt" | "container" | "codec_profile" | "resize" | "lens_correction" | "lens_vignette"
                 | "lens_distortion" | "lens_ca" | "lens_resampling" | "lens_crop" | "brightness"
                 | "estimator" | "ev_limits" | "roi" | "dng_linear_frame" | "ffmpeg" | "ffprobe"
                 | "exiftool" | "converter",

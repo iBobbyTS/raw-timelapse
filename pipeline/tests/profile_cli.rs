@@ -125,6 +125,58 @@ fn custom_profile_delivers_by_its_own_container_beside_input() {
 }
 
 #[test]
+fn custom_profile_selects_a_named_export_preset() {
+    require_ffmpeg();
+    let root = test_dir("profile-export-preset");
+    let input = root.join("sequence");
+    make_input(&input, &["IMG_1.DNG", "IMG_2.DNG", "IMG_10.DNG"]);
+    let fixtures = root.join("fixtures");
+    fs::create_dir_all(&fixtures).unwrap();
+    let tool = fake_native_tool(&fixtures, &standard_frames(&fixtures), None, false);
+    let profile = root.join("export.json");
+    let mut settings = vec![
+        ("dng_linear_frame", Json::Str(tool.to_str().unwrap().into())),
+        ("export_profile", Json::Str("x265-8bit-420".into())),
+        ("output_color", Json::Str("srgb-preview".into())),
+        ("resize", Json::Str("64x64".into())),
+        ("strength", Json::Int(0)),
+    ];
+    let args = [
+        "--input",
+        input.to_str().unwrap(),
+        "--profile",
+        profile.to_str().unwrap(),
+    ];
+    settings.push(("pix_fmt", Json::Str("yuv444p10le".into())));
+    fs::write(
+        &profile,
+        rawtl_linear_video::json::to_pretty_string(&Json::obj(settings.clone())),
+    )
+    .unwrap();
+    let result = cli(&args);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("export_profile replaces"));
+
+    settings.pop();
+    fs::write(
+        &profile,
+        rawtl_linear_video::json::to_pretty_string(&Json::obj(settings)),
+    )
+    .unwrap();
+    let result = cli(&args);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let probe = ffprobe(&root.join("sequence.mov"));
+    assert!(
+        probe.contains("codec_name=hevc") && probe.contains("pix_fmt=yuv420p"),
+        "{probe}"
+    );
+}
+
+#[test]
 fn auto_log_resolves_only_the_first_numeric_source() {
     require_ffmpeg();
     let root = test_dir("profile-auto-log");

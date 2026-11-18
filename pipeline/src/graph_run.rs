@@ -1065,7 +1065,12 @@ pub(crate) fn resolve_processing(options: &crate::cli::Options) -> Result<(Graph
             .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
     }
     let patch = graph.encoder_patch();
-    let config = match patch.and_then(|patch| patch.export.as_ref()) {
+    let selection = options
+        .encoder
+        .export
+        .as_ref()
+        .or_else(|| patch.and_then(|patch| patch.export.as_ref()));
+    let config = match selection {
         Some(selection) => {
             let export = match selection {
                 Selection::Manual(profile) => profile.clone(),

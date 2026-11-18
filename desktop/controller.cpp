@@ -52,6 +52,19 @@ QString colorName(const QString &id, bool shortName = false) {
     return shortName || name.second.isEmpty() ? name.first : name.first + " / " + name.second;
 }
 
+QString exportPresetName(const QString &id) {
+    static const QHash<QString, QString> names = {
+        {"x265-12bit-444", "x265 12-bit 4:4:4"},
+        {"x265-10bit-422", "x265 10-bit 4:2:2"},
+        {"x265-8bit-420", "x265 8-bit 4:2:0"},
+        {"dnxhr-sq", "DNxHR SQ"},
+        {"dnxhr-444", "DNxHR 444"},
+        {"prores-422", "ProRes 422"},
+        {"prores-4444", "ProRes 4444"},
+    };
+    return names.value(id, id);
+}
+
 void appendTail(QByteArray &tail, const QByteArray &chunk) {
     tail = (tail + chunk).right(8192);
 }
@@ -117,6 +130,26 @@ Controller::Controller(PreviewProvider &provider) : provider_(provider) {
     const QString workerPath = executable("RAW_TIMELAPSE_WORKER", "rawtl-desktop-worker", RAWTL_WORKER_FALLBACK);
     worker_.setProgram(workerPath);
     worker_.setArguments({scratch_.path(), nativePath_, exiftool_, converter_});
+    hardwareProbe_.setProgram(workerPath);
+    hardwareProbe_.setArguments({"--hardware-presets", ffmpeg_});
+    connect(&hardwareProbe_, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
+        if (status != QProcess::NormalExit || code != 0)
+            return;
+        const auto presets = QJsonDocument::fromJson(hardwareProbe_.readAllStandardOutput()).array();
+        for (const auto &entry : presets) {
+            const auto preset = entry.toObject();
+            const auto id = preset.value("id").toString();
+            const auto codec = id.startsWith("h264_") ? "H.264" : "H.265";
+            const auto backend = id.section('_', 1);
+            const auto bits = preset.value("bits").toInt();
+            exportPresetIds_.append(id);
+            exportPresets_.append(tr("%1 · %2 · %3-bit").arg(codec, backend).arg(bits));
+        }
+        if (!presets.isEmpty()) {
+            emit exportPresetsChanged();
+            emit changed();
+        }
+    });
     connect(&worker_, &QProcess::started, this, [this] { send(Request::Hello, {{"command", "hello"}}); });
     connect(&worker_, &QProcess::readyReadStandardError, this, [this] {
         appendTail(workerError_, worker_.readAllStandardError());
@@ -165,10 +198,12 @@ Controller::Controller(PreviewProvider &provider) : provider_(provider) {
 Controller::~Controller() {
     shuttingDown_ = true;
     worker_.disconnect(this);
+    hardwareProbe_.disconnect(this);
     encoder_.disconnect(this);
     worker_.closeWriteChannel();
     if (worker_.state() != QProcess::NotRunning && !worker_.waitForFinished(250))
         terminateProcess(worker_);
+    terminateProcess(hardwareProbe_);
     terminateProcess(encoder_);
 }
 
@@ -228,6 +263,15 @@ void Controller::onWorkerReply(const QJsonObject &reply) {
                 colorIds_.insert(colorIds_.indexOf("srgb-preview") + 1, "auto-log");
             colorIndex_ = std::max<qsizetype>(0, colorIds_.indexOf(baseProfile_.value("output_color").toString()));
             fps_ = QString::number(baseProfile_.value("fps").toInt(60));
+            for (const auto &entry : result.value("export_presets").toArray()) {
+                const auto id = entry.toString();
+                exportPresetIds_.append(id);
+                exportPresets_.append(exportPresetName(id));
+            }
+            const auto defaultPreset = baseProfile_.value("export_profile").toString("prores-4444");
+            exportPresetIndex_ = exportPresetIds_.indexOf(defaultPreset);
+            emit exportPresetsChanged();
+            hardwareProbe_.start();
         }
         break;
     case Request::Open:
@@ -360,6 +404,13 @@ void Controller::selectColor(int index) {
     }
 }
 
+void Controller::selectExportPreset(int index) {
+    if (index >= 0 && index < exportPresetIds_.size() && index != exportPresetIndex_) {
+        exportPresetIndex_ = index;
+        emit changed();
+    }
+}
+
 void Controller::setLensEnabled(bool enabled) {
     if (!lensModel_.isEmpty() && enabled != lensEnabled_) {
         lensEnabled_ = enabled;
@@ -418,7 +469,8 @@ bool Controller::fpsValid() const {
 
 bool Controller::canExport() const {
     const auto fps = profileFps();
-    if (!ready() || inputPath_.isEmpty() || !fps || (selectedColor() == "auto-log" && autoLog_.isEmpty()))
+    if (!ready() || inputPath_.isEmpty() || !fps || exportPresetIndex_ < 0
+        || (selectedColor() == "auto-log" && autoLog_.isEmpty()))
         return false;
     const auto profile = exportProfile(*fps);
     return std::ranges::none_of(jobs_, [this, &profile](const Job &job) {
@@ -429,6 +481,10 @@ bool Controller::canExport() const {
 
 QJsonObject Controller::exportProfile(const QJsonValue &fps) const {
     auto profile = baseProfile_;
+    profile.remove("signal_bits");
+    profile.remove("encoder");
+    profile.remove("pix_fmt");
+    profile.insert("export_profile", exportPresetIds_.value(exportPresetIndex_));
     profile.insert("fps", fps);
     profile.insert("white_balance", whiteBalanceIndex_ == 0 ? "first-frame" : "per-frame");
     profile.insert("lens_correction", lensEnabled_ ? "auto" : "off");

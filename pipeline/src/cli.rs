@@ -694,6 +694,13 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
                     "--steps (file form) was removed; repeat --step START:EV",
                 ));
             }
+            "--export-profile" => {
+                let name = take_value(args, &mut index, flag, inline_value)?;
+                if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                    return Err(Error::new(EXIT_USAGE, format!("invalid export profile {name:?}")));
+                }
+                encoder.export = Some(rawtl_linear_video::export::Selection::Named(name));
+            }
             "--encoder" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
                 if !encoder::SUPPORTED_ENCODERS.contains(&value.as_str()) {
@@ -803,6 +810,18 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
             encoder::parse_output_options(&output_options)
                 .map_err(|message| Error::new(EXIT_USAGE, message))?,
         );
+    }
+    if encoder.export.is_some()
+        && (encoder.encoder.is_some()
+            || encoder.pix_fmt.is_some()
+            || encoder.profile.is_some()
+            || encoder.rate.is_some()
+            || encoder.options.is_some())
+    {
+        return Err(Error::new(
+            EXIT_USAGE,
+            "export_profile replaces encoder, pix_fmt, codec_profile, rate and output_options",
+        ));
     }
     Ok(Parsed::Run(Options {
         profile_source: None,

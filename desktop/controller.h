@@ -35,6 +35,8 @@ class Controller final : public QObject {
     Q_PROPERTY(QString actionError READ actionError NOTIFY changed)
     Q_PROPERTY(QVariantList colors READ colors NOTIFY changed)
     Q_PROPERTY(int colorIndex READ colorIndex NOTIFY changed)
+    Q_PROPERTY(QVariantList exportPresets READ exportPresets NOTIFY exportPresetsChanged)
+    Q_PROPERTY(int exportPresetIndex READ exportPresetIndex NOTIFY changed)
     Q_PROPERTY(int whiteBalanceIndex READ whiteBalanceIndex NOTIFY changed)
     Q_PROPERTY(QString lensModel READ lensModel NOTIFY changed)
     Q_PROPERTY(bool lensSupported READ lensSupported NOTIFY changed)
@@ -65,6 +67,8 @@ public:
     QString actionError() const { return actionError_; }
     QVariantList colors() const;
     int colorIndex() const { return colorIndex_; }
+    QVariantList exportPresets() const { return exportPresets_; }
+    int exportPresetIndex() const { return exportPresetIndex_; }
     int whiteBalanceIndex() const { return whiteBalanceIndex_; }
     QString lensModel() const { return lensModel_; }
     bool lensSupported() const { return lensSupported_; }
@@ -84,6 +88,7 @@ public:
     Q_INVOKABLE void selectFrame(int frame);
     Q_INVOKABLE void selectWhiteBalance(int index);
     Q_INVOKABLE void selectColor(int index);
+    Q_INVOKABLE void selectExportPreset(int index);
     Q_INVOKABLE void setLensEnabled(bool enabled);
     Q_INVOKABLE void setFps(const QString &fps);
     Q_INVOKABLE void enqueueExport();
@@ -93,6 +98,7 @@ public:
 
 signals:
     void changed();
+    void exportPresetsChanged();
     void progressChanged();
 
 private:
@@ -110,10 +116,13 @@ private:
     PreviewProvider &provider_;
     QTemporaryDir scratch_;
     QProcess worker_;
+    QProcess hardwareProbe_;
     QProcess encoder_;
     QString cliPath_, nativePath_, exiftool_, converter_, ffmpeg_, ffprobe_;
     QJsonObject baseProfile_;
     QStringList colorIds_;
+    QStringList exportPresetIds_;
+    QVariantList exportPresets_;
     QByteArray previewReplies_, workerError_, encoderError_;
     Request activeRequest_ = Request::None;
     std::optional<QString> queuedSource_;
@@ -129,6 +138,7 @@ private:
     int frameCount_ = 0;
     int frame_ = 1;
     int colorIndex_ = 0;
+    int exportPresetIndex_ = -1;
     int whiteBalanceIndex_ = 0;
     bool lensSupported_ = false;
     bool lensEnabled_ = true;
