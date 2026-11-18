@@ -331,7 +331,7 @@ exit. Legacy `ffprobe` settings are accepted for compatibility and ignored.
 ## Colour/Log profiles
 
 The profile’s `output_color` field selects the output colour/Log rendering. The
-built-in `default` profile uses `auto-log`. Canon Cinema Gamut/CLog profiles
+built-in `default` profile uses sRGB (`srgb-preview`). Canon Cinema Gamut/CLog profiles
 are signalled per field and are
 never disguised as BT.2020 transfer/primaries. ProRes delivery is limited range
 because MOV `colr/nclc` cannot carry a range field and ProRes decoders assume
