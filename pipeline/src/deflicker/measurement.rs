@@ -109,10 +109,10 @@ impl AnalysisSidecar {
         Self::from_json(&json::parse(text)?)
     }
     pub fn from_json(j: &Json) -> Result<Self> {
-        if field(j, "schema_version")?.as_u64() != Some(2)
-            || field(j, "kind")?.as_str() != Some("rawtl-analysis-sidecar")
+        if j.get("schema_version").and_then(Json::as_u64) != Some(2)
+            || j.get("kind").and_then(Json::as_str) != Some("rawtl-analysis-sidecar")
         {
-            return Err("unsupported analysis schema".into());
+            return Err("analysis sidecar has an unsupported schema".into());
         }
         let a = field(j, "analysis")?;
         let mut m = FrameMeasurement {

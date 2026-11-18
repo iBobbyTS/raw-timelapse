@@ -22,11 +22,6 @@ pub(crate) fn parse_analysis(bytes: &[u8], expected: Option<&str>, ev: f64)
     -> Result<FrameMeasurement>
 {
     let sidecar = parse_json(bytes)?;
-    if sidecar.get("schema_version").and_then(Json::as_u64) != Some(2)
-        || sidecar.get("kind").and_then(Json::as_str) != Some("rawtl-analysis-sidecar")
-    {
-        return Err(failure("analysis sidecar has an unsupported schema"));
-    }
     let hash = sidecar
         .get("source_sha256")
         .and_then(Json::as_str)

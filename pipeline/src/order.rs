@@ -112,10 +112,16 @@ pub fn enumerate_dng(dir: &Path) -> Result<Vec<SourceFrame>> {
         ) {
             continue;
         }
-        let metadata = fs::metadata(&path).map_err(|err| {
-            Error::new(EXIT_INPUT, format!("cannot stat {}: {err}", path.display()))
+        let file_type = entry.file_type().map_err(|err| {
+            Error::new(EXIT_INPUT, format!("cannot inspect {}: {err}", path.display()))
         })?;
-        if !metadata.is_file() {
+        if file_type.is_symlink() {
+            if !fs::metadata(&path).map_err(|err| {
+                Error::new(EXIT_INPUT, format!("cannot stat {}: {err}", path.display()))
+            })?.is_file() {
+                continue;
+            }
+        } else if !file_type.is_file() {
             continue;
         }
         let name = match file_name.to_str() {

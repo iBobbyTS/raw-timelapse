@@ -45,10 +45,14 @@ struct Policy {
   Sampling sampling = Sampling::quality;
 };
 void validate_policy(const Policy &);
+// Domains depend on which operators can be active. Resampling and strength
+// above zero do not change the mapping or vignette positivity test.
+std::string domain_token(uint32_t width, uint32_t height, const Policy &);
 struct Request {
   const Calibration *calibration = nullptr;
   bool enabled = false;
   Policy policy;
+  std::string certified_domain;
 };
 struct Decision {
   std::string status, source, fingerprint;
@@ -65,11 +69,12 @@ struct Result {
 std::array<Decision, 3> decide(const Calibration &, bool enabled, const Policy & = {});
 Result correct(std::span<const float> rgb, uint32_t width, uint32_t height,
                const Calibration &, bool enabled, void (*cancel)() = nullptr,
-               const Policy & = {});
+               const Policy & = {}, bool domain_certified = false);
 // Normalized pixel-centre rectangle certified for all three channels and the
 // selected sampler footprint. The output/sequence layer owns its application.
 std::array<double, 4> safe_area(const Calibration &, uint32_t width, uint32_t height,
-                                bool enabled, const Policy & = {}, void (*cancel)() = nullptr);
+                                bool enabled, const Policy & = {}, void (*cancel)() = nullptr,
+                                bool domain_certified = false);
 void validate(const Calibration &);
 void validate_domain(const Calibration &, uint32_t width, uint32_t height,
                      const Policy & = {}, void (*cancel)() = nullptr);

@@ -183,6 +183,7 @@ pub(crate) struct NativeRun {
     pub(crate) lens: crate::lens::Settings,
     pub(crate) log: PathBuf,
     pub(crate) analysis_roi: Option<[f64; 4]>,
+    pub(crate) decode_diagnostics: bool,
     pub(crate) analysis_detail: Option<&'static str>,
     pub(crate) preview_edge: Option<u32>,
     #[cfg(test)]
@@ -202,6 +203,7 @@ impl NativeRun {
             converter_timeout: config.converter_timeout,
             analysis_roi: config.analysis_roi,
             analysis_detail: None,
+            decode_diagnostics: false,
             preview_edge: None,
         }
     }

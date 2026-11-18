@@ -214,7 +214,7 @@ FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
   std::vector<float> gained_scene;
   if (want_analysis || f32)
     gained_scene.resize(d.camera.size());
-  const bool report_scene = !prepared.frame_id || (want_analysis && diagnostics);
+  const bool report_scene = !prepared.frame_id || d.semantics.text != "null";
   double low = report_scene ? INFINITY : 0., high = report_scene ? -INFINITY : 0.;
   size_t negatives = 0, upper = 0;
   const auto &camera_pixels = d.delivery_camera.empty() ? d.camera : d.delivery_camera;
@@ -275,7 +275,7 @@ FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
       {"analysis_sidecar",
        analysis_sidecar ? Json(analysis_sidecar->string()) : Json()},
       {"as_shot_neutral", vec(prepared.own)},
-      {"decoded_as_shot_neutral", vec(d.as_shot)},
+      {"decoded_as_shot_neutral", report_scene ? vec(d.as_shot) : Json()},
       {"applied_white_balance", vec(d.applied)},
       {"white_balance_source",
        wb_override ? Json("override") : Json("as-shot")},
@@ -514,7 +514,7 @@ int main(int argc, char **argv) {
     // argv[1] is the mode flag. argv[2] is either the source path or the
     // literal --prepared followed by a prepared-context path; options follow.
     const bool want_analysis = mode == "--stdout-analysis";
-    bool detail = true, diagnostics = true;
+    bool detail = true, diagnostics = true, decode_diagnostics = false;
     const bool f32 = mode == "--stdout-frame-f32";
     CameraRecipe recipe;
     lens::PrepareOptions lens_options;
@@ -607,6 +607,9 @@ int main(int argc, char **argv) {
         if (value == "none") recipe.calibration = CameraCalibration::none;
         else if (value == "canon-normal-white-fixed-v1") recipe.calibration = CameraCalibration::canon_normal_white_fixed_v1;
         else throw Error(2, "unknown camera calibration policy");
+      } else if (a == "--decode-diagnostics") {
+        if (value != "on") throw Error(2, "decode diagnostics expects on");
+        decode_diagnostics = true;
       } else if (a == "--analysis-detail") {
         if (!want_analysis || (value != "basic" && value != "pairwise" && value != "diagnostic" && value != "basic-diagnostic"))
           throw Error(2, "invalid analysis detail");
@@ -671,11 +674,18 @@ int main(int argc, char **argv) {
       if (decisions[1].model || decisions[2].model) {
         // Stage3 can differ from the main IFD. Never assume sensor dimensions.
         recipe.highlight_recovery=false;
-        const auto geometry=decode_prepared(prepared,wb,recipe,false);
-        if (use_file_versions) check_prepared_versions(prepared);
-        width=geometry.width; height=geometry.height;
+        const auto metadata_geometry = linear_geometry(prepared.prepared_dng);
+        if (metadata_geometry) {
+          width = (*metadata_geometry)[0];
+          height = (*metadata_geometry)[1];
+        } else {
+          const auto geometry = decode_prepared(prepared, wb, recipe, false, {}, 0, false);
+          width = geometry.width; height = geometry.height;
+        }
+        if (use_file_versions && !in_memory) check_prepared_versions(prepared);
       }
-      const auto area=lens::safe_area(prepared.lens_calibration,width,height,lens_enabled,lens_policy,check_cancelled);
+      const auto area=lens::safe_area(prepared.lens_calibration,width,height,lens_enabled,lens_policy,check_cancelled,
+        prepared.certified_lens_domain == lens::domain_token(width, height, lens_policy));
       std::cout << Json{{"revision",1},{"source_sha256",prepared.source_hash},
           {"prepared_sha256",prepared.prepared_hash},{"frame_id",prepared.frame_id ? Json(double(*prepared.frame_id)) : Json()},{"width",double(width)},{"height",double(height)},
           {"area",std::vector<Json>{area[0],area[1],area[2],area[3]}},
@@ -686,14 +696,16 @@ int main(int argc, char **argv) {
           {"resampling",lens_policy.sampling == lens::Sampling::bilinear ? "bilinear" : "quality"}}.text << '\n';
       return 0;
     }
-    Decoded decoded = decode_prepared(prepared, wb, recipe, lens_enabled, lens_policy, preview_edge);
-    if (use_file_versions) check_prepared_versions(prepared);
+    decode_diagnostics = decode_diagnostics || !in_memory;
+    Decoded decoded = decode_prepared(prepared, wb, recipe, lens_enabled, lens_policy, preview_edge,
+                                      decode_diagnostics);
+    if (use_file_versions && !in_memory) check_prepared_versions(prepared);
     else if (!in_memory && provisional && sha256(prepared.prepared_dng) != prepared.prepared_hash)
       throw Error(26, "DNG changed during early measurement");
     FrameOutput frame =
         render(prepared, decoded, std::optional<fs::path>(), roi, exposure_ev,
                want_analysis, !want_analysis, f32, prepared_mode,
-               wb.has_value(), detail, diagnostics);
+               wb.has_value(), detail, want_analysis ? diagnostics : decode_diagnostics);
     if (temp)
       temp->clear();
     check_cancelled();

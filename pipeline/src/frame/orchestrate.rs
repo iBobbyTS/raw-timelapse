@@ -404,6 +404,7 @@ pub fn prepare_export_active(
     settings: &PrepareSequenceSettings<'_>,
     active: ActiveNative,
     capture_time: bool,
+    preview: bool,
     mut early: Option<&mut dyn FnMut(usize, PreparedFrame)>,
 ) -> Result<(Vec<PreparedFrame>, String)> {
     use std::io::{BufRead, BufReader, Read, Write};
@@ -415,6 +416,8 @@ pub fn prepare_export_active(
         .map_err(|e| failure(format!("export sources: {e}")))?;
     let mut request = format!("rawtl-export-request/1\ncount={}\n", paths.len());
     if capture_time { request.push_str("capture_time=1\n"); }
+    if preview { request.push_str("preview=1\n"); }
+    if settings.lens.crop.is_safe() { request.push_str("safe_crop=1\n"); }
     for (i, path) in paths.iter().enumerate() {
         request.push_str(&format!("item{i}_source={}\n", percent_encode(&path.display().to_string())));
     }
@@ -462,7 +465,7 @@ pub fn prepare_export_active(
                 return Err(failure("truncated or oversized export frame record"));
             }
             let kind = bytes.remove(0);
-            let prepared = PreparedFrame::load_export(bytes, &scratch, kind == b'E')?;
+            let prepared = PreparedFrame::load_export(bytes, &scratch, kind == b'E', &settings.lens)?;
             let id = prepared.export.as_ref().unwrap().id;
             if paths.get(id) != Some(&prepared.source) {
                 return Err(failure("export result frame id/source differs from request"));
@@ -487,12 +490,9 @@ pub fn prepare_export_active(
         return Err(failure(format!("export prepare failed: {}; {message}; {}",
                                    proc::exit_description(&status), proc::tail(&diagnostics, 1600))));
     }
-    let mut prepared = read_frames?;
+    let prepared = read_frames?;
     if prepared.len() != paths.len() {
         return Err(failure("export prepare did not return every frame"));
-    }
-    for frame in &mut prepared {
-        query_lens_area(tool, frame, &settings.lens, active.clone())?;
     }
     sequence_check_stop(&active)?;
     Ok((prepared, diagnostics))
@@ -559,44 +559,14 @@ fn query_lens_area(tool:&Path,prepared:&mut PreparedFrame,settings:&crate::lens:
     if !settings.crop.is_safe() { return Ok(()); }
     let log=prepared.context.with_extension("lens-area.log");
     let mut args = vec!["--lens-valid-area".into()];
-    let captured = if let Some(record) = &prepared.export {
-        args.push("--export-frame".into());
-        lens_area_args(prepared, settings, &mut args);
-        let mut process = proc::OwnedProcess::spawn_piped_active(
-            tool, &args, &prepared.source.with_extension("lens-area"), EXIT_FRAME, true, true, active,
-        )?;
-        use std::io::{Read, Write};
-        let (mut input, output) = {
-            let mut child = process.child.lock().unwrap();
-            (child.stdin.take().unwrap(), child.stdout.take().unwrap())
-        };
-        let written = input.write_all(&record.input()?);
-        drop(input);
-        if let Err(e) = written {
-            drop(output);
-            return Err(failure(format!("lens area stdin: {e}; {}", process.failure(true))));
-        }
-        let mut stdout = String::new();
-        output.take(16385).read_to_string(&mut stdout)
-            .map_err(|e| failure(format!("lens area stdout: {e}")))?;
-        let status = process.finish(stdout.len() > 16384)?;
-        proc::Captured { status, stdout, stderr: process.stderr() }
-    } else {
-        args.extend(["--prepared".into(), prepared.context.display().to_string()]);
-        lens_area_args(prepared, settings, &mut args);
-        let captured = proc::run_capture_active(tool, &args, EXIT_FRAME, &log, active)?;
-        write_prepare_log(&log,tool,&args,&captured)?;
-        captured
-    };
+    args.extend(["--prepared".into(), prepared.context.display().to_string()]);
+    lens_area_args(prepared, settings, &mut args);
+    let captured = proc::run_capture_active(tool, &args, EXIT_FRAME, &log, active)?;
+    write_prepare_log(&log, tool, &args, &captured)?;
     proc::check_stop()?;
     if !captured.status.success() {return Err(failure(format!("lens valid-area query failed: {}; transcript {}: {}",proc::exit_description(&captured.status),log.display(),proc::tail(&captured.stderr,1200))));}
     if captured.stdout.len()>16384 {return Err(failure("lens valid-area response exceeds bound"));}
     let value=crate::json::parse(&captured.stdout).map_err(|e|failure(format!("lens valid-area JSON: {e}")))?;
-    if let Some(record) = &prepared.export {
-        if value.get("frame_id").and_then(Json::as_u64) != Some(record.id as u64) {
-            return Err(failure("lens valid-area export frame id mismatch"));
-        }
-    }
     prepared.lens_valid_area=Some(crate::lens::ValidArea::parse(&value,&prepared.source_sha256,&prepared.dng_sha256,settings)?);
     Ok(())
 }
@@ -639,6 +609,7 @@ fn prepared_native_run(
         log: log.to_path_buf(),
         analysis_roi,
         analysis_detail: None,
+        decode_diagnostics: false,
         preview_edge: settings.preview_edge,
         #[cfg(test)]
         converter: None,
@@ -761,9 +732,11 @@ pub fn develop_prepared_at(
     total: usize,
     log: &Path,
     active: ActiveNative,
+    diagnostics: bool,
     consume: &mut impl FnMut(&FrameInfo, &mut NativeStream) -> Result<()>,
 ) -> Result<FrameInfo> {
-    let run = prepared_native_run(settings, None, log);
+    let mut run = prepared_native_run(settings, None, log);
+    run.decode_diagnostics = diagnostics;
     run_frame(
         tool,
         FrameInput::Prepared(prepared),
@@ -825,6 +798,7 @@ fn frame_args(
             }
         }
     }
+    if run.decode_diagnostics { args.extend(["--decode-diagnostics".into(), "on".into()]); }
     if let Some(detail) = run.analysis_detail {
         args.extend(["--analysis-detail".into(), detail.into()]);
     }
@@ -927,6 +901,7 @@ fn run_frame(
             )?;
         }
         let mut info = FrameInfo {
+            decode_semantics: run.decode_diagnostics.then(|| sidecar.get("decode_semantics").cloned()).flatten(),
             index,
             source_name: input.name().to_string(),
             camera_color: sidecar.get("color").cloned(),

@@ -80,7 +80,8 @@ struct CameraRecipe {
 Decoded decode(const fs::path &, const std::optional<Vec> &,
                CameraRecipe = CameraRecipe{}, void (*cancel)() = nullptr,
                lens::Request lens_request = {}, uint32_t preview_edge = 0,
-               bool export_input = false);
+               bool export_input = false, bool diagnostics = true);
+std::optional<std::array<uint32_t, 2>> linear_geometry(const fs::path &);
 double canon_normal_white_gain(double maximum, double black, double white,
                                double dng_white, double dng_black);
 void calibrate_canon_cr3(const fs::path &, Decoded &);
@@ -150,6 +151,7 @@ struct PreparedFrame {
   ConversionInfo conversion;    // provenance copied into frame metadata
   std::optional<std::string> capture_time;
   Vec own{};                    // original/as-shot camera neutral
+  std::string certified_lens_domain;
   lens::Calibration lens_calibration; // frozen Prepare -> Develop contract
 };
 const char *route_name(Route);
@@ -185,7 +187,7 @@ void check_prepared_versions(const PreparedFrame &);
 // calibration when requested. Never invokes the Converter or deletes a file.
 Decoded decode_prepared(const PreparedFrame &, const std::optional<Vec> &wb,
                         CameraRecipe recipe, bool lens_enabled = false, const lens::Policy & = {},
-                        uint32_t preview_edge = 0);
+                        uint32_t preview_edge = 0, bool diagnostics = true);
 std::string sha256(const fs::path &);
 void write_png(const fs::path &, uint32_t, uint32_t,
                const std::vector<uint16_t> &);

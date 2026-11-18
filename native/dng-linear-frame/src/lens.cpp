@@ -462,13 +462,18 @@ void validate_domain(const Calibration &c, uint32_t w, uint32_t h,
     for (const auto &term : vign->terms)
       positive(term.plane[0]);
 }
+std::string domain_token(uint32_t width, uint32_t height, const Policy &policy) {
+  unsigned components = (policy.components[0] && policy.vignette_strength > 0 ? 1 : 0)
+                        | (policy.components[1] ? 2 : 0) | (policy.components[2] ? 4 : 0);
+  return std::to_string(width) + "x" + std::to_string(height) + ":" + std::to_string(components);
+}
 std::array<double, 4> safe_area(const Calibration &c, uint32_t w, uint32_t h,
-                               bool enabled, const Policy &policy, void (*cancel)()) {
+                               bool enabled, const Policy &policy, void (*cancel)(), bool domain_certified) {
   if (!w || !h) throw std::runtime_error("invalid lens safe-area extent");
   const auto d = decide(c, enabled, policy);
   const Model *dist = d[1].model, *ca = d[2].model;
   if (!dist && !ca) return {0, 0, 1, 1};
-  validate_domain(c, w, h, policy, cancel);
+  if (!domain_certified) validate_domain(c, w, h, policy, cancel);
   auto inside = [&](double ratio) {
     struct Box { double x0, x1, y0, y1; unsigned depth; };
     std::vector<Box> pending{{(w-1)*(.5-.5*ratio), (w-1)*(.5+.5*ratio),
@@ -517,13 +522,13 @@ std::array<double, 4> safe_area(const Calibration &c, uint32_t w, uint32_t h,
   return {(.5-.5*lo),(.5-.5*lo),(.5+.5*lo),(.5+.5*lo)};
 }
 Result correct(std::span<const float> rgb, uint32_t w, uint32_t h,
-               const Calibration &c, bool enabled, void (*cancel)(), const Policy &policy) {
+               const Calibration &c, bool enabled, void (*cancel)(), const Policy &policy, bool domain_certified) {
   if (!w || !h || uint64_t(w) * h > 200000000 ||
       rgb.size() != size_t(w) * h * 3)
     throw std::runtime_error("invalid lens RGB extent");
   Result out;
   out.decisions = decide(c, enabled, policy);
-  if (enabled)
+  if (enabled && !domain_certified)
     validate_domain(c, w, h, policy, cancel);
   const Model *vign = out.decisions[0].model, *dist = out.decisions[1].model,
               *ca = out.decisions[2].model;

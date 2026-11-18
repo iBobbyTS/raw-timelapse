@@ -355,7 +355,7 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
                                   "Composite:FocusDistance"}));
     c.fallback = interpolate_profile(*fit.profile, c.focal, c.aperture, c.focus, fit.crop);
   }
-  for (size_t i = 0; i < sources.size(); ++i) {
+  for (size_t i = 0; !in_memory && i < sources.size(); ++i) {
     validate(out[i]);
     validate_domain(out[i], sources[i].width, sources[i].height, options.policy, check_cancelled);
   }

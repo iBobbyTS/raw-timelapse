@@ -1,4 +1,5 @@
 //! Prepared-context line document: parsing, validation and encoding.
+use crate::json::Json;
 use super::failure;
 use crate::error::Result;
 use std::collections::{BTreeMap, BTreeSet};
@@ -82,6 +83,7 @@ pub struct PreparedFrame {
     pub main_ifd_height: u32,
     pub as_shot_neutral: [f64; 3],
     pub capture_time: Option<String>,
+    pub preview_lens: Option<Json>,
     pub lens_valid_area: Option<crate::lens::ValidArea>,
 }
 
@@ -99,7 +101,7 @@ impl PreparedFrame {
         Self::load_context(context, false, &mut ConversionRecords::default())
     }
 
-    pub(crate) fn load_export(bytes: Vec<u8>, scratch: &Path, provisional: bool) -> Result<Self> {
+    pub(crate) fn load_export(bytes: Vec<u8>, scratch: &Path, provisional: bool, lens: &crate::lens::Settings) -> Result<Self> {
         let fields = parse_document_fields(&bytes, "rawtl-export-frame/1", PREPARED_CONTEXT_LIMIT)?;
         let get = |key| field_value(&fields, key);
         let id = parse_u32(get("frame_id")?, "frame_id")? as usize;
@@ -134,6 +136,12 @@ impl PreparedFrame {
         } else {
             None
         };
+        let lens_valid_area = if !provisional && lens.crop.is_safe() {
+            let area = crate::json::parse(get("lens_valid_area")?).map_err(failure)?;
+            Some(crate::lens::ValidArea::parse(&area, "", "", lens)?)
+        } else {
+            None
+        };
         Ok(Self {
             context: PathBuf::new(),
             export: Some(std::sync::Arc::new(ExportRecord {
@@ -142,7 +150,9 @@ impl PreparedFrame {
             source, source_name, source_sha256: String::new(), route, dng,
             dng_sha256: String::new(), has_file_versions: true, generated,
             main_ifd_width, main_ifd_height, as_shot_neutral, capture_time,
-            lens_valid_area: None,
+            preview_lens: fields.iter().find(|(key, _)| key == "preview_lens")
+                .map(|(_, value)| crate::json::parse(value).map_err(failure)).transpose()?,
+            lens_valid_area,
         })
     }
     pub fn load_early_measurement(context: &Path) -> Result<Self> {
@@ -264,6 +274,7 @@ impl PreparedFrame {
             main_ifd_height,
             as_shot_neutral,
             capture_time,
+            preview_lens: None,
             lens_valid_area: None,
         })
     }

@@ -80,7 +80,6 @@ struct Runner<'a, 'b> {
     prepared_count: usize,
     sequence: Option<SequenceSummary>,
     source_geometry: Option<(u32, u32)>,
-    resize_target: Option<(u32, u32)>,
     resize: Option<ResizeRecord>,
     lens_area: Option<[f64;4]>,
     generated_paths: BTreeSet<std::path::PathBuf>,
@@ -248,6 +247,7 @@ impl Runner<'_, '_> {
     ) -> graph::Result<FrameTask<Image>> {
         let log = self.task_key(stage, id);
         let delivery = stage == "develop";
+        let diagnostics = self.context.options.deflicker_diagnostics;
         let tool = self.context.options.native_tool.clone();
         let prepared = r.clone();
         let wb = self.wb(id);
@@ -273,10 +273,8 @@ impl Runner<'_, '_> {
                 total,
                 &log,
                 active,
+                diagnostics,
                 &mut |info, native| {
-                    if let Some(area)=prepared.lens_valid_area {
-                        if area.bounds!=[0.,0.,1.,1.]&&(area.width!=info.width||area.height!=info.height) {return Err(Error::new(EXIT_FRAME,"lens valid-area geometry differs from delivery"));}
-                    }
                     pixels = Some(native.pixels(info.width, info.height)?);
                     Ok(())
                 },
@@ -307,7 +305,7 @@ impl Backend for Runner<'_, '_> {
                 "streaming encoder failed; scheduling cancelled",
             )));
         }
-        if self.prepared_count == 0
+        if self.log.reports_progress() && self.prepared_count == 0
             && self.convert_progress_at.elapsed() >= Duration::from_millis(250)
         {
             self.convert_progress_at = Instant::now();
@@ -349,7 +347,7 @@ impl Backend for Runner<'_, '_> {
         let converter_timeout = self.context.options.converter_timeout;
         let lens = self.context.options.lens.clone();
         let active = self.active.clone();
-        let capture_time = self.context.options.deflicker_diagnostics;
+        let capture_time = self.context.options.deflicker_diagnostics && self.context.options.deflicker.enabled();
         Ok(Box::new(move || {
             fs::create_dir(&scratch).map_err(|e| format!("private sequence scratch: {e}"))?;
             let mut provisional = |id, value| {
@@ -366,6 +364,7 @@ impl Backend for Runner<'_, '_> {
                 },
                 active,
                 capture_time,
+                false,
                 streaming.then_some(&mut provisional),
             ).map_err(|e| e.message)?;
             let diagnostics = prepare_diagnostics(&diagnostics)?;
@@ -511,7 +510,7 @@ impl Backend for Runner<'_, '_> {
             return Err("graph: measurement commit identity/order mismatch".into());
         }
         let measurement = if let Some(window) = &mut self.pairwise {
-            window.push(measurement)?
+            window.push_parsed(measurement)?
         } else {
             measurement.log_pixel_samples = None;
             measurement.log_channel_means = None;
@@ -749,15 +748,6 @@ impl Backend for Runner<'_, '_> {
                 }
             } else {
                 self.source_geometry = Some((info.width, info.height));
-                // An explicit resize replaces the default source geometry; only the
-                // geometry that actually reaches the codec is validated here.
-                let geometry = self.resize_target.unwrap_or((info.width, info.height));
-                if let Err(message) = self
-                    .encoder_config
-                    .validate_geometry(geometry.0, geometry.1)
-                {
-                    return Err(message);
-                }
             }
             let c = info.camera_color.as_ref().expect("validated color contract");
             let model = c.get("camera_model").and_then(crate::json::Json::as_str);
@@ -776,6 +766,11 @@ impl Backend for Runner<'_, '_> {
                     text("hue_sat_map_status"), text("look_table_status"), text("tone_curve_status"), text("baseline_exposure_status"), text("camera_calibration_effective"),
                     if self.context.camera_recipe.calibration() != "none" { "calibrated" } else { "uncalibrated" }
                 ));
+                self.result(written)?;
+            }
+            if let Some(report) = &info.decode_semantics {
+                let document = crate::json::to_pretty_string(report).replace('\n', "");
+                let written = self.log.line(&format!("kind=decode.diagnostics frame={} report={document}", info.index));
                 self.result(written)?;
             }
             if let Some(lens) = &info.lens_correction {
@@ -1255,7 +1250,6 @@ pub fn run(
         prepared_count: 0,
         sequence: None,
         source_geometry: None,
-        resize_target: explicit_resize,
         resize: None,
         lens_area: None,
         generated_paths: BTreeSet::new(),

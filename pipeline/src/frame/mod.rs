@@ -52,6 +52,7 @@ pub(crate) const JSON_MEDIA_TYPE: &str = "application/json; charset=utf-8";
 
 #[derive(Debug, Clone)]
 pub struct FrameInfo {
+    pub decode_semantics: Option<crate::json::Json>,
     pub index: usize,
     pub source_name: String,
     pub camera_color: Option<Json>,

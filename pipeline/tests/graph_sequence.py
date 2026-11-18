@@ -160,7 +160,7 @@ def run_case(mode):
             conn.sendall(b'!')
         stdout,stderr=p.communicate(timeout=25)
         trace=log.read_text()
-        success=mode in ['partial','complete','descendant-complete','out-of-order','mapping','shared-lifetime','long-sequence','early-mutation']
+        success=mode in ['extra','partial','complete','descendant-complete','out-of-order','mapping','shared-lifetime','long-sequence','early-mutation']
         assert (p.returncode==0)==success,(mode,p.returncode,stderr.decode())
         assert video.exists()==success
         if success:

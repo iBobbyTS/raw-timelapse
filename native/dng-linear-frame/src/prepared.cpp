@@ -423,7 +423,7 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
   for (const auto &source : sources) {
     check_cancelled();
     PreparedFrame out;
-    out.source = canonical_existing(source, "original source");
+    out.source = in_memory ? source : canonical_existing(source, "original source");
     out.source_version = file_version(out.source);
     if (!in_memory) out.source_hash = sha256(out.source);
     else out.frame_id = uint32_t(frames.size());
@@ -443,6 +443,7 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
   }
   // Publish only measurement inputs here. The final context and associated
   // Converter provenance are written through the sealed sequence path.
+  std::map<size_t, Vec> early_neutrals;
   const auto offer = [&](size_t index, const fs::path &dng) {
     try {
       auto candidate = frames[index];
@@ -456,7 +457,10 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
         candidate.main_ifd_width = check->width;
         candidate.main_ifd_height = check->height;
       }
-      if (candidate.kind == Route::vendor_raw) candidate.own = read_neutral(dng);
+      if (candidate.kind == Route::vendor_raw) {
+        candidate.own = read_neutral(dng);
+        if (in_memory) early_neutrals.emplace(index, candidate.own);
+      }
       if (!in_memory && capture_time) candidate.capture_time = read_capture_time(candidate.kind == Route::vendor_raw ? dng : candidate.source);
       if (early) {
         if (!in_memory) check_prepared_versions(candidate);
@@ -502,9 +506,13 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
       : std::nullopt;
   if (in_memory && !first_geometry)
     throw Error(23, "cannot determine first prepared DNG geometry: " + frames.front().source.string());
-  for (auto &out : frames) {
+  for (size_t index = 0; index < frames.size(); ++index) {
     check_cancelled();
-    if (out.kind == Route::vendor_raw) out.own = read_neutral(out.prepared_dng);
+    auto &out = frames[index];
+    if (out.kind == Route::vendor_raw) {
+      auto neutral = early_neutrals.find(index);
+      out.own = neutral == early_neutrals.end() ? read_neutral(out.prepared_dng) : neutral->second;
+    }
     if (in_memory) {
       out.main_ifd_width = first_geometry->width;
       out.main_ifd_height = first_geometry->height;
@@ -522,6 +530,7 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
     if (capture_time) out.capture_time = read_capture_time(out.kind == Route::vendor_raw ? out.prepared_dng : out.source);
     if (!in_memory) check_prepared_versions(out);
   }
+  early_neutrals.clear();
   if (lens_options.collect) {
     std::vector<lens::SourcePair> lens_sources;
     lens_sources.reserve(frames.size());
@@ -616,7 +625,7 @@ void check_prepared_versions(const PreparedFrame &prepared) {
     throw Error(26, "prepared DNG changed after Prepare: " + prepared.prepared_dng.string());
 }
 
-static std::string prepared_document(const PreparedFrame &prepared, bool provisional) {
+static std::string prepared_document(const PreparedFrame &prepared, bool provisional, const std::optional<Json> &preview_lens = {}, const std::optional<Json> &safe_area = {}) {
   std::ostringstream out;
   out << (prepared.frame_id ? kExportContextMagic : provisional ? kEarlyContextMagic : kContextMagic) << '\n';
   field(out, "source", prepared.source.string());
@@ -649,6 +658,9 @@ static std::string prepared_document(const PreparedFrame &prepared, bool provisi
     field(out, "converter_cleanup", conversion.cleanup);
   }
   if (prepared.lens_calibration.collected) field(out, "lens_calibration", lens::serialize(prepared.lens_calibration));
+  if (!prepared.certified_lens_domain.empty()) field(out, "certified_lens_domain", prepared.certified_lens_domain);
+  if (preview_lens) field(out, "preview_lens", preview_lens->text);
+  if (safe_area) field(out, "lens_valid_area", safe_area->text);
   return out.str();
 }
 
@@ -685,6 +697,12 @@ static PreparedFrame parse_prepared_document(const std::string &text, bool provi
   PreparedFrame out;
   if (in_memory) {
     allowed.insert("frame_id");
+    if (context.has("certified_lens_domain")) {
+      allowed.insert("certified_lens_domain");
+      out.certified_lens_domain = context.at("certified_lens_domain");
+    }
+    if (context.has("preview_lens")) allowed.insert("preview_lens");
+    if (context.has("lens_valid_area")) allowed.insert("lens_valid_area");
     out.frame_id = parse_u32(context.at("frame_id"), "frame_id");
   } else {
     allowed.insert("source_sha256");
@@ -769,7 +787,10 @@ static PreparedFrame parse_prepared_document(const std::string &text, bool provi
   if (in_memory) {
     out.source = context.at("source");
     out.prepared_dng = context.at("prepared_dng");
-    if (use_file_versions) check_prepared_versions(out);
+    if (use_file_versions) {
+      if (file_version(out.prepared_dng) != out.prepared_version)
+        throw Error(26, "prepared DNG changed after Prepare: " + out.prepared_dng.string());
+    }
     return out;
   }
   // Original identity: never replaced by the cache path.
@@ -855,7 +876,10 @@ void prepare_export(const fs::path &scratch_in, const std::string &converter,
                                "rawtl-export-request/1", kSequenceDocumentLimit);
   const auto count = parse_u32(request.at("count"), "count");
   const bool capture_time = request.has("capture_time") && parse_bool(request.at("capture_time"), "capture_time");
-  if (!count || count != request.fields.size() - 1 - size_t(request.has("capture_time")))
+  const bool preview = request.has("preview") && parse_bool(request.at("preview"), "preview");
+  const bool safe_crop = request.has("safe_crop") && parse_bool(request.at("safe_crop"), "safe_crop");
+  if (!count || count != request.fields.size() - 1 - size_t(request.has("capture_time"))
+      - size_t(request.has("preview")) - size_t(request.has("safe_crop")))
     throw Error(26, "export request count disagrees with its input entries");
   std::vector<fs::path> sources;
   sources.reserve(count);
@@ -865,8 +889,79 @@ void prepare_export(const fs::path &scratch_in, const std::string &converter,
     sources.push_back(std::move(source));
   }
   request.fields.clear();
-  const auto emit = [](char kind, const PreparedFrame &frame) {
-    auto text = prepared_document(frame, kind == 'E');
+  const auto &policy = lens_options.policy;
+  std::map<std::string, std::array<double, 4>> certified;
+  bool read_sequence_geometry = false;
+  std::optional<std::array<uint32_t, 2>> sequence_geometry;
+  const auto finish_lens = [&](PreparedFrame &frame) -> std::optional<Json> {
+    uint32_t width = frame.main_ifd_width, height = frame.main_ifd_height;
+    const auto decisions = lens::decide(frame.lens_calibration, lens_options.collect, policy);
+    lens::Calibration models;
+    bool active = false;
+    for (size_t component = 0; component < decisions.size(); ++component) {
+      if (!decisions[component].model) continue;
+      active = true;
+      models.fallback[component] = *decisions[component].model;
+      models.fallback[component].source = "prepared";
+      models.fallback[component].fingerprint.clear();
+    }
+    if (safe_crop && (decisions[1].model || decisions[2].model)) {
+      if (const auto geometry = linear_geometry(frame.prepared_dng)) {
+        width = (*geometry)[0];
+        height = (*geometry)[1];
+      } else {
+        const auto image = decode_prepared(frame, {}, {}, false, {}, 0, false);
+        width = image.width;
+        height = image.height;
+      }
+    }
+    if (active && !safe_crop) {
+      if (!read_sequence_geometry) {
+        sequence_geometry = linear_geometry(frame.prepared_dng);
+        read_sequence_geometry = true;
+      }
+      // If the SDK must execute geometry-changing opcodes, certify using the
+      // actual dimensions in Develop instead of guessing from the raw IFD.
+      if (!sequence_geometry) return {};
+      width = (*sequence_geometry)[0];
+      height = (*sequence_geometry)[1];
+    }
+    std::array<double, 4> bounds{0, 0, 1, 1};
+    if (active) {
+      const auto domain = lens::domain_token(width, height, policy);
+      const auto key = domain + lens::serialize(models);
+      auto [entry, inserted] = certified.try_emplace(key, bounds);
+      if (inserted) {
+        lens::validate_domain(frame.lens_calibration, width, height, policy, check_cancelled);
+        if (safe_crop)
+          entry->second = lens::safe_area(frame.lens_calibration, width, height, true, policy, check_cancelled, true);
+      }
+      bounds = entry->second;
+      frame.certified_lens_domain = domain;
+    }
+    if (!safe_crop) return {};
+    return Json{{"revision",1},{"source_sha256",""},{"prepared_sha256",""},
+        {"width",double(width)},{"height",double(height)},
+        {"area",std::vector<Json>{bounds[0],bounds[1],bounds[2],bounds[3]}},
+        {"coordinate_system","normalized-pixel-centres"},{"certified",true},
+        {"mode",lens_options.collect ? "auto" : "off"},
+        {"components",std::vector<Json>{policy.components[0],policy.components[1],policy.components[2]}},
+        {"vignette_strength",policy.vignette_strength},
+        {"resampling",policy.sampling == lens::Sampling::bilinear ? "bilinear" : "quality"}};
+  };
+  const auto emit = [&](char kind, const PreparedFrame &frame, const std::optional<Json> &area = {}) {
+    std::optional<Json> status;
+    if (preview && kind == 'F') {
+      const auto &calibration = frame.lens_calibration;
+      const auto decisions = lens::decide(calibration, lens_options.collect, lens_options.policy);
+      const bool supported = std::any_of(decisions.begin(), decisions.end(), [](const auto &d) {
+        return d.status == "applied" || d.status == "identity" ||
+               d.status == "already-applied" || d.status == "sdk-owned" ||
+               d.status == "embedded-opcode-owned";
+      });
+      status = Json{{"model", calibration.lens}, {"supported", supported}};
+    }
+    auto text = prepared_document(frame, kind == 'E', status, area);
     if (text.size() > kContextLimit) throw Error(26, "export frame exceeds size limit");
     std::cout << kind << text << '\0' << std::flush;
     if (!std::cout) throw Error(50, "export frame pipe closed");
@@ -875,24 +970,27 @@ void prepare_export(const fs::path &scratch_in, const std::string &converter,
   if (early) provisional = [&](size_t, const PreparedFrame &frame) { emit('E', frame); };
   auto frames = prepare_frames(sources, scratch, converter, timeout, false,
                                lens_options, {}, true, true, provisional, capture_time);
-  for (const auto &frame : frames) {
+  for (auto &frame : frames) {
     check_cancelled();
-    check_prepared_versions(frame);
-    emit('F', frame);
+    const auto area = !preview && (lens_options.collect || safe_crop) ? finish_lens(frame) : std::nullopt;
+    emit('F', frame, area);
   }
 }
 
 Decoded decode_prepared(const PreparedFrame &prepared,
                         const std::optional<Vec> &wb,
                         CameraRecipe recipe, bool lens_enabled, const lens::Policy &policy,
-                        uint32_t preview_edge) {
+                        uint32_t preview_edge, bool diagnostics) {
   if (lens_enabled && !prepared.lens_calibration.collected) throw Error(26, "lens auto requires a context prepared with lens metadata collection");
   Decoded decoded = decode(prepared.prepared_dng,
                            wb ? wb : std::optional<Vec>(prepared.own), recipe, check_cancelled,
-                           {&prepared.lens_calibration, lens_enabled, policy}, preview_edge,
-                           prepared.frame_id.has_value());
+                           {&prepared.lens_calibration, lens_enabled, policy, prepared.certified_lens_domain}, preview_edge,
+                           prepared.frame_id.has_value(), diagnostics);
   if (recipe.calibration == CameraCalibration::canon_normal_white_fixed_v1) {
     if (prepared.kind != Route::vendor_raw) throw Error(40, "Canon calibration requires original Canon CR3");
+    if (prepared.frame_id && !prepared.source_version.empty() &&
+        file_version(prepared.source) != prepared.source_version)
+      throw Error(26, "original source changed after Prepare: " + prepared.source.string());
     calibrate_canon_cr3(prepared.source, decoded);
   }
   return decoded;

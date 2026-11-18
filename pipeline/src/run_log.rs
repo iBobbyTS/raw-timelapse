@@ -55,6 +55,8 @@ impl RunLog {
         self.started.elapsed().as_secs_f64()
     }
 
+    pub(crate) fn reports_progress(&self) -> bool { self.report_progress }
+
     pub fn progress(&self, phase: &str, percent: u32) {
         if self.report_progress {
             // The desktop consumes complete lines from a child process pipe.

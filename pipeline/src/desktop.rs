@@ -2,13 +2,13 @@
 
 use crate::cli::{Parsed, ReferenceGain};
 use crate::color_profile::{self, OutputCatSelection};
-use crate::error::{Error, Result, EXIT_FRAME, EXIT_USAGE};
+use crate::error::{Error, Result, EXIT_USAGE};
 use crate::frame::{self, PreparedFrame};
 use crate::json::{self, Json};
 use crate::lens;
 use crate::order::SourceFrame;
-use crate::output_color::{self, ResolvedOutputColor, AUTO_LOG};
 use crate::proc;
+use crate::output_color::{self, ResolvedOutputColor, AUTO_LOG};
 use rawtl_linear_video::export::SOFTWARE_PROFILES;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -66,35 +66,24 @@ struct Session {
 impl Session {
     fn prepare(&self, index: usize, root: &Path, tools: &Tools) -> Result<Prepared> {
         let scratch = Scratch::create(root.join(format!("frame-{index}")))?;
-        let context_path = scratch.0.join("frame.context");
-        let prepared = frame::prepare_active(
+        let mut lens_settings = self.settings.lens.clone();
+        lens_settings.crop = lens::Crop::Preserve;
+        let (mut prepared, _) = frame::prepare_export_active(
             &tools.native,
-            &self.sources[index],
-            &frame::PrepareSettings {
+            std::slice::from_ref(&self.sources[index]),
+            &frame::PrepareSequenceSettings {
                 scratch_dir: &scratch.0,
-                context_path: &context_path,
-                log: &scratch.0.join("prepare.log"),
                 converter: tools.converter.as_deref(),
                 converter_timeout: None,
-                lens: self.settings.lens.clone(),
+                lens: lens_settings,
             },
             Default::default(),
+            false,
+            true,
+            None,
         )?;
-        let mut args = vec![
-            "--lens-status".into(),
-            "--prepared".into(),
-            path_text(&context_path)?,
-        ];
-        prepared.file_check_args(&mut args);
-        self.settings.lens.policy.args(lens::Mode::Auto, &mut args);
-        let status = proc::run_capture(&tools.native, &args, EXIT_FRAME)?;
-        if !status.status.success() {
-            return Err(Error::new(
-                EXIT_FRAME,
-                format!("镜头状态读取失败：{}", proc::tail(&status.stderr, 1200)),
-            ));
-        }
-        let lens = json::parse(&status.stdout).map_err(frame::failure)?;
+        let mut prepared = prepared.pop().ok_or_else(|| frame::failure("显影准备未返回帧"))?;
+        let lens = prepared.preview_lens.take().ok_or_else(|| frame::failure("显影准备未返回镜头状态"))?;
         Ok(Prepared {
             frame: prepared,
             _scratch: scratch,
@@ -152,6 +141,7 @@ impl Session {
             self.sources.len(),
             &prepared._scratch.0.join("develop.log"),
             Default::default(),
+            false,
             &mut |info, stream| {
                 if info.width.max(info.height) > PREVIEW_EDGE {
                     return Err(frame::failure("预览画面超出分辨率上限"));

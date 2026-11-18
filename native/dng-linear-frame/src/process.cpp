@@ -183,7 +183,7 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
   std::vector<fs::path> paths;
   for (size_t i = 0; i < inputs.size(); ++i) {
     auto name = fs::path(command[command_prefix.size() + i]).stem().string() + ".dng";
-    expected.insert(name);
+    if (!in_memory) expected.insert(name);
     paths.push_back(linear_dir / name);
   }
   fs::path invocation;
@@ -240,15 +240,17 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
                 " failed; exit=" + std::to_string(result.exit_code));
   }
   check_cancelled();
-  std::set<std::string> actual;
-  for (auto &e : fs::directory_iterator(linear_dir)) {
-    check_cancelled();
-    if (!fs::is_regular_file(e.symlink_status()))
-      throw Error(23, identity + ": unexpected non-regular output " + e.path().string());
-    actual.insert(e.path().filename().string());
+  if (!in_memory) {
+    std::set<std::string> actual;
+    for (auto &e : fs::directory_iterator(linear_dir)) {
+      check_cancelled();
+      if (!fs::is_regular_file(e.symlink_status()))
+        throw Error(23, identity + ": unexpected non-regular output " + e.path().string());
+      actual.insert(e.path().filename().string());
+    }
+    if (actual != expected)
+      throw Error(23, identity + ": Converter output set differs from requested names");
   }
-  if (actual != expected)
-    throw Error(23, identity + ": Converter output set differs from requested names");
   std::vector<Conversion> outputs;
   const auto version_name = in_memory ? std::string{} : converter_version(command.front());
   for (size_t i = 0; i < inputs.size(); ++i) {

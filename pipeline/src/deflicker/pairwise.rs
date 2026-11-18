@@ -263,8 +263,13 @@ impl PairwiseWindow {
         }
     }
 
-    pub fn push(&mut self, mut frame: FrameMeasurement) -> Result<FrameMeasurement> {
+    pub fn push(&mut self, frame: FrameMeasurement) -> Result<FrameMeasurement> {
         frame.validate()?;
+        self.push_parsed(frame)
+    }
+
+    /// Push a measurement whose shape has already been checked by the native sidecar parser.
+    pub fn push_parsed(&mut self, mut frame: FrameMeasurement) -> Result<FrameMeasurement> {
         let j = self.received;
         if j >= self.count {
             return Err("too many pairwise measurements".into());

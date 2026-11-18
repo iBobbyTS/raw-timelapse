@@ -619,7 +619,12 @@ fn solve_with_evidence(
     evidence: Option<(Vec<GraphEdge>, EdgeStats)>,
     diagnostics: bool,
 ) -> Result<(Vec<f64>, Option<ExposureResult>)> {
-    let k = compatible(ms)?;
+    // Streaming evidence already checked each frame before computing its edges.
+    let k = if evidence.is_some() {
+        ms.first().ok_or("empty exposure sequence")?.valid.len()
+    } else {
+        compatible(ms)?
+    };
     let n = ms.len();
     if k < 8 {
         return Err("insufficient tile grid".into());

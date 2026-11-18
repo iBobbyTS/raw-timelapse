@@ -199,9 +199,31 @@ void reduce_preview(Decoded &decoded, uint32_t edge, void (*cancel)()) {
   decoded.height = out_height;
 }
 } // namespace
+std::optional<std::array<uint32_t, 2>> linear_geometry(const fs::path &path) {
+  try {
+    Host host;
+    host.SetForPreview(false);
+    host.SetIgnoreEnhanced(true);
+    dng_file_stream stream(path.c_str());
+    dng_info info;
+    info.Parse(host, stream);
+    info.PostParse(host);
+    if (!info.IsValidDNG() || info.fMainIndex < 0) throw Error(30, "SDK rejected DNG");
+    const auto &ifd = *info.fIFD.at(info.fMainIndex);
+    // LinearRaw Stage3 inherits the Stage2 active area. Opcodes can trim
+    // bounds, so leave those inputs to the actual SDK decode.
+    if (ifd.fPhotometricInterpretation != 34892 || ifd.fSamplesPerPixel != 3 ||
+        ifd.fOpcodeList1Count || ifd.fOpcodeList2Count || ifd.fOpcodeList3Count)
+      return std::nullopt;
+    const auto area = ifd.fActiveArea.IsEmpty() ? ifd.Bounds() : ifd.fActiveArea;
+    return std::array<uint32_t, 2>{area.W(), area.H()};
+  } catch (const dng_exception &e) {
+    throw Error(30, "Adobe DNG SDK error " + std::to_string(e.ErrorCode()));
+  }
+}
 Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe recipe,
                void (*cancel)(), lens::Request lens_request, uint32_t preview_edge,
-               bool export_input) {
+               bool export_input, bool diagnostics) {
   std::array<bool, 3> lens_coverage{};
   if (!export_input) {
     auto routing = inspect(path, lens_request.calibration ? &lens_coverage : nullptr);
@@ -227,7 +249,7 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe 
     if (!n->HasCameraNeutral() || n->CameraNeutral().Count() != 3)
       throw Error(40, "three-channel AsShotNeutral required");
     Decoded d;
-    d.as_shot = read_neutral(path);
+    if (!wb || diagnostics) d.as_shot = read_neutral(path);
     d.applied = wb.value_or(d.as_shot);
     for (double x : d.applied)
       if (!std::isfinite(x) || x <= 0)
@@ -337,7 +359,9 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe 
     // profile correction can work on an area-reduced camera-linear image.
     reduce_preview(d, preview_edge, cancel);
     auto corrected = lens::correct(d.delivery_camera.empty() ? d.camera : d.delivery_camera,
-                                   d.width, d.height, lens_calibration, lens_request.enabled, cancel, lens_request.policy);
+                                   d.width, d.height, lens_calibration, lens_request.enabled, cancel, lens_request.policy,
+                                   !lens_request.certified_domain.empty() &&
+                                   lens_request.certified_domain == lens::domain_token(d.width, d.height, lens_request.policy));
     d.lens_correction = lens::report(lens_calibration, corrected, lens_request.enabled, lens_request.policy);
     if (!corrected.pixels.empty()) d.delivery_camera = std::move(corrected.pixels);
     Json correction;
@@ -402,41 +426,43 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe 
         {"profile_correction_effective", correction_policy},
         {"camera_calibration_requested", calibration_policy},
         {"camera_calibration_effective", calibration_policy}};
-    auto range = std::minmax_element(d.camera.begin(), d.camera.end());
-    d.semantics = Json{
-        {"adapter", "SDK Stage1 -> SDK Linearize(FP32 destination) -> Stage2 "
-                    "-> Stage3; no dng_render"},
-        {"evidence", "tests/integration.py controlled LinearRaw probes; "
-                     "docs/migration-log.md S01"},
-        {"linearization_table",
-         Json{{"entries", int(ifd.fLinearizationTableCount)},
-              {"status", ifd.fLinearizationTableCount
-                             ? "applied by SDK Linearize"
-                             : "absent"}}},
-        {"black_level",
-         Json{
-             {"values", black},
-             {"delta_h_count", int(ifd.fBlackLevelDeltaHCount)},
-             {"delta_v_count", int(ifd.fBlackLevelDeltaVCount)},
-             {"status",
-              "applied by SDK Linearize; controlled 2x2 nonzero-black probe"}}},
-        {"white_level", Json{{"values", white_levels},
-                             {"status", "applied by SDK Linearize"}}},
-        {"opcodes", host.dispatches},
-        {"baseline_exposure",
-         Json{{"ev", baseline},
-              {"applied", false},
-              {"evidence", "controlled 0 vs 1.9 EV probe produces equal camera "
-                           "samples/PNG; decode bypasses dng_render"}}},
-        {"storage_bits_per_sample", int(ifd.fBitsPerSample[0])},
-        {"storage_sample_format", int(ifd.fSampleFormat[0])},
-        {"camera_min", double(*range.first)},
-        {"camera_max", double(*range.second)},
-        {"residual_stage3_black", int(n->Stage3BlackLevel())},
-        {"upstream_clipping",
-         "SDK integer Linearize clamps below black and above white to [0,1]; "
-         "probed. Converter demosaic clipping UNKNOWN. Scene FP32 color "
-         "transform is unclipped."}};
+    if (diagnostics) {
+      auto range = std::minmax_element(d.camera.begin(), d.camera.end());
+      d.semantics = Json{
+          {"adapter", "SDK Stage1 -> SDK Linearize(FP32 destination) -> Stage2 "
+                      "-> Stage3; no dng_render"},
+          {"evidence", "tests/integration.py controlled LinearRaw probes; "
+                       "docs/migration-log.md S01"},
+          {"linearization_table",
+           Json{{"entries", int(ifd.fLinearizationTableCount)},
+                {"status", ifd.fLinearizationTableCount
+                               ? "applied by SDK Linearize"
+                               : "absent"}}},
+          {"black_level",
+           Json{
+               {"values", black},
+               {"delta_h_count", int(ifd.fBlackLevelDeltaHCount)},
+               {"delta_v_count", int(ifd.fBlackLevelDeltaVCount)},
+               {"status",
+                "applied by SDK Linearize; controlled 2x2 nonzero-black probe"}}},
+          {"white_level", Json{{"values", white_levels},
+                               {"status", "applied by SDK Linearize"}}},
+          {"opcodes", host.dispatches},
+          {"baseline_exposure",
+           Json{{"ev", baseline},
+                {"applied", false},
+                {"evidence", "controlled 0 vs 1.9 EV probe produces equal camera "
+                             "samples/PNG; decode bypasses dng_render"}}},
+          {"storage_bits_per_sample", int(ifd.fBitsPerSample[0])},
+          {"storage_sample_format", int(ifd.fSampleFormat[0])},
+          {"camera_min", double(*range.first)},
+          {"camera_max", double(*range.second)},
+          {"residual_stage3_black", int(n->Stage3BlackLevel())},
+          {"upstream_clipping",
+           "SDK integer Linearize clamps below black and above white to [0,1]; "
+           "probed. Converter demosaic clipping UNKNOWN. Scene FP32 color "
+           "transform is unclipped."}};
+    }
     return d;
   } catch (const dng_exception &e) {
     throw Error(30, "Adobe DNG SDK error " + std::to_string(e.ErrorCode()));

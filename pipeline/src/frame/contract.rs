@@ -204,7 +204,7 @@ pub(crate) fn frame_metadata(
     }
 
     let source_sha256 = if let Some(id) = export_id {
-        if index != id + 1 || sidecar.get("frame_id").and_then(Json::as_u64) != Some(id as u64) {
+        if sidecar.get("frame_id").and_then(Json::as_u64) != Some(id as u64) {
             return Err(failure("native export frame id does not match its task"));
         }
         None
