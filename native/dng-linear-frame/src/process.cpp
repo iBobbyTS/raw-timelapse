@@ -11,6 +11,9 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <libproc.h>
+#include <sys/proc_info.h>
+#include <sys/stat.h>
 #include <spawn.h>
 #include <sstream>
 #include <sys/wait.h>
@@ -95,10 +98,57 @@ std::string output_collision_key(const fs::path &source) {
   out.resize(strlen(out.c_str()));
   return out;
 }
+namespace {
+using Clock = std::chrono::steady_clock;
+struct OutputState {
+  dev_t device;
+  ino_t inode;
+  off_t size;
+  timespec modified;
+  timespec changed;
+  bool operator==(const OutputState &other) const {
+    return device == other.device && inode == other.inode && size == other.size &&
+           modified.tv_sec == other.modified.tv_sec && modified.tv_nsec == other.modified.tv_nsec &&
+           changed.tv_sec == other.changed.tv_sec && changed.tv_nsec == other.changed.tv_nsec;
+  }
+};
+
+std::optional<OutputState> output_state(const fs::path &path) {
+  struct stat info {};
+  if (lstat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) return {};
+  return OutputState{info.st_dev, info.st_ino, info.st_size, info.st_mtimespec, info.st_ctimespec};
+}
+
+using FileIdentity = std::pair<dev_t, ino_t>;
+std::optional<std::set<FileIdentity>> writable_files(int pid) {
+  // A helper process could still own a writer. Use the sealed batch path
+  // whenever this Converter invocation cannot be observed unambiguously.
+  pid_t child;
+  if (proc_listchildpids(pid, &child, sizeof child) != 0) return {};
+  struct proc_fdinfo descriptors[4096];
+  int bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, descriptors, sizeof descriptors);
+  if (bytes <= 0 || bytes >= int(sizeof descriptors)) return {};
+  std::set<FileIdentity> writers;
+  for (size_t i = 0; i < size_t(bytes) / sizeof descriptors[0]; ++i) {
+    if (descriptors[i].proc_fdtype != PROX_FDTYPE_VNODE) continue;
+    struct vnode_fdinfowithpath info {};
+    if (proc_pidfdinfo(pid, descriptors[i].proc_fd, PROC_PIDFDVNODEPATHINFO,
+                       &info, sizeof info) != sizeof info)
+      return {};
+    if (info.pfi.fi_openflags & FWRITE) {
+      const auto &stat = info.pvip.vip_vi.vi_stat;
+      writers.emplace(stat.vst_dev, stat.vst_ino);
+    }
+  }
+  return writers;
+}
+} // namespace
+
 std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
                          const fs::path &linear_dir,
                          const std::string &converter, int timeout,
-                         bool temporary) {
+                         bool temporary,
+                         const std::function<void(size_t, const fs::path &)> &ready) {
   std::vector<std::string> command{converter, "-c", "-l", "-d", linear_dir.string(), "-mp"};
   std::set<std::string> expected;
   for (const auto &input : inputs) {
@@ -108,7 +158,47 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
   }
   auto log = linear_dir.parent_path() / (linear_dir.filename().string() + "-converter.log");
   auto conversion_start = std::chrono::steady_clock::now();
-  auto result = run_process(command, log, timeout);
+  struct Candidate {
+    std::optional<OutputState> state;
+    std::optional<Clock::time_point> quiet_since;
+    bool saw_writer = false;
+    bool offered = false;
+  };
+  std::vector<Candidate> candidates(ready ? inputs.size() : 0);
+  std::vector<fs::path> paths;
+  if (ready)
+    for (const auto &input : inputs)
+      paths.push_back(linear_dir / (input.stem().string() + ".dng"));
+  const auto observe = [&](int pid) {
+    auto writers = writable_files(pid);
+    auto now = Clock::now();
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      auto &candidate = candidates[i];
+      if (candidate.offered) continue;
+      auto state = output_state(paths[i]);
+      if (!state) {
+        candidate = {};
+        continue;
+      }
+      if (candidate.state && (candidate.state->device != state->device ||
+                              candidate.state->inode != state->inode))
+        candidate = {};
+      if (!candidate.state || *candidate.state != *state) candidate.quiet_since.reset();
+      candidate.state = state;
+      if (!writers || writers->contains({state->device, state->inode})) {
+        candidate.saw_writer |= writers.has_value();
+        candidate.quiet_since.reset();
+      } else if (candidate.saw_writer && state->size > 0) {
+        if (!candidate.quiet_since) candidate.quiet_since = now;
+        if (now - *candidate.quiet_since >= std::chrono::seconds(5)) {
+          candidate.offered = true;
+          ready(i, paths[i]);
+        }
+      }
+    }
+  };
+  auto result = run_process(command, log, timeout, std::nullopt,
+                            ready ? std::function<void(int)>(observe) : std::function<void(int)>{});
   auto verification_start = std::chrono::steady_clock::now();
   std::string transcript = read_text(log);
   std::string identity = "batch Converter [" + inputs.front().string() + " .. " + inputs.back().string() +
@@ -158,7 +248,8 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
   return outputs;
 }
 ProcessResult run_process(const std::vector<std::string> &args,
-                          const fs::path &log, int timeout, std::optional<fs::path> stdout_path) {
+                          const fs::path &log, int timeout, std::optional<fs::path> stdout_path,
+                          const std::function<void(int)> &observe) {
   check_cancelled();
   std::vector<char *> argv;
   for (auto &a : args)
@@ -225,6 +316,14 @@ ProcessResult run_process(const std::vector<std::string> &args,
       expired = true;
       terminate_group();
       break;
+    }
+    if (!reaped && observe) {
+      try {
+        observe(pid);
+      } catch (...) {
+        terminate_group();
+        throw;
+      }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }

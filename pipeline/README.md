@@ -213,6 +213,17 @@ first. The slot releases after all references are materialized, without waiting
 for measure/develop/delete consumption. Exact frame coverage and no outstanding
 batch are required for EOF. Other stages retain their frame capacities.
 
+When a batched Prepare directly feeds Solve on macOS, it may offer frames for
+early measurement while Adobe DNG Converter is still running. After an observed
+writable descriptor disappears, the output must stay unchanged with no observed
+writer for five seconds. Measurement admits only the ready prefix in frame
+order. Early and final measurement share Solve's concurrency, while queued
+contexts and provisional results are stored in scratch on disk. Final batch
+validation still gates accepted measurements. A matching source, prepared DNG
+hash and white balance allow reuse; other frames use the normal measurement
+path. The run log records early admissions and whether each final measurement
+reused an early result.
+
 Heavy frames across the chain are bounded by the sum of stage capacities, plus
 native worksets and each transformation's temporary buffers.
 Frame 0's white balance is frozen at ordered prepare commit. Solve runs once,

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -85,7 +86,8 @@ struct ProcessResult {
   bool timed_out;
 };
 ProcessResult run_process(const std::vector<std::string> &, const fs::path &log,
-                          int timeout_seconds, std::optional<fs::path> stdout_path = std::nullopt);
+                          int timeout_seconds, std::optional<fs::path> stdout_path = std::nullopt,
+                          const std::function<void(int)> &observe = {});
 // One verified output plus a reference to its shared invocation record.
 struct ConversionInfo {
   bool used = false;
@@ -111,7 +113,8 @@ struct Conversion {
 std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
                          const fs::path &linear_dir,
                          const std::string &converter, int timeout_seconds,
-                         bool temporary);
+                         bool temporary,
+                         const std::function<void(size_t, const fs::path &)> &ready = {});
 // Actual platform argv/environment budget, capped for bounded record transport.
 size_t converter_argv_budget();
 std::string output_collision_key(const fs::path &source);
@@ -145,16 +148,17 @@ PreparedFrame prepare_frame(const fs::path &source, const fs::path &scratch,
 // Batch and single-frame commands use this same routing/conversion core.
 std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
                             const fs::path &scratch, const std::string &converter,
-                            int timeout_seconds, bool temporary, const lens::PrepareOptions &lens_options = {});
+                            int timeout_seconds, bool temporary, const lens::PrepareOptions &lens_options = {},
+                            const std::vector<fs::path> &early_contexts = {});
 void prepare_batch(const fs::path &request, const fs::path &scratch,
                    const fs::path &result, const std::string &converter,
                    int timeout_seconds, const lens::PrepareOptions &lens_options = {});
 // Deterministic versioned context document (not the metadata sidecar).
-void write_prepared(const PreparedFrame &, const fs::path &context_path);
+void write_prepared(const PreparedFrame &, const fs::path &context_path, bool provisional = false);
 // Strictly parses the context and revalidates every original/prepared identity:
 // absolute paths, hashes, route recomputation and a three-channel LinearRaw
 // prepared artifact. Any mismatch is an explicit Error(26).
-PreparedFrame read_prepared(const fs::path &context_path);
+PreparedFrame read_prepared(const fs::path &context_path, bool provisional = false);
 // SDK decode of the prepared artifact, then the unchanged fixed Canon CR3
 // calibration when requested. Never invokes the Converter or deletes a file.
 Decoded decode_prepared(const PreparedFrame &, const std::optional<Vec> &wb,

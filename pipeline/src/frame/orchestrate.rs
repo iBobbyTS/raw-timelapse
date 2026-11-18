@@ -31,6 +31,7 @@ enum FrameInput<'a> {
     #[cfg(test)]
     Source(&'a SourceFrame),
     Prepared(&'a PreparedFrame),
+    EarlyMeasurement(&'a PreparedFrame),
 }
 
 impl FrameInput<'_> {
@@ -38,21 +39,21 @@ impl FrameInput<'_> {
         match self {
             #[cfg(test)]
             Self::Source(source) => &source.name,
-            Self::Prepared(prepared) => &prepared.source_name,
+            Self::Prepared(prepared) | Self::EarlyMeasurement(prepared) => &prepared.source_name,
         }
     }
     fn path(&self) -> &Path {
         match self {
             #[cfg(test)]
             Self::Source(source) => &source.path,
-            Self::Prepared(prepared) => &prepared.source,
+            Self::Prepared(prepared) | Self::EarlyMeasurement(prepared) => &prepared.source,
         }
     }
     fn prepared(&self) -> Option<&PreparedFrame> {
         match self {
             #[cfg(test)]
             Self::Source(_) => None,
-            Self::Prepared(prepared) => Some(prepared),
+            Self::Prepared(prepared) | Self::EarlyMeasurement(prepared) => Some(prepared),
         }
     }
 }
@@ -310,6 +311,25 @@ pub fn prepare_batch_active(
     settings: &PrepareBatchSettings<'_>,
     active: ActiveNative,
 ) -> Result<Vec<(usize, PreparedFrame)>> {
+    prepare_batch(tool, items, settings, active, false)
+}
+
+pub fn prepare_batch_with_early_measurements(
+    tool: &Path,
+    items: &[PrepareBatchItem<'_>],
+    settings: &PrepareBatchSettings<'_>,
+    active: ActiveNative,
+) -> Result<Vec<(usize, PreparedFrame)>> {
+    prepare_batch(tool, items, settings, active, true)
+}
+
+fn prepare_batch(
+    tool: &Path,
+    items: &[PrepareBatchItem<'_>],
+    settings: &PrepareBatchSettings<'_>,
+    active: ActiveNative,
+    early_measurements: bool,
+) -> Result<Vec<(usize, PreparedFrame)>> {
     batch_check_stop(&active)?;
     if items.is_empty() || items.len() > 64 {
         return Err(failure("batch count must be 1..64"));
@@ -324,6 +344,10 @@ pub fn prepare_batch_active(
         return Err(failure(
             "batch adapter requires an empty private scratch directory",
         ));
+    }
+    if early_measurements {
+        fs::create_dir(scratch.join("early"))
+            .map_err(|e| failure(format!("early measurement scratch: {e}")))?;
     }
     let request = scratch.join("prepare.request");
     let result = scratch.join("prepare.result");
@@ -570,11 +594,17 @@ pub fn analyze_prepared_at(
     total: usize,
     log: &Path,
     active: ActiveNative,
+    provisional: bool,
 ) -> Result<FrameInfo> {
     let run = prepared_native_run(settings, Some(roi), log);
+    let input = if provisional {
+        FrameInput::EarlyMeasurement(prepared)
+    } else {
+        FrameInput::Prepared(prepared)
+    };
     run_frame(
         tool,
-        FrameInput::Prepared(prepared),
+        input,
         id + 1,
         total,
         wb,
@@ -642,10 +672,15 @@ fn frame_args(
     match input {
         #[cfg(test)]
         FrameInput::Source(source) => args.push(source.path.display().to_string()),
-        FrameInput::Prepared(prepared) => {
+        FrameInput::Prepared(prepared) | FrameInput::EarlyMeasurement(prepared) => {
             // The context already records the conversion; never pass a
             // Converter option on this path.
-            args.push("--prepared".into());
+            let mode = if matches!(input, FrameInput::EarlyMeasurement(_)) {
+                "--early-measurement"
+            } else {
+                "--prepared"
+            };
+            args.push(mode.into());
             args.push(prepared.context.display().to_string());
         }
     }

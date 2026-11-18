@@ -298,3 +298,45 @@ fn controlled_backend_dispatches_short_available_prefix_without_waiting_for_full
         "no empty batch at EOF"
     );
 }
+
+#[test]
+fn early_measurements_drain_an_ordered_prefix_without_waiting_for_batch_or_using_final_slots() {
+    let (trace, events) = std::sync::mpsc::channel();
+    let (seal, batch_completion) = std::sync::mpsc::channel();
+    let ready = Arc::new(std::sync::Mutex::new(BTreeSet::from([1, 2, 3])));
+    let mut fake = Fake {
+        frame_count: 4,
+        trace: Some(trace),
+        early_ready: Some(ready.clone()),
+        batch_completion: Some(batch_completion),
+        ..Default::default()
+    };
+    let worker = std::thread::spawn(move || {
+        let text = config("4", "1").replace(
+            r#""kind":"solve", "concurrency":8"#,
+            r#""kind":"solve", "concurrency":1"#,
+        );
+        execute(&Graph::parse(&text).unwrap(), 4, &mut fake).unwrap();
+        fake
+    });
+    assert_eq!(
+        events.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "batch-start [0, 1, 2, 3]"
+    );
+    assert!(events.recv_timeout(Duration::from_millis(120)).is_err());
+    ready.lock().unwrap().insert(0);
+    // With a single measurement worker, success on all four while Prepare
+    // remains unsealed proves provisional completions release their slots.
+    for id in 0..4 {
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            format!("early {id}")
+        );
+    }
+    for id in (0..4).rev() {
+        seal.send(id).unwrap();
+    }
+    let fake = worker.join().unwrap();
+    assert_eq!(fake.prepare_commits, vec![0, 1, 2, 3]);
+    assert_eq!(fake.measured, vec![0, 1, 2, 3]);
+}

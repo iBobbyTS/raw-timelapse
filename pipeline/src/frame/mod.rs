@@ -17,7 +17,7 @@ pub use doc::PreparedFrame;
 pub use doc::PreparedRoute;
 pub use orchestrate::{
     analyze_prepared_at, develop_prepared_at, prepare_active, prepare_batch_active,
-    PrepareBatchItem, PrepareBatchSettings, PrepareSettings, PreparedSettings,
+    prepare_batch_with_early_measurements, PrepareBatchItem, PrepareBatchSettings, PrepareSettings, PreparedSettings,
 };
 pub use sidecar::{analysis_bytes, format_wb};
 #[cfg(test)]

@@ -704,6 +704,12 @@ pub trait Backend {
         id: usize,
         r: &Self::Reference,
     ) -> Result<FrameTask<Self::Measurement>>;
+    /// Unsealed input yielded by an active Prepare batch. A worker may
+    /// compute and persist a candidate, but only a normal measurement task
+    /// with the final reference can accept it into the exposure plan.
+    fn early_measure_task(&mut self, _id: usize) -> Result<Option<FrameTask<()>>> {
+        Ok(None)
+    }
     fn commit_measure(
         &mut self,
         id: usize,
@@ -888,6 +894,17 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                 .then(|| OrderedStage::<B::Measurement>::new(n.concurrency, wake.clone()))
         })
         .collect();
+    let mut early_measurements = graph
+        .nodes
+        .iter()
+        .find(|node| {
+            node.kind == Kind::Solve
+                && graph.nodes[node.inputs["frames"]].kind == Kind::Prepare
+                && graph.nodes[node.inputs["frames"]].batch_size > 1
+        })
+        .map(|node| OrderedStage::<usize>::new(node.concurrency, wake.clone()));
+    let mut early_pending = BTreeSet::new();
+    let mut early_next = 0;
     let mut images: Vec<_> = graph
         .nodes
         .iter()
@@ -922,6 +939,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
         loop {
             while completion_ready.try_recv().is_ok() {}
             b.check()?;
+            let mut progress_from_early = false;
             // Observe all failures before committing successes or dispatching more.
             for stage in preparations.iter_mut().flatten() {
                 stage.poll()?;
@@ -932,13 +950,21 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
             for stage in measurements.iter_mut().flatten() {
                 stage.poll()?;
             }
+            if let Some(stage) = early_measurements.as_mut() {
+                stage.poll()?;
+                while let Some(output) = stage.commit_next() {
+                    early_pending.remove(&output.value);
+                    stage.delivered(output.key.frame_id)?;
+                    progress_from_early = true;
+                }
+            }
             for stage in images.iter_mut().flatten() {
                 stage.poll()?;
             }
             if states.iter().all(|s| s.closed) {
                 return Ok(());
             }
-            let mut progress = false;
+            let mut progress = progress_from_early;
             for (i, stage) in preparations.iter_mut().enumerate() {
                 if let Some(stage) = stage {
                     while let Some(output) = stage.commit_next() {
@@ -1138,21 +1164,50 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                         let p = input("frames");
                         // Measurements are incremental, but publishing is gated on
                         // the producer's exact sealed inventory, including EOF.
-                        if let Some(r) = states[p].refs.get(id).cloned() {
-                            if let Some(stage) = measurements[i].as_mut() {
-                                if stage.has_capacity() {
-                                    let task = b.measure_task(id, &r)?;
-                                    stage.submit(
-                                        ordered_frames::TaskKey {
-                                            node: node.id.clone(),
-                                            frame_id: id,
-                                            source: b.hash(&r).into(),
-                                        },
-                                        task,
-                                    )?;
-                                    progress = true;
+                        if let Some(stage) = measurements[i].as_mut() {
+                            let early_in_flight =
+                                early_measurements.as_ref().map_or(0, |s| s.outstanding());
+                            if stage.outstanding() + early_in_flight < node.concurrency {
+                                early_next = early_next.max(id);
+                                if let Some(r) = states[p].refs.get(id) {
+                                    if !early_pending.contains(&id) {
+                                        let task = b.measure_task(id, r)?;
+                                        stage.submit(
+                                            ordered_frames::TaskKey {
+                                                node: node.id.clone(),
+                                                frame_id: id,
+                                                source: b.hash(r).into(),
+                                            },
+                                            task,
+                                        )?;
+                                        progress = true;
+                                        continue;
+                                    }
+                                } else if let Some(early) = early_measurements.as_mut() {
+                                    if early_next < count && ready(node, &states, Some(early_next)) {
+                                        if let Some(task) = b.early_measure_task(early_next)? {
+                                            let frame = early_next;
+                                            early.submit(
+                                                ordered_frames::TaskKey {
+                                                    node: node.id.clone(),
+                                                    frame_id: early.accepted(),
+                                                    source: b.source_identity(frame),
+                                                },
+                                                Box::new(move || {
+                                                    task()?;
+                                                    Ok(frame)
+                                                }),
+                                            )?;
+                                            early_pending.insert(frame);
+                                            early_next += 1;
+                                            progress = true;
+                                        }
+                                    }
                                 }
-                            } else {
+                            }
+                        }
+                        if states[p].refs.get(id).is_some() {
+                            if node.kind == Kind::Zero {
                                 states[i].next += 1;
                                 progress = true;
                             }
@@ -1317,13 +1372,15 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                 }
             }
             if !progress {
-                let active = batches.iter().flatten().any(|s| s.outstanding() > 0)
+                let active = early_measurements.as_ref().is_some_and(|s| s.outstanding() > 0)
+                    || batches.iter().flatten().any(|s| s.outstanding() > 0)
                     || preparations.iter().flatten().any(|s| s.outstanding() > 0)
                     || measurements.iter().flatten().any(|s| s.outstanding() > 0)
                     || images.iter().flatten().any(|s| s.outstanding() > 0);
                 if active {
-                    // Timed wake only exists to observe async-signal-safe STOP;
-                    // completions themselves wake this receiver immediately.
+                    // Timed wake observes async-signal-safe STOP.
+                    // Worker completions wake immediately; the timeout also polls
+                    // newly published early measurement contexts.
                     let _ = completion_ready.recv_timeout(Duration::from_millis(50));
                 } else {
                     return Err("graph: unsatisfied data/EOF/event dependencies".into());
@@ -1338,6 +1395,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
     // cannot strand the coordinator on the first failing worker.
     drop(batches);
     drop(preparations);
+    drop(early_measurements);
     drop(measurements);
     drop(images);
     result

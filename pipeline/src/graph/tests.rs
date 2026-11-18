@@ -19,6 +19,7 @@ struct Fake {
     cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     trace: Option<std::sync::mpsc::Sender<String>>,
     batch_completion: Option<std::sync::mpsc::Receiver<usize>>,
+    early_ready: Option<Arc<std::sync::Mutex<BTreeSet<usize>>>>,
     slow_measure: Option<std::sync::mpsc::Receiver<()>>,
     plan_defect: Option<&'static str>,
     plan_ready_calls: usize,
@@ -116,6 +117,17 @@ impl Backend for Fake {
     }
     fn hash<'a>(&self, r: &'a String) -> &'a str {
         r
+    }
+    fn early_measure_task(&mut self, id: usize) -> Result<Option<FrameTask<()>>> {
+        if self
+            .early_ready
+            .as_ref()
+            .is_none_or(|ready| !ready.lock().unwrap().contains(&id))
+        {
+            return Ok(None);
+        }
+        self.trace.as_ref().unwrap().send(format!("early {id}")).unwrap();
+        Ok(Some(Box::new(|| Ok(()))))
     }
     fn measure_task(&mut self, id: usize, _: &String) -> Result<FrameTask<usize>> {
         let gate = if id == 0 {

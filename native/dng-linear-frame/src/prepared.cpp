@@ -20,6 +20,7 @@
 #include <unistd.h>
 namespace frame {
 namespace {
+constexpr const char *kEarlyContextMagic = "rawtl-early-measurement/1";
 constexpr const char *kContextMagic = "rawtl-prepared-frame/2";
 // Calibration/2 can carry eight image-field endpoints per component.
 constexpr size_t kContextLimit = 256 * 1024;
@@ -353,7 +354,8 @@ Json ConversionInfo::record() const {
 
 std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
                             const fs::path &scratch_in, const std::string &converter,
-                            int timeout, bool temporary, const lens::PrepareOptions &lens_options) {
+                            int timeout, bool temporary, const lens::PrepareOptions &lens_options,
+                            const std::vector<fs::path> &early_contexts) {
   auto started = std::chrono::steady_clock::now();
   if (sources.empty() || sources.size() > 64) throw Error(26, "batch count must be 1..64");
   lens::validate_prepare_options(lens_options);
@@ -394,6 +396,31 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
     if (bytes+n > budget) throw Error(26, "single source exceeds Converter argv byte budget: " + frames[i].source.string());
     groups.back().push_back(i); names.insert(key); bytes += n;
   }
+  // Publish only measurement inputs here. The final context and associated
+  // Converter provenance are written through the normal sealed batch path.
+  const auto offer = [&](size_t index, const fs::path &dng) {
+    try {
+      auto candidate = frames[index];
+      auto check = inspect(dng);
+      if (!check || check->photometric != 34892 || !check->width || !check->height) return;
+      candidate.generated = candidate.kind != Route::direct;
+      candidate.prepared_dng = dng;
+      candidate.prepared_hash = candidate.generated ? sha256(dng) : candidate.source_hash;
+      candidate.main_ifd_width = check->width;
+      candidate.main_ifd_height = check->height;
+      if (candidate.kind == Route::vendor_raw) candidate.own = read_neutral(dng);
+      candidate.capture_time = read_capture_time(candidate.kind == Route::vendor_raw ? dng : candidate.source);
+      write_prepared(candidate, early_contexts[index], true);
+    } catch (const Error &e) {
+      if (e.code == 130) throw;
+      // Failed or unavailable observations fall back to validated batch output.
+    } catch (const fs::filesystem_error &) {
+      // The file may have been replaced while collecting a provisional input.
+    }
+  };
+  if (!early_contexts.empty() && !groups.empty())
+    for (size_t i = 0; i < frames.size(); ++i)
+      if (frames[i].kind == Route::direct) offer(i, frames[i].source);
   auto conversion_start = std::chrono::steady_clock::now();
   for (size_t g = 0; g < groups.size(); ++g) {
     check_cancelled();
@@ -401,7 +428,17 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
     if (!fs::create_directory(dir)) throw Error(26, "prepare scratch already contains a linear directory: " + dir.string());
     std::vector<fs::path> inputs;
     for (size_t i : groups[g]) inputs.push_back(frames[i].source);
-    auto converted = convert_inputs(inputs, dir, converter, timeout, temporary);
+    std::function<void(size_t, const fs::path &)> ready;
+    if (!early_contexts.empty())
+      ready = [&](size_t item, const fs::path &path) { offer(groups[g][item], path); };
+    auto converted = convert_inputs(inputs, dir, converter, timeout, temporary, ready);
+    if (ready && g + 1 < groups.size()) {
+      for (size_t item = 0; item < converted.size(); ++item) {
+        std::error_code error;
+        if (!fs::exists(early_contexts[groups[g][item]], error) && !error)
+          ready(item, converted[item].output);
+      }
+    }
     for (size_t j = 0; j < groups[g].size(); ++j) {
       auto &out = frames[groups[g][j]];
       out.prepared_dng = canonical_existing(converted[j].output, "prepared DNG");
@@ -452,7 +489,9 @@ void prepare_batch(const fs::path &request, const fs::path &scratch_in,
   if (!count || count > 64) throw Error(26, "batch count must be 1..64");
   std::set<std::string> allowed{"count"}, targets;
   std::set<uint32_t> ids;
-  std::vector<fs::path> sources, contexts;
+  std::vector<fs::path> sources, contexts, early_contexts;
+  const auto early = scratch / "early";
+  const bool stream_measurements = fs::is_directory(fs::symlink_status(early));
   auto output_path = [&](const fs::path &p) {
     if (!p.is_absolute()) throw Error(26, "batch output paths must be absolute");
     auto resolved = fs::weakly_canonical(p);
@@ -475,6 +514,8 @@ void prepare_batch(const fs::path &request, const fs::path &scratch_in,
     if (!source.is_absolute()) throw Error(26, "batch source must be absolute");
     sources.push_back(canonical_existing(source,"original source"));
     contexts.push_back(output_path(doc.at(item(i,"context"))));
+    if (stream_measurements)
+      early_contexts.push_back(output_path(early / ("frame_" + std::to_string(id) + ".context")));
   }
   doc.require_only(allowed);
   for (const auto &source : sources)
@@ -482,7 +523,7 @@ void prepare_batch(const fs::path &request, const fs::path &scratch_in,
       throw Error(26, "batch output/request must be distinct from source");
   for (const auto &path : contexts)
     if (fs::weakly_canonical(request) == path) throw Error(26, "batch context must differ from request");
-  auto frames = prepare_frames(sources,scratch,converter,timeout,false,lens_options);
+  auto frames = prepare_frames(sources,scratch,converter,timeout,false,lens_options,early_contexts);
   std::ostringstream out;
   out << "rawtl-prepare-result/1\ncount=" << count << '\n';
   for (size_t i = 0; i < count; ++i) {
@@ -501,7 +542,7 @@ void prepare_batch(const fs::path &request, const fs::path &scratch_in,
 }
 
 void write_prepared(const PreparedFrame &prepared,
-                    const fs::path &context_path) {
+                    const fs::path &context_path, bool provisional) {
   auto same = [&](const fs::path &other) {
     std::error_code error;
     auto left = fs::weakly_canonical(context_path, error);
@@ -515,7 +556,7 @@ void write_prepared(const PreparedFrame &prepared,
     throw Error(2, "prepared context path must be distinct from the source "
                    "and prepared DNG");
   std::ostringstream out;
-  out << kContextMagic << '\n';
+  out << (provisional ? kEarlyContextMagic : kContextMagic) << '\n';
   field(out, "source", prepared.source.string());
   field(out, "source_sha256", prepared.source_hash);
   field(out, "route", route_name(prepared.kind));
@@ -544,11 +585,12 @@ void write_prepared(const PreparedFrame &prepared,
   atomic_document(context_path, out.str(), kContextLimit);
 }
 
-PreparedFrame read_prepared(const fs::path &context_path) {
+PreparedFrame read_prepared(const fs::path &context_path, bool provisional) {
   std::error_code error;
   if (!fs::is_regular_file(context_path, error) || error)
     throw Error(26, "prepared context is missing: " + context_path.string());
-  Context context = parse_context(read_bounded(context_path, kContextLimit));
+  Context context = parse_context(read_bounded(context_path, kContextLimit),
+                                  provisional ? kEarlyContextMagic : kContextMagic);
 
   const std::set<std::string> base{"source",
                                    "source_sha256",
@@ -654,8 +696,8 @@ PreparedFrame read_prepared(const fs::path &context_path) {
     if (sha256(out.prepared_dng) != out.prepared_hash)
       throw Error(26, "prepared DNG hash does not match the context: " +
                           out.prepared_dng.string());
-    if (out.conversion.output_sha256 != out.prepared_hash ||
-        out.conversion.output_name != out.prepared_dng.filename().string())
+    if (!provisional && (out.conversion.output_sha256 != out.prepared_hash ||
+        out.conversion.output_name != out.prepared_dng.filename().string()))
       throw Error(26, "prepared context Converter provenance does not "
                       "describe the prepared DNG");
   }
@@ -666,8 +708,9 @@ PreparedFrame read_prepared(const fs::path &context_path) {
   if (check->width != out.main_ifd_width ||
       check->height != out.main_ifd_height)
     throw Error(26, "prepared context geometry does not match the prepared DNG");
-  if (out.conversion.used != out.generated) throw Error(26, "prepared context converter_used disagrees with generated");
-  if (out.generated) read_conversion_record(out, context);
+  if (out.conversion.used != (out.generated && !provisional))
+    throw Error(26, "prepared context converter_used disagrees with its publication state");
+  if (out.conversion.used) read_conversion_record(out, context);
   return out;
 }
 

@@ -51,11 +51,17 @@ struct Image {
     crop_record: Option<crate::resample::CropWindow>,
 }
 
+struct MeasuredFrame {
+    measurement: FrameMeasurement,
+    reused: bool,
+}
+
 struct Runner<'a, 'b> {
     context: &'a RunContext<'b>,
     log: &'a mut RunLog,
     measurements: Vec<FrameMeasurement>,
     reference_wb: Option<[f64; 3]>,
+    early_contexts: Vec<Option<std::path::PathBuf>>,
     capture_times: Vec<Option<String>>,
     frames: Vec<FrameInfo>,
     source_geometry: Option<(u32, u32)>,
@@ -88,6 +94,33 @@ struct Runner<'a, 'b> {
     /// Worker count for the auto scan; mirrors the graph's develop concurrency.
     scan_workers: usize,
 }
+fn reuse_measurement(
+    path: &std::path::Path,
+    prepared: &PreparedFrame,
+    wb: Option<[f64; 3]>,
+) -> Option<FrameMeasurement> {
+    let candidate = PreparedFrame::load_early_measurement(path).ok()?;
+    if candidate.source != prepared.source
+        || candidate.source_sha256 != prepared.source_sha256
+        || candidate.route != prepared.route
+        || candidate.dng != prepared.dng
+        || candidate.dng_sha256 != prepared.dng_sha256
+        || candidate.main_ifd_width != prepared.main_ifd_width
+        || candidate.main_ifd_height != prepared.main_ifd_height
+        || candidate.as_shot_neutral != prepared.as_shot_neutral
+        || candidate.capture_time != prepared.capture_time
+    {
+        return None;
+    }
+    let content = fs::read_to_string(path.with_extension("analysis")).ok()?;
+    let (recorded_wb, json) = content.split_once('\n')?;
+    if recorded_wb != wb.map(frame::format_wb).unwrap_or_default() {
+        return None;
+    }
+    let measurement = AnalysisSidecar::parse(json).ok()?.measurement;
+    (measurement.source_sha256 == prepared.source_sha256).then_some(measurement)
+}
+
 fn frame_failure(id: usize, total: usize, name: &str, message: &str) -> String {
     format!(
         "frame {}/{} ({}) failed: {}; no video was produced",
@@ -265,7 +298,7 @@ impl Runner<'_, '_> {
 }
 impl Backend for Runner<'_, '_> {
     type Reference = PreparedFrame;
-    type Measurement = FrameMeasurement;
+    type Measurement = MeasuredFrame;
     type Image = Image;
     fn check(&mut self) -> graph::Result<()> {
         self.result(proc::check_stop())?;
@@ -328,6 +361,13 @@ impl Backend for Runner<'_, '_> {
             .iter()
             .map(|id| (*id, self.context.sources[*id].clone()))
             .collect();
+        let streaming = self.context.options.deflicker.enabled();
+        if streaming {
+            for &id in ids {
+                self.early_contexts[id] =
+                    Some(scratch.join("early").join(format!("frame_{id}.context")));
+            }
+        }
         let tool = self.context.options.native_tool.clone();
         let converter = self.context.options.converter.clone();
         let converter_timeout = self.context.options.converter_timeout;
@@ -344,7 +384,12 @@ impl Backend for Runner<'_, '_> {
                     source,
                 })
                 .collect();
-            let prepared = frame::prepare_batch_active(
+            let prepare = if streaming {
+                frame::prepare_batch_with_early_measurements
+            } else {
+                frame::prepare_batch_active
+            };
+            let prepared = prepare(
                 &tool,
                 &items,
                 &frame::PrepareBatchSettings {
@@ -434,11 +479,61 @@ impl Backend for Runner<'_, '_> {
     fn hash<'a>(&self, r: &'a PreparedFrame) -> &'a str {
         &r.source_sha256
     }
+    fn early_measure_task(&mut self, id: usize) -> graph::Result<Option<FrameTask<()>>> {
+        let Some(candidate) = self.early_contexts[id].as_ref() else {
+            return Ok(None);
+        };
+        let Ok(prepared) = PreparedFrame::load_early_measurement(candidate) else {
+            return Ok(None);
+        };
+        if fs::canonicalize(&self.context.sources[id].path).ok().as_ref() != Some(&prepared.source) {
+            return Ok(None);
+        }
+        let wb = if id > 0 && self.context.options.white_balance.freezes_reference() {
+            let reference = self.reference_wb.or_else(|| {
+                let path = self.early_contexts[0].as_ref()?;
+                Some(PreparedFrame::load_early_measurement(path).ok()?.as_shot_neutral)
+            });
+            let Some(reference) = reference else {
+                return Ok(None);
+            };
+            Some(reference)
+        } else {
+            None
+        };
+        let log = self.transcript("measure-early", id);
+        let tool = self.context.options.native_tool.clone();
+        let output = candidate.with_extension("analysis");
+        let roi = self.context.options.deflicker.roi;
+        let settings = self.settings();
+        let total = self.context.sources.len();
+        let active = self.active.clone();
+        let written = self.log.line(&format!(
+            "kind=measure.early frame={} source={}",
+            id + 1,
+            quote(&prepared.source_name)
+        ));
+        self.result(written)?;
+        Ok(Some(Box::new(move || {
+            if let Ok(info) = frame::analyze_prepared_at(
+                &tool, &prepared, wb, roi, &settings, id, total, &log, active, true,
+            ) {
+                if let Some(bytes) = frame::analysis_bytes(&info) {
+                    let mut output_bytes = wb.map(frame::format_wb).unwrap_or_default().into_bytes();
+                    output_bytes.push(b'\n');
+                    output_bytes.extend_from_slice(bytes);
+                    // An early failure is retried through the sealed input.
+                    let _ = fs::write(output, output_bytes);
+                }
+            }
+            Ok(())
+        })))
+    }
     fn measure_task(
         &mut self,
         id: usize,
         r: &PreparedFrame,
-    ) -> graph::Result<FrameTask<FrameMeasurement>> {
+    ) -> graph::Result<FrameTask<MeasuredFrame>> {
         let log = self.transcript("measure", id);
         let tool = self.context.options.native_tool.clone();
         let prepared = r.clone();
@@ -450,9 +545,19 @@ impl Backend for Runner<'_, '_> {
         let settings = self.settings();
         let total = self.context.sources.len();
         let active = self.active.clone();
+        let early = self.early_contexts[id].clone();
         Ok(Box::new(move || {
+            if let Some(measurement) = early
+                .as_deref()
+                .and_then(|path| reuse_measurement(path, &prepared, wb))
+            {
+                return Ok(MeasuredFrame {
+                    measurement,
+                    reused: true,
+                });
+            }
             let info = frame::analyze_prepared_at(
-                &tool, &prepared, wb, roi, &settings, id, total, &log, active,
+                &tool, &prepared, wb, roi, &settings, id, total, &log, active, false,
             )
             .map_err(|e| frame_failure(id, total, &prepared.source_name, &e.message))?;
             let bytes = frame::analysis_bytes(&info).ok_or("graph: missing measurement")?;
@@ -461,26 +566,31 @@ impl Backend for Runner<'_, '_> {
             if sidecar.measurement.source_sha256 != prepared.source_sha256 {
                 return Err("graph: measurement identity mismatch".into());
             }
-            Ok(sidecar.measurement)
+            Ok(MeasuredFrame {
+                measurement: sidecar.measurement,
+                reused: false,
+            })
         }))
     }
     fn commit_measure(
         &mut self,
         id: usize,
         r: &PreparedFrame,
-        measurement: FrameMeasurement,
+        measured: MeasuredFrame,
         elapsed: Duration,
     ) -> graph::Result<()> {
+        let MeasuredFrame { measurement, reused } = measured;
         if id != self.measurements.len() || measurement.source_sha256 != r.source_sha256 {
             return Err("graph: measurement commit identity/order mismatch".into());
         }
         self.measurements.push(measurement);
         self.progress("deflicker");
         let written = self.log.line(&format!(
-            "kind=measure frame={} source={} duration={:.3}",
+            "kind=measure frame={} source={} duration={:.3} reused_early={}",
             id + 1,
             quote(&r.source_name),
-            elapsed.as_secs_f64()
+            elapsed.as_secs_f64(),
+            reused
         ));
         self.result(written)
     }
@@ -1189,6 +1299,7 @@ pub fn run(
         log,
         measurements: vec![],
         reference_wb: None,
+        early_contexts: vec![None; context.sources.len()],
         capture_times: vec![],
         frames: vec![],
         source_geometry: None,

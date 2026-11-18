@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 /// bytes and the native consumer revalidates every hash before decoding.
 #[allow(dead_code)] // consumed by the graph scheduling integration
 pub const PREPARED_CONTEXT_MAGIC: &str = "rawtl-prepared-frame/2";
+const EARLY_MEASUREMENT_MAGIC: &str = "rawtl-early-measurement/1";
 const PREPARED_CONTEXT_LIMIT: usize = 256 * 1024;
 
 /// Routing identity carried by a prepared context. `Direct` is a LinearRaw
@@ -72,8 +73,20 @@ impl PreparedFrame {
     /// consistency and file existence so a mis-wired graph fails before a
     /// native process is started.
     pub fn load(context: &Path) -> Result<Self> {
+        Self::load_context(context, false)
+    }
+
+    pub fn load_early_measurement(context: &Path) -> Result<Self> {
+        Self::load_context(context, true)
+    }
+
+    fn load_context(context: &Path, provisional: bool) -> Result<Self> {
         let bytes = read_document(context, PREPARED_CONTEXT_LIMIT)?;
-        let fields = parse_context_fields(&bytes)?;
+        let fields = if provisional {
+            parse_document_fields(&bytes, EARLY_MEASUREMENT_MAGIC, PREPARED_CONTEXT_LIMIT)?
+        } else {
+            parse_context_fields(&bytes)?
+        };
         let get = |key: &str| -> Result<&str> {
             fields
                 .iter()
@@ -145,7 +158,10 @@ impl PreparedFrame {
                 "prepared context cannot use the original source as its converted DNG",
             ));
         }
-        validate_conversion(&fields, &source_raw, &source_sha256, &dng_raw, &dng_sha256, generated)?;
+        validate_conversion(
+            &fields, &source_raw, &source_sha256, &dng_raw, &dng_sha256,
+            generated && !provisional,
+        )?;
         let source_name = source
             .file_name()
             .and_then(|name| name.to_str())

@@ -509,7 +509,10 @@ int main(int argc, char **argv) {
     lens::Policy lens_policy;
     if (argc < 3)
       throw Error(2, "option value missing");
-    const bool prepared_mode = std::string(argv[2]) == "--prepared";
+    const bool provisional = std::string(argv[2]) == "--early-measurement";
+    if (provisional && !want_analysis)
+      throw Error(2, "--early-measurement requires --stdout-analysis");
+    const bool prepared_mode = provisional || std::string(argv[2]) == "--prepared";
     if ((mode == "--lens-valid-area" || mode == "--lens-status") && !prepared_mode)
       throw Error(2, mode + " requires a frozen prepared context");
     fs::path input, context;
@@ -619,7 +622,7 @@ int main(int argc, char **argv) {
     std::optional<Temp> temp;
     PreparedFrame prepared;
     if (prepared_mode) {
-      prepared = read_prepared(context);
+      prepared = read_prepared(context, provisional);
     } else {
       temp.emplace();
       prepared = prepare_frame(input, temp->path, converter, timeout, true, lens_options);
@@ -661,6 +664,8 @@ int main(int argc, char **argv) {
       return 0;
     }
     Decoded decoded = decode_prepared(prepared, wb, recipe, lens_enabled, lens_policy, preview_edge);
+    if (provisional && sha256(prepared.prepared_dng) != prepared.prepared_hash)
+      throw Error(26, "DNG changed during early measurement");
     FrameOutput frame =
         render(prepared, decoded, std::optional<fs::path>(), roi, exposure_ev,
                want_analysis, !want_analysis, f32, prepared_mode,
