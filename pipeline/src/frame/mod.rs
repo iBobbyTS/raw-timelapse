@@ -62,6 +62,7 @@ pub struct FrameInfo {
     pub exposure_ev: f64,
     pub duration: Duration,
     pub analysis_envelope: Option<DataEnvelope>,
+    pub measurement: Option<crate::deflicker::FrameMeasurement>,
 }
 #[derive(Debug, Clone)]
 pub struct FrameSequence {

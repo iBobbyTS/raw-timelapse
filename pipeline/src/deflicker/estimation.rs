@@ -551,6 +551,13 @@ fn robust_segment(
     Ok(failed)
 }
 pub fn estimate_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Result<ExposureResult> {
+    let mut result = solve_exposure(ms, cfg)?;
+    result.plan_quality = super::validation::evaluate_plan(ms, &result, cfg)?;
+    ExposurePlan::from_result(ms, &result)?;
+    Ok(result)
+}
+
+pub fn solve_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Result<ExposureResult> {
     let k = compatible(ms)?;
     let n = ms.len();
     if k < 8 {
@@ -760,7 +767,7 @@ pub fn estimate_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Resul
         .collect();
     gaps.sort_unstable();
     gaps.dedup();
-    let mut result = ExposureResult {
+    Ok(ExposureResult {
         frames,
         tile_log_luminance: x,
         tile_valid: q,
@@ -773,8 +780,5 @@ pub fn estimate_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Resul
         time_gaps: gaps,
         pairwise_summary: summary,
         plan_quality: Default::default(),
-    };
-    result.plan_quality = super::validation::evaluate_plan(ms, &result, cfg)?;
-    ExposurePlan::from_result(ms, &result)?;
-    Ok(result)
+    })
 }

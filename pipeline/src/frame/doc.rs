@@ -58,7 +58,7 @@ pub struct PreparedFrame {
     pub route: PreparedRoute,
     pub dng: PathBuf,
     pub dng_sha256: String,
-    pub(crate) has_file_versions: bool,
+    has_file_versions: bool,
     pub generated: bool,
     pub main_ifd_width: u32,
     pub main_ifd_height: u32,
@@ -71,6 +71,12 @@ pub struct PreparedFrame {
 impl PreparedFrame {
     /// Validate the document and check source and output associations before
     /// starting a native consumer.
+    pub(crate) fn file_check_args(&self, args: &mut Vec<String>) {
+        if self.has_file_versions {
+            args.extend(["--prepared-file-check".into(), "state".into()]);
+        }
+    }
+
     pub fn load(context: &Path) -> Result<Self> {
         Self::load_context(context, false, &mut ConversionRecords::default())
     }

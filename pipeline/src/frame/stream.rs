@@ -121,13 +121,6 @@ impl NativeStream {
                     .note(&format!("pixel record failed: {}", e.message));
                 e
             })?;
-        if self.f32
-            && pixels
-                .chunks_exact(4)
-                .any(|b| !f32::from_le_bytes(b.try_into().unwrap()).is_finite())
-        {
-            return Err(failure("nonfinite FP32 pixel"));
-        }
         self.pixel_bytes = pixels.len();
         self.process
             .note(&format!("pixel bytes: {}", self.pixel_bytes));
@@ -138,10 +131,7 @@ impl NativeStream {
     }
     pub(crate) fn json(&mut self, kind: u8) -> Result<Arc<[u8]>> {
         let bytes = self.protocol.as_mut().unwrap().record(kind, None)?;
-        let text =
-            std::str::from_utf8(&bytes).map_err(|e| failure(format!("invalid UTF-8 JSON: {e}")))?;
-        // JSON summaries only: pixel payloads never enter transcripts.
-        self.process.note(&format!("JSON {kind:#04x}: {text}"));
+        self.process.note(&format!("JSON {kind:#04x}: {} bytes", bytes.len()));
         Ok(bytes)
     }
     pub(crate) fn finish(&mut self) -> Result<()> {

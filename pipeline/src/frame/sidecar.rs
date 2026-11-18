@@ -1,10 +1,10 @@
 //! Frame metadata parsing, transport envelopes and white-balance formatting.
 use super::{failure, FrameInfo, JSON_MEDIA_TYPE};
+use crate::deflicker::{measurement::AnalysisSidecar, FrameMeasurement};
 use crate::error::{Error, Result, EXIT_FRAME};
 use crate::json::{self, Json};
 use crate::transport::{
-    self, DataEnvelope, MemoryFile, MetadataDoc, Payload, Provenance, ANALYSIS_SIDECAR,
-    FRAME_METADATA,
+    DataEnvelope, MemoryFile, MetadataDoc, Payload, Provenance, ANALYSIS_SIDECAR,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ pub fn analysis_sidecar_envelope(
     bytes: Arc<[u8]>,
     expected: Option<&str>,
     ev: f64,
-) -> Result<DataEnvelope> {
+) -> Result<(DataEnvelope, FrameMeasurement)> {
     let sidecar = parse_json(&bytes)?;
     if sidecar.get("schema_version").and_then(Json::as_u64) != Some(2)
         || sidecar.get("kind").and_then(Json::as_str) != Some("rawtl-analysis-sidecar")
@@ -46,6 +46,7 @@ pub fn analysis_sidecar_envelope(
     if !reported.is_some_and(|v| sidecar_ev_matches(v, ev)) {
         return Err(failure("analysis sidecar exposure_ev mismatch"));
     }
+    let measurement = AnalysisSidecar::from_json(&sidecar).map_err(failure)?.measurement;
     let metadata = MetadataDoc::new(vec![
         ("source.schema_version".into(), Json::Int(2)),
         (
@@ -63,13 +64,14 @@ pub fn analysis_sidecar_envelope(
     .map_err(|e| failure(e.to_string()))?;
     let file =
         MemoryFile::new(bytes.into(), JSON_MEDIA_TYPE).map_err(|e| failure(e.to_string()))?;
-    DataEnvelope::new(
+    let envelope = DataEnvelope::new(
         ANALYSIS_SIDECAR,
         Payload::MemoryFile(file),
         metadata,
         provenance,
     )
-    .map_err(|e| failure(e.to_string()))
+    .map_err(|e| failure(e.to_string()))?;
+    Ok((envelope, measurement))
 }
 pub fn analysis_bytes(frame: &FrameInfo) -> Option<&[u8]> {
     match frame.analysis_envelope.as_ref()?.payload() {
@@ -77,72 +79,6 @@ pub fn analysis_bytes(frame: &FrameInfo) -> Option<&[u8]> {
         _ => None,
     }
 }
-pub(crate) fn frame_metadata_envelope(
-    file: MemoryFile,
-    schema_version: u64,
-    width: u32,
-    height: u32,
-    source_sha256: Option<&str>,
-    index: usize,
-    total: usize,
-    name: &str,
-) -> Result<DataEnvelope> {
-    let mut fields = vec![
-        (
-            "source.schema_version".to_string(),
-            Json::Int(schema_version as i64),
-        ),
-        ("source.width".to_string(), Json::Int(width as i64)),
-        ("source.height".to_string(), Json::Int(height as i64)),
-    ];
-    if let Some(hash) = source_sha256 {
-        fields.push(("source.sha256".to_string(), Json::Str(hash.to_string())));
-    }
-    let metadata =
-        MetadataDoc::new(fields).map_err(|err| metadata_contract_error(err, index, total, name))?;
-    let provenance = Provenance::new(
-        "dng-linear-frame",
-        source_sha256.map(str::to_string).into_iter().collect(),
-        Vec::new(),
-    )
-    .map_err(|err| metadata_contract_error(err, index, total, name))?;
-    DataEnvelope::new(
-        FRAME_METADATA,
-        Payload::MemoryFile(file),
-        metadata,
-        provenance,
-    )
-    .map_err(|err| metadata_contract_error(err, index, total, name))
-}
-
-fn metadata_contract_error(
-    err: transport::TransportError,
-    index: usize,
-    total: usize,
-    name: &str,
-) -> Error {
-    match err {
-        transport::TransportError::MissingMetadata(field)
-        | transport::TransportError::InvalidMetadataValue(field) => {
-            let field = match field.as_str() {
-                "source.sha256" => "source_sha256".to_string(),
-                other => other.strip_prefix("source.").unwrap_or(other).to_string(),
-            };
-            missing_field(index, total, name, &field)
-        }
-        transport::TransportError::SourceHashMismatch(hash) => Error::new(
-            EXIT_FRAME,
-            format!(
-                "frame {index}/{total} ({name}) metadata source_sha256 {hash:?} is not bound to the processed source"
-            ),
-        ),
-        other => Error::new(
-            EXIT_FRAME,
-            format!("frame {index}/{total} ({name}) metadata violates the transport contract: {other}"),
-        ),
-    }
-}
-
 pub(crate) fn sidecar_ev_matches(reported: f64, requested: f64) -> bool {
     if reported == requested {
         return true;

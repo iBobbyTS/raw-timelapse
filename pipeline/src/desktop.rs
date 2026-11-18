@@ -85,6 +85,7 @@ impl Session {
             "--prepared".into(),
             path_text(&context_path)?,
         ];
+        prepared.file_check_args(&mut args);
         self.settings.lens.policy.args(lens::Mode::Auto, &mut args);
         let status = proc::run_capture(&tools.native, &args, EXIT_FRAME)?;
         if !status.status.success() {

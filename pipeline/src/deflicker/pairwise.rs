@@ -27,6 +27,16 @@ pub fn pair_difference(
     {
         return Err("pair shape mismatch".into());
     }
+    Ok(pair_difference_validated(a, b, lag, train))
+}
+
+fn pair_difference_validated(
+    a: &FrameMeasurement,
+    b: &FrameMeasurement,
+    lag: usize,
+    train: Option<&[bool]>,
+) -> GraphEdge {
+    let k = a.valid.len();
     let mut e = GraphEdge {
         i: 0,
         j: 0,
@@ -57,12 +67,15 @@ pub fn pair_difference(
             "no_shared_valid_tiles".into(),
             (0..k).filter(|&i| a.valid[i] && b.valid[i]).count(),
         );
-        return Ok(e);
+        return e;
     }
     let mut good = usable.clone();
     if let (Some(sa), Some(sb)) = (&a.log_pixel_samples, &b.log_pixel_samples) {
         let mut rejected = 0;
         for i in 0..k {
+            if !usable[i] {
+                continue;
+            }
             let diff: Vec<_> = sa[i].iter().zip(&sb[i]).map(|(x, y)| y - x).collect();
             let shape = mad(&diff, median(&diff));
             let ok = shape < 0.0401;
@@ -78,6 +91,9 @@ pub fn pair_difference(
     if let (Some(ca), Some(cb)) = (&a.log_channel_means, &b.log_channel_means) {
         let mut rejected = 0;
         for i in 0..k {
+            if !usable[i] {
+                continue;
+            }
             let cs: Vec<_> = (0..3)
                 .map(|c| cb[i][c] - ca[i][c])
                 .filter(|v| v.is_finite())
@@ -111,7 +127,7 @@ pub fn pair_difference(
     e.support = good.iter().filter(|v| **v).count();
     if e.support < 24.max(k.div_ceil(4)) {
         e.rejects.insert("insufficient_support".into(), e.support);
-        return Ok(e);
+        return e;
     }
     let values: Vec<_> = (0..k).filter(|&i| good[i]).map(|i| d[i]).collect();
     let mut med = median(&values);
@@ -134,7 +150,7 @@ pub fn pair_difference(
     e.consensus_fraction = inliers.len() as f64 / e.support as f64;
     e.quadrants = quadrants(inliers.into_iter(), a.grid_nx, a.grid_ny);
     e.weight = (e.support as f64 / 200.).min(1.) / (0.01_f64.powi(2) + scale.powi(2));
-    Ok(e)
+    e
 }
 #[derive(Debug, Clone, Default)]
 pub struct EdgeStats {
@@ -149,7 +165,10 @@ pub fn build_edges(
     train: Option<&[bool]>,
     lags: &[usize],
 ) -> Result<(Vec<GraphEdge>, EdgeStats)> {
-    compatible(ms)?;
+    let tiles = compatible(ms)?;
+    if train.is_some_and(|mask| mask.len() != tiles) {
+        return Err("pair shape mismatch".into());
+    }
     let n = ms.len();
     if lags.contains(&0) {
         return Err("lag must be positive".into());
@@ -171,7 +190,7 @@ pub fn build_edges(
                 continue;
             }
             stats.candidate_edges += 1;
-            let mut e = pair_difference(&ms[i], &ms[j], lag, train)?;
+            let mut e = pair_difference_validated(&ms[i], &ms[j], lag, train);
             if !e.delta_ev.is_finite() || !e.reliable() {
                 stats.rejected_edges += 1;
                 if let Some(v) = stats.by_lag.get_mut(&lag) {

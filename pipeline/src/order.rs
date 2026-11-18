@@ -1,7 +1,7 @@
 //! Deterministic numeric ordering of source frames.
 //!
 //! Every regular file in the input directory is a candidate frame except
-//! hidden (dot-prefixed) files and `.xmp` sidecars. All candidates must share
+//! hidden files and known non-RAW companions. All candidates must share
 //! one file extension (case-insensitive); a mixed-extension directory is
 //! rejected rather than guessed at. File names are tokenised into alternating
 //! non-digit / digit runs. Text runs compare case-insensitively; digit runs
@@ -125,7 +125,9 @@ pub fn enumerate_dng(dir: &Path) -> Result<Vec<SourceFrame>> {
             .and_then(|extension| extension.to_str())
             .map(|extension| extension.to_ascii_lowercase())
             .unwrap_or_default();
-        if extension == "xmp" {
+        if matches!(extension.as_str(),
+            "xmp" | "txt" | "md" | "jpg" | "jpeg" | "png" | "heic" | "heif" | "thm"
+        ) {
             continue;
         }
         names.push((name, path, extension));
@@ -135,7 +137,7 @@ pub fn enumerate_dng(dir: &Path) -> Result<Vec<SourceFrame>> {
         return Err(Error::new(
             EXIT_INPUT,
             format!(
-                "no candidate frames found in {} (hidden files and .xmp sidecars are skipped)",
+                "no candidate frames found in {} (hidden files and known non-RAW companions are skipped)",
                 dir.display()
             ),
         ));

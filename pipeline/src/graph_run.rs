@@ -11,7 +11,7 @@ use crate::video::{self, ResizeRecord};
 use crate::{proc, EncodedStage, RunContext};
 use rawtl_linear_video::deflicker::estimation::ExposurePlan;
 use rawtl_linear_video::deflicker::measurement::AnalysisSidecar;
-use rawtl_linear_video::deflicker::{estimate_exposure, ExposureConfig, FrameMeasurement};
+use rawtl_linear_video::deflicker::{estimation::solve_exposure, ExposureConfig, FrameMeasurement};
 use rawtl_linear_video::graph::ordered_frames::FrameTask;
 use rawtl_linear_video::color_profile::AutoReferenceGain;
 use rawtl_linear_video::export::{ExportProfile, Selection};
@@ -560,14 +560,9 @@ impl Backend for Runner<'_, '_> {
                 &tool, &prepared, wb, roi, &settings, id, total, &log, active, false,
             )
             .map_err(|e| frame_failure(id, total, &prepared.source_name, &e.message))?;
-            let bytes = frame::analysis_bytes(&info).ok_or("graph: missing measurement")?;
-            let sidecar =
-                AnalysisSidecar::parse(std::str::from_utf8(bytes).map_err(|e| e.to_string())?)?;
-            if sidecar.measurement.source_sha256 != prepared.source_sha256 {
-                return Err("graph: measurement identity mismatch".into());
-            }
+            let measurement = info.measurement.ok_or("graph: missing measurement")?;
             Ok(MeasuredFrame {
-                measurement: sidecar.measurement,
+                measurement,
                 reused: false,
             })
         }))
@@ -609,23 +604,7 @@ impl Backend for Runner<'_, '_> {
             ..Default::default()
         };
         let started = Instant::now();
-        let result = estimate_exposure(&self.measurements, &config)?;
-        // Quality is durable for this invocation in ExposureResult, never a
-        // product quality surface. Consume its internal accounting before
-        // admitting the frozen plan; uncovered pairs are retained as uncovered,
-        // and no render probe, feedback pass or invented all-clear follows.
-        let q = &result.plan_quality;
-        if q.coverage.eligible != self.measurements.len().saturating_sub(1)
-            || q.coverage.evaluated + q.coverage.skipped != q.coverage.eligible
-            || q.coverage.evaluated != q.pairs.len()
-            || q.common_jump_frames.iter().any(|id| {
-                *id == 0
-                    || *id >= self.measurements.len()
-                    || !q.pairs.iter().any(|p| p.frame_id == *id)
-            })
-        {
-            return Err("graph: inconsistent internal solver coverage".into());
-        }
+        let result = solve_exposure(&self.measurements, &config)?;
         let plan = ExposurePlan::from_result(&self.measurements, &result)?;
         let gains = plan
             .entries()

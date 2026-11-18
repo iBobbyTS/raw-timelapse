@@ -467,7 +467,7 @@ fn query_lens_area(tool:&Path,prepared:&mut PreparedFrame,settings:&crate::lens:
     let mut args=vec!["--lens-valid-area".into(),"--prepared".into(),prepared.context.display().to_string(),
         "--camera-recipe".into(),"generic".into(),"--camera-color-method".into(),"dng-camera-to-pcs".into(),
         "--camera-calibration".into(),"none".into(),"--highlight-recovery".into(),"off".into()];
-    if prepared.has_file_versions { args.extend(["--prepared-file-check".into(), "state".into()]); }
+    prepared.file_check_args(&mut args);
     settings.policy.args(settings.mode,&mut args);
     let captured=proc::run_capture_active(tool,&args,EXIT_FRAME,&log,active)?;
     write_prepare_log(&log,tool,&args,&captured)?;
@@ -688,9 +688,7 @@ fn frame_args(
         }
     }
     if let Some(prepared) = input.prepared() {
-        if prepared.has_file_versions {
-            args.extend(["--prepared-file-check".into(), "state".into()]);
-        }
+        prepared.file_check_args(&mut args);
         #[cfg(test)]
         if run.converter.is_some() || run.converter_timeout.is_some() {
             return Err(failure(
@@ -765,7 +763,6 @@ fn run_frame(
     let sidecar = parse_json(&bytes)?;
     validate_sidecar_contracts(&sidecar, &run.method, pixels, lens_mode, lens_policy)?;
     let meta = frame_metadata(
-        bytes,
         &sidecar,
         index,
         total,
@@ -798,6 +795,7 @@ fn run_frame(
         exposure_ev: meta.reported_ev,
         duration: Duration::ZERO,
         analysis_envelope: None,
+        measurement: None,
     };
     attach_payload(&mut stream, &sidecar, &mut info, pixels)?;
     consume(&info, &mut stream)?;
@@ -842,9 +840,10 @@ fn attach_payload(
         }
     } else {
         let bytes = stream.json(2)?;
-        let envelope =
+        let (envelope, measurement) =
             analysis_sidecar_envelope(bytes, info.source_sha256.as_deref(), info.exposure_ev)?;
         info.analysis_envelope = Some(envelope);
+        info.measurement = Some(measurement);
     }
     Ok(())
 }

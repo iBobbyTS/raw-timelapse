@@ -2,15 +2,13 @@
 //! and prepared-context cross-checks consumed by the orchestration layer.
 use super::doc::PreparedFrame;
 use super::sidecar::{
-    canonical_source_pair, frame_metadata_envelope, missing_field, parse_wb, wb_close,
+    canonical_source_pair, missing_field, parse_wb, wb_close,
 };
-use super::{failure, JSON_MEDIA_TYPE, WB_SOURCE_AS_SHOT, WB_SOURCE_OVERRIDE};
+use super::{failure, WB_SOURCE_AS_SHOT, WB_SOURCE_OVERRIDE};
 use crate::error::{Error, Result, EXIT_FRAME};
 use crate::json::Json;
-use crate::transport::MemoryFile;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 
 // Matched native/Rust contract: no silent fallback to sensor-relative exposure.
 fn valid_fixed_calibration(color: &Json) -> bool {
@@ -164,7 +162,6 @@ pub(crate) struct FrameMetadata {
 }
 
 pub(crate) fn frame_metadata(
-    bytes: Arc<[u8]>,
     sidecar: &Json,
     index: usize,
     total: usize,
@@ -173,8 +170,6 @@ pub(crate) fn frame_metadata(
     override_wb: Option<[f64; 3]>,
     exposure_ev: Option<f64>,
 ) -> Result<FrameMetadata> {
-    let file =
-        MemoryFile::new(bytes.into(), JSON_MEDIA_TYPE).map_err(|e| failure(e.to_string()))?;
     let frame_width = sidecar
         .get("width")
         .and_then(Json::as_u32)
@@ -226,16 +221,6 @@ pub(crate) fn frame_metadata(
             .ok_or_else(|| missing_field(index, total, name, "source_sha256"))?
             .to_string(),
     );
-    let _metadata_envelope = frame_metadata_envelope(
-        file,
-        schema_version,
-        frame_width,
-        frame_height,
-        source_sha256.as_deref(),
-        index,
-        total,
-        name,
-    )?;
     let applied_wb = parse_wb(
         &sidecar,
         "applied_white_balance",

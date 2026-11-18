@@ -210,7 +210,6 @@ pub(crate) fn compatible(ms: &[FrameMeasurement]) -> Result<usize> {
     let Some(first) = ms.first() else {
         return Err("empty exposure sequence".into());
     };
-    first.validate()?;
     for (i, m) in ms.iter().enumerate() {
         m.validate()?;
         if m.centers != first.centers || m.grid_nx != first.grid_nx || m.grid_ny != first.grid_ny {
