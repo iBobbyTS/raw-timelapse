@@ -2,6 +2,7 @@
 //! per-frame native run with full metadata contract checks.
 use super::contract::{frame_metadata, validate_prepared_metadata, validate_sidecar_contracts};
 use super::doc::{
+    ConversionRecords,
     field_value, hex64, parse_document_fields, parse_u32, PreparedFrame, PreparedRoute,
     read_document, require_fields,
 };
@@ -422,6 +423,7 @@ fn load_batch_result(
     }
     let mut keys = vec!["count".into()];
     let mut found = std::collections::BTreeMap::new();
+    let mut records = ConversionRecords::default();
     for i in 0..count {
         for k in ["id", "source", "source_sha256", "context"] {
             keys.push(format!("item{i}_{k}"));
@@ -436,7 +438,7 @@ fn load_batch_result(
         {
             return Err(failure("batch result source/context differs from request"));
         }
-        let frame = PreparedFrame::load(context)?;
+        let frame = PreparedFrame::load_in_batch(context, &mut records)?;
         if frame.source != *source
             || frame.source_sha256
                 != hex64(get(&format!("item{i}_source_sha256"))?, "source_sha256")?
@@ -465,6 +467,7 @@ fn query_lens_area(tool:&Path,prepared:&mut PreparedFrame,settings:&crate::lens:
     let mut args=vec!["--lens-valid-area".into(),"--prepared".into(),prepared.context.display().to_string(),
         "--camera-recipe".into(),"generic".into(),"--camera-color-method".into(),"dng-camera-to-pcs".into(),
         "--camera-calibration".into(),"none".into(),"--highlight-recovery".into(),"off".into()];
+    if prepared.has_file_versions { args.extend(["--prepared-file-check".into(), "state".into()]); }
     settings.policy.args(settings.mode,&mut args);
     let captured=proc::run_capture_active(tool,&args,EXIT_FRAME,&log,active)?;
     write_prepare_log(&log,tool,&args,&captured)?;
@@ -685,6 +688,9 @@ fn frame_args(
         }
     }
     if let Some(prepared) = input.prepared() {
+        if prepared.has_file_versions {
+            args.extend(["--prepared-file-check".into(), "state".into()]);
+        }
         #[cfg(test)]
         if run.converter.is_some() || run.converter_timeout.is_some() {
             return Err(failure(

@@ -98,27 +98,31 @@ std::string output_collision_key(const fs::path &source) {
   out.resize(strlen(out.c_str()));
   return out;
 }
-namespace {
-using Clock = std::chrono::steady_clock;
-struct OutputState {
-  dev_t device;
-  ino_t inode;
-  off_t size;
-  timespec modified;
-  timespec changed;
-  bool operator==(const OutputState &other) const {
-    return device == other.device && inode == other.inode && size == other.size &&
-           modified.tv_sec == other.modified.tv_sec && modified.tv_nsec == other.modified.tv_nsec &&
-           changed.tv_sec == other.changed.tv_sec && changed.tv_nsec == other.changed.tv_nsec;
-  }
-};
-
-std::optional<OutputState> output_state(const fs::path &path) {
+bool FileState::operator==(const FileState &other) const {
+  return device == other.device && inode == other.inode && size == other.size &&
+         modified.tv_sec == other.modified.tv_sec && modified.tv_nsec == other.modified.tv_nsec &&
+         changed.tv_sec == other.changed.tv_sec && changed.tv_nsec == other.changed.tv_nsec;
+}
+std::string FileState::token() const {
+  std::ostringstream text;
+  text << device << ',' << inode << ',' << size << ','
+       << modified.tv_sec << ',' << modified.tv_nsec << ','
+       << changed.tv_sec << ',' << changed.tv_nsec;
+  return text.str();
+}
+std::optional<FileState> file_state(const fs::path &path) {
   struct stat info {};
   if (lstat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) return {};
-  return OutputState{info.st_dev, info.st_ino, info.st_size, info.st_mtimespec, info.st_ctimespec};
+  return FileState{info.st_dev, info.st_ino, info.st_size, info.st_mtimespec, info.st_ctimespec};
+}
+std::string file_version(const fs::path &path) {
+  const auto state = file_state(path);
+  if (!state) throw Error(26, "cannot read file state: " + path.string());
+  return state->token();
 }
 
+namespace {
+using Clock = std::chrono::steady_clock;
 using FileIdentity = std::pair<dev_t, ino_t>;
 std::optional<std::set<FileIdentity>> writable_files(int pid) {
   // A helper process could still own a writer. Use the sealed batch path
@@ -159,7 +163,7 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
   auto log = linear_dir.parent_path() / (linear_dir.filename().string() + "-converter.log");
   auto conversion_start = std::chrono::steady_clock::now();
   struct Candidate {
-    std::optional<OutputState> state;
+    std::optional<FileState> state;
     std::optional<Clock::time_point> quiet_since;
     bool saw_writer = false;
     bool offered = false;
@@ -175,7 +179,7 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
     for (size_t i = 0; i < candidates.size(); ++i) {
       auto &candidate = candidates[i];
       if (candidate.offered) continue;
-      auto state = output_state(paths[i]);
+      auto state = file_state(paths[i]);
       if (!state) {
         candidate = {};
         continue;
@@ -222,6 +226,7 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
   for (const auto &input : inputs) {
     check_cancelled();
     auto output = linear_dir / (input.stem().string() + ".dng");
+    const auto version = file_version(output);
     auto check = inspect(output);
     if (!check || check->photometric != 34892 || !check->width || !check->height)
       throw Error(23, identity + ": output is not nonzero LinearRaw (34892): " + output.string());
@@ -238,7 +243,9 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
     info.directory = linear_dir.string();
     info.cleanup = temporary ? "removed before publishing sidecar"
                              : "caller-owned; retained until caller deletes it";
-    outputs.push_back({output, info});
+    if (file_version(output) != version)
+      throw Error(23, identity + ": Converter output changed during verification: " + output.string());
+    outputs.push_back({output, version, info});
   }
   std::cerr << "converter batch count=" << inputs.size()
             << " source_first=" << inputs.front() << " source_last=" << inputs.back()

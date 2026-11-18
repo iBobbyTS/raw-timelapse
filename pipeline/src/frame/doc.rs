@@ -1,6 +1,7 @@
 //! Prepared-context line document: parsing, validation and encoding.
 use super::failure;
 use crate::error::Result;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 /// Versioned prepared-context header. The context is a strict line document
 /// written by `dng-linear-frame --prepare`; both processes parse the same
-/// bytes and the native consumer revalidates every hash before decoding.
+/// bytes. The native consumer checks the captured file versions or verifies the file hashes.
 #[allow(dead_code)] // consumed by the graph scheduling integration
 pub const PREPARED_CONTEXT_MAGIC: &str = "rawtl-prepared-frame/2";
 const EARLY_MEASUREMENT_MAGIC: &str = "rawtl-early-measurement/1";
@@ -57,6 +58,7 @@ pub struct PreparedFrame {
     pub route: PreparedRoute,
     pub dng: PathBuf,
     pub dng_sha256: String,
+    pub(crate) has_file_versions: bool,
     pub generated: bool,
     pub main_ifd_width: u32,
     pub main_ifd_height: u32,
@@ -67,20 +69,21 @@ pub struct PreparedFrame {
 
 #[allow(dead_code)] // consumed by the graph scheduling integration
 impl PreparedFrame {
-    /// Parse and structurally validate a context document. Hash *binding* is
-    /// revalidated by the native consumer against the actual files; this side
-    /// checks the versioned grammar, absolute identities, route/generated
-    /// consistency and file existence so a mis-wired graph fails before a
-    /// native process is started.
+    /// Validate the document and check source and output associations before
+    /// starting a native consumer.
     pub fn load(context: &Path) -> Result<Self> {
-        Self::load_context(context, false)
+        Self::load_context(context, false, &mut ConversionRecords::default())
     }
 
     pub fn load_early_measurement(context: &Path) -> Result<Self> {
-        Self::load_context(context, true)
+        Self::load_context(context, true, &mut ConversionRecords::default())
     }
 
-    fn load_context(context: &Path, provisional: bool) -> Result<Self> {
+    pub(crate) fn load_in_batch(context: &Path, records: &mut ConversionRecords) -> Result<Self> {
+        Self::load_context(context, false, records)
+    }
+
+    fn load_context(context: &Path, provisional: bool, records: &mut ConversionRecords) -> Result<Self> {
         let bytes = read_document(context, PREPARED_CONTEXT_LIMIT)?;
         let fields = if provisional {
             parse_document_fields(&bytes, EARLY_MEASUREMENT_MAGIC, PREPARED_CONTEXT_LIMIT)?
@@ -158,9 +161,18 @@ impl PreparedFrame {
                 "prepared context cannot use the original source as its converted DNG",
             ));
         }
+        let has_file_versions = fields.iter().any(|(key, _)| {
+            key == "source_version" || key == "prepared_version"
+        });
+        if has_file_versions && (get("source_version")?.is_empty()
+            || get("prepared_version")?.is_empty()
+            || (!generated && get("source_version")? != get("prepared_version")?))
+        {
+            return Err(failure("invalid prepared context file versions"));
+        }
         validate_conversion(
             &fields, &source_raw, &source_sha256, &dng_raw, &dng_sha256,
-            generated && !provisional,
+            generated && !provisional, has_file_versions, records,
         )?;
         let source_name = source
             .file_name()
@@ -175,6 +187,7 @@ impl PreparedFrame {
             route,
             dng,
             dng_sha256,
+            has_file_versions,
             generated,
             main_ifd_width,
             main_ifd_height,
@@ -366,6 +379,8 @@ fn validate_conversion(
     dng: &Path,
     dng_hash: &str,
     generated: bool,
+    has_file_versions: bool,
+    records: &mut ConversionRecords,
 ) -> Result<()> {
     let get = |key: &str| field_value(fields, key);
     let mut allowed: Vec<String> = [
@@ -384,6 +399,9 @@ fn validate_conversion(
     .iter()
     .map(|s| s.to_string())
     .collect();
+    if has_file_versions {
+        allowed.extend(["source_version".into(), "prepared_version".into()]);
+    }
     if fields.iter().any(|(key, _)| key == "lens_calibration") {
         if !get("lens_calibration")?.starts_with("rawtl-lens-calibration/2 ") {
             return Err(failure("unsupported prepared lens calibration; run Prepare again"));
@@ -415,10 +433,63 @@ fn validate_conversion(
         if !path.is_absolute() {
             return Err(failure("conversion record path must be absolute"));
         }
-        let bytes = read_document(path, 1024 * 1024)?;
-        if crate::digest::sha256(&bytes)
-            != hex64(get("converter_record_sha256")?, "converter_record_sha256")?
+        let digest = hex64(get("converter_record_sha256")?, "converter_record_sha256")?;
+        let record = records.load(path, &digest)?;
+        let name = get("converter_output_name")?;
+        if get("converter_photometric")? != "34892"
+            || get("converter_output_sha256")? != dng_hash
+            || dng.file_name().and_then(|s| s.to_str()) != Some(name)
+            || record.directory.join(name) != dng
         {
+            return Err(failure("conversion record output mismatch"));
+        }
+        let Some(output) = record.outputs.get(source) else {
+            return Err(failure("conversion record does not contain prepared source"));
+        };
+        if output.source_hash != source_hash || output.name != name || output.output_hash != dng_hash {
+            return Err(failure("conversion record does not describe prepared source/output"));
+        }
+    }
+    require_fields(fields, &allowed)
+}
+/// A record belongs to one Converter invocation and is shared by its frames.
+#[derive(Default)]
+pub(crate) struct ConversionRecords {
+    by_path: BTreeMap<PathBuf, ConversionRecord>,
+}
+
+struct ConversionRecord {
+    digest: String,
+    directory: PathBuf,
+    outputs: BTreeMap<PathBuf, ConversionOutput>,
+}
+
+struct ConversionOutput {
+    source_hash: String,
+    name: String,
+    output_hash: String,
+}
+
+impl ConversionRecords {
+    fn load(&mut self, path: &Path, digest: &str) -> Result<&ConversionRecord> {
+        use std::collections::btree_map::Entry;
+        match self.by_path.entry(path.to_path_buf()) {
+            Entry::Occupied(entry) => {
+                let record = entry.into_mut();
+                if record.digest != digest {
+                    return Err(failure("conversion record hash mismatch"));
+                }
+                Ok(record)
+            }
+            Entry::Vacant(entry) => Ok(entry.insert(ConversionRecord::read(path, digest)?)),
+        }
+    }
+}
+
+impl ConversionRecord {
+    fn read(path: &Path, digest: &str) -> Result<Self> {
+        let bytes = read_document(path, 1024 * 1024)?;
+        if crate::digest::sha256(&bytes) != digest {
             return Err(failure("conversion record hash mismatch"));
         }
         let record = parse_document_fields(&bytes, "rawtl-conversion/1", 1024 * 1024)?;
@@ -458,17 +529,8 @@ fn validate_conversion(
         {
             return Err(failure("conversion record invocation mismatch"));
         }
-        let name = get("converter_output_name")?;
-        if get("converter_photometric")? != "34892"
-            || get("converter_output_sha256")? != dng_hash
-            || dng.file_name().and_then(|s| s.to_str()) != Some(name)
-            || Path::new(r("directory")?).join(name) != dng
-        {
-            return Err(failure("conversion record output mismatch"));
-        }
-        let mut matched = false;
-        let mut sources = std::collections::BTreeSet::new();
-        let mut names = std::collections::BTreeSet::new();
+        let mut outputs = BTreeMap::new();
+        let mut names = BTreeSet::new();
         for i in 0..count {
             for key in ["source", "source_sha256", "output_name", "output_sha256"] {
                 keys.push(format!("item{i}_{key}"));
@@ -485,29 +547,27 @@ fn validate_conversion(
                     .map(|s| format!("{s}.dng"))
                     .as_deref()
                     != Some(output)
-                || !sources.insert(src)
                 || !names.insert(output)
             {
                 return Err(failure("conversion record source/output identity mismatch"));
             }
-            if Path::new(src) == source {
-                if sh != source_hash || output != name || oh != dng_hash {
-                    return Err(failure(
-                        "conversion record does not describe prepared source/output",
-                    ));
-                }
-                matched = true;
+            if outputs.insert(PathBuf::from(src), ConversionOutput {
+                source_hash: sh,
+                name: output.into(),
+                output_hash: oh,
+            }).is_some() {
+                return Err(failure("conversion record repeats a source"));
             }
         }
         require_fields(&record, &keys)?;
-        if !matched {
-            return Err(failure(
-                "conversion record does not contain prepared source",
-            ));
-        }
+        Ok(Self {
+            digest: digest.into(),
+            directory: PathBuf::from(r("directory")?),
+            outputs,
+        })
     }
-    require_fields(fields, &allowed)
 }
+
 pub(crate) fn percent_encode(text: &str) -> String {
     let mut out = String::new();
     for c in text.chars() {

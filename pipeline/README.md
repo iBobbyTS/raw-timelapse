@@ -224,6 +224,12 @@ hash and white balance allow reuse; other frames use the normal measurement
 path. The run log records early admissions and whether each final measurement
 reused an early result.
 
+Prepare hashes RAW inputs and sealed Converter outputs once. Internal consumers
+check file identity, length and modification/change times without rereading the
+contents for integrity. An early candidate is hashed once before publication
+and compared with the sealed hash before reuse. Native checks its captured file
+state before and after decode to catch writes or replacement during measurement.
+
 Heavy frames across the chain are bounded by the sum of stage capacities, plus
 native worksets and each transformation's temporary buffers.
 Frame 0's white balance is frozen at ordered prepare commit. Solve runs once,
@@ -500,7 +506,7 @@ color algorithm revision 4, output pipeline revision 5). Requests specify
 and `--camera-calibration <none|canon-normal-white-fixed-v1>`. The reader checks
 requested/effective recipe and policies, profile presence/applied/skip states,
 input CAT and matrices, calibration evidence, source/prepared identity, WB, EV,
-FP32 framing/hash/finite samples, EOF and successful native exit. Old contracts
+FP32 framing, geometry and finite samples, EOF and successful native exit. Old contracts
 fail; prepared v2 and pixel framing are unchanged. The native legacy matrix mode
 is retained only for explicit historical tests/tools, outside product auto routing.
 See [Log2](../docs/canon-log2-rev-eng.md), [Log3](../docs/canon-log3-rev-eng.md)

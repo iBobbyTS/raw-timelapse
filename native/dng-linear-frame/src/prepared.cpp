@@ -367,6 +367,7 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
     check_cancelled();
     PreparedFrame out;
     out.source = canonical_existing(source, "original source");
+    out.source_version = file_version(out.source);
     out.source_hash = sha256(out.source);
     out.routing = inspect(out.source);
     out.kind = out.routing ? route(out.routing->photometric) : Route::vendor_raw;
@@ -401,6 +402,7 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
   const auto offer = [&](size_t index, const fs::path &dng) {
     try {
       auto candidate = frames[index];
+      candidate.prepared_version = candidate.kind == Route::direct ? candidate.source_version : file_version(dng);
       auto check = inspect(dng);
       if (!check || check->photometric != 34892 || !check->width || !check->height) return;
       candidate.generated = candidate.kind != Route::direct;
@@ -445,6 +447,7 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
       out.conversion = converted[j].info;
       out.generated = true;
       out.prepared_hash = out.conversion.output_sha256;
+      out.prepared_version = converted[j].output_version;
     }
     write_conversion_record(frames, groups[g], scratch / ("conversion-" + std::to_string(g) + ".record"));
   }
@@ -455,10 +458,14 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
     auto check = inspect(out.prepared_dng);
     if (!check || check->photometric != 34892 || !check->width || !check->height)
       throw Error(23, "batch prepared DNG is not nonzero LinearRaw (34892): " + out.source.string());
-    if (!out.generated) out.prepared_hash = out.source_hash;
+    if (!out.generated) {
+      out.prepared_hash = out.source_hash;
+      out.prepared_version = out.source_version;
+    }
     out.main_ifd_width = check->width;
     out.main_ifd_height = check->height;
     out.capture_time = read_capture_time(out.kind == Route::vendor_raw ? out.prepared_dng : out.source);
+    check_prepared_versions(out);
   }
   std::vector<lens::SourcePair> lens_sources;
   for (const auto &f : frames) lens_sources.push_back({f.source, f.prepared_dng, f.generated, f.main_ifd_width, f.main_ifd_height});
@@ -541,6 +548,13 @@ void prepare_batch(const fs::path &request, const fs::path &scratch_in,
             << " total_including_publication_s=" << std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count() << '\n';
 }
 
+void check_prepared_versions(const PreparedFrame &prepared) {
+  if (file_version(prepared.source) != prepared.source_version)
+    throw Error(26, "original source changed after Prepare: " + prepared.source.string());
+  if (prepared.generated && file_version(prepared.prepared_dng) != prepared.prepared_version)
+    throw Error(26, "prepared DNG changed after Prepare: " + prepared.prepared_dng.string());
+}
+
 void write_prepared(const PreparedFrame &prepared,
                     const fs::path &context_path, bool provisional) {
   auto same = [&](const fs::path &other) {
@@ -555,6 +569,7 @@ void write_prepared(const PreparedFrame &prepared,
       (prepared.conversion.used && same(prepared.conversion.record_path)))
     throw Error(2, "prepared context path must be distinct from the source "
                    "and prepared DNG");
+  check_prepared_versions(prepared);
   std::ostringstream out;
   out << (provisional ? kEarlyContextMagic : kContextMagic) << '\n';
   field(out, "source", prepared.source.string());
@@ -562,6 +577,8 @@ void write_prepared(const PreparedFrame &prepared,
   field(out, "route", route_name(prepared.kind));
   field(out, "prepared_dng", prepared.prepared_dng.string());
   field(out, "prepared_sha256", prepared.prepared_hash);
+  field(out, "source_version", prepared.source_version);
+  field(out, "prepared_version", prepared.prepared_version);
   field(out, "generated", prepared.generated ? "1" : "0");
   field(out, "main_ifd_width", std::to_string(prepared.main_ifd_width));
   field(out, "main_ifd_height", std::to_string(prepared.main_ifd_height));
@@ -585,7 +602,8 @@ void write_prepared(const PreparedFrame &prepared,
   atomic_document(context_path, out.str(), kContextLimit);
 }
 
-PreparedFrame read_prepared(const fs::path &context_path, bool provisional) {
+PreparedFrame read_prepared(const fs::path &context_path, bool provisional,
+                            bool use_file_versions) {
   std::error_code error;
   if (!fs::is_regular_file(context_path, error) || error)
     throw Error(26, "prepared context is missing: " + context_path.string());
@@ -607,6 +625,16 @@ PreparedFrame read_prepared(const fs::path &context_path, bool provisional) {
   PreparedFrame out;
   out.source_hash = hex64(context.at("source_sha256"), "source_sha256");
   out.prepared_hash = hex64(context.at("prepared_sha256"), "prepared_sha256");
+  if (context.has("source_version") || context.has("prepared_version")) {
+    allowed.insert("source_version");
+    allowed.insert("prepared_version");
+    out.source_version = context.at("source_version");
+    out.prepared_version = context.at("prepared_version");
+    if (out.source_version.empty() || out.prepared_version.empty())
+      throw Error(26, "prepared context file versions must be non-empty");
+  } else if (use_file_versions) {
+    throw Error(26, "prepared context is missing file versions");
+  }
   out.kind = route_from_name(context.at("route"));
   out.generated = parse_bool(context.at("generated"), "generated");
   out.main_ifd_width = parse_u32(context.at("main_ifd_width"), "main_ifd_width");
@@ -671,7 +699,8 @@ PreparedFrame read_prepared(const fs::path &context_path, bool provisional) {
   out.source = canonical_existing(context.at("source"), "original source");
   out.prepared_dng =
       canonical_existing(context.at("prepared_dng"), "prepared DNG");
-  if (sha256(out.source) != out.source_hash)
+  if (use_file_versions) check_prepared_versions(out);
+  if (!use_file_versions && sha256(out.source) != out.source_hash)
     throw Error(26, "prepared context original source hash does not match: " +
                         out.source.string());
   auto routing = inspect(out.source);
@@ -686,14 +715,14 @@ PreparedFrame read_prepared(const fs::path &context_path, bool provisional) {
     if (out.prepared_dng != out.source)
       throw Error(26, "prepared context for a LinearRaw source must reference "
                       "the original DNG");
-    if (out.prepared_hash != out.source_hash)
+    if (out.prepared_hash != out.source_hash || out.prepared_version != out.source_version)
       throw Error(26, "prepared context prepared hash differs from the "
                       "original source hash");
   } else {
     if (out.prepared_dng == out.source)
       throw Error(26, "prepared context cannot use the original source as its "
                       "converted DNG");
-    if (sha256(out.prepared_dng) != out.prepared_hash)
+    if (!use_file_versions && sha256(out.prepared_dng) != out.prepared_hash)
       throw Error(26, "prepared DNG hash does not match the context: " +
                           out.prepared_dng.string());
     if (!provisional && (out.conversion.output_sha256 != out.prepared_hash ||

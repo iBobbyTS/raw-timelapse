@@ -513,6 +513,7 @@ int main(int argc, char **argv) {
     if (provisional && !want_analysis)
       throw Error(2, "--early-measurement requires --stdout-analysis");
     const bool prepared_mode = provisional || std::string(argv[2]) == "--prepared";
+    bool use_file_versions = false;
     if ((mode == "--lens-valid-area" || mode == "--lens-status") && !prepared_mode)
       throw Error(2, mode + " requires a frozen prepared context");
     fs::path input, context;
@@ -545,7 +546,11 @@ int main(int argc, char **argv) {
       if (i + 1 >= argc)
         throw Error(2, "option value missing");
       std::string value = argv[++i];
-      if (a == "--white-balance")
+      if (a == "--prepared-file-check") {
+        if (!prepared_mode || value != "state")
+          throw Error(2, "--prepared-file-check state requires a prepared context");
+        use_file_versions = true;
+      } else if (a == "--white-balance")
         wb = parse_wb(value);
       else if (a == "--exposure-ev")
         exposure_ev = parse_ev(value);
@@ -622,7 +627,7 @@ int main(int argc, char **argv) {
     std::optional<Temp> temp;
     PreparedFrame prepared;
     if (prepared_mode) {
-      prepared = read_prepared(context, provisional);
+      prepared = read_prepared(context, provisional, use_file_versions);
     } else {
       temp.emplace();
       prepared = prepare_frame(input, temp->path, converter, timeout, true, lens_options);
@@ -650,6 +655,7 @@ int main(int argc, char **argv) {
         // Stage3 can differ from the main IFD. Never assume sensor dimensions.
         recipe.highlight_recovery=false;
         const auto geometry=decode_prepared(prepared,wb,recipe,false);
+        if (use_file_versions) check_prepared_versions(prepared);
         width=geometry.width; height=geometry.height;
       }
       const auto area=lens::safe_area(prepared.lens_calibration,width,height,lens_enabled,lens_policy,check_cancelled);
@@ -664,7 +670,8 @@ int main(int argc, char **argv) {
       return 0;
     }
     Decoded decoded = decode_prepared(prepared, wb, recipe, lens_enabled, lens_policy, preview_edge);
-    if (provisional && sha256(prepared.prepared_dng) != prepared.prepared_hash)
+    if (use_file_versions) check_prepared_versions(prepared);
+    else if (provisional && sha256(prepared.prepared_dng) != prepared.prepared_hash)
       throw Error(26, "DNG changed during early measurement");
     FrameOutput frame =
         render(prepared, decoded, std::optional<fs::path>(), roi, exposure_ev,

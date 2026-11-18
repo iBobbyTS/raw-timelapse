@@ -13,6 +13,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <sys/types.h>
+#include <time.h>
 namespace frame {
 void install_stop_handlers();
 void check_cancelled();
@@ -105,8 +107,22 @@ struct ConversionInfo {
   std::string cleanup;
   Json record() const;
 };
+// Change detection for local files across the stages of one job.
+struct FileState {
+  dev_t device;
+  ino_t inode;
+  off_t size;
+  timespec modified;
+  timespec changed;
+  bool operator==(const FileState &) const;
+  std::string token() const;
+};
+std::optional<FileState> file_state(const fs::path &);
+std::string file_version(const fs::path &);
+
 struct Conversion {
   fs::path output;
+  std::string output_version;
   ConversionInfo info;
 };
 // Inputs have distinct normalized stem names. The caller owns the empty dir.
@@ -125,10 +141,12 @@ std::string output_collision_key(const fs::path &source);
 struct PreparedFrame {
   fs::path source;              // canonical original input
   std::string source_hash;      // sha256 of the original bytes
+  std::string source_version;
   std::optional<Routing> routing; // recognized original DNG main IFD, if any
   Route kind = Route::vendor_raw;
   fs::path prepared_dng;        // canonical LinearRaw SDK input
   std::string prepared_hash;    // sha256 of prepared_dng
+  std::string prepared_version;
   bool generated = false;       // prepared_dng was produced in this run
   uint32_t main_ifd_width = 0;  // prepared main IFD storage geometry
   uint32_t main_ifd_height = 0;
@@ -155,10 +173,11 @@ void prepare_batch(const fs::path &request, const fs::path &scratch,
                    int timeout_seconds, const lens::PrepareOptions &lens_options = {});
 // Deterministic versioned context document (not the metadata sidecar).
 void write_prepared(const PreparedFrame &, const fs::path &context_path, bool provisional = false);
-// Strictly parses the context and revalidates every original/prepared identity:
-// absolute paths, hashes, route recomputation and a three-channel LinearRaw
-// prepared artifact. Any mismatch is an explicit Error(26).
-PreparedFrame read_prepared(const fs::path &context_path, bool provisional = false);
+// Standalone consumers verify bytes. In-job consumers may use the file
+// versions captured during Prepare and keep the content hashes as identities.
+PreparedFrame read_prepared(const fs::path &context_path, bool provisional = false,
+                            bool use_file_versions = false);
+void check_prepared_versions(const PreparedFrame &);
 // SDK decode of the prepared artifact, then the unchanged fixed Canon CR3
 // calibration when requested. Never invokes the Converter or deletes a file.
 Decoded decode_prepared(const PreparedFrame &, const std::optional<Vec> &wb,

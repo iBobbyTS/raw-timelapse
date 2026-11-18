@@ -327,11 +327,17 @@ duplicate or malformed rows fail with exit 26:
 | `source`, `source_sha256` | canonical original path and its SHA-256 |
 | `route` | `linearraw-sdk`, `cfa-converter-linearraw-sdk` or `vendor-raw-converter-linearraw-sdk` |
 | `prepared_dng`, `prepared_sha256` | canonical LinearRaw SDK input and its SHA-256 |
+| `source_version`, `prepared_version` | optional device, inode, size, mtime and ctime captured during Prepare |
 | `generated` | `1` when the Converter produced the artifact |
 | `main_ifd_width`, `main_ifd_height` | prepared main-IFD storage geometry (not the active-area output size) |
 | `as_shot_neutral` | original/as-shot camera neutral (three positive numbers) |
 | `has_capture_time`, `capture_time` | optional original capture time |
 | `converter_used` plus `converter_*` | typed Converter provenance reconstructed into the frame metadata |
+
+The standalone `--prepared` commands verify the file content hashes. For
+contexts from the current job, the Rust runner passes
+`--prepared-file-check state` to check the captured file versions before and
+after decode instead. Contexts without version fields still use content hashes.
 
 Converted contexts store `converter_record` (absolute path) and
 `converter_record_sha256`, plus `converter_output_name`,

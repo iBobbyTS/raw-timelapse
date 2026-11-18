@@ -5,7 +5,7 @@ LinearRaw scratch DNG plus a versioned context, and every later
 analysis/develop call consumes that context without invoking the Converter or
 deleting the prepared artifact. Python is test infrastructure only.
 """
-import hashlib, json, pathlib, shutil, struct, subprocess, sys
+import hashlib, json, os, pathlib, shutil, struct, subprocess, sys
 
 from dng_fixture import make_dng
 
@@ -329,6 +329,38 @@ run([exe, "--stdout-analysis", "--prepared", work / "escape.ctx"], 26)
                                  b"rawtl-prepared-frame/1", 1))
 run([exe, "--stdout-analysis", "--prepared", work / "header.ctx"], 26)
 print("PASS: tampered prepared contexts fail closed with explicit errors", flush=True)
+
+# Same-size in-place writes with restored mtime still change ctime on APFS.
+def checked_analysis(path, code=0):
+    return stream([exe, "--stdout-analysis", "--prepared", path,
+                   "--prepared-file-check", "state"], code)
+
+assert checked_analysis(context).stdout == stream([exe, "--stdout-analysis", "--prepared", context]).stdout
+changed_source = make_dng(work, "changed-source")
+changed_scratch = work / "changed-scratch"
+changed_scratch.mkdir()
+changed_context = changed_scratch / "frame.ctx"
+run([exe, "--prepare", changed_source, "--scratch", changed_scratch,
+     "--emit-prepared", changed_context])
+old = changed_source.stat()
+with changed_source.open("r+b") as f:
+    tail = f.seek(-1, 2)
+    byte = f.read(1)
+    f.seek(tail)
+    f.write(bytes([byte[0] ^ 1]))
+os.utime(changed_source, ns=(old.st_atime_ns, old.st_mtime_ns))
+assert changed_source.stat().st_size == old.st_size
+assert changed_source.stat().st_mtime_ns == old.st_mtime_ns
+assert b"original source changed" in checked_analysis(changed_context, 26).stderr
+
+# Replacing a sealed Converter output with byte-identical data changes its inode.
+converted = pathlib.Path(cfa_fields["prepared_dng"])
+replacement = converted.with_suffix(".replacement")
+shutil.copy2(converted, replacement)
+assert replacement.stat().st_ino != converted.stat().st_ino
+replacement.replace(converted)
+assert b"prepared DNG changed" in checked_analysis(cfa_context, 26).stderr
+run([exe, "--stdout-analysis", "--prepared", cfa_context])
 
 # --- Prepare-time Converter failures are explicit ---------------------------
 def failing(name, body):
