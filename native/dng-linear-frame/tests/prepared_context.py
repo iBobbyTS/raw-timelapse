@@ -380,6 +380,18 @@ run([exe, "--stdout-analysis", "--prepared"], 2)
 run([exe, "--stdout-analysis", "--prepared", work / "nope.ctx"], 26)
 print("PASS: prepare/consume CLI grammar rejects unsupported combinations", flush=True)
 
+# The desktop preview downsamples camera-linear pixels while the normal
+# consumer of the same prepared context still receives the source geometry.
+_, preview_context = prepare(half, "preview-scratch", "preview.ctx")
+develop = [exe, "--stdout-frame-f32", "--prepared", preview_context]
+full = records(stream(develop).stdout, b"RAWTLST2")
+reduced = records(stream([*develop, "--preview-edge", "64"]).stdout, b"RAWTLST2")
+assert [kind for kind, _ in reduced] == [1, 3, 4]
+assert (json.loads(full[1][1])["width"], json.loads(full[1][1])["height"]) == (128, 128)
+assert (json.loads(reduced[1][1])["width"], json.loads(reduced[1][1])["height"]) == (64, 64)
+assert reduced[2][1] == full[2][1][:12] * (64 * 64)
+run([*develop, "--preview-edge", "0"], 2)
+
 # --- Compatibility wrapper keeps the original single-shot contract ----------
 # Positional output still exists, the stdout source path still emits no
 # context, and the two implementations agree on the analysis bytes.

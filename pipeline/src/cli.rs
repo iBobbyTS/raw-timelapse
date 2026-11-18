@@ -11,8 +11,6 @@ use std::path::PathBuf;
 pub const DEFAULT_NATIVE_TOOL: &str = "native/build/dng-linear-frame";
 pub const DEFAULT_FFMPEG: &str = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg";
 pub const DEFAULT_FFPROBE: &str = "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe";
-pub const LEGACY_FPS_PROVENANCE: &str =
-    "legacy/python/src/rawtl/cli.py:91 (argparse default Fraction(30))";
 pub const USAGE: &str = "\
 rawtl-linear-video --input <DIR> --profile <default|ABSOLUTE_FILE> [--output <VIDEO_FILE>]
 
@@ -44,7 +42,7 @@ REQUIRED:
 
 OPTIONS:
     --graph <FILE>            Typed graph JSON (default: prepare P1/B32, solve 8, develop 4)
-    --fps <N[/D]>              Frame rate as an integer or rational (default: 30)
+    --fps <N[/D]>              Frame rate as an integer or rational (default: 60)
     --white-balance <MODE>     first-frame | per-frame (default: first-frame)
                                first-frame freezes frame 1's as-shot neutral for the sequence;
                                per-frame decodes every frame with its own RAW as-shot neutral
@@ -148,7 +146,7 @@ pub struct Fps {
 }
 
 impl Fps {
-    pub const DEFAULT: Fps = Fps { num: 30, den: 1 };
+    pub const DEFAULT: Fps = Fps { num: 60, den: 1 };
 
     pub fn parse(text: &str) -> Result<Fps> {
         let (num, den) = match text.split_once('/') {
@@ -1203,12 +1201,11 @@ mod tests {
         }
     }
     #[test]
-    fn default_fps_is_legacy_thirty() {
+    fn default_fps_is_sixty() {
         let options = parse_run(&["--input", "in", "--output", "out.mov"]).expect("parse");
         assert_eq!(options.fps, Fps::DEFAULT);
-        assert_eq!(options.fps.arg(), "30/1");
+        assert_eq!(options.fps.arg(), "60/1");
         assert!(!options.fps_explicit);
-        assert!(LEGACY_FPS_PROVENANCE.contains("Fraction(30)"));
     }
 
     #[test]

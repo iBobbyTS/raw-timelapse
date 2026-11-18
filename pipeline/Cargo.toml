@@ -2,12 +2,18 @@
 name = "rawtl-linear-video"
 version = "0.1.0"
 edition = "2021"
+default-run = "rawtl-linear-video"
 description = "Frame-sequence graph pipeline and configurable high-bit video encoder for scene-linear ACEScg DNG frames"
 publish = false
 
 [[bin]]
 name = "rawtl-linear-video"
 path = "src/main.rs"
+
+[[bin]]
+name = "rawtl-desktop-worker"
+path = "src/desktop_main.rs"
+test = false
 
 [profile.release]
 opt-level = 3

@@ -74,7 +74,7 @@ struct CameraRecipe {
 };
 Decoded decode(const fs::path &, const std::optional<Vec> &,
                CameraRecipe = CameraRecipe{}, void (*cancel)() = nullptr,
-               lens::Request lens_request = {});
+               lens::Request lens_request = {}, uint32_t preview_edge = 0);
 double canon_normal_white_gain(double maximum, double black, double white,
                                double dng_white, double dng_black);
 void calibrate_canon_cr3(const fs::path &, Decoded &);
@@ -156,7 +156,8 @@ PreparedFrame read_prepared(const fs::path &context_path);
 // SDK decode of the prepared artifact, then the unchanged fixed Canon CR3
 // calibration when requested. Never invokes the Converter or deletes a file.
 Decoded decode_prepared(const PreparedFrame &, const std::optional<Vec> &wb,
-                        CameraRecipe recipe, bool lens_enabled = false, const lens::Policy & = {});
+                        CameraRecipe recipe, bool lens_enabled = false, const lens::Policy & = {},
+                        uint32_t preview_edge = 0);
 std::string sha256(const fs::path &);
 void write_png(const fs::path &, uint32_t, uint32_t,
                const std::vector<uint16_t> &);

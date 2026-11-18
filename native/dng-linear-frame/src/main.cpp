@@ -304,7 +304,8 @@ int main(int argc, char **argv) {
     const bool prepare_mode = mode == "--prepare" || batch_mode;
     const bool stdout_mode = mode == "--stdout-analysis" ||
                              mode == "--stdout-frame" ||
-                             mode == "--stdout-frame-f32" || mode == "--lens-valid-area";
+                             mode == "--stdout-frame-f32" || mode == "--lens-valid-area" ||
+                             mode == "--lens-status";
     const std::string default_converter =
         "/Applications/Adobe DNG "
         "Converter.app/Contents/MacOS/Adobe DNG Converter";
@@ -509,8 +510,8 @@ int main(int argc, char **argv) {
     if (argc < 3)
       throw Error(2, "option value missing");
     const bool prepared_mode = std::string(argv[2]) == "--prepared";
-    if (mode == "--lens-valid-area" && !prepared_mode)
-      throw Error(2, "lens valid-area query requires a frozen prepared context");
+    if ((mode == "--lens-valid-area" || mode == "--lens-status") && !prepared_mode)
+      throw Error(2, mode + " requires a frozen prepared context");
     fs::path input, context;
     int option_start = 3;
     if (prepared_mode) {
@@ -525,6 +526,7 @@ int main(int argc, char **argv) {
     std::string converter = default_converter;
     int timeout = 120;
     double exposure_ev = 0;
+    uint32_t preview_edge = 0;
     analysis::Roi roi;
     for (int i = option_start; i < argc; ++i) {
       std::string a = argv[i];
@@ -544,6 +546,15 @@ int main(int argc, char **argv) {
         wb = parse_wb(value);
       else if (a == "--exposure-ev")
         exposure_ev = parse_ev(value);
+      else if (a == "--preview-edge") {
+        size_t end = 0;
+        int edge = 0;
+        try { edge = std::stoi(value, &end); }
+        catch (...) { throw Error(2, "invalid preview edge"); }
+        if (!prepared_mode || !f32 || end != value.size() || edge < 64 || edge > 4096)
+          throw Error(2, "--preview-edge requires prepared FP32 output and a long edge of 64..4096");
+        preview_edge = uint32_t(edge);
+      }
       else if (a == "--camera-color-method") {
         if (value == "dng-camera-to-pcs")
           recipe.method = CameraColorMethod::dng_camera_to_pcs;
@@ -613,6 +624,19 @@ int main(int argc, char **argv) {
       temp.emplace();
       prepared = prepare_frame(input, temp->path, converter, timeout, true, lens_options);
     }
+    if (mode == "--lens-status") {
+      const auto &calibration = prepared.lens_calibration;
+      if (!calibration.collected)
+        throw Error(26, "lens status requires a context prepared with lens metadata collection");
+      const auto decisions = lens::decide(calibration, true, lens_policy);
+      const bool supported = std::any_of(decisions.begin(), decisions.end(), [](const auto &decision) {
+        return decision.status == "applied" || decision.status == "identity" ||
+               decision.status == "already-applied" || decision.status == "sdk-owned" ||
+               decision.status == "embedded-opcode-owned";
+      });
+      std::cout << Json{{"model", calibration.lens}, {"supported", supported}}.text << '\n';
+      return 0;
+    }
     if (mode == "--lens-valid-area") {
       if (lens_enabled && !prepared.lens_calibration.collected)
         throw Error(26, "lens auto requires a context prepared with lens metadata collection");
@@ -636,7 +660,7 @@ int main(int argc, char **argv) {
           {"resampling",lens_policy.sampling == lens::Sampling::bilinear ? "bilinear" : "quality"}}.text << '\n';
       return 0;
     }
-    Decoded decoded = decode_prepared(prepared, wb, recipe, lens_enabled, lens_policy);
+    Decoded decoded = decode_prepared(prepared, wb, recipe, lens_enabled, lens_policy, preview_edge);
     FrameOutput frame =
         render(prepared, decoded, std::optional<fs::path>(), roi, exposure_ev,
                want_analysis, !want_analysis, f32, prepared_mode,

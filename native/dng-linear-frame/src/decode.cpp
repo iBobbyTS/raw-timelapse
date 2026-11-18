@@ -18,6 +18,7 @@
 #include "dng_pixel_buffer.h"
 #include "dng_tag_types.h"
 #include "frame.h"
+#include "analysis.h"
 #include <algorithm>
 #include <cmath>
 namespace frame {
@@ -169,8 +170,37 @@ Mat mat(const dng_matrix &m) {
 Json optional_matrix(const dng_matrix &m) {
   return m.NotEmpty() ? matrix(mat(m)) : Json();
 }
+
+void reduce_preview(Decoded &decoded, uint32_t edge, void (*cancel)()) {
+  const uint32_t width = decoded.width, height = decoded.height;
+  const uint32_t longest = std::max(width, height);
+  if (edge == 0 || edge >= longest)
+    return;
+  const auto scale = [&](uint32_t side) {
+    return std::max(1u, uint32_t((uint64_t(side) * edge + longest / 2) / longest));
+  };
+  const uint32_t out_width = scale(width), out_height = scale(height);
+  const auto reduce_rgb = [&](std::vector<float> &pixels) {
+    if (pixels.empty())
+      return;
+    std::vector<float> reduced(size_t(out_width) * out_height * 3);
+    for (size_t channel = 0; channel < 3; ++channel) {
+      if (cancel) cancel();
+      const auto plane = analysis::box_downsample(width, height, out_width, out_height,
+          [&](size_t index) { return pixels[index * 3 + channel]; });
+      for (size_t index = 0; index < plane.size(); ++index)
+        reduced[index * 3 + channel] = float(plane[index]);
+    }
+    pixels.swap(reduced);
+  };
+  reduce_rgb(decoded.camera);
+  reduce_rgb(decoded.delivery_camera);
+  decoded.width = out_width;
+  decoded.height = out_height;
+}
 } // namespace
-Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe recipe, void (*cancel)(), lens::Request lens_request) {
+Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe recipe,
+               void (*cancel)(), lens::Request lens_request, uint32_t preview_edge) {
   auto routing = inspect(path);
   if (!routing || route(routing->photometric) != Route::direct)
     throw Error(23, "CFA cannot enter SDK");
@@ -297,6 +327,9 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe 
         {"max_channel_ratio", s.max_ratio}, {"measurement_uses_observations", true}};
       d.delivery_camera = std::move(recovered.camera);
     }
+    // Highlight recovery needs the sensor extent. Preview lens sampling and
+    // profile correction can work on an area-reduced camera-linear image.
+    reduce_preview(d, preview_edge, cancel);
     auto corrected = lens::correct(d.delivery_camera.empty() ? d.camera : d.delivery_camera,
                                    d.width, d.height, lens_calibration, lens_request.enabled, cancel, lens_request.policy);
     d.lens_correction = lens::report(lens_calibration, corrected, lens_request.enabled, lens_request.policy);

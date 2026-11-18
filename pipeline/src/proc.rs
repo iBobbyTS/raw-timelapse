@@ -333,6 +333,7 @@ impl Drop for OwnedProcess {
 static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 unsafe extern "C" {
     fn signal(sig: i32, handler: usize) -> usize;
+    #[cfg(unix)]
     fn kill(pid: i32, sig: i32) -> i32;
 }
 extern "C" fn stopped(_: i32) {
@@ -357,9 +358,12 @@ pub fn check_stop() -> Result<()> {
 pub fn terminate(child: &ChildHandle) {
     let mut child = child.lock().unwrap();
     if matches!(child.try_wait(), Ok(None)) {
+        #[cfg(unix)]
         unsafe {
             kill(child.id() as i32, 15);
         }
+        #[cfg(not(unix))]
+        let _ = child.kill();
     }
 }
 fn wait_owned(child: &ChildHandle, abort: bool, code: i32) -> Result<std::process::ExitStatus> {

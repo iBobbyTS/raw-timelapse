@@ -2,6 +2,7 @@
 /native/vendor/
 /outputs/
 /native/build/
+/desktop/build/
 
 # macOS Finder and resource-fork metadata
 .DS_Store

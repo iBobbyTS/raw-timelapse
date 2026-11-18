@@ -686,7 +686,7 @@ pub fn fake_failing_encoder(dir: &Path) -> PathBuf {
 pub fn fake_ffprobe_wrong_codec(dir: &Path) -> PathBuf {
     let path = dir.join("fake-ffprobe-wrong-codec");
     let script = format!(
-        "#!/bin/sh\ncat <<EOF\ncodec_name=ffv1\npix_fmt=yuv420p\nwidth={WIDTH}\nheight={HEIGHT}\nnb_read_frames=2\navg_frame_rate=30/1\nEOF\nexit 0\n"
+        "#!/bin/sh\ncat <<EOF\ncodec_name=ffv1\npix_fmt=yuv420p\nwidth={WIDTH}\nheight={HEIGHT}\nnb_read_frames=2\navg_frame_rate=60/1\nEOF\nexit 0\n"
     );
     write_executable(&path, &script);
     path

@@ -35,9 +35,11 @@ rawtl-linear-video --input /data/banff --profile /absolute/path/to/profile.json 
 ```
 
 Both `--input` (a RAW or DNG sequence directory) and `--profile` are required.
-The sole built-in profile, `default`, renders sRGB at 30 fps, source dimensions
+The sole built-in profile, `default`, renders sRGB at 60 fps, source dimensions
 and ProRes 4444 in MOV. A custom profile is selected by its absolute JSON file
-path and controls the processing and delivery settings.
+path and controls the processing and delivery settings. Its `fps` field accepts
+a positive integer (for example `60`) or a rational string (for example
+`"60000/1001"`), up to 1000 fps. When omitted, `fps` defaults to 60.
 
 Omit `--output` to write beside the source directory. With the default profile,
 `/data/banff.v2/` produces `/data/banff.v2.mov` and `/data/banff.v2.log`. An

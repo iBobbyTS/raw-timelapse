@@ -182,6 +182,7 @@ esac
             String::from_utf8_lossy(&result.stderr)
         );
         let log = fs::read_to_string(video.with_extension("log")).unwrap();
+        assert!(log.contains("kind=settings fps=60/1"), "{log}");
         assert!(log.contains("kind=colour profile=clog2"), "{log}");
         assert!(log.contains("reference_gain=1.25"), "{log}");
         if color == "auto-log" {

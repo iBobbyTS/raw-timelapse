@@ -212,6 +212,7 @@ pub struct PrepareSettings<'a> {
 pub struct PreparedSettings {
     pub camera_recipe: crate::camera::CameraRecipe,
     pub lens: crate::lens::Settings,
+    pub preview_edge: Option<u32>,
 }
 
 /// Run the native prepare operation once for one source and load the resulting
@@ -481,6 +482,7 @@ fn prepared_native_run(
         lens: settings.lens.clone(),
         log: log.to_path_buf(),
         analysis_roi,
+        preview_edge: settings.preview_edge,
         #[cfg(test)]
         converter: None,
         #[cfg(test)]
@@ -668,6 +670,9 @@ fn frame_args(
         if pixels && run.method != crate::camera::CameraRecipe::LegacyInverseCm { "on" } else { "off" }.into(),
     ]);
     lens_policy.args(lens_mode, &mut args);
+    if let Some(edge) = run.preview_edge.filter(|_| pixels) {
+        args.extend(["--preview-edge".into(), edge.to_string()]);
+    }
     if let Some(wb) = override_wb {
         args.extend(["--white-balance".into(), format_wb(wb)]);
     }

@@ -66,9 +66,7 @@ impl OutputColor {
             Self::Explicit(resolved) => return Ok(resolved.clone()),
             Self::AutoLog { cat, gain } => (*cat, *gain),
         };
-        let (make, model) = read_camera(first, exiftool)?;
-        let id = camera_log(&make, &model).map_err(|reason| camera_error(first, reason))?;
-        let profile = color_profile::lookup(id).expect("Auto Log only selects registered profiles");
+        let (profile, make, model) = detect(first, exiftool)?;
         let resolved = ResolvedOutputColor::new(profile, cat, gain)?;
         log.line(&format!(
             "kind=auto-log source={} make={} model={} profile={}",
@@ -79,6 +77,16 @@ impl OutputColor {
         ))?;
         Ok(resolved)
     }
+}
+
+pub(crate) fn detect(
+    first: &SourceFrame,
+    exiftool: &Path,
+) -> Result<(&'static ColorProfile, String, String)> {
+    let (make, model) = read_camera(first, exiftool)?;
+    let id = camera_log(&make, &model).map_err(|reason| camera_error(first, reason))?;
+    let profile = color_profile::lookup(id).expect("Auto Log only selects registered profiles");
+    Ok((profile, make, model))
 }
 
 fn camera_error(first: &SourceFrame, reason: impl std::fmt::Display) -> Error {

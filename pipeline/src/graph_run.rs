@@ -122,6 +122,7 @@ impl Runner<'_, '_> {
         PreparedSettings {
             lens: self.context.options.lens.clone(),
             camera_recipe: self.context.camera_recipe,
+            preview_edge: None,
         }
     }
     fn scan_task(

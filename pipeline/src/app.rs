@@ -168,7 +168,7 @@ fn execute(
         if options.fps_explicit {
             if options.profile_source.is_some() { "profile" } else { "CLI override" }
         } else {
-            cli::LEGACY_FPS_PROVENANCE
+            "default"
         }
     );
     let deflicker = &options.deflicker;

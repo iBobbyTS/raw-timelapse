@@ -250,6 +250,7 @@ if mode.startswith('late:'):
                 let settings = PreparedSettings {
                     lens: Default::default(),
                     camera_recipe: method,
+                    preview_edge: None,
                 };
                 let a = analyze_prepared(
                     &tool,
@@ -347,6 +348,7 @@ if mode.startswith('late:'):
                 &PreparedSettings {
                     lens: Default::default(),
                     camera_recipe: crate::camera::CameraRecipe::LegacyInverseCm,
+                    preview_edge: None,
                 },
                 &dir.join("after-delete.log"),
             )
@@ -365,6 +367,7 @@ if mode.startswith('late:'):
         let settings = PreparedSettings {
             lens: Default::default(),
             camera_recipe: crate::camera::CameraRecipe::LegacyInverseCm,
+            preview_edge: None,
         };
         for name in ["context-nul.ctx", "record-nul.ctx"] {
             let error = PreparedFrame::load(&root.join(name)).expect_err("forged NUL must be rejected");

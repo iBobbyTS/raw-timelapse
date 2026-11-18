@@ -673,10 +673,12 @@ PreparedFrame read_prepared(const fs::path &context_path) {
 
 Decoded decode_prepared(const PreparedFrame &prepared,
                         const std::optional<Vec> &wb,
-                        CameraRecipe recipe, bool lens_enabled, const lens::Policy &policy) {
+                        CameraRecipe recipe, bool lens_enabled, const lens::Policy &policy,
+                        uint32_t preview_edge) {
   if (lens_enabled && !prepared.lens_calibration.collected) throw Error(26, "lens auto requires a context prepared with lens metadata collection");
   Decoded decoded = decode(prepared.prepared_dng,
-                           wb ? wb : std::optional<Vec>(prepared.own), recipe, check_cancelled, {&prepared.lens_calibration, lens_enabled, policy});
+                           wb ? wb : std::optional<Vec>(prepared.own), recipe, check_cancelled,
+                           {&prepared.lens_calibration, lens_enabled, policy}, preview_edge);
   if (recipe.calibration == CameraCalibration::canon_normal_white_fixed_v1) {
     if (prepared.kind != Route::vendor_raw) throw Error(40, "Canon calibration requires original Canon CR3");
     calibrate_canon_cr3(prepared.source, decoded);

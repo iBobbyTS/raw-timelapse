@@ -136,7 +136,7 @@ fn publishes_one_video_and_one_run_log_with_a_clean_scratch() {
         "width=8",
         "height=6",
         "nb_read_frames=3",
-        "avg_frame_rate=30/1",
+        "avg_frame_rate=60/1",
     ] {
         assert!(probe.contains(expected), "{probe}");
     }
@@ -144,7 +144,7 @@ fn publishes_one_video_and_one_run_log_with_a_clean_scratch() {
     // The log records the run contract in one place.
     for expected in [
         "kind=run.start",
-        "kind=settings fps=30/1",
+        "kind=settings fps=60/1",
         "kind=graph source=\"built-in\"",
         "kind=encoder encoder=prores_ks",
         "kind=colour profile=srgb-preview",

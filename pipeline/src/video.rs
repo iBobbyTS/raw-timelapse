@@ -1085,7 +1085,7 @@ mod output_verify_tests {
             if let Some(count) = frames {
                 lines.push(format!("echo nb_read_frames={count}"));
             }
-            lines.push("echo avg_frame_rate=30/1".to_string());
+            lines.push(format!("echo avg_frame_rate={}", Fps::DEFAULT.arg()));
             lines.push(format!(
                 "echo color_space={}",
                 profile.tag_policy.matrix_token()

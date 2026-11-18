@@ -136,7 +136,7 @@ fn default_delivery_keeps_source_geometry_and_real_ten_bit_precision() {
         "width=5000",
         "height=40",
         "nb_read_frames=1",
-        "avg_frame_rate=30/1",
+        "avg_frame_rate=60/1",
         "color_space=bt709",
         "color_primaries=bt709",
         "color_transfer=iec61966-2-1",
