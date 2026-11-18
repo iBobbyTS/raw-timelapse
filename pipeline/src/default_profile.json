@@ -1,9 +1,8 @@
 {
-  "output_color": "srgb-preview",
+  "output_color": "auto-log",
   "output_cat": "profile",
   "camera_color": "auto",
   "white_balance": "first-frame",
-  "log_reference_gain": 1,
   "lens_correction": "auto",
   "lens_vignette": "auto",
   "lens_distortion": "auto",

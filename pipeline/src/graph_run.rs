@@ -63,6 +63,8 @@ struct Runner<'a, 'b> {
     resize: Option<ResizeRecord>,
     lens_area: Option<[f64;4]>,
     generated_paths: Vec<std::path::PathBuf>,
+    exposure_plan_ready: bool,
+    gain_scanned: usize,
     encoder: Arc<Mutex<video::GraphEncoder>>,
     encoder_inputs: video::EncoderInputs,
     active: proc::ActiveNative,
@@ -97,6 +99,42 @@ fn frame_failure(id: usize, total: usize, name: &str, message: &str) -> String {
 }
 
 impl Runner<'_, '_> {
+    fn progress(&self, phase: &str) {
+        let total = self.context.sources.len() as f64;
+        let conversion = if self.generated_paths.is_empty() {
+            0.0
+        } else {
+            40.0
+        };
+        let deflicker = if !self.context.options.deflicker.enabled() {
+            0.0
+        } else if conversion > 0.0 {
+            10.0
+        } else {
+            20.0
+        };
+        let prepared = self.capture_times.len() as f64 / total;
+        let measured = if self.exposure_plan_ready {
+            1.0
+        } else {
+            self.measurements.len() as f64 / (total + 1.0)
+        };
+        let scan_passes = if matches!(
+            self.context.output_color.reference_gain,
+            crate::cli::ReferenceGain::Auto
+        ) {
+            1.0
+        } else {
+            0.0
+        };
+        let delivered =
+            (self.frames.len() + self.gain_scanned) as f64 / (total * (1.0 + scan_passes));
+        let percent =
+            conversion * prepared + deflicker * measured + (100.0 - conversion - deflicker) * delivered;
+        // Keep 100% for a successfully published file, after verification.
+        self.log.progress(phase, (percent.floor() as u32).min(99));
+    }
+
     fn result<T>(&mut self, result: Result<T>) -> graph::Result<T> {
         result.map_err(|e| {
             let message = e.message.clone();
@@ -377,6 +415,9 @@ impl Backend for Runner<'_, '_> {
         if prepared.generated {
             self.generated_paths.push(prepared.dng.clone());
         }
+        if !self.generated_paths.is_empty() {
+            self.progress("convert");
+        }
         let written = self.log.line(&format!(
             "kind=prepare frame={} source={} route={} generated={} cache={} mode={} duration_scope={} duration={:.6}",
             id + 1,
@@ -434,6 +475,7 @@ impl Backend for Runner<'_, '_> {
             return Err("graph: measurement commit identity/order mismatch".into());
         }
         self.measurements.push(measurement);
+        self.progress("deflicker");
         let written = self.log.line(&format!(
             "kind=measure frame={} source={} duration={:.3}",
             id + 1,
@@ -490,6 +532,8 @@ impl Backend for Runner<'_, '_> {
             started.elapsed().as_secs_f64()
         ));
         self.result(written)?;
+        self.exposure_plan_ready = true;
+        self.progress("deflicker");
         Ok(gains)
     }
     fn plan_ready(&mut self, plan: &[Gain], refs: &[PreparedFrame]) -> graph::Result<()> {
@@ -514,47 +558,48 @@ impl Backend for Runner<'_, '_> {
             tasks.push(Some(self.scan_task(plan[id].ev, id, &refs[id])?));
         }
         let queue = Mutex::new(tasks);
-        {
-            std::thread::scope(|scope| {
-                let next = &next;
-                let abort = &abort;
-                let queue = &queue;
-                for _ in 0..workers {
-                    let tx = tx.clone();
-                    scope.spawn(move || loop {
-                        if abort.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let id = next.fetch_add(1, Ordering::Relaxed);
-                        if id >= total {
-                            break;
-                        }
-                        let task = queue.lock().unwrap()[id]
-                            .take()
-                            .expect("graph: auto reference gain scan task taken twice");
-                        let result = task().map_err(|e| e.to_string());
-                        if result.is_err() {
-                            abort.store(true, Ordering::Relaxed);
-                        }
-                        if tx.send((id, result)).is_err() {
-                            break;
-                        }
-                    });
-                }
-            });
-        }
-        drop(tx);
         let mut max_target = f64::NEG_INFINITY;
         let mut min_target = f64::INFINITY;
         let mut samples: u128 = 0;
-        for (id, result) in rx {
-            let (max, min, count) = result.map_err(|e| {
-                format!("graph: auto reference gain scan failed on frame {}: {e}", id + 1)
-            })?;
-            max_target = max_target.max(max);
-            min_target = min_target.min(min);
-            samples += count;
-        }
+        std::thread::scope(|scope| -> graph::Result<()> {
+            let next = &next;
+            let abort = &abort;
+            let queue = &queue;
+            for _ in 0..workers {
+                let tx = tx.clone();
+                scope.spawn(move || loop {
+                    if abort.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let id = next.fetch_add(1, Ordering::Relaxed);
+                    if id >= total {
+                        break;
+                    }
+                    let task = queue.lock().unwrap()[id]
+                        .take()
+                        .expect("graph: auto reference gain scan task taken twice");
+                    let result = task().map_err(|e| e.to_string());
+                    if result.is_err() {
+                        abort.store(true, Ordering::Relaxed);
+                    }
+                    if tx.send((id, result)).is_err() {
+                        break;
+                    }
+                });
+            }
+            drop(tx);
+            for (id, result) in rx {
+                let (max, min, count) = result.map_err(|e| {
+                    format!("graph: auto reference gain scan failed on frame {}: {e}", id + 1)
+                })?;
+                max_target = max_target.max(max);
+                min_target = min_target.min(min);
+                samples += count;
+                self.gain_scanned += 1;
+                self.progress("exposure");
+            }
+            Ok(())
+        })?;
         let decision = profile.auto_reference_gain(max_target, min_target);
         let gain = decision.gain;
         if !gain.is_finite() || gain <= 0.0 {
@@ -821,6 +866,7 @@ impl Backend for Runner<'_, '_> {
         ));
         self.result(written)?;
         self.frames.push(image.info);
+        self.progress("encode");
         Ok(())
     }
     fn activity(
@@ -1145,6 +1191,8 @@ pub fn run(
         resize: None,
         lens_area: None,
         generated_paths: vec![],
+        exposure_plan_ready: false,
+        gain_scanned: 0,
         encoder: {
             let mut encoder =
                 video::GraphEncoder::new(config.clone(), context.sources.len(), &output_name);
@@ -1230,6 +1278,7 @@ pub fn run(
     let mut timings = BTreeMap::new();
     timings.insert("graph".into(), graph_started.elapsed());
     timings.insert("preflight".into(), preflight_elapsed);
+    runner.log.progress("verify", 99);
     let validation_started = Instant::now();
     let output = context.scratch.join(&output_name);
     let probe = video::validate_output(

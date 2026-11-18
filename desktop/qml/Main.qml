@@ -23,6 +23,15 @@ ApplicationWindow {
     readonly property color accent: "#9acdb7"
     readonly property color foreground: "#e8eeec"
     readonly property bool hasSource: workspace.frameCount > 0
+    property bool exitConfirmed: false
+
+    onClosing: function(event) {
+        if (workspace.exporting && !exitConfirmed) {
+            event.accepted = false
+            queuePopup.close()
+            exitDialog.open()
+        }
+    }
 
     palette.window: window.color
     palette.windowText: window.foreground
@@ -52,6 +61,35 @@ ApplicationWindow {
         id: directoryDialog
         title: qsTr("选择 RAW 素材文件夹")
         onAccepted: window.workspace.openFolder(selectedFolder)
+    }
+
+    Dialog {
+        id: exitDialog
+        objectName: "exitWhileExporting"
+        anchors.centerIn: parent
+        width: Math.min(420, window.width - 32)
+        modal: true
+        title: qsTr("退出 RAW Timelapse？")
+        contentItem: Label {
+            text: qsTr("退出会中止正在导出的任务，并丢弃队列中等待的任务。")
+            wrapMode: Text.WordWrap
+        }
+        footer: DialogButtonBox {
+            Button {
+                objectName: "keepExporting"
+                text: qsTr("继续导出")
+                DialogButtonBox.buttonRole: DialogButtonBox.RejectRole
+            }
+            Button {
+                objectName: "confirmExportExit"
+                text: qsTr("退出")
+                DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
+            }
+        }
+        onAccepted: {
+            window.exitConfirmed = true
+            window.close()
+        }
     }
 
     header: Rectangle {
@@ -182,8 +220,18 @@ ApplicationWindow {
                             }
                             PathLabel {
                                 Layout.fillWidth: true
-                                text: modelData.error ? modelData.status + "  " + modelData.error : modelData.status
+                                text: modelData.running
+                                    ? qsTr("%1 · %2%").arg(window.workspace.exportPhase).arg(window.workspace.exportPercent)
+                                    : modelData.error ? modelData.status + "  " + modelData.error : modelData.status
                                 color: modelData.running ? window.accent : window.muted
+                            }
+                            ProgressBar {
+                                objectName: "exportProgress"
+                                Layout.fillWidth: true
+                                visible: modelData.running
+                                from: 0
+                                to: 100
+                                value: window.workspace.exportPercent
                             }
                         }
                         Button {

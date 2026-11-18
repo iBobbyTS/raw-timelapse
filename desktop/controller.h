@@ -43,6 +43,8 @@ class Controller final : public QObject {
     Q_PROPERTY(bool fpsValid READ fpsValid NOTIFY changed)
     Q_PROPERTY(bool canExport READ canExport NOTIFY changed)
     Q_PROPERTY(bool exporting READ exporting NOTIFY changed)
+    Q_PROPERTY(int exportPercent READ exportPercent NOTIFY progressChanged)
+    Q_PROPERTY(QString exportPhase READ exportPhase NOTIFY progressChanged)
     Q_PROPERTY(int outstanding READ outstanding NOTIFY changed)
     Q_PROPERTY(bool canClear READ canClear NOTIFY changed)
     Q_PROPERTY(QVariantList jobs READ jobs NOTIFY changed)
@@ -71,6 +73,8 @@ public:
     bool fpsValid() const;
     bool canExport() const;
     bool exporting() const { return outstanding() > 0; }
+    int exportPercent() const { return exportPercent_; }
+    QString exportPhase() const { return exportPhase_; }
     int outstanding() const;
     bool canClear() const;
     QVariantList jobs() const;
@@ -89,6 +93,7 @@ public:
 
 signals:
     void changed();
+    void progressChanged();
 
 private:
     enum class Request { None, Hello, Open, Close, Preview };
@@ -132,6 +137,9 @@ private:
     QList<Job> jobs_;
     int nextJobId_ = 0;
     int activeJob_ = 0;
+    int exportPercent_ = 0;
+    QString exportPhase_;
+    QByteArray exportReplies_;
 
     void startWorker();
     void onWorkerReply(const QJsonObject &reply);
@@ -142,6 +150,9 @@ private:
     void resetSource();
     QString selectedColor() const;
     std::optional<QJsonValue> profileFps() const;
+    QJsonObject exportProfile(const QJsonValue &fps) const;
+    QString availableOutputPath() const;
+    void readExportProgress();
     void runNextExport();
     void finishExport(bool success, const QString &error);
     void setError(const QString &error);

@@ -35,9 +35,10 @@ rawtl-linear-video --input /data/banff --profile /absolute/path/to/profile.json 
 ```
 
 Both `--input` (a RAW or DNG sequence directory) and `--profile` are required.
-The sole built-in profile, `default`, renders sRGB at 60 fps, source dimensions
-and ProRes 4444 in MOV. A custom profile is selected by its absolute JSON file
-path and controls the processing and delivery settings. Its `fps` field accepts
+The sole built-in profile, `default`, selects the Log from the first input and
+exports at 60 fps in ProRes 4444 MOV at source dimensions. A custom profile
+is selected by its absolute JSON file path and controls the processing
+and delivery settings. Its `fps` field accepts
 a positive integer (for example `60`) or a rational string (for example
 `"60000/1001"`), up to 1000 fps. When omitted, `fps` defaults to 60.
 
@@ -312,8 +313,9 @@ failure leaves only the scratch partial and a non-zero exit.
 
 ## Colour/Log profiles
 
-The profile’s `output_color` field selects the output colour/Log rendering (default
-`srgb-preview`). Canon Cinema Gamut/CLog profiles are signalled per field and are
+The profile’s `output_color` field selects the output colour/Log rendering. The
+built-in `default` profile uses `auto-log`. Canon Cinema Gamut/CLog profiles
+are signalled per field and are
 never disguised as BT.2020 transfer/primaries. ProRes delivery is limited range
 because MOV `colr/nclc` cannot carry a range field and ProRes decoders assume
 video range; other encoders are validated against the configured pixel format

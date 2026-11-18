@@ -17,6 +17,7 @@ pub struct RunLog {
     file: File,
     path: PathBuf,
     started: Instant,
+    report_progress: bool,
     #[cfg(test)]
     before_line: Option<Box<dyn FnMut(&str, &mut File)>>,
 }
@@ -38,6 +39,7 @@ impl RunLog {
             file,
             path: path.to_path_buf(),
             started: Instant::now(),
+            report_progress: std::env::var_os("RAWTL_DESKTOP_PROGRESS").is_some_and(|value| value == "1"),
             #[cfg(test)]
             before_line: None,
         };
@@ -51,6 +53,15 @@ impl RunLog {
 
     pub fn elapsed_seconds(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
+    }
+
+    pub fn progress(&self, phase: &str, percent: u32) {
+        if self.report_progress {
+            // The desktop consumes complete lines from a child process pipe.
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "rawtl-progress {percent} {phase}");
+            let _ = out.flush();
+        }
     }
 
     /// Append one `wall=... elapsed=... <payload>` line.

@@ -7,6 +7,7 @@
 #include <QFileInfo>
 #include <QHash>
 #include <QMutexLocker>
+#include <QProcessEnvironment>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QRegularExpression>
@@ -141,7 +142,10 @@ Controller::Controller(PreviewProvider &provider) : provider_(provider) {
             workerFailed(tr("预览进程已退出。%1").arg(QString::fromUtf8(workerError_).trimmed()));
     });
 
-    connect(&encoder_, &QProcess::readyReadStandardOutput, this, [this] { encoder_.readAllStandardOutput(); });
+    auto exportEnvironment = QProcessEnvironment::systemEnvironment();
+    exportEnvironment.insert("RAWTL_DESKTOP_PROGRESS", "1");
+    encoder_.setProcessEnvironment(exportEnvironment);
+    connect(&encoder_, &QProcess::readyReadStandardOutput, this, &Controller::readExportProgress);
     connect(&encoder_, &QProcess::readyReadStandardError, this, [this] {
         appendTail(encoderError_, encoder_.readAllStandardError());
     });
@@ -413,39 +417,50 @@ bool Controller::fpsValid() const {
 }
 
 bool Controller::canExport() const {
-    return ready() && !inputPath_.isEmpty() && fpsValid()
-        && (selectedColor() != "auto-log" || !autoLog_.isEmpty());
+    const auto fps = profileFps();
+    if (!ready() || inputPath_.isEmpty() || !fps || (selectedColor() == "auto-log" && autoLog_.isEmpty()))
+        return false;
+    const auto profile = exportProfile(*fps);
+    return std::ranges::none_of(jobs_, [this, &profile](const Job &job) {
+        return (job.state == JobState::Waiting || job.state == JobState::Running)
+            && job.input == inputPath_ && job.profile == profile;
+    });
 }
 
-void Controller::enqueueExport() {
-    if (!canExport())
-        return;
-    if (std::ranges::any_of(jobs_, [this](const Job &job) {
-        return (job.state == JobState::Waiting || job.state == JobState::Running) && job.output == outputPath_;
-    })) {
-        setError(tr("这个输出路径已有导出任务：%1").arg(QDir::toNativeSeparators(outputPath_)));
-        return;
-    }
-    const QFileInfo output(outputPath_);
-    const QFileInfo log(output.dir().filePath(output.completeBaseName() + ".log"));
-    if (output.exists() || output.isSymLink() || log.exists() || log.isSymLink()) {
-        setError(tr("输出文件或日志已存在：%1").arg(QDir::toNativeSeparators(outputPath_)));
-        return;
-    }
+QJsonObject Controller::exportProfile(const QJsonValue &fps) const {
     auto profile = baseProfile_;
-    profile.insert("fps", *profileFps());
+    profile.insert("fps", fps);
     profile.insert("white_balance", whiteBalanceIndex_ == 0 ? "first-frame" : "per-frame");
     profile.insert("lens_correction", lensEnabled_ ? "auto" : "off");
     profile.insert("output_color", selectedColor());
-    if (selectedColor() != "srgb-preview")
-        profile.remove("log_reference_gain");
     profile.insert("dng_linear_frame", nativePath_);
     profile.insert("exiftool", exiftool_);
     profile.insert("ffmpeg", ffmpeg_);
     profile.insert("ffprobe", ffprobe_);
     if (!converter_.isEmpty())
         profile.insert("converter", QFileInfo(converter_).absoluteFilePath());
-    jobs_.append(Job{++nextJobId_, inputPath_, outputPath_, std::move(profile), JobState::Waiting, {}});
+    return profile;
+}
+
+QString Controller::availableOutputPath() const {
+    const QFileInfo base(outputPath_);
+    QString path = outputPath_;
+    for (int number = 2; ; ++number) {
+        const QFileInfo video(path);
+        const QFileInfo log(video.dir().filePath(video.completeBaseName() + ".log"));
+        if (!video.exists() && !video.isSymLink() && !log.exists() && !log.isSymLink()
+            && std::ranges::none_of(jobs_, [&path](const Job &job) {
+                return job.output == path && (job.state == JobState::Waiting || job.state == JobState::Running);
+            }))
+            return path;
+        path = base.dir().filePath(QString("%1-%2.%3").arg(base.completeBaseName()).arg(number).arg(base.suffix()));
+    }
+}
+
+void Controller::enqueueExport() {
+    if (!canExport())
+        return;
+    jobs_.append(Job{++nextJobId_, inputPath_, availableOutputPath(), exportProfile(*profileFps()), JobState::Waiting, {}});
     actionError_.clear();
     emit changed();
     runNextExport();
@@ -460,6 +475,10 @@ void Controller::runNextExport() {
         activeJob_ = job.id;
         job.state = JobState::Running;
         encoderError_.clear();
+        exportReplies_.clear();
+        exportPercent_ = 0;
+        exportPhase_ = tr("准备导出");
+        emit progressChanged();
         const auto profilePath = QDir(scratch_.path()).filePath(QString("job-%1.json").arg(job.id));
         QSaveFile profileFile(profilePath);
         const auto data = QJsonDocument(job.profile).toJson();
@@ -472,6 +491,31 @@ void Controller::runNextExport() {
         emit changed();
         return;
     }
+}
+
+void Controller::readExportProgress() {
+    exportReplies_.append(encoder_.readAllStandardOutput());
+    static const QRegularExpression message(R"(^rawtl-progress ([0-9]{1,2}) (convert|deflicker|exposure|encode|verify)$)");
+    static const QHash<QString, QString> phases = {
+        {"convert", tr("Adobe DNG 转换")}, {"deflicker", tr("计算去闪")},
+        {"exposure", tr("计算参考曝光")}, {"encode", tr("显影与编码")}, {"verify", tr("检查输出")},
+    };
+    qsizetype start = 0;
+    for (qsizetype end = exportReplies_.indexOf('\n'); end >= 0; end = exportReplies_.indexOf('\n', start)) {
+        const auto line = QString::fromUtf8(QByteArrayView(exportReplies_).sliced(start, end - start)).trimmed();
+        start = end + 1;
+        const auto match = message.match(line);
+        if (!match.hasMatch())
+            continue;
+        const int percent = match.captured(1).toInt();
+        const QString phase = phases.value(match.captured(2));
+        if (percent >= exportPercent_ && (percent != exportPercent_ || phase != exportPhase_)) {
+            exportPercent_ = percent;
+            exportPhase_ = phase;
+            emit progressChanged();
+        }
+    }
+    exportReplies_.remove(0, start);
 }
 
 void Controller::finishExport(bool success, const QString &error) {
