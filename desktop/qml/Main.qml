@@ -225,6 +225,15 @@ ApplicationWindow {
                                     : modelData.error ? modelData.status + "  " + modelData.error : modelData.status
                                 color: modelData.running ? window.accent : window.muted
                             }
+                            PathLabel {
+                                objectName: "exportCompletion"
+                                Layout.fillWidth: true
+                                visible: modelData.finished
+                                text: modelData.secondsPerFrame
+                                    ? qsTr("%1 · 平均 %2 秒/帧").arg(modelData.completedAt).arg(modelData.secondsPerFrame)
+                                    : modelData.completedAt
+                                color: window.muted
+                            }
                             ProgressBar {
                                 objectName: "exportProgress"
                                 Layout.fillWidth: true
@@ -238,7 +247,8 @@ ApplicationWindow {
                             objectName: "revealOutputFolder"
                             visible: modelData.finished
                             Layout.preferredWidth: 36
-                            icon.source: "folder.svg"
+                            display: AbstractButton.IconOnly
+                            icon.source: "folder.png"
                             icon.color: "transparent"
                             icon.width: 18
                             icon.height: 18

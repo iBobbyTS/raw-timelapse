@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QHash>
+#include <QLocale>
 #include <QMutexLocker>
 #include <QProcessEnvironment>
 #include <QJsonArray>
@@ -178,6 +179,7 @@ Controller::Controller(PreviewProvider &provider) : provider_(provider) {
         appendTail(encoderError_, encoder_.readAllStandardError());
     });
     connect(&encoder_, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
+        readExportProgress();
         appendTail(encoderError_, encoder_.readAllStandardError());
         const QString detail = QString::fromUtf8(encoderError_).trimmed().right(1600);
         finishExport(status == QProcess::NormalExit && code == 0,
@@ -513,7 +515,7 @@ QString Controller::availableOutputPath() const {
 void Controller::enqueueExport() {
     if (!canExport())
         return;
-    jobs_.append(Job{++nextJobId_, inputPath_, availableOutputPath(), exportProfile(*profileFps()), JobState::Waiting, {}});
+    jobs_.append(Job{++nextJobId_, inputPath_, availableOutputPath(), exportProfile(*profileFps())});
     actionError_.clear();
     emit changed();
     runNextExport();
@@ -530,9 +532,11 @@ void Controller::runNextExport() {
         encoderError_.clear();
         exportReplies_.clear();
         exportPercent_ = 0;
+        exportedFrames_ = 0;
         exportPhase_ = tr("准备导出");
         emit progressChanged();
         const auto data = QJsonDocument(job.profile).toJson(QJsonDocument::Compact);
+        exportTimer_.start();
         encoder_.start(cliPath_, {"--desktop-export", "--input", job.input, "--output", job.output});
         encoder_.write(data);
         encoder_.closeWriteChannel();
@@ -544,6 +548,7 @@ void Controller::runNextExport() {
 void Controller::readExportProgress() {
     exportReplies_.append(encoder_.readAllStandardOutput());
     static const QRegularExpression message(R"(^rawtl-progress ([0-9]{1,2}) (convert|deflicker|exposure|encode|verify)$)");
+    static const QRegularExpression completion(R"(^rawtl-complete ([0-9]+)$)");
     static const QHash<QString, QString> phases = {
         {"convert", tr("Adobe DNG 转换")}, {"deflicker", tr("计算去闪")},
         {"exposure", tr("计算参考曝光")}, {"encode", tr("显影与编码")}, {"verify", tr("检查输出")},
@@ -553,8 +558,12 @@ void Controller::readExportProgress() {
         const auto line = QString::fromUtf8(QByteArrayView(exportReplies_).sliced(start, end - start)).trimmed();
         start = end + 1;
         const auto match = message.match(line);
-        if (!match.hasMatch())
+        if (!match.hasMatch()) {
+            const auto completed = completion.match(line);
+            if (completed.hasMatch())
+                exportedFrames_ = completed.captured(1).toLongLong();
             continue;
+        }
         const int percent = match.captured(1).toInt();
         const QString phase = phases.value(match.captured(2));
         if (percent >= exportPercent_ && (percent != exportPercent_ || phase != exportPhase_)) {
@@ -576,8 +585,13 @@ void Controller::finishExport(bool success, const QString &error) {
         const bool published = success && QFileInfo(job.output).isFile();
         job.state = published ? JobState::Done : JobState::Failed;
         job.profile = {};
-        if (!published)
+        if (published) {
+            job.completedAt = QDateTime::currentDateTime();
+            if (exportedFrames_ > 0)
+                job.secondsPerFrame = exportTimer_.nsecsElapsed() / 1e9 / exportedFrames_;
+        } else {
             job.error = success ? tr("导出完成，但未找到输出文件。") : error;
+        }
         break;
     }
     emit changed();
@@ -609,6 +623,9 @@ QVariantList Controller::jobs() const {
         result.append(QVariantMap{
             {"jobId", job.id}, {"path", job.input}, {"status", status}, {"error", job.error},
             {"finished", job.state == JobState::Done}, {"running", job.state == JobState::Running},
+            {"completedAt", job.completedAt.toString("yyyy-MM-dd HH:mm:ss")},
+            {"secondsPerFrame", job.secondsPerFrame
+                ? QLocale().toString(*job.secondsPerFrame, 'f', 3) : QString()},
         });
     }
     return result;

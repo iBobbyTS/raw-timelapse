@@ -318,6 +318,9 @@ fn execute(
     println!("\nrun complete in {:.2}s", total.as_secs_f64());
     println!("video: {}", video.display());
     println!("log:   {}", log.path().display());
+    if log.reports_progress() {
+        println!("rawtl-complete {}", stage.probe.frames.unwrap_or(result.sequence.count as u64));
+    }
     Ok(())
 }
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <QDateTime>
+#include <QElapsedTimer>
 #include <QImage>
 #include <QJsonObject>
 #include <QMutex>
@@ -111,6 +113,8 @@ private:
         QJsonObject profile;
         JobState state = JobState::Waiting;
         QString error;
+        QDateTime completedAt;
+        std::optional<double> secondsPerFrame;
     };
 
     PreviewProvider &provider_;
@@ -148,6 +152,8 @@ private:
     QList<Job> jobs_;
     int nextJobId_ = 0;
     int activeJob_ = 0;
+    QElapsedTimer exportTimer_;
+    qint64 exportedFrames_ = 0;
     int exportPercent_ = 0;
     QString exportPhase_;
     QByteArray exportReplies_;

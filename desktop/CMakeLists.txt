@@ -30,13 +30,13 @@ target_compile_definitions(raw-timelapse PRIVATE
     RAWTL_WORKER_FALLBACK="${RUST_TARGET}/release/rawtl-desktop-worker${CMAKE_EXECUTABLE_SUFFIX}"
     RAWTL_NATIVE_FALLBACK="${ROOT}/native/build/dng-linear-frame${CMAKE_EXECUTABLE_SUFFIX}"
 )
-set_source_files_properties(qml/folder.svg PROPERTIES QT_RESOURCE_ALIAS folder.svg)
+set_source_files_properties(qml/folder.png PROPERTIES QT_RESOURCE_ALIAS folder.png)
 set_source_files_properties(qml/Main.qml PROPERTIES QT_RESOURCE_ALIAS Main.qml)
 qt_add_qml_module(raw-timelapse
     URI RawTimelapse
     VERSION 1.0
     QML_FILES qml/Main.qml
-    RESOURCES qml/folder.svg
+    RESOURCES qml/folder.png
 )
 
 install(TARGETS raw-timelapse BUNDLE DESTINATION . RUNTIME DESTINATION bin)
