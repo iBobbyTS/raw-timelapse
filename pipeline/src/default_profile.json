@@ -21,5 +21,6 @@
   "encoder": "prores_ks",
   "pix_fmt": "yuv444p10le",
   "container": "mov",
+  "log": false,
   "verify_output": false
 }

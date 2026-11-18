@@ -86,6 +86,7 @@ fn custom_profile_delivers_by_its_own_container_beside_input() {
         ("resize", Json::Str("4x4".into())),
         ("strength", Json::Int(0)),
         ("verify_output", Json::Bool(true)),
+        ("log", Json::Bool(true)),
     ]);
     fs::write(&profile, rawtl_linear_video::json::to_pretty_string(&settings)).unwrap();
     let args = [
@@ -122,6 +123,33 @@ fn custom_profile_delivers_by_its_own_container_beside_input() {
     let log = fs::read_to_string(root.join("sequence.v2.log")).unwrap();
     assert!(log.contains("kind=profile") && log.contains("clog3"));
     assert_eq!(cli(&args).status.code(), Some(12));
+
+    // When logging is disabled, an existing sibling log is irrelevant and
+    // must not be overwritten. A fresh target leaves only its video.
+    fs::remove_file(video).unwrap();
+    assert_eq!(cli(&args).status.code(), Some(12));
+    let settings = rawtl_linear_video::json::to_pretty_string(&settings);
+    let without_log = settings.replace("\"log\": true", "\"log\": false");
+    assert_ne!(settings, without_log);
+    fs::write(&profile, without_log).unwrap();
+    let result = cli(&args);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read_to_string(root.join("sequence.v2.log")).unwrap(), log);
+    let fresh = root.join("fresh.mkv");
+    let mut fresh_args = args.to_vec();
+    fresh_args.extend(["--output", fresh.to_str().unwrap()]);
+    let result = cli(&fresh_args);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(fresh.is_file());
+    assert!(!fresh.with_extension("log").exists());
 }
 
 #[test]
@@ -170,6 +198,7 @@ fn custom_profile_selects_a_named_export_preset() {
         String::from_utf8_lossy(&result.stderr)
     );
     let probe = ffprobe(&root.join("sequence.mov"));
+    assert!(!root.join("sequence.log").exists());
     assert!(
         probe.contains("codec_name=hevc") && probe.contains("pix_fmt=yuv420p"),
         "{probe}"
@@ -212,6 +241,7 @@ esac
             ("output_cat", Json::Str("cat02".into())),
             ("log_reference_gain", Json::Str("1.25".into())),
             ("strength", Json::Int(0)),
+            ("log", Json::Bool(true)),
         ]);
         let profile = root.join(format!("{color}.json"));
         fs::write(

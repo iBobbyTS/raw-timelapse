@@ -1,4 +1,4 @@
-// rawtl-linear-video: RAW/DNG frame sequence -> one video file and one log.
+// rawtl-linear-video: RAW/DNG frame sequence -> one video file and an optional log.
 //
 // The graph runtime owns preparation, measurement/solve, rendering, encoding
 // and event-driven cleanup. This module owns the product surface: the single
@@ -88,21 +88,29 @@ fn run(options: &Options) -> Result<()> {
     let started = Instant::now();
     let input = guard::canonical_input(&options.input)?;
     let mut video = guard::canonical_artifact(&options.video)?;
-    let mut log_path = guard::canonical_artifact(&options.log)?;
-    guard::ensure_outside_input(&input, &[&video, &log_path])?;
+    guard::ensure_outside_input(&input, &[&video])?;
+    if options.write_log {
+        let log_path = guard::canonical_artifact(&options.log)?;
+        guard::ensure_outside_input(&input, &[&log_path])?;
+    }
     // Configuration failures must not create a directory, log, scratch or
     // output.
     let graph_config = graph_run::resolve_configuration(options)?;
     guard::prepare_parent(&video)?;
     video = guard::canonical_artifact(&video)?;
-    log_path = guard::canonical_artifact(&log_path)?;
-    guard::ensure_absent(&[&video, &log_path])?;
+    guard::ensure_absent(&[&video])?;
 
-    let mut log = RunLog::create(&log_path, env!("CARGO_PKG_VERSION"))?;
+    let mut log = if options.write_log {
+        let log_path = guard::canonical_artifact(&options.log)?;
+        guard::ensure_absent(&[&log_path])?;
+        RunLog::create(&log_path, env!("CARGO_PKG_VERSION"))?
+    } else {
+        RunLog::disabled()
+    };
     let scratch = match guard::create_scratch(&video) {
         Ok(scratch) => scratch,
         Err(err) => {
-            let _ = log.line(&format!(
+            let _ = log.line(|| format!(
                 "kind=run.error code={} message={}",
                 err.code,
                 quote(&err.message)
@@ -114,7 +122,7 @@ fn run(options: &Options) -> Result<()> {
     if let Err(err) = outcome {
         let cleanup = fs::remove_dir_all(&scratch);
         let retained = cleanup.as_ref().is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
-        let _ = log.line(&format!(
+        let _ = log.line(|| format!(
             "kind=run.error code={} message={} scratch={} retained={retained}",
             err.code,
             quote(&err.message),
@@ -124,7 +132,7 @@ fn run(options: &Options) -> Result<()> {
             if retained {
                 let message = format!("could not remove export scratch {}: {error}", scratch.display());
                 eprintln!("{message}");
-                log.line_best_effort(&format!("kind=warning message={}", quote(&message)));
+                log.line_best_effort(|| format!("kind=warning message={}", quote(&message)));
             }
         }
         return Err(err);
@@ -141,20 +149,25 @@ fn execute(
     log: &mut RunLog,
     graph_config: (rawtl_linear_video::graph::Graph, encoder::ResolvedConfig),
 ) -> Result<()> {
-    log.line(&format!(
-        "kind=run.start input={} video={} log={} scratch={}",
-        quote(&input.display().to_string()),
-        quote(&video.display().to_string()),
-        quote(&log.path().display().to_string()),
-        quote(&scratch.display().to_string())
-    ))?;
+    let log_path = log.path().map(Path::to_path_buf);
+    if let Some(path) = &log_path {
+        log.line(|| format!(
+            "kind=run.start input={} video={} log={} scratch={}",
+            quote(&input.display().to_string()),
+            quote(&video.display().to_string()),
+            quote(&path.display().to_string()),
+            quote(&scratch.display().to_string())
+        ))?;
+    }
     if let Some(profile) = &options.profile_source {
-        log.line(&format!("kind=profile source={}", quote(profile)))?;
+        log.line(|| format!("kind=profile source={}", quote(profile)))?;
     }
     println!("rawtl-linear-video {}", env!("CARGO_PKG_VERSION"));
     println!("input:   {}", input.display());
     println!("video:   {}", video.display());
-    println!("log:     {}", log.path().display());
+    if let Some(path) = &log_path {
+        println!("log:     {}", path.display());
+    }
     println!("scratch: {}", scratch.display());
     println!(
         "fps:     {} ({})",
@@ -186,7 +199,7 @@ fn execute(
     let sources = order::enumerate_dng(input)?;
     let first = sources.first().expect("inventory is nonempty");
     let output_color = options.output_color.resolve(first, &options.lens.exiftool, log)?;
-    log.line(&format!(
+    log.line(|| format!(
         "kind=settings fps={} white_balance={} strength={} period={} brightness={} \
          estimator={} ev_limits={} roi={} exclude_rois={} steps={} reference_gain={} \
          signal_bits={}",
@@ -208,7 +221,7 @@ fn execute(
         output_color.reference_gain.token(),
         options.signal_depth.token()
     ))?;
-    log.line(&format!(
+    log.line(|| format!(
         "kind=inventory frames={} first={} last={}",
         sources.len(),
         quote(&sources.first().map_or_else(String::new, |s| s.name.clone())),
@@ -238,7 +251,7 @@ fn execute(
     print_sequence_summary(&result.sequence, options.white_balance);
 
     let stage = &result.stage;
-    log.line(&format!(
+    log.line(|| format!(
         "kind=video path={} bytes={} codec={} profile={} width={} height={} frames={} \
          pix_fmt={} range={} resize={} verify={}",
         quote(&video.display().to_string()),
@@ -259,7 +272,7 @@ fn execute(
         },
         stage.verify
     ))?;
-    log.line(&format!(
+    log.line(|| format!(
         "kind=timing preflight={:.3} graph={:.3} validate={:.3}",
         stage
             .timings
@@ -281,12 +294,12 @@ fn execute(
     let published = publish_started.elapsed();
     let total = started.elapsed();
 
-    log.line_best_effort(&format!(
+    log.line_best_effort(|| format!(
         "kind=publish path={} duration={:.3}",
         quote(&video.display().to_string()),
         published.as_secs_f64()
     ));
-    log.line_best_effort(&format!(
+    log.line_best_effort(|| format!(
         "kind=timing.publish duration={:.3} total={:.3}",
         published.as_secs_f64(),
         total.as_secs_f64()
@@ -300,7 +313,7 @@ fn execute(
                 "warning: could not remove run scratch {}: {err}",
                 scratch.display()
             );
-            log.line_best_effort(&format!(
+            log.line_best_effort(|| format!(
                 "kind=warning message={}",
                 quote(&format!("could not remove run scratch: {err}"))
             ));
@@ -308,16 +321,18 @@ fn execute(
     } else {
         let cache = scratch.join("cache");
         println!("retained graph cache: {}", cache.display());
-        log.line_best_effort(&format!(
+        log.line_best_effort(|| format!(
             "kind=retained-cache count={} path={}",
             stage.retained_cache.len(),
             quote(&cache.display().to_string())
         ));
     }
-    log.line_best_effort("kind=run.complete");
+    log.line_best_effort(|| "kind=run.complete");
     println!("\nrun complete in {:.2}s", total.as_secs_f64());
     println!("video: {}", video.display());
-    println!("log:   {}", log.path().display());
+    if let Some(path) = &log_path {
+        println!("log:   {}", path.display());
+    }
     if log.reports_progress() {
         println!("rawtl-complete {}", stage.probe.frames.unwrap_or(result.sequence.count as u64));
     }

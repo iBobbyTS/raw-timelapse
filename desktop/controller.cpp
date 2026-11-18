@@ -509,11 +509,13 @@ QJsonObject Controller::exportProfile(const QJsonValue &fps) const {
 
 QString Controller::availableOutputPath() const {
     const QFileInfo base(outputPath_);
+    const bool writeLog = baseProfile_.value("log").toBool(
+        baseProfile_.value("deflicker_diagnostics").toBool());
     QString path = outputPath_;
     for (int number = 2; ; ++number) {
         const QFileInfo video(path);
         const QFileInfo log(video.dir().filePath(video.completeBaseName() + ".log"));
-        if (!video.exists() && !video.isSymLink() && !log.exists() && !log.isSymLink()
+        if (!video.exists() && !video.isSymLink() && (!writeLog || (!log.exists() && !log.isSymLink()))
             && std::ranges::none_of(jobs_, [&path](const Job &job) {
                 return job.output == path && (job.state == JobState::Waiting || job.state == JobState::Running);
             }))

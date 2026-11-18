@@ -20,7 +20,8 @@ rawtl-linear-video --input <DIR> --profile <default|ABSOLUTE_FILE> [--output <VI
     -h, --help             Print help
     --version              Print version
 
-The video and its sibling log are never overwritten.
+The video is never overwritten. Set \"log\": true in the profile to also save
+a sibling .log file.
 ";
 
 #[cfg(test)]
@@ -366,6 +367,7 @@ pub struct Options {
     pub video: PathBuf,
     /// The run log beside it: same file stem, `.log` extension.
     pub log: PathBuf,
+    pub write_log: bool,
     pub fps: Fps,
     pub fps_explicit: bool,
     pub white_balance: WhiteBalance,
@@ -841,6 +843,7 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
         input,
         video,
         log,
+        write_log: require_output,
         fps,
         fps_explicit,
         white_balance,

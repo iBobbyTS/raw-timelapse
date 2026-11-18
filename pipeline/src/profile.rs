@@ -70,7 +70,8 @@ fn parse_with_profile(args: &[String], desktop: Option<&str>) -> Result<Parsed> 
         let loaded = load(&profile);
         (profile, loaded)
     };
-    let mut settings = loaded.map_err(|message| usage(format!("profile {profile:?}: {message}")))?;
+    let (mut settings, write_log) =
+        loaded.map_err(|message| usage(format!("profile {profile:?}: {message}")))?;
     settings.push(format!("--input={input}"));
     if let Some(output) = &output {
         settings.push(format!("--output={output}"));
@@ -85,6 +86,10 @@ fn parse_with_profile(args: &[String], desktop: Option<&str>) -> Result<Parsed> 
         unreachable!("profile fields represent run settings");
     };
     options.profile_source = Some(profile.clone());
+    if write_log == Some(false) && options.deflicker_diagnostics {
+        return Err(usage("deflicker_diagnostics requires a run log; set \"log\": true or omit \"log\""));
+    }
+    options.write_log = write_log.unwrap_or(options.deflicker_diagnostics);
     if output.is_none() {
         let input = crate::guard::canonical_input(&options.input)?;
         let container = crate::graph_run::output_container(&options)?;
@@ -107,7 +112,7 @@ fn usage(message: impl Into<String>) -> Error {
     Error::new(EXIT_USAGE, message)
 }
 
-fn load(source: &str) -> std::result::Result<Vec<String>, String> {
+fn load(source: &str) -> std::result::Result<(Vec<String>, Option<bool>), String> {
     let contents = if source == "default" {
         include_str!("default_profile.json").to_owned()
     } else {
@@ -123,17 +128,19 @@ fn load(source: &str) -> std::result::Result<Vec<String>, String> {
     parse_contents(&contents)
 }
 
-fn parse_contents(contents: &str) -> std::result::Result<Vec<String>, String> {
+fn parse_contents(contents: &str) -> std::result::Result<(Vec<String>, Option<bool>), String> {
     let Json::Object(fields) = json::parse(contents)? else {
         return Err("expected a JSON object".into());
     };
     let mut seen = BTreeSet::new();
     let mut settings = Vec::new();
+    let mut write_log = None;
     for (key, value) in fields {
         if !seen.insert(key.clone()) {
             return Err(format!("duplicate field {key:?}"));
         }
         match (key.as_str(), value) {
+            ("log", Json::Bool(enabled)) => write_log = Some(enabled),
             ("deflicker_diagnostics", Json::Bool(true)) => settings.push("--deflicker-diagnostics".into()),
             ("deflicker_diagnostics", Json::Bool(false)) => {}
             ("verify_output", Json::Bool(true)) => settings.push("--verify-output".into()),
@@ -194,5 +201,5 @@ fn parse_contents(contents: &str) -> std::result::Result<Vec<String>, String> {
             }
         }
     }
-    Ok(settings)
+    Ok((settings, write_log))
 }

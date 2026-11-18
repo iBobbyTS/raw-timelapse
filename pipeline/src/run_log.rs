@@ -14,8 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub struct RunLog {
-    file: File,
-    path: PathBuf,
+    output: Option<(File, PathBuf)>,
     started: Instant,
     report_progress: bool,
     #[cfg(test)]
@@ -23,9 +22,19 @@ pub struct RunLog {
 }
 
 impl RunLog {
+    pub fn disabled() -> Self {
+        Self {
+            output: None,
+            started: Instant::now(),
+            report_progress: std::env::var_os("RAWTL_DESKTOP_PROGRESS").is_some_and(|value| value == "1"),
+            #[cfg(test)]
+            before_line: None,
+        }
+    }
+
     /// Create the log with `create_new`: an existing log is never overwritten.
     pub fn create(path: &Path, version: &str) -> Result<Self> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(path)
@@ -35,24 +44,14 @@ impl RunLog {
                     format!("cannot create run log {}: {err}", path.display()),
                 )
             })?;
-        let mut log = Self {
-            file,
-            path: path.to_path_buf(),
-            started: Instant::now(),
-            report_progress: std::env::var_os("RAWTL_DESKTOP_PROGRESS").is_some_and(|value| value == "1"),
-            #[cfg(test)]
-            before_line: None,
-        };
-        writeln!(log.file, "rawtl-linear-video {version}").map_err(|err| log_write_error(path, err))?;
+        writeln!(file, "rawtl-linear-video {version}").map_err(|err| log_write_error(path, err))?;
+        let mut log = Self::disabled();
+        log.output = Some((file, path.to_path_buf()));
         Ok(log)
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn elapsed_seconds(&self) -> f64 {
-        self.started.elapsed().as_secs_f64()
+    pub fn path(&self) -> Option<&Path> {
+        self.output.as_ref().map(|(_, path)| path.as_path())
     }
 
     pub(crate) fn reports_progress(&self) -> bool { self.report_progress }
@@ -67,26 +66,31 @@ impl RunLog {
     }
 
     /// Append one `wall=... elapsed=... <payload>` line.
-    pub fn line(&mut self, payload: &str) -> Result<()> {
+    pub fn line<T: AsRef<str>>(&mut self, payload: impl FnOnce() -> T) -> Result<()> {
+        let Some((file, path)) = &mut self.output else {
+            return Ok(());
+        };
+        let payload = payload();
+        let payload = payload.as_ref();
         #[cfg(test)]
         if let Some(hook) = &mut self.before_line {
-            hook(payload, &mut self.file);
+            hook(payload, file);
         }
         let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs_f64())
             .unwrap_or(0.0);
         writeln!(
-            self.file,
+            file,
             "wall={wall:.3} elapsed={:.3} {payload}",
-            self.elapsed_seconds()
+            self.started.elapsed().as_secs_f64()
         )
-        .map_err(|err| log_write_error(&self.path, err))
+        .map_err(|err| log_write_error(path, err))
     }
 
     /// Best-effort append used after the video is already published: a log
     /// failure must not turn a published deliverable into a failed run.
-    pub fn line_best_effort(&mut self, payload: &str) {
+    pub fn line_best_effort<T: AsRef<str>>(&mut self, payload: impl FnOnce() -> T) {
         if let Err(err) = self.line(payload) {
             eprintln!("warning: {}", err.message);
         }
@@ -138,7 +142,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("run.log");
         let mut log = RunLog::create(&path, "9.9.9").unwrap();
-        log.line(&format!("kind=note message={}", quote("two\nlines \"q\"")))
+        log.line(|| format!("kind=note message={}", quote("two\nlines \"q\"")))
             .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();

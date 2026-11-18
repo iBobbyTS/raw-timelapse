@@ -68,7 +68,7 @@ impl OutputColor {
         };
         let (profile, make, model) = detect(first, exiftool)?;
         let resolved = ResolvedOutputColor::new(profile, cat, gain)?;
-        log.line(&format!(
+        log.line(|| format!(
             "kind=auto-log source={} make={} model={} profile={}",
             quote(&first.name),
             quote(&make),

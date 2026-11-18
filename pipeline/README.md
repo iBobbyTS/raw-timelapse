@@ -5,11 +5,10 @@ frames, convert each source once into a run-local LinearRaw cache, measure and
 solve a best-effort exposure plan in one sequential node, stream each developed
 frame through scene-linear colour conversion into FFmpeg, check the encoded
 file against container metadata (full verification is opt-in via
-`verify_output`), and publish **one video file and one run log**.
+`verify_output`), and publish **one video file** with an optional run log.
 
 The deflicker node is enabled by default. There is no report directory, manifest,
-CSV, audit JSON or per-frame log in the product output: the log beside the video
-is the operational record.
+CSV, audit JSON or per-frame log in the product output.
 
 The crate has no external Rust dependencies, no async runtime and no Python in
 the product path. Child processes are invoked with `std::process::Command` using
@@ -43,9 +42,10 @@ a positive integer (for example `60`) or a rational string (for example
 `"60000/1001"`), up to 1000 fps. When omitted, `fps` defaults to 60.
 
 Omit `--output` to write beside the source directory. With the default profile,
-`/data/banff.v2/` produces `/data/banff.v2.mov` and `/data/banff.v2.log`. An
-explicit video path must match the profile's container. Existing videos and
-logs are never overwritten. Use `--help` or `--version` for CLI information.
+`/data/banff.v2/` produces `/data/banff.v2.mov`. Set `"log": true` in a
+processing profile to also write a sibling `.log` file. Logging is off by
+default. An explicit video path must match the profile's container. Existing
+deliverables are never overwritten. Use `--help` or `--version` for CLI information.
 
 ## Lens correction
 
@@ -78,11 +78,11 @@ consumers default to recovery off for diagnostic development.
 <video file>     the deliverable, published by one rename after a container
                  metadata check (verify_output adds frame counting by decode
                  and a complete decode)
-<stem>.log       the single run log
+<stem>.log       optional run log ("log": true)
 ```
 
-A normal run leaves exactly those two files beside whatever already existed in
-the directory. Nothing else is created there.
+With `"deflicker_diagnostics": true`, the diagnostic report is stored in the
+run log. Enable logging or omit the `log` field when using this option.
 
 The log is line-oriented; every entry carries `wall=<epoch seconds>` and
 `elapsed=<monotonic seconds>` followed by `kind=...` and bounded fields:

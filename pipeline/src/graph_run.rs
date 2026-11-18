@@ -382,7 +382,7 @@ impl Backend for Runner<'_, '_> {
         elapsed: Duration,
         diagnostics: &str,
     ) -> graph::Result<()> {
-        let written = self.log.line(&format!(
+        let written = self.log.line(|| format!(
             "kind=prepare.sequence count={count} {diagnostics} total_wall={:.6}",
             elapsed.as_secs_f64()
         ));
@@ -417,7 +417,7 @@ impl Backend for Runner<'_, '_> {
         if id + 1 == self.context.sources.len() && !self.generated_paths.is_empty() {
             self.progress("convert");
         }
-        let written = self.log.line(&format!(
+        let written = self.log.line(|| format!(
             "kind=prepare frame={} source={} route={} generated={} cache={}",
             id + 1,
             quote(&prepared.source_name),
@@ -450,7 +450,7 @@ impl Backend for Runner<'_, '_> {
         let active = self.active.clone();
         let results = self.early_results.clone();
         let detail = self.analysis_detail();
-        let written = self.log.line(&format!(
+        let written = self.log.line(|| format!(
             "kind=measure.early frame={} source={}", id + 1, quote(&prepared.source_name)
         ));
         self.result(written)?;
@@ -518,7 +518,7 @@ impl Backend for Runner<'_, '_> {
         };
         self.measurements.push(measurement);
         self.progress("deflicker");
-        let written = self.log.line(&format!(
+        let written = self.log.line(|| format!(
             "kind=measure frame={} source={} duration={:.3} reused_early={}",
             id + 1,
             quote(&r.source_name),
@@ -547,7 +547,7 @@ impl Backend for Runner<'_, '_> {
         self.capture_times = Vec::new();
         if let Some(report) = report {
             let document = crate::json::to_pretty_string(&report.diagnostics(&self.measurements)).replace('\n', "");
-            let written = self.log.line(&format!("kind=deflicker.diagnostics report={document}"));
+            let written = self.log.line(|| format!("kind=deflicker.diagnostics report={document}"));
             self.result(written)?;
         }
         self.measurements = Vec::new();
@@ -557,7 +557,7 @@ impl Backend for Runner<'_, '_> {
             reference_identity: id.to_string(),
             ev,
         }).collect();
-        let written = self.log.line(&format!(
+        let written = self.log.line(|| format!(
             "kind=solve frames={} duration={:.3}",
             count,
             started.elapsed().as_secs_f64()
@@ -644,7 +644,7 @@ impl Backend for Runner<'_, '_> {
             limited_by,
             ..
         } = decision;
-        let written = self.log.line(&format!(
+        let written = self.log.line(|| format!(
             "kind=reference_gain requested=auto profile={} frames={} channel_samples={} \
              desired={:.9} desired_ev={:.2} safe_positive={:.9} safe_negative={:.9} \
              max_target_linear={:.9} min_target_linear={:.9} applied={:.9} applied_ev={:+.2} \
@@ -738,7 +738,7 @@ impl Backend for Runner<'_, '_> {
             return Err("graph: image identity mismatch".into());
         }
         if let Some(window)=image.crop_record {
-            let written=self.log.line(&format!("kind=lens.crop frame={} fixed_sequence=true window={:.9},{:.9},{:.9},{:.9} output={}x{} scale={:.9},{:.9}",info.index,window.left,window.top,window.right,window.bottom,info.width,info.height,f64::from(info.width)/(window.right-window.left),f64::from(info.height)/(window.bottom-window.top)));
+            let written=self.log.line(|| format!("kind=lens.crop frame={} fixed_sequence=true window={:.9},{:.9},{:.9},{:.9} output={}x{} scale={:.9},{:.9}",info.index,window.left,window.top,window.right,window.bottom,info.width,info.height,f64::from(info.width)/(window.right-window.left),f64::from(info.height)/(window.bottom-window.top)));
             self.result(written)?;
         }
         if kind == Kind::Develop {
@@ -760,7 +760,7 @@ impl Backend for Runner<'_, '_> {
             if id == 0 {
                 self.camera_model = model.map(str::to_owned);
                 let text = |key| c.get(key).and_then(crate::json::Json::as_str).unwrap_or("unknown");
-                let written = self.log.line(&format!(
+                let written = self.log.line(|| format!(
                     "kind=camera.colour color_contract_version=2 algorithm_revision=4 recipe_requested={} recipe_effective={} profile_fingerprint={} camera_model={} hue_sat_map={} look_table={} tone_curve={} baseline_exposure={} calibration={} calibration_status={} input_cat=bradford-d50-d60",
                     text("recipe_requested"), text("recipe_effective"), quote(text("profile_fingerprint")), quote(text("camera_model")),
                     text("hue_sat_map_status"), text("look_table_status"), text("tone_curve_status"), text("baseline_exposure_status"), text("camera_calibration_effective"),
@@ -770,23 +770,23 @@ impl Backend for Runner<'_, '_> {
             }
             if let Some(report) = &info.decode_semantics {
                 let document = crate::json::to_pretty_string(report).replace('\n', "");
-                let written = self.log.line(&format!("kind=decode.diagnostics frame={} report={document}", info.index));
+                let written = self.log.line(|| format!("kind=decode.diagnostics frame={} report={document}", info.index));
                 self.result(written)?;
             }
             if let Some(lens) = &info.lens_correction {
-                let written = self.log.line(&format!("kind=lens frame={} report={}", info.index, crate::json::to_pretty_string(lens).replace('\n', "")));
+                let written = self.log.line(|| format!("kind=lens frame={} report={}", info.index, crate::json::to_pretty_string(lens).replace('\n', "")));
                 self.result(written)?;
             }
             if let Some(recovery) = &info.highlight_recovery {
                 let text = |key| recovery.get(key).and_then(crate::json::Json::as_str).unwrap_or("unknown");
                 let count = |key| recovery.get(key).and_then(crate::json::Json::as_u64).unwrap_or(0);
-                let written = self.log.line(&format!(
+                let written = self.log.line(|| format!(
                     "kind=highlight frame={} revision=1 status={} affected={} partial={} full={} spatial={} fallback={} evidence={}",
                     info.index, text("status"), count("affected_pixels"), count("partial_pixels"),
                     count("full_pixels"), count("spatial_pixels"), count("fallback_pixels"), quote(text("evidence"))));
                 self.result(written)?;
             }
-            let written=self.log.line(&format!(
+            let written=self.log.line(|| format!(
                 "kind=develop frame={} source={} ev={:.9} wb={} wb_source={} as_shot={} pixels={} duration={:.3}",
                 info.index,quote(&info.source_name),info.exposure_ev,frame::format_wb(info.applied_wb),info.wb_source,frame::format_wb(info.as_shot_neutral),
                 match &image.pixels {Pixels::Linear(p)=>p.len(),_=>0},elapsed.as_secs_f64()));
@@ -806,7 +806,7 @@ impl Backend for Runner<'_, '_> {
                 }
             }
             if let Kind::Exposure(ev) = kind {
-                let written = self.log.line(&format!(
+                let written = self.log.line(|| format!(
                     "kind=exposure frame={} ev={:.9} total_ev={:.9}",
                     info.index, ev, info.exposure_ev
                 ));
@@ -819,7 +819,7 @@ impl Backend for Runner<'_, '_> {
                 Kind::Color => "color",
                 _ => unreachable!("only image transformations reach this commit"),
             };
-            if kind == Kind::Color {
+            if kind == Kind::Color && self.log.path().is_some() {
                 // Ordered commit: one accumulation per delivered frame. Worker
                 // threads never share these counters, so concurrency cannot
                 // duplicate or drop a frame's samples.
@@ -832,7 +832,7 @@ impl Backend for Runner<'_, '_> {
                 self.color_channel_samples += samples;
                 self.color_frames += 1;
             }
-            let written = self.log.line(&format!(
+            let written = self.log.line(|| format!(
                 "kind=image node_kind={token} frame={} duration={:.3}",
                 info.index,
                 elapsed.as_secs_f64()
@@ -868,16 +868,16 @@ impl Backend for Runner<'_, '_> {
         if id != self.sequence.as_ref().map_or(0, |sequence| sequence.count) {
             return Err("graph: encode commit order mismatch".into());
         }
-        if id == 0 {
+        if id == 0 && self.log.path().is_some() {
             let command = self.encoder.lock().unwrap().command().map(str::to_owned);
             if let Some(command) = command {
                 let written = self
                     .log
-                    .line(&format!("kind=encoder.command args={}", quote(&command)));
+                    .line(|| format!("kind=encoder.command args={}", quote(&command)));
                 self.result(written)?;
             }
         }
-        let written = self.log.line(&format!(
+        let written = self.log.line(|| format!(
             "kind=encode frame={} duration={:.3}",
             id + 1,
             elapsed.as_secs_f64()
@@ -902,7 +902,9 @@ impl Backend for Runner<'_, '_> {
         node: &str,
         stats: graph::ordered_frames::StageStats,
     ) -> graph::Result<()> {
-        self.stage_stats.insert(node.into(), stats);
+        if self.log.path().is_some() {
+            self.stage_stats.insert(node.into(), stats);
+        }
         Ok(())
     }
     fn end(&mut self) -> graph::Result<()> {
@@ -916,7 +918,7 @@ impl Backend for Runner<'_, '_> {
             });
             self.result(result)?;
             self.generated_paths.remove(&r.dng);
-            let written = self.log.line(&format!(
+            let written = self.log.line(|| format!(
                 "kind=delete frame={} source={} path={}",
                 id + 1,
                 quote(&r.source_name),
@@ -927,19 +929,18 @@ impl Backend for Runner<'_, '_> {
         Ok(())
     }
     fn event(&mut self, event: &Event) -> graph::Result<()> {
-        let frame = match event.frame_id {
-            Some(id) => (id + 1).to_string(),
-            None => "sequence".to_string(),
-        };
-        let scope = if event.scope == Scope::Frame {
-            "frame"
-        } else {
-            "sequence"
-        };
-        let written = self.log.line(&format!(
-            "kind=node node={} frame={} scope={}",
-            event.node, frame, scope
-        ));
+        let written = self.log.line(|| {
+            let frame = match event.frame_id {
+                Some(id) => (id + 1).to_string(),
+                None => "sequence".to_string(),
+            };
+            let scope = if event.scope == Scope::Frame {
+                "frame"
+            } else {
+                "sequence"
+            };
+            format!("kind=node node={} frame={} scope={}", event.node, frame, scope)
+        });
         self.result(written)
     }
 }
@@ -1148,7 +1149,7 @@ pub fn run(
     let explicit_resize = graph.resize_geometry();
     let profile = context.output_color.profile;
     let range = config.effective_range(profile);
-    log.line(&format!(
+    log.line(|| format!(
         "kind=graph source={} nodes={} concurrency={}",
         match &context.options.graph {
             Some(path) => quote(&path.display().to_string()),
@@ -1163,9 +1164,9 @@ pub fn run(
             .join(","),
     ))?;
     if let Some(export) = config.export() {
-        log.line(&format!("kind=export profile={} input_format={}", quote(&export.name), export.input.name()))?;
+        log.line(|| format!("kind=export profile={} input_format={}", quote(&export.name), export.input.name()))?;
     }
-    log.line(&format!(
+    log.line(|| format!(
         "kind=encoder encoder={} container={} pix_fmt={} profile={} range={} geometry={}",
         config.encoder,
         config.container.as_str(),
@@ -1177,7 +1178,7 @@ pub fn run(
             None => "source".to_string(),
         }
     ))?;
-    log.line(&format!(
+    log.line(|| format!(
         "kind=colour profile={} camera_color={} matrix={} primaries={} transfer={} \
          reference_gain={} reference_status=unverified effective_range={} \
          camera_color_requested={} recipe_effective={} profile_correction={} camera_calibration={} \
@@ -1287,7 +1288,7 @@ pub fn run(
     let graph_started = Instant::now();
     let result = graph::execute(&graph, context.sources.len(), &mut runner);
     for (node, stats) in &runner.stage_stats {
-        let written = runner.log.line(&format!("kind=stage node={} concurrency={} accepted={} committed={} delivered={} peak_in_flight={} capacity_unit={}",node,stats.capacity,stats.accepted,stats.committed,stats.delivered,stats.peak,if node == graph.prepare_node_id() { "sequence" } else { "frames" }));
+        let written = runner.log.line(|| format!("kind=stage node={} concurrency={} accepted={} committed={} delivered={} peak_in_flight={} capacity_unit={}",node,stats.capacity,stats.accepted,stats.committed,stats.delivered,stats.peak,if node == graph.prepare_node_id() { "sequence" } else { "frames" }));
         // Diagnostics must not replace the graph's selected error or STOP.
         // With a successful graph, a summary append failure remains fatal.
         if result.is_ok() {
@@ -1295,7 +1296,7 @@ pub fn run(
         }
     }
     if let Err(message) = result {
-        let _ = runner.log.line(&format!(
+        let _ = runner.log.line(|| format!(
             "kind=node.error message={} cache_root={}",
             quote(&message),
             quote(&context.scratch.join("cache").display().to_string())
@@ -1358,7 +1359,7 @@ pub fn run(
     let clip_low = runner.clipped_low;
     let clip_high = runner.clipped_high;
     let clip_samples = runner.color_channel_samples;
-    runner.log.line(&format!(
+    runner.log.line(|| format!(
         "kind=clip frames={} clipped_low={} clipped_high={} clipped_total={} \
          total_channel_samples={} unit=channel_samples",
         clip_frames,
