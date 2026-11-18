@@ -200,11 +200,14 @@ void reduce_preview(Decoded &decoded, uint32_t edge, void (*cancel)()) {
 }
 } // namespace
 Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe recipe,
-               void (*cancel)(), lens::Request lens_request, uint32_t preview_edge) {
+               void (*cancel)(), lens::Request lens_request, uint32_t preview_edge,
+               bool export_input) {
   std::array<bool, 3> lens_coverage{};
-  auto routing = inspect(path, lens_request.calibration ? &lens_coverage : nullptr);
-  if (!routing || route(routing->photometric) != Route::direct)
-    throw Error(23, "CFA cannot enter SDK");
+  if (!export_input) {
+    auto routing = inspect(path, lens_request.calibration ? &lens_coverage : nullptr);
+    if (!routing || route(routing->photometric) != Route::direct)
+      throw Error(23, "CFA cannot enter SDK");
+  }
   try {
     Host host;
     host.SetForPreview(false);
@@ -280,9 +283,10 @@ Decoded decode(const fs::path &path, const std::optional<Vec> &wb, CameraRecipe 
     const bool highlight_endpoints_supported = ifd.fSampleFormat[0] == 1 &&
         n->OpcodeList2().Count() == 0 && n->OpcodeList3().Count() == 0;
     lens::Calibration lens_calibration = lens_request.calibration ? *lens_request.calibration : lens::Calibration{};
-    for (size_t i = 0; i < lens_coverage.size(); ++i)
-      if (lens_coverage[i] && lens_calibration.upstream[i] != lens::Upstream::applied)
-        lens_calibration.upstream[i] = lens::Upstream::sdk;
+    if (!export_input)
+      for (size_t i = 0; i < lens_coverage.size(); ++i)
+        if (lens_coverage[i] && lens_calibration.upstream[i] != lens::Upstream::applied)
+          lens_calibration.upstream[i] = lens::Upstream::sdk;
     n->BuildStage2Image(host);
     n->BuildStage3Image(host);
     const auto *image = n->Stage3Image();

@@ -189,11 +189,12 @@ def run_case(mode):
                 assert len(develops)==5
                 assert all(' wb=0.5,1,0.75' in line for line in develops),develops
         else:
-            if mode!='measure-error':
+            if mode not in ['measure-error','wrong']:
                 assert 'kind=prepare frame=' not in trace and not measure.exists(),trace
             assert 'kind=run.success' not in trace
             assert all(absent(pid) for pid in owned),owned
             if mode=='measure-error':assert b'chosen measurement failure' in stderr,stderr
+            if mode=='wrong':assert measure.exists() and b'SDK' in stderr,stderr
             if mode in ['interrupt','terminate']:assert p.returncode==130,p.returncode
             if mode=='timeout':assert b'timed out' in stderr or b'timeout' in stderr,stderr
         if mode in ['interrupt','terminate','timeout']:assert len(calls.read_text().splitlines())==1,'Converter restarted after cancellation'

@@ -395,9 +395,9 @@ std::vector<std::filesystem::path> default_profile_roots() {
 }
 ProfileCatalog::ProfileCatalog(std::vector<std::filesystem::path> roots)
     : roots_(std::move(roots)) {}
-std::array<Model, 3> ProfileCatalog::resolve(Calibration &c, double crop,
-                                             double aspect, std::string &reason,
-                                             const std::string &lens_info) {
+const Profile *ProfileCatalog::match(Calibration &c, double crop,
+                                     double aspect, std::string &reason,
+                                     const std::string &lens_info) {
   const auto make = normalized(c.make);
   const auto camera = normalized(c.camera);
   // Use body identity only for verified fixed-lens models. The same optics
@@ -444,11 +444,14 @@ std::array<Model, 3> ProfileCatalog::resolve(Calibration &c, double crop,
     reason = "no-matching-lcp";
     return {};
   }
-  std::vector<Profile> candidates;
+  std::vector<const Profile *> candidates;
   int best = -1;
   std::set<std::string> hashes;
   for (const auto &path : it->second) {
-    auto p = read_profile(path);
+    auto stored = parsed_.find(path);
+    if (stored == parsed_.end())
+      stored = parsed_.emplace(path, read_profile(path)).first;
+    const auto &p = stored->second;
     const auto lens_key = normalized(c.lens);
     const bool named = normalized(p.lens) == lens_key ||
         std::any_of(p.aliases.begin(), p.aliases.end(), [&](const auto &alias) {
@@ -473,7 +476,7 @@ std::array<Model, 3> ProfileCatalog::resolve(Calibration &c, double crop,
       best = score;
     }
     if (score == best && hashes.insert(p.fingerprint).second)
-      candidates.push_back(std::move(p));
+      candidates.push_back(&p);
   }
   if (candidates.empty()) {
     reason = "unsupported-lcp-or-unknown-sensor-geometry";
@@ -483,7 +486,7 @@ std::array<Model, 3> ProfileCatalog::resolve(Calibration &c, double crop,
     reason = "ambiguous-lcp-match";
     return {};
   }
-  const auto &selected = candidates.front();
+  const auto &selected = *candidates.front();
   if (fixed) {
     c.lens = selected.pretty_name.empty() ? selected.lens : selected.pretty_name;
     reason = "match=fixed-camera-lens-spec; ";
@@ -492,7 +495,13 @@ std::array<Model, 3> ProfileCatalog::resolve(Calibration &c, double crop,
         ? "match=primary-lens; " : "match=official-alias; ";
   }
   reason += "lcp-image-field-log-focal-apex-aperture-log-focus; missing-focus=far";
-  return interpolate_profile(selected, c.focal, c.aperture, c.focus,
-                             crop);
+  return &selected;
+}
+std::array<Model, 3> ProfileCatalog::resolve(Calibration &c, double crop,
+                                             double aspect, std::string &reason,
+                                             const std::string &lens_info) {
+  const auto *profile = match(c, crop, aspect, reason, lens_info);
+  return profile ? interpolate_profile(*profile, c.focal, c.aperture, c.focus, crop)
+                 : std::array<Model, 3>{};
 }
 } // namespace frame::lens

@@ -485,7 +485,8 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
     auto converted = convert_inputs(inputs, dir, converter, timeout, temporary, sequence, ready, in_memory);
     for (size_t i = 0; i < indices.size(); ++i) {
       auto &out = frames[indices[i]];
-      out.prepared_dng = canonical_existing(converted[i].output, "prepared DNG");
+      out.prepared_dng = in_memory ? converted[i].output
+                                   : canonical_existing(converted[i].output, "prepared DNG");
       out.conversion = std::move(converted[i].info);
       out.generated = true;
       out.prepared_hash = out.conversion.output_sha256;
@@ -496,28 +497,43 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
     if (!sequence) write_standalone_conversion(frames.front(), scratch / "conversion-0.record");
   }
   auto verification_start = std::chrono::steady_clock::now();
+  const auto first_geometry = in_memory
+      ? (frames.front().generated ? inspect(frames.front().prepared_dng) : frames.front().routing)
+      : std::nullopt;
+  if (in_memory && !first_geometry)
+    throw Error(23, "cannot determine first prepared DNG geometry: " + frames.front().source.string());
   for (auto &out : frames) {
     check_cancelled();
     if (out.kind == Route::vendor_raw) out.own = read_neutral(out.prepared_dng);
-    auto check = in_memory && !out.generated ? out.routing : inspect(out.prepared_dng);
-    if (!check || check->photometric != 34892 || !check->width || !check->height)
-      throw Error(23, "prepared DNG is not nonzero LinearRaw (34892): " + out.source.string());
+    if (in_memory) {
+      out.main_ifd_width = first_geometry->width;
+      out.main_ifd_height = first_geometry->height;
+    } else {
+      const auto geometry = inspect(out.prepared_dng);
+      if (!geometry || geometry->photometric != 34892)
+        throw Error(23, "prepared DNG is not nonzero LinearRaw (34892): " + out.source.string());
+      out.main_ifd_width = geometry->width;
+      out.main_ifd_height = geometry->height;
+    }
     if (!out.generated) {
       out.prepared_hash = out.source_hash;
       out.prepared_version = out.source_version;
     }
-    out.main_ifd_width = check->width;
-    out.main_ifd_height = check->height;
     if (capture_time) out.capture_time = read_capture_time(out.kind == Route::vendor_raw ? out.prepared_dng : out.source);
     if (!in_memory) check_prepared_versions(out);
   }
-  std::vector<lens::SourcePair> lens_sources;
-  for (const auto &f : frames) lens_sources.push_back({f.source, f.prepared_dng, f.generated, f.main_ifd_width, f.main_ifd_height});
-  try {
-    auto calibration = lens::collect(lens_sources, scratch, lens_options, in_memory);
-    for (size_t i = 0; i < frames.size(); ++i) frames[i].lens_calibration = std::move(calibration[i]);
-  } catch (const Error &) { throw; }
-  catch (const std::exception &e) { throw Error(26, std::string("lens calibration acquisition failed: ") + e.what()); }
+  if (lens_options.collect) {
+    std::vector<lens::SourcePair> lens_sources;
+    lens_sources.reserve(frames.size());
+    for (const auto &f : frames)
+      lens_sources.push_back({f.source, f.prepared_dng, f.generated, f.main_ifd_width, f.main_ifd_height});
+    try {
+      auto calibration = lens::collect(lens_sources, scratch, lens_options, in_memory);
+      for (size_t i = 0; i < frames.size(); ++i)
+        frames[i].lens_calibration = std::move(calibration[i]);
+    } catch (const Error &) { throw; }
+    catch (const std::exception &e) { throw Error(26, std::string("lens calibration acquisition failed: ") + e.what()); }
+  }
   auto end = std::chrono::steady_clock::now();
   auto seconds = [](auto a, auto b) { return std::chrono::duration<double>(b-a).count(); };
   std::cerr << "prepare count=" << frames.size() << " adc_calls=" << (inputs.empty() ? 0 : 1)
@@ -873,7 +889,8 @@ Decoded decode_prepared(const PreparedFrame &prepared,
   if (lens_enabled && !prepared.lens_calibration.collected) throw Error(26, "lens auto requires a context prepared with lens metadata collection");
   Decoded decoded = decode(prepared.prepared_dng,
                            wb ? wb : std::optional<Vec>(prepared.own), recipe, check_cancelled,
-                           {&prepared.lens_calibration, lens_enabled, policy}, preview_edge);
+                           {&prepared.lens_calibration, lens_enabled, policy}, preview_edge,
+                           prepared.frame_id.has_value());
   if (recipe.calibration == CameraCalibration::canon_normal_white_fixed_v1) {
     if (prepared.kind != Route::vendor_raw) throw Error(40, "Canon calibration requires original Canon CR3");
     calibrate_canon_cr3(prepared.source, decoded);

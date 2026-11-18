@@ -79,7 +79,8 @@ struct CameraRecipe {
 };
 Decoded decode(const fs::path &, const std::optional<Vec> &,
                CameraRecipe = CameraRecipe{}, void (*cancel)() = nullptr,
-               lens::Request lens_request = {}, uint32_t preview_edge = 0);
+               lens::Request lens_request = {}, uint32_t preview_edge = 0,
+               bool export_input = false);
 double canon_normal_white_gain(double maximum, double black, double white,
                                double dng_white, double dng_black);
 void calibrate_canon_cr3(const fs::path &, Decoded &);

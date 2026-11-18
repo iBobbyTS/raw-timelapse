@@ -180,123 +180,97 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
   const auto directory = scratch / "lens";
   if (!in_memory && !std::filesystem::create_directory(directory))
     throw Error(26, "lens metadata requires a fresh private scratch directory");
-  auto xml_path = directory / "metadata.xml", log = directory / "metadata.log";
-  std::vector<std::string> args = {
-      options.exiftool,
-      "-config",
-      "",
-      "-X",
-      "-n",
-      "-a",
-      "-G1",
-      "-Make",
-      "-Model",
-      "-LensModel",
-      "-LensInfo",
-      "-LensType", "-LensID", "-Lens", "-LensSpec",
-      "-FocalLength",
-      "-FocalLengthIn35mmFormat",
-      "-FNumber",
-      "-FocusDistance",
-      "-FocusDistance2",
-      "-FocalPlaneXResolution",
-      "-FocalPlaneResolutionUnit",
-      "-ExifImageWidth",
-      "-VignettingCorrParams",
-      "-DistortionCorrParams",
-      "-ChromaticAberrationCorrParams",
-      "-RadialDistortionCoefficient1",
-      "-RadialDistortionCoefficient2",
-      "-RadialDistortionCoefficient3",
-      "-VignetteCoefficient1",
-      "-VignetteCoefficient2",
-      "-VignetteCoefficient3",
-      "-DistortionCorrectionVersion",
-      "-DistortionCorrection",
-      "-VignetteCorrectionVersion",
-      "-GeometricDistortionParams",
-      "-VignettingParams",
-      "-ChromaticAberrationParams",
-      "-DistortionCorrectionAlreadyApplied",
-      "-VignetteCorrectionAlreadyApplied",
-      "-LateralChromaticAberrationCorrectionAlreadyApplied",
-      "-OpcodeList1",
-      "-OpcodeList2",
-      "-OpcodeList3",
-      "-Error",
-      "-Warning"};
-  std::set<std::string> paths;
+  const std::vector<std::string> flags = {
+      "-XMP-aux:VignetteCorrectionAlreadyApplied",
+      "-XMP-aux:DistortionCorrectionAlreadyApplied",
+      "-XMP-aux:LateralChromaticAberrationCorrectionAlreadyApplied"};
+  std::vector<std::string> original_tags = {
+      "-IFD0:Make", "-XMP-tiff:Make", "-IFD0:Model", "-XMP-tiff:Model",
+      "-ExifIFD:LensInfo", "-ExifIFD:FocalLength", "-Sony:FocalLength", "-Nikon:FocalLength",
+      "-ExifIFD:FocalLengthIn35mmFormat",
+      "-ExifIFD:FocalPlaneXResolution", "-ExifIFD:FocalPlaneResolutionUnit", "-ExifIFD:ExifImageWidth",
+      "-SR2SubIFD:VignettingCorrParams", "-SubIFD:VignettingCorrParams",
+      "-SR2SubIFD:DistortionCorrParams", "-SubIFD:DistortionCorrParams",
+      "-SR2SubIFD:ChromaticAberrationCorrParams", "-SubIFD:ChromaticAberrationCorrParams",
+      "-Nikon:VignetteCorrectionVersion", "-Nikon:DistortionCorrectionVersion",
+      "-SubIFD:OpcodeList1", "-SubIFD:OpcodeList2", "-SubIFD:OpcodeList3",
+      "-IFD0:OpcodeList1", "-IFD0:OpcodeList2", "-IFD0:OpcodeList3"};
+  for (auto field : identity_detail::model_fields)
+    original_tags.emplace_back(std::string("-") + field);
+  for (auto field : identity_detail::vendor_fields)
+    original_tags.emplace_back(std::string("-") + field);
+  original_tags.insert(original_tags.end(), flags.begin(), flags.end());
+
+  std::set<std::string> originals, generated;
   for (const auto &s : sources) {
-    paths.insert(s.source.string());
-    paths.insert(s.prepared.string());
+    originals.insert(s.source.string());
+    if (s.converted)
+      generated.insert(s.prepared.string());
   }
-  size_t base_bytes = 0;
-  for (const auto &arg : args)
-    base_bytes += arg.size() + 1 + sizeof(char *);
   const size_t budget = std::min<size_t>(65536, converter_argv_budget());
-  // Short paths can otherwise pack hundreds of network reads into one timeout.
-  constexpr size_t max_paths_per_invocation = 96;
-  std::map<std::string, Tags> records;
-  std::vector<std::string> invocation = args;
-  size_t bytes = base_bytes, part = 0;
-  auto extract = [&] {
-    const auto output =
-        part == 0 ? xml_path
-                  : directory / ("metadata-" + std::to_string(part) + ".xml");
-    const auto transcript =
-        part == 0 ? log
-                  : directory / ("metadata-" + std::to_string(part) + ".log");
-    const auto extract_xml = [&](const auto &args, const auto &log_path,
-                                 const auto &output_path) {
-      auto result = run_process(args, log_path, 120, output_path, {}, {},
-                                in_memory, 16 * 1024 * 1024);
-      if (result.timed_out || result.exit_code != 0)
-        throw Error(26, (result.timed_out ? "lens metadata extraction timed out: "
-                                      : "lens metadata extraction failed: ") +
-                            (in_memory ? result.errors : log_path.string()));
-      return metadata(in_memory ? result.output : xml::read(output_path));
+  // Bound each invocation as well as argv size for slow network sources.
+  constexpr size_t max_paths = 96;
+  auto extract = [&](const std::set<std::string> &paths,
+                     const std::vector<std::string> &tags,
+                     const char *name, bool numeric) {
+    std::map<std::string, Tags> result;
+    std::vector<std::string> args = {options.exiftool, "-config", "", "-X", "-a", "-G1", "-Error"};
+    if (numeric)
+      args.emplace_back("-n");
+    args.insert(args.end(), tags.begin(), tags.end());
+    size_t base_bytes = 0;
+    for (const auto &arg : args)
+      base_bytes += arg.size() + 1 + sizeof(char *);
+    size_t bytes = base_bytes, part = 0;
+    auto invocation = args;
+    auto flush = [&] {
+      const auto stem = directory / (std::string(name) + "-" + std::to_string(part++));
+      const auto xml_path = stem.string() + ".xml";
+      const auto transcript = stem.string() + ".log";
+      auto process = run_process(invocation, transcript, 120, xml_path, {}, {},
+                                 in_memory, 16 * 1024 * 1024);
+      if (process.timed_out || process.exit_code != 0)
+        throw Error(26, (process.timed_out ? "lens metadata extraction timed out: "
+                                         : "lens metadata extraction failed: ") +
+                            (in_memory ? process.errors : transcript));
+      result.merge(metadata(in_memory ? process.output : xml::read(xml_path)));
+      invocation = args;
+      bytes = base_bytes;
     };
-    auto values = extract_xml(invocation, transcript, output);
-    std::vector<std::string> named = {options.exiftool, "-config", "", "-X", "-a", "-G1",
-        "-LensID", "-LensType", "-Lens", "-LensSpec", "-Error", "-Warning"};
-    named.insert(named.end(), invocation.begin() + args.size(), invocation.end());
-    const auto named_output = directory / ("identities-" + std::to_string(part) + ".xml");
-    const auto named_log = directory / ("identities-" + std::to_string(part) + ".log");
-    auto labels = extract_xml(named, named_log, named_output);
-    for (auto &[path, tags] : values) {
-      const auto label = labels.find(path);
-      if (label == labels.end())
-        throw Error(26, "lens identity extraction omitted an input");
-      for (const auto &[key, value] : label->second)
-        tags.emplace("display:" + key, value);
-      if (!records.emplace(path, std::move(tags)).second)
-        throw Error(26, "duplicate lens metadata source");
+    for (const auto &path : paths) {
+      const size_t size = path.size() + 1 + sizeof(char *);
+      if (base_bytes + size > budget)
+        throw Error(26, "lens metadata source exceeds argv budget");
+      if (bytes + size > budget || invocation.size() - args.size() == max_paths)
+        flush();
+      invocation.push_back(path);
+      bytes += size;
     }
-    invocation = args;
-    bytes = base_bytes;
-    ++part;
+    if (invocation.size() > args.size())
+      flush();
+    return result;
   };
-  for (const auto &path : paths) {
-    const size_t size = path.size() + 1 + sizeof(char *);
-    if (base_bytes + size > budget)
-      throw Error(26, "lens metadata source exceeds argv budget");
-    if (bytes + size > budget || invocation.size() - args.size() == max_paths_per_invocation)
-      extract();
-    invocation.push_back(path);
-    bytes += size;
-  }
-  if (invocation.size() > args.size())
-    extract();
+
+  auto records = extract(originals, original_tags, "metadata", true);
+  // Try the decoded composite only when no explicit model was found.
+  std::set<std::string> needs_identity;
+  for (const auto &[path, tags] : records)
+    if (identity_detail::explicit_model(tags).first.empty())
+      needs_identity.insert(path);
+  for (const auto &[path, tags] : extract(needs_identity, {"-Composite:LensID"}, "identities", false))
+    for (const auto &[key, value] : tags)
+      records.at(path).emplace("display:" + key, value);
+  auto prepared_flags = extract(generated, flags, "prepared", true);
   ProfileCatalog catalog(options.profile_roots.empty() ? default_profile_roots()
                                                        : options.profile_roots);
+  struct Fit { size_t frame; const Profile *profile; double crop; };
+  std::vector<Fit> fits;
+  std::set<std::string> fit_sources;
   for (size_t i = 0; i < sources.size(); ++i) {
     check_cancelled();
     const auto &s = sources[i];
-    auto a = records.find(s.source.string()),
-         b = records.find(s.prepared.string());
-    if (a == records.end() || b == records.end())
-      throw Error(26, "lens metadata extraction omitted an input");
-    const auto &original = a->second, &prepared = b->second;
+    const auto &original = records.at(s.source.string());
+    const auto &prepared = s.converted ? prepared_flags.at(s.prepared.string()) : original;
     auto &c = out[i];
     c.collected = true;
     c.make = first(original, {"IFD0:Make", "XMP-tiff:Make"});
@@ -306,10 +280,6 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
     c.focal =
         numeric(first(original, {"ExifIFD:FocalLength", "Sony:FocalLength",
                                  "Nikon:FocalLength"}));
-    c.aperture = numeric(get(original, "ExifIFD:FNumber"));
-    c.focus =
-        numeric(first(original, {"Nikon:FocusDistance", "Sony:FocusDistance2",
-                                 "Composite:FocusDistance"}));
     std::array<bool, 3> source_coverage{}, prepared_coverage{};
     if (!inspect(s.source, &source_coverage) && opcodes(original))
       source_coverage.fill(true); // Vendor RAW whose opcode data cannot be inspected.
@@ -319,9 +289,8 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
     evidence << "identity-source=" << lens_identity.second << char(10);
     for (const auto &[k, v] : original)
       evidence << k << '=' << v << char(10);
-    for (const auto &[k, v] : prepared)
-      if (k.find("AlreadyApplied") != std::string::npos ||
-          k.find("OpcodeList") != std::string::npos)
+    if (s.converted)
+      for (const auto &[k, v] : prepared)
         evidence << "prepared:" << k << '=' << v << char(10);
     c.evidence = evidence.str();
     const char *flags[] = {
@@ -364,14 +333,31 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
     for (int j = 0; j < 3; ++j)
       needs_lcp |= c.upstream[j] == Upstream::not_reported &&
                    c.embedded[j].kind == Kind::none;
-    if (needs_lcp)
-      c.fallback = catalog.resolve(c, sensor_crop(original, c.focal),
-                                   double(s.width) / s.height, c.selection,
-                                   get(original, "ExifIFD:LensInfo"));
-    else
+    if (needs_lcp) {
+      const double crop = sensor_crop(original, c.focal);
+      if (const auto *profile = catalog.match(c, crop, double(s.width) / s.height,
+                                             c.selection, get(original, "ExifIFD:LensInfo"))) {
+        fits.push_back({i, profile, crop});
+        fit_sources.insert(s.source.string());
+      }
+    } else {
       c.selection = "embedded-or-upstream-owned";
-    validate(c);
-    validate_domain(c, s.width, s.height, options.policy, check_cancelled);
+    }
+  }
+  // Aperture and focus feed interpolation only after a profile has been selected.
+  auto fit_tags = extract(fit_sources, {"-ExifIFD:FNumber", "-Nikon:FocusDistance",
+      "-Sony:FocusDistance2", "-Composite:FocusDistance"}, "interpolation", true);
+  for (const auto &fit : fits) {
+    const auto &tags = fit_tags.at(sources[fit.frame].source.string());
+    auto &c = out[fit.frame];
+    c.aperture = numeric(get(tags, "ExifIFD:FNumber"));
+    c.focus = numeric(first(tags, {"Nikon:FocusDistance", "Sony:FocusDistance2",
+                                  "Composite:FocusDistance"}));
+    c.fallback = interpolate_profile(*fit.profile, c.focal, c.aperture, c.focus, fit.crop);
+  }
+  for (size_t i = 0; i < sources.size(); ++i) {
+    validate(out[i]);
+    validate_domain(out[i], sources[i].width, sources[i].height, options.policy, check_cancelled);
   }
   return out;
 }

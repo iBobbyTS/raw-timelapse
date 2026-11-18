@@ -49,15 +49,25 @@ inline bool precise_lens_name(const std::string &name) {
   }
   return false;
 }
-inline std::pair<std::string, std::string> resolve(const Tags &tags) {
-  for (const auto *key : {"ExifIFD:LensModel", "Sony:LensModel", "Canon:LensModel",
+inline constexpr const char *model_fields[] = {"ExifIFD:LensModel", "Sony:LensModel", "Canon:LensModel",
                           "XMP-exifEX:LensModel", "Nikon:LensModel", "Panasonic:LensModel",
                           "Olympus:LensModel", "FujiFilm:LensModel", "Pentax:LensModel",
-                          "Samsung:LensModel", "PhaseOne:LensModel", "Leica:LensModel"}) {
+                          "Samsung:LensModel", "PhaseOne:LensModel", "Leica:LensModel"};
+inline constexpr const char *vendor_fields[] = {"Panasonic:LensType", "Olympus:LensType", "Leica:LensType",
+                          "Samsung:LensType", "Pentax:LensType", "Minolta:LensType",
+                          "Sony:LensType", "Canon:LensType"};
+inline std::pair<std::string, std::string> explicit_model(const Tags &tags) {
+  for (const auto *key : model_fields) {
     auto value = tag_value(tags, key);
     if (precise_lens_name(value))
       return {value, std::string("model-field:") + key};
   }
+  return {};
+}
+inline std::pair<std::string, std::string> resolve(const Tags &tags) {
+  auto model = explicit_model(tags);
+  if (!model.first.empty())
+    return model;
   // Composite resolution can disambiguate shared vendor IDs using the other
   // captured lens fields. A vendor ID's display label is not independent proof:
   // even a single displayed name (e.g. Canon 136) can hide shared IDs.
@@ -66,9 +76,7 @@ inline std::pair<std::string, std::string> resolve(const Tags &tags) {
     return {composite, "decoded-identity:display:Composite:LensID"};
   // Without a disambiguated result, accept a factory string only when it is
   // already a concrete name in the numeric/raw extraction, never a decoded ID.
-  for (const auto *key : {"Panasonic:LensType", "Olympus:LensType", "Leica:LensType",
-                          "Samsung:LensType", "Pentax:LensType", "Minolta:LensType",
-                          "Sony:LensType", "Canon:LensType"}) {
+  for (const auto *key : vendor_fields) {
     auto value = tag_value(tags, key);
     if (precise_lens_name(value))
       return {value, std::string("vendor-name:") + key};

@@ -27,12 +27,15 @@ std::vector<std::filesystem::path> default_profile_roots();
 class ProfileCatalog {
 public:
   explicit ProfileCatalog(std::vector<std::filesystem::path> roots);
+  const Profile *match(Calibration &, double crop, double aspect,
+                       std::string &reason, const std::string &lens_info = {});
   std::array<Model, 3> resolve(Calibration &, double crop, double aspect,
                                std::string &reason, const std::string &lens_info = {});
 
 private:
   std::vector<std::filesystem::path> roots_;
   std::map<std::string, std::vector<std::filesystem::path>> index_;
+  std::map<std::filesystem::path, Profile> parsed_;
   bool indexed_ = false;
 };
 } // namespace frame::lens
