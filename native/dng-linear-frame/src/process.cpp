@@ -153,7 +153,7 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
                          const fs::path &linear_dir,
                          const std::string &converter, std::optional<int> timeout_override,
                          bool temporary, bool sequence,
-                         const std::function<void(size_t, const fs::path &)> &ready) {
+                         const std::function<void(size_t, const fs::path &)> &ready, bool in_memory) {
   constexpr int seconds_per_image = 15;
   if (!timeout_override && inputs.size() > size_t(std::numeric_limits<int>::max() / seconds_per_image))
     throw Error(24, "too many inputs to represent the Converter timeout");
@@ -181,7 +181,8 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
     // Adobe accepts explicit relative filenames but does not accept a directory
     // as input. Short uniquely named aliases keep one invocation across volumes.
     working_directory = scratch / "converter-input";
-    fs::create_directory(working_directory);
+    if (!fs::create_directory(working_directory))
+      throw Error(24, "Converter aliases require a fresh working directory");
     command = command_prefix;
     for (size_t i = 0; i < inputs.size(); ++i) {
       check_cancelled();
@@ -200,7 +201,7 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
     paths.push_back(linear_dir / name);
   }
   fs::path invocation;
-  if (sequence) {
+  if (sequence && !in_memory) {
     invocation = scratch / "converter.argv";
     std::ofstream trace(invocation, std::ios::binary);
     for (const auto &arg : command) trace.write(arg.c_str(), arg.size() + 1);
@@ -245,9 +246,9 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
   };
   auto result = run_process(command, log, timeout, std::nullopt,
                             ready ? std::function<void(int)>(observe) : std::function<void(int)>{},
-                            working_directory);
+                            working_directory, in_memory);
   auto verification_start = std::chrono::steady_clock::now();
-  std::string transcript = read_text(log);
+  std::string transcript = in_memory ? std::move(result.errors) : read_text(log);
   std::string identity = "Converter [" + inputs.front().string() + " .. " + inputs.back().string() +
       "] count=" + std::to_string(inputs.size()) + " timeout=" + std::to_string(timeout) + "s";
   if (result.timed_out || result.exit_code != 0) {
@@ -266,7 +267,7 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
   if (actual != expected)
     throw Error(23, identity + ": Converter output set differs from requested names");
   std::vector<Conversion> outputs;
-  const auto version_name = converter_version(command.front());
+  const auto version_name = in_memory ? std::string{} : converter_version(command.front());
   for (size_t i = 0; i < inputs.size(); ++i) {
     check_cancelled();
     const auto &output = paths[i];
@@ -274,6 +275,12 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
     auto check = inspect(output);
     if (!check || check->photometric != 34892 || !check->width || !check->height)
       throw Error(23, identity + ": output is not nonzero LinearRaw (34892): " + output.string());
+    if (in_memory) {
+      ConversionInfo info;
+      info.used = true;
+      outputs.push_back({output, version, std::move(info)});
+      continue;
+    }
     ConversionInfo info;
     info.used = true;
     info.executable = command.front();
@@ -299,12 +306,13 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
             << " timeout_s=" << timeout
             << " process_s=" << std::chrono::duration<double>(verification_start-conversion_start).count()
             << " output_verification_s=" << std::chrono::duration<double>(std::chrono::steady_clock::now()-verification_start).count() << '\n';
+  if (in_memory && !working_directory.empty()) fs::remove_all(working_directory);
   return outputs;
 }
 ProcessResult run_process(const std::vector<std::string> &args,
                           const fs::path &log, int timeout, std::optional<fs::path> stdout_path,
                           const std::function<void(int)> &observe,
-                          const fs::path &working_directory) {
+                          const fs::path &working_directory, bool capture, size_t output_limit) {
   check_cancelled();
   std::vector<char *> argv;
   for (auto &a : args)
@@ -312,12 +320,61 @@ ProcessResult run_process(const std::vector<std::string> &args,
   argv.push_back(nullptr);
   posix_spawn_file_actions_t actions;
   posix_spawn_file_actions_init(&actions);
-  posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, stdout_path.value_or(log).c_str(),
-                                   O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  if (stdout_path)
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-  else
-    posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+  struct CapturePipe {
+    int fds[2]{-1, -1};
+    std::string data;
+    bool overflow = false;
+    ~CapturePipe() { for (int fd : fds) if (fd >= 0) close(fd); }
+    void open_pipe() {
+      if (pipe(fds) || fcntl(fds[0], F_SETFL, O_NONBLOCK) < 0)
+        throw Error(24, "cannot open subprocess capture pipe");
+    }
+    void redirect(posix_spawn_file_actions_t &actions, int target) const {
+      posix_spawn_file_actions_addclose(&actions, fds[0]);
+      posix_spawn_file_actions_adddup2(&actions, fds[1], target);
+      posix_spawn_file_actions_addclose(&actions, fds[1]);
+    }
+    void parent_only() {
+      close(fds[1]);
+      fds[1] = -1;
+    }
+    void drain(size_t limit, bool tail) {
+      if (fds[0] < 0) return;
+      char buffer[8192];
+      for (size_t pass = 0; pass < 128; ++pass) {
+        auto n = read(fds[0], buffer, sizeof buffer);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return;
+        if (tail) {
+          data.append(buffer, size_t(n));
+          if (data.size() > limit) data.erase(0, data.size() - limit);
+        } else if (size_t(n) <= limit - data.size()) {
+          data.append(buffer, size_t(n));
+        } else {
+          overflow = true;
+        }
+      }
+    }
+  } output, errors;
+  if (capture) {
+    try {
+      if (output_limit) output.open_pipe();
+      errors.open_pipe();
+    } catch (...) {
+      posix_spawn_file_actions_destroy(&actions);
+      throw;
+    }
+    errors.redirect(actions, STDERR_FILENO);
+    if (output_limit) output.redirect(actions, STDOUT_FILENO);
+    else posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDOUT_FILENO);
+  } else {
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, stdout_path.value_or(log).c_str(),
+                                     O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (stdout_path)
+      posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    else
+      posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+  }
   if (!working_directory.empty()) {
     int error;
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
@@ -346,6 +403,10 @@ ProcessResult run_process(const std::vector<std::string> &args,
   posix_spawn_file_actions_destroy(&actions);
   if (err)
     throw Error(24, "cannot spawn child " + args.front() + ": " + std::to_string(err));
+  if (capture) {
+    errors.parent_only();
+    if (output_limit) output.parent_only();
+  }
   auto start = std::chrono::steady_clock::now();
   bool expired = false, reaped = false;
   int status = 0;
@@ -366,6 +427,12 @@ ProcessResult run_process(const std::vector<std::string> &args,
     }
   };
   for (;;) {
+    output.drain(output_limit, false);
+    errors.drain(8192, true);
+    if (output.overflow) {
+      terminate_group();
+      throw Error(24, "subprocess stdout exceeds the capture limit");
+    }
     if (!reaped) {
       pid_t r = waitpid(pid, &status, WNOHANG);
       if (r == pid) reaped = true;
@@ -400,7 +467,11 @@ ProcessResult run_process(const std::vector<std::string> &args,
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  return {WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status), expired};
+  output.drain(output_limit, false);
+  errors.drain(8192, true);
+  if (output.overflow) throw Error(24, "subprocess stdout exceeds the capture limit");
+  return {WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status), expired,
+          std::move(output.data), std::move(errors.data)};
 }
 std::string sha256(const fs::path &p) {
   std::ifstream in(p, std::ios::binary);

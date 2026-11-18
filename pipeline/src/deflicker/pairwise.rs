@@ -4,7 +4,7 @@ use super::{
     stats::{mad, median, percentile},
     FrameMeasurement, Result,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub const DEFAULT_LAGS: [usize; 4] = [1, 2, 4, 8];
 pub(crate) fn quadrants(ids: impl Iterator<Item = usize>, nx: usize, ny: usize) -> usize {
     ids.map(|i| (i % nx >= nx / 2, i / nx >= ny / 2))
@@ -173,15 +173,8 @@ pub fn build_edges(
     if lags.contains(&0) {
         return Err("lag must be positive".into());
     }
-    let mut active = lags.to_vec();
-    if n >= 32 && !active.contains(&16) {
-        active.push(16);
-        active.sort_unstable();
-    }
-    let mut stats = EdgeStats::default();
-    for &l in &active {
-        stats.by_lag.insert(l, (0, 0));
-    }
+    let active = active_lags(n, lags);
+    let mut stats = edge_stats(&active);
     let mut edges = vec![];
     for lag in active {
         for j in lag..n {
@@ -189,28 +182,122 @@ pub fn build_edges(
             if boundaries.iter().any(|&b| i < b && b <= j) {
                 continue;
             }
-            stats.candidate_edges += 1;
-            let mut e = pair_difference_validated(&ms[i], &ms[j], lag, train);
-            if !e.delta_ev.is_finite() || !e.reliable() {
-                stats.rejected_edges += 1;
-                if let Some(v) = stats.by_lag.get_mut(&lag) {
-                    v.1 += 1;
-                }
-                for reason in e.rejects.keys() {
-                    *stats.reject_reasons.entry(reason.clone()).or_default() += 1;
-                }
-            } else {
-                e.i = i;
-                e.j = j;
-                edges.push(e);
-                if let Some(v) = stats.by_lag.get_mut(&lag) {
-                    v.0 += 1;
-                }
+            let edge = pair_difference_validated(&ms[i], &ms[j], lag, train);
+            if let Some(edge) = accept_edge(&mut stats, edge, i, j) {
+                edges.push(edge);
             }
         }
     }
     Ok((edges, stats))
 }
+
+fn active_lags(n: usize, lags: &[usize]) -> Vec<usize> {
+    let mut active = lags.to_vec();
+    if n >= 32 && !active.contains(&16) {
+        active.push(16);
+        active.sort_unstable();
+    }
+    active
+}
+
+fn edge_stats(lags: &[usize]) -> EdgeStats {
+    let mut stats = EdgeStats::default();
+    for &lag in lags {
+        stats.by_lag.insert(lag, (0, 0));
+    }
+    stats
+}
+
+fn accept_edge(stats: &mut EdgeStats, mut edge: GraphEdge, i: usize, j: usize) -> Option<GraphEdge> {
+    stats.candidate_edges += 1;
+    let counts = stats.by_lag.get_mut(&edge.lag).unwrap();
+    if !edge.delta_ev.is_finite() || !edge.reliable() {
+        stats.rejected_edges += 1;
+        counts.1 += 1;
+        for reason in edge.rejects.keys() {
+            *stats.reject_reasons.entry(reason.clone()).or_default() += 1;
+        }
+        None
+    } else {
+        counts.0 += 1;
+        edge.i = i;
+        edge.j = j;
+        Some(edge)
+    }
+}
+
+pub(super) fn train_tiles(first: &FrameMeasurement, excludes: &[[f64; 4]]) -> Vec<bool> {
+    first.centers.iter().map(|c| {
+        !excludes.iter().any(|r| c[0] >= r[0] && c[0] < r[2] && c[1] >= r[1] && c[1] < r[3])
+    }).collect()
+}
+
+/// Detailed samples are needed only within the longest pairwise lag. Edges
+/// remain grouped by lag so the global solve keeps its original sum order.
+pub struct PairwiseWindow {
+    count: usize,
+    received: usize,
+    window: VecDeque<FrameMeasurement>,
+    edges: BTreeMap<usize, Vec<GraphEdge>>,
+    stats: EdgeStats,
+    excludes: Vec<[f64; 4]>,
+    train: Vec<bool>,
+}
+impl PairwiseWindow {
+    pub fn new(count: usize, excludes: Vec<[f64; 4]>) -> Self {
+        let lags = active_lags(count, &DEFAULT_LAGS);
+        let stats = edge_stats(&lags);
+        Self {
+            count, received: 0, window: VecDeque::new(), stats, excludes, train: Vec::new(),
+            edges: lags.into_iter().map(|lag| (lag, Vec::new())).collect(),
+        }
+    }
+
+    pub fn push(&mut self, mut frame: FrameMeasurement) -> Result<FrameMeasurement> {
+        frame.validate()?;
+        let j = self.received;
+        if j >= self.count {
+            return Err("too many pairwise measurements".into());
+        }
+        if let Some(prev) = self.window.back() {
+            if frame.centers != prev.centers || frame.grid_nx != prev.grid_nx || frame.grid_ny != prev.grid_ny {
+                return Err(format!("processing conditions changed at frame {j}"));
+            }
+        } else {
+            self.train = train_tiles(&frame, &self.excludes);
+        }
+        let window_len = self.window.len();
+        for (&lag, edges) in &mut self.edges {
+            if lag <= window_len {
+                let edge = pair_difference_validated(&self.window[window_len - lag], &frame, lag, Some(&self.train));
+                if let Some(edge) = accept_edge(&mut self.stats, edge, j - lag, j) {
+                    edges.push(edge);
+                }
+            }
+        }
+        let samples = frame.log_pixel_samples.take();
+        let channels = frame.log_channel_means.take();
+        let mut detailed = frame.clone();
+        detailed.log_pixel_samples = samples;
+        detailed.log_channel_means = channels;
+        if let Some((&lag, _)) = self.edges.last_key_value() {
+            if window_len == lag {
+                self.window.pop_front();
+            }
+        }
+        self.window.push_back(detailed);
+        self.received += 1;
+        Ok(frame)
+    }
+
+    pub(super) fn finish(self, count: usize) -> Result<(Vec<GraphEdge>, EdgeStats)> {
+        if self.received != count || self.count != count {
+            return Err("incomplete pairwise measurements".into());
+        }
+        Ok((self.edges.into_values().flatten().collect(), self.stats))
+    }
+}
+
 pub fn persistent_background(ms: &[FrameMeasurement], brightness: &[f64]) -> Result<Vec<bool>> {
     persistent_background_with(ms, brightness, 0.8, 0.1)
 }

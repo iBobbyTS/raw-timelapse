@@ -2,7 +2,6 @@
 Actual native/ADC ownership and prepared readers, real FFmpeg for successful runs.
 """
 import hashlib, json, os, pathlib, select, signal, socket, subprocess, sys, textwrap, time
-from urllib.parse import unquote
 sys.dont_write_bytecode = True
 cli,native,work = [pathlib.Path(p).resolve() for p in sys.argv[1:]]
 repo = pathlib.Path(__file__).resolve().parents[2]
@@ -11,9 +10,6 @@ from dng_fixture import make_dng
 
 def executable(path, body):
     path.write_text('#!/usr/bin/python3\n'+textwrap.dedent(body));path.chmod(0o755);return path
-
-def fields(path):
-    return {k:unquote(v) for k,v in (line.split('=',1) for line in path.read_text().splitlines()[1:])}
 
 def absent(pid):
     try: os.kill(pid,0);return False
@@ -36,9 +32,9 @@ def run_case(mode):
     cfa=make_dng(root,'wrong',pi=32803,w=64,h=64)
     sock=socket.socket();sock.bind(('127.0.0.1',0));sock.listen(8);sock.settimeout(15)
     address=sock.getsockname()
-    calls=root/'calls.jsonl';measure=root/'measure-starts';owned=[];connections=[]
+    calls=root/'calls.jsonl';measure=root/'measure-starts';early=root/'early-finished';owned=[];connections=[]
     converter=executable(root/'converter',f'''
-        import json,os,pathlib,signal,socket,subprocess,sys
+        import json,os,pathlib,signal,socket,subprocess,sys,time
         args=sys.argv[1:];out=pathlib.Path(args[args.index('-d')+1]);inputs=args[args.index('-mp')+1:]
         with open({str(calls)!r},'a') as f:f.write(json.dumps(inputs)+'\\n')
         mode={mode!r};s=None
@@ -61,39 +57,64 @@ def run_case(mode):
             if mode=='partial' and i==0:
                 target.write_bytes(data[:32]);s.sendall(b'{{"kind":"partial"}}\\n');s.recv(1)
                 with target.open('ab') as f:f.write(data[32:])
+            elif mode=='early-mutation' and i<2:
+                with target.open('wb') as f:
+                    f.write(data);f.flush();time.sleep(.25)
             else:target.write_bytes(data)
             if mode=='out-of-order' and first:
                 s.sendall((json.dumps({{'kind':'written','id':i}})+'\\n').encode());s.recv(1)
         if mode=='extra':(out/'unexpected.dng').write_bytes(data)
+        if mode=='early-mutation':
+            marker=pathlib.Path({str(early)!r})
+            deadline=time.monotonic()+9
+            while not marker.exists() or len(marker.read_text().splitlines())<2:
+                if time.monotonic()>deadline:sys.exit(11)
+                time.sleep(.02)
+            # Identical bytes, different file identity. The second result must
+            # be rejected even though a content hash comparison would match.
+            target=out/'frame_1.dng'
+            replacement=out/'replacement'
+            replacement.write_bytes(target.read_bytes())
+            os.replace(replacement,target)
         if s:
             s.sendall(b'{{"kind":"complete"}}\\n');s.recv(1)
         if mode=='nonzero':sys.exit(7)
     ''')
     wrapper=executable(root/'native-adapter',f'''
         import json,os,pathlib,socket,subprocess,sys
+        from urllib.parse import unquote
         args=sys.argv[1:];mode={mode!r}
-        if args[0]=='--stdout-frame-f32' and mode=='shared-lifetime' and pathlib.Path(args[2]).name=='frame_4.context':
-            from urllib.parse import unquote
-            def fields(p):return {{k:unquote(v) for k,v in (line.split('=',1) for line in pathlib.Path(p).read_text().splitlines()[1:])}}
-            context=fields(args[2]);record=pathlib.Path(context['converter_record']);assert record.exists()
-            first=pathlib.Path(args[2]).parent/'frame_0.context';assert not pathlib.Path(fields(first)['prepared_dng']).exists()
-            pathlib.Path({str(root/'shared-survived-delete')!r}).write_text(str(record))
-        if args[0]=='--stdout-analysis':
-            with open({str(measure)!r},'a') as f:f.write(args[2]+'\\n')
-            if mode=='measure-error':
-                s=socket.socket();s.connect({address!r});s.sendall(b'{{"kind":"measurement"}}\\n');s.recv(1);sys.stderr.write('chosen measurement failure');sys.exit(9)
-        if args[0]=='--prepare-sequence' and mode in ['missing-id','extra-id','duplicate-id','source-id','last-context']:
-            result=pathlib.Path(args[args.index('--emit-result')+1])
-            if mode=='last-context':
-                request=pathlib.Path(args[1]);text=request.read_text();last=[l for l in text.splitlines() if l.startswith('item3_context=')][0];request.write_text(text.replace(last,'item3_context='+str(result.parent/'absent'/'last.context')))
-            p=subprocess.run([{str(native)!r},*args]);
+        if args[0] in ['--stdout-analysis','--stdout-frame-f32']:
+            payload=sys.stdin.buffer.read()
+            context={{k:unquote(v) for k,v in (line.split('=',1) for line in payload.decode().splitlines()[1:])}}
+            if args[0]=='--stdout-frame-f32' and mode=='shared-lifetime' and context['frame_id']=='4':
+                dng=pathlib.Path(context['prepared_dng'])
+                assert dng.is_file() and not dng.with_name('frame_0.dng').exists()
+                assert list(dng.parent.parent.iterdir())==[dng.parent]
+                pathlib.Path({str(root/'shared-survived-delete')!r}).write_text(str(dng))
+            if args[0]=='--stdout-analysis' and mode=='early-mutation' and args[1]=='--export-early':
+                child=subprocess.run([{str(native)!r},*args],input=payload)
+                if child.returncode==0:
+                    with open({str(early)!r},'a') as f:f.write(context['frame_id']+'\\n')
+                sys.exit(child.returncode)
+            if args[0]=='--stdout-analysis':
+                with open({str(measure)!r},'a') as f:f.write(context['frame_id']+'\\n')
+                if mode=='measure-error':
+                    s=socket.socket();s.connect({address!r});s.sendall(b'{{"kind":"measurement"}}\\n');s.recv(1);sys.stderr.write('chosen measurement failure');sys.exit(9)
+            reader,writer=os.pipe()
+            assert os.write(writer,payload)==len(payload)
+            os.close(writer);os.dup2(reader,0);os.close(reader)
+        if args[0]=='--prepare-export-early' and mode in ['missing-id','extra-id','duplicate-id','source-id','truncated-frame']:
+            p=subprocess.run([{str(native)!r},*args],stdout=subprocess.PIPE)
             if p.returncode:sys.exit(p.returncode)
-            text=result.read_text()
-            if mode=='missing-id':text=text.replace('count=4','count=3')
-            if mode=='extra-id':text=text.replace('item3_id=3','item3_id=999')
-            if mode=='duplicate-id':text=text.replace('item3_id=3','item3_id=0')
-            if mode=='source-id':text=text.replace('item3_source=','item3_source=/wrong/',1)
-            result.write_text(text);sys.exit(0)
+            records=p.stdout.split(b'\\0')[:-1]
+            if mode=='missing-id':records.pop()
+            if mode=='extra-id':records[-1]=records[-1].replace(b'frame_id=3',b'frame_id=999')
+            if mode=='duplicate-id':records[-1]=records[-1].replace(b'frame_id=3',b'frame_id=0')
+            if mode=='source-id':records[-1]=records[-1].replace(b'source=',b'source=/wrong/',1)
+            data=b'\\0'.join(records)+b'\\0'
+            if mode=='truncated-frame':data=data[:-8]
+            sys.stdout.buffer.write(data);sys.exit(0)
         os.execv({str(native)!r},[{str(native)!r},*args])
     ''')
     graph=json.loads((repo/'pipeline/src/graph/default.json').read_text())
@@ -136,7 +157,7 @@ def run_case(mode):
             conn.sendall(b'!')
         stdout,stderr=p.communicate(timeout=25)
         trace=log.read_text()
-        success=mode in ['partial','complete','descendant-complete','out-of-order','mapping','shared-lifetime','long-sequence']
+        success=mode in ['partial','complete','descendant-complete','out-of-order','mapping','shared-lifetime','long-sequence','early-mutation']
         assert (p.returncode==0)==success,(mode,p.returncode,stderr.decode())
         assert video.exists()==success
         if success:
@@ -147,15 +168,19 @@ def run_case(mode):
             assert len(calls.read_text().splitlines())==1
             assert trace.count('kind=solve frames=')==1
             assert trace.count('kind=node node=convert-cache frame=sequence ')==1
+            if mode=='early-mutation':
+                assert set(early.read_text().splitlines())=={'0','1'}
+                completed=[line for line in trace.splitlines() if 'kind=measure frame=' in line]
+                assert 'frame=1 ' in completed[0] and 'reused_early=true' in completed[0], completed
+                assert 'frame=2 ' in completed[1] and 'reused_early=false' in completed[1], completed
             if mode=='shared-lifetime':assert (root/'shared-survived-delete').is_file()
             if mode=='mapping':
                 import shlex
                 start=next(line for line in trace.splitlines() if 'kind=run.start' in line)
                 scratch=pathlib.Path(next(t.split('=',1)[1] for t in shlex.split(start) if t.startswith('scratch=')))
-                contexts=[fields(p) for p in scratch.glob('cache/*.context')]
-                assert len(contexts)==6
-                assert len({c['prepared_dng'] for c in contexts})==6
-                assert all(pathlib.Path(c['prepared_dng']).is_file() and pathlib.Path(c['converter_record']).is_file() for c in contexts)
+                cache=scratch/'cache'
+                assert list(cache.iterdir())==[cache/'linear']
+                assert len(list((cache/'linear').glob('*.dng')))==6
             if mode=='out-of-order':
                 develops=[line for line in trace.splitlines() if 'kind=develop frame=' in line]
                 assert len(develops)==5
@@ -185,5 +210,5 @@ def run_case(mode):
                 try:os.kill(pid,signal.SIGKILL)
                 except ProcessLookupError:pass
 
-for mode in ['partial','complete','descendant-complete','nonzero','missing','wrong','extra','missing-id','extra-id','duplicate-id','source-id','last-context','interrupt','terminate','timeout','out-of-order','measure-error','mapping','shared-lifetime','long-sequence']:
+for mode in ['partial','complete','descendant-complete','nonzero','missing','wrong','extra','missing-id','extra-id','duplicate-id','source-id','truncated-frame','interrupt','terminate','timeout','out-of-order','measure-error','mapping','shared-lifetime','long-sequence','early-mutation']:
     run_case(mode)

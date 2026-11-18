@@ -21,6 +21,7 @@
 namespace frame {
 namespace {
 constexpr const char *kEarlyContextMagic = "rawtl-early-measurement/1";
+constexpr const char *kExportContextMagic = "rawtl-export-frame/1";
 constexpr const char *kContextMagic = "rawtl-prepared-frame/2";
 // Calibration/2 can carry eight image-field endpoints per component.
 constexpr size_t kContextLimit = 256 * 1024;
@@ -409,7 +410,8 @@ Json ConversionInfo::record() const {
 std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
                             const fs::path &scratch_in, const std::string &converter,
                             std::optional<int> timeout, bool temporary, const lens::PrepareOptions &lens_options,
-                            const std::vector<fs::path> &early_contexts, bool sequence) {
+                            const std::vector<fs::path> &early_contexts, bool sequence, bool in_memory,
+                            const std::function<void(size_t, const PreparedFrame &)> &early) {
   auto started = std::chrono::steady_clock::now();
   if (sources.empty()) throw Error(26, "prepare requires at least one source");
   lens::validate_prepare_options(lens_options);
@@ -422,7 +424,8 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
     PreparedFrame out;
     out.source = canonical_existing(source, "original source");
     out.source_version = file_version(out.source);
-    out.source_hash = sha256(out.source);
+    if (!in_memory) out.source_hash = sha256(out.source);
+    else out.frame_id = uint32_t(frames.size());
     out.routing = inspect(out.source);
     out.kind = out.routing ? route(out.routing->photometric) : Route::vendor_raw;
     if (out.kind != Route::vendor_raw) out.own = read_neutral(out.source);
@@ -447,20 +450,25 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
       if (!check || check->photometric != 34892 || !check->width || !check->height) return;
       candidate.generated = candidate.kind != Route::direct;
       candidate.prepared_dng = dng;
-      candidate.prepared_hash = candidate.generated ? sha256(dng) : candidate.source_hash;
+      if (!in_memory) candidate.prepared_hash = candidate.generated ? sha256(dng) : candidate.source_hash;
       candidate.main_ifd_width = check->width;
       candidate.main_ifd_height = check->height;
       if (candidate.kind == Route::vendor_raw) candidate.own = read_neutral(dng);
       candidate.capture_time = read_capture_time(candidate.kind == Route::vendor_raw ? dng : candidate.source);
-      write_prepared(candidate, early_contexts[index], true);
+      if (early) {
+        check_prepared_versions(candidate);
+        early(index, candidate);
+      } else {
+        write_prepared(candidate, early_contexts[index], true);
+      }
     } catch (const Error &e) {
-      if (e.code == 130) throw;
+      if (e.code == 130 || e.code == 50) throw;
       // Failed or unavailable observations fall back to validated sequence output.
     } catch (const fs::filesystem_error &) {
       // The file may have been replaced while collecting a provisional input.
     }
   };
-  if (!early_contexts.empty() && !inputs.empty())
+  if ((early || !early_contexts.empty()) && !inputs.empty())
     for (size_t i = 0; i < frames.size(); ++i)
       if (frames[i].kind == Route::direct) offer(i, frames[i].source);
   auto conversion_start = std::chrono::steady_clock::now();
@@ -469,9 +477,9 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
     if (!fs::create_directory(dir))
       throw Error(26, "prepare scratch already contains a linear directory: " + dir.string());
     std::function<void(size_t, const fs::path &)> ready;
-    if (!early_contexts.empty())
+    if (early || !early_contexts.empty())
       ready = [&](size_t item, const fs::path &path) { offer(indices[item], path); };
-    auto converted = convert_inputs(inputs, dir, converter, timeout, temporary, sequence, ready);
+    auto converted = convert_inputs(inputs, dir, converter, timeout, temporary, sequence, ready, in_memory);
     for (size_t i = 0; i < indices.size(); ++i) {
       auto &out = frames[indices[i]];
       out.prepared_dng = canonical_existing(converted[i].output, "prepared DNG");
@@ -479,7 +487,7 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
       out.generated = true;
       out.prepared_hash = out.conversion.output_sha256;
       out.prepared_version = converted[i].output_version;
-      if (sequence)
+      if (sequence && !in_memory)
         write_sequence_conversion(out, scratch / ("conversion-" + std::to_string(indices[i]) + ".record"));
     }
     if (!sequence) write_standalone_conversion(frames.front(), scratch / "conversion-0.record");
@@ -503,7 +511,7 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
   std::vector<lens::SourcePair> lens_sources;
   for (const auto &f : frames) lens_sources.push_back({f.source, f.prepared_dng, f.generated, f.main_ifd_width, f.main_ifd_height});
   try {
-    auto calibration = lens::collect(lens_sources, scratch, lens_options);
+    auto calibration = lens::collect(lens_sources, scratch, lens_options, in_memory);
     for (size_t i = 0; i < frames.size(); ++i) frames[i].lens_calibration = std::move(calibration[i]);
   } catch (const Error &) { throw; }
   catch (const std::exception &e) { throw Error(26, std::string("lens calibration acquisition failed: ") + e.what()); }
@@ -589,6 +597,40 @@ void check_prepared_versions(const PreparedFrame &prepared) {
     throw Error(26, "prepared DNG changed after Prepare: " + prepared.prepared_dng.string());
 }
 
+static std::string prepared_document(const PreparedFrame &prepared, bool provisional) {
+  std::ostringstream out;
+  out << (prepared.frame_id ? kExportContextMagic : provisional ? kEarlyContextMagic : kContextMagic) << '\n';
+  field(out, "source", prepared.source.string());
+  if (prepared.frame_id) field(out, "frame_id", std::to_string(*prepared.frame_id));
+  else field(out, "source_sha256", prepared.source_hash);
+  field(out, "route", route_name(prepared.kind));
+  field(out, "prepared_dng", prepared.prepared_dng.string());
+  if (!prepared.frame_id) field(out, "prepared_sha256", prepared.prepared_hash);
+  field(out, "source_version", prepared.source_version);
+  field(out, "prepared_version", prepared.prepared_version);
+  field(out, "generated", prepared.generated ? "1" : "0");
+  field(out, "main_ifd_width", std::to_string(prepared.main_ifd_width));
+  field(out, "main_ifd_height", std::to_string(prepared.main_ifd_height));
+  field(out, "as_shot_neutral", number(prepared.own[0]) + "," +
+                               number(prepared.own[1]) + "," +
+                               number(prepared.own[2]));
+  field(out, "has_capture_time", prepared.capture_time ? "1" : "0");
+  if (prepared.capture_time)
+    field(out, "capture_time", *prepared.capture_time);
+  const ConversionInfo &conversion = prepared.conversion;
+  field(out, "converter_used", conversion.used ? "1" : "0");
+  if (conversion.used && !prepared.frame_id) {
+    field(out, "converter_record", conversion.record_path.string());
+    field(out, "converter_record_sha256", conversion.record_hash);
+    field(out, "converter_output_name", conversion.output_name);
+    field(out, "converter_output_sha256", conversion.output_sha256);
+    field(out, "converter_photometric", std::to_string(conversion.photometric));
+    field(out, "converter_cleanup", conversion.cleanup);
+  }
+  if (prepared.lens_calibration.collected) field(out, "lens_calibration", lens::serialize(prepared.lens_calibration));
+  return out.str();
+}
+
 void write_prepared(const PreparedFrame &prepared,
                     const fs::path &context_path, bool provisional) {
   auto same = [&](const fs::path &other) {
@@ -604,51 +646,16 @@ void write_prepared(const PreparedFrame &prepared,
     throw Error(2, "prepared context path must be distinct from the source "
                    "and prepared DNG");
   check_prepared_versions(prepared);
-  std::ostringstream out;
-  out << (provisional ? kEarlyContextMagic : kContextMagic) << '\n';
-  field(out, "source", prepared.source.string());
-  field(out, "source_sha256", prepared.source_hash);
-  field(out, "route", route_name(prepared.kind));
-  field(out, "prepared_dng", prepared.prepared_dng.string());
-  field(out, "prepared_sha256", prepared.prepared_hash);
-  field(out, "source_version", prepared.source_version);
-  field(out, "prepared_version", prepared.prepared_version);
-  field(out, "generated", prepared.generated ? "1" : "0");
-  field(out, "main_ifd_width", std::to_string(prepared.main_ifd_width));
-  field(out, "main_ifd_height", std::to_string(prepared.main_ifd_height));
-  field(out, "as_shot_neutral", number(prepared.own[0]) + "," +
-                               number(prepared.own[1]) + "," +
-                               number(prepared.own[2]));
-  field(out, "has_capture_time", prepared.capture_time ? "1" : "0");
-  if (prepared.capture_time)
-    field(out, "capture_time", *prepared.capture_time);
-  const ConversionInfo &conversion = prepared.conversion;
-  field(out, "converter_used", conversion.used ? "1" : "0");
-  if (conversion.used) {
-    field(out, "converter_record", conversion.record_path.string());
-    field(out, "converter_record_sha256", conversion.record_hash);
-    field(out, "converter_output_name", conversion.output_name);
-    field(out, "converter_output_sha256", conversion.output_sha256);
-    field(out, "converter_photometric", std::to_string(conversion.photometric));
-    field(out, "converter_cleanup", conversion.cleanup);
-  }
-  if (prepared.lens_calibration.collected) field(out, "lens_calibration", lens::serialize(prepared.lens_calibration));
-  atomic_document(context_path, out.str(), kContextLimit);
+  atomic_document(context_path, prepared_document(prepared, provisional), kContextLimit);
 }
 
-PreparedFrame read_prepared(const fs::path &context_path, bool provisional,
-                            bool use_file_versions) {
-  std::error_code error;
-  if (!fs::is_regular_file(context_path, error) || error)
-    throw Error(26, "prepared context is missing: " + context_path.string());
-  Context context = parse_context(read_bounded(context_path, kContextLimit),
-                                  provisional ? kEarlyContextMagic : kContextMagic);
-
+static PreparedFrame parse_prepared_document(const std::string &text, bool provisional,
+                                              bool use_file_versions, bool in_memory) {
+  Context context = parse_context(text, in_memory ? kExportContextMagic :
+                                       provisional ? kEarlyContextMagic : kContextMagic);
   const std::set<std::string> base{"source",
-                                   "source_sha256",
                                    "route",
                                    "prepared_dng",
-                                   "prepared_sha256",
                                    "generated",
                                    "main_ifd_width",
                                    "main_ifd_height",
@@ -657,8 +664,15 @@ PreparedFrame read_prepared(const fs::path &context_path, bool provisional,
                                    "converter_used"};
   std::set<std::string> allowed = base;
   PreparedFrame out;
-  out.source_hash = hex64(context.at("source_sha256"), "source_sha256");
-  out.prepared_hash = hex64(context.at("prepared_sha256"), "prepared_sha256");
+  if (in_memory) {
+    allowed.insert("frame_id");
+    out.frame_id = parse_u32(context.at("frame_id"), "frame_id");
+  } else {
+    allowed.insert("source_sha256");
+    allowed.insert("prepared_sha256");
+    out.source_hash = hex64(context.at("source_sha256"), "source_sha256");
+    out.prepared_hash = hex64(context.at("prepared_sha256"), "prepared_sha256");
+  }
   if (context.has("source_version") || context.has("prepared_version")) {
     allowed.insert("source_version");
     allowed.insert("prepared_version");
@@ -706,7 +720,7 @@ PreparedFrame read_prepared(const fs::path &context_path, bool provisional,
       parse_bool(context.at("converter_used"), "converter_used");
   ConversionInfo &conversion = out.conversion;
   conversion.used = converter_used;
-  if (converter_used) {
+  if (converter_used && !in_memory) {
     for (const char *key : {"converter_record", "converter_record_sha256",
                             "converter_output_name", "converter_output_sha256",
                             "converter_photometric", "converter_cleanup"}) allowed.insert(key);
@@ -759,7 +773,7 @@ PreparedFrame read_prepared(const fs::path &context_path, bool provisional,
     if (!use_file_versions && sha256(out.prepared_dng) != out.prepared_hash)
       throw Error(26, "prepared DNG hash does not match the context: " +
                           out.prepared_dng.string());
-    if (!provisional && (out.conversion.output_sha256 != out.prepared_hash ||
+    if (!in_memory && !provisional && (out.conversion.output_sha256 != out.prepared_hash ||
         out.conversion.output_name != out.prepared_dng.filename().string()))
       throw Error(26, "prepared context Converter provenance does not "
                       "describe the prepared DNG");
@@ -773,8 +787,69 @@ PreparedFrame read_prepared(const fs::path &context_path, bool provisional,
     throw Error(26, "prepared context geometry does not match the prepared DNG");
   if (out.conversion.used != (out.generated && !provisional))
     throw Error(26, "prepared context converter_used disagrees with its publication state");
-  if (out.conversion.used) read_conversion_record(out, context);
+  if (out.conversion.used && !in_memory) read_conversion_record(out, context);
   return out;
+}
+
+PreparedFrame read_prepared(const fs::path &context_path, bool provisional,
+                            bool use_file_versions) {
+  std::error_code error;
+  if (!fs::is_regular_file(context_path, error) || error)
+    throw Error(26, "prepared context is missing: " + context_path.string());
+  return parse_prepared_document(read_bounded(context_path, kContextLimit), provisional,
+                                 use_file_versions, false);
+}
+
+static std::string read_stdin(size_t limit) {
+  std::string text;
+  char chunk[8192];
+  while (std::cin.read(chunk, sizeof chunk) || std::cin.gcount()) {
+    const size_t bytes = size_t(std::cin.gcount());
+    if (bytes > limit - text.size()) throw Error(26, "export input exceeds size limit");
+    text.append(chunk, bytes);
+  }
+  if (!std::cin.eof() || std::cin.bad()) throw Error(26, "cannot read export input");
+  return text;
+}
+
+PreparedFrame read_export_frame(bool provisional) {
+  return parse_prepared_document(read_stdin(kContextLimit), provisional, true, true);
+}
+
+void prepare_export(const fs::path &scratch_in, const std::string &converter,
+                    std::optional<int> timeout, const lens::PrepareOptions &lens_options,
+                    bool early) {
+  const auto scratch = canonical_existing(scratch_in, "export scratch");
+  if (!fs::is_directory(scratch) || !fs::is_empty(scratch))
+    throw Error(26, "export requires a fresh scratch directory");
+  auto request = parse_context(read_stdin(kSequenceDocumentLimit),
+                               "rawtl-export-request/1", kSequenceDocumentLimit);
+  const auto count = parse_u32(request.at("count"), "count");
+  if (!count || count != request.fields.size() - 1)
+    throw Error(26, "export request count disagrees with its input entries");
+  std::vector<fs::path> sources;
+  sources.reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    fs::path source = request.at(item(i, "source"));
+    if (!source.is_absolute()) throw Error(26, "export source must be absolute");
+    sources.push_back(std::move(source));
+  }
+  request.fields.clear();
+  const auto emit = [](char kind, const PreparedFrame &frame) {
+    auto text = prepared_document(frame, kind == 'E');
+    if (text.size() > kContextLimit) throw Error(26, "export frame exceeds size limit");
+    std::cout << kind << text << '\0' << std::flush;
+    if (!std::cout) throw Error(50, "export frame pipe closed");
+  };
+  std::function<void(size_t, const PreparedFrame &)> provisional;
+  if (early) provisional = [&](size_t, const PreparedFrame &frame) { emit('E', frame); };
+  auto frames = prepare_frames(sources, scratch, converter, timeout, false,
+                               lens_options, {}, true, true, provisional);
+  for (const auto &frame : frames) {
+    check_cancelled();
+    check_prepared_versions(frame);
+    emit('F', frame);
+  }
 }
 
 Decoded decode_prepared(const PreparedFrame &prepared,

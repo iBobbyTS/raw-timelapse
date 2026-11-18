@@ -18,12 +18,20 @@ pub struct Captured {
 /// `spawn_code` is used when the executable cannot be started; a nonzero exit
 /// status is returned to the caller for context-specific handling.
 pub fn run_capture(program: &Path, args: &[String], spawn_code: i32) -> Result<Captured> {
+    run_capture_inner(program, args, spawn_code, true)
+}
+
+pub fn run_capture_errors(program: &Path, args: &[String], spawn_code: i32) -> Result<Captured> {
+    run_capture_inner(program, args, spawn_code, false)
+}
+
+fn run_capture_inner(program: &Path, args: &[String], spawn_code: i32, output: bool) -> Result<Captured> {
     use std::io::Read;
     use std::process::Stdio;
     check_stop()?;
     let mut child = Command::new(program)
         .args(args)
-        .stdout(Stdio::piped())
+        .stdout(if output { Stdio::piped() } else { Stdio::null() })
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| {
@@ -33,22 +41,21 @@ pub fn run_capture(program: &Path, args: &[String], spawn_code: i32) -> Result<C
                 err,
             )
         })?;
-    let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
-    let out = std::thread::spawn(move || {
+    let out = child.stdout.take().map(|mut stdout| std::thread::spawn(move || {
         let mut b = Vec::new();
         stdout.read_to_end(&mut b).map(|_| b)
-    });
+    }));
     let err = std::thread::spawn(move || {
         let mut b = Vec::new();
         stderr.read_to_end(&mut b).map(|_| b)
     });
     let child = std::sync::Arc::new(std::sync::Mutex::new(child));
     let status = wait_owned(&child, false, spawn_code)?;
-    let stdout = out
-        .join()
-        .unwrap()
-        .map_err(|e| io_error(spawn_code, "stdout read", e))?;
+    let stdout = match out {
+        Some(out) => out.join().unwrap().map_err(|e| io_error(spawn_code, "stdout read", e))?,
+        None => Vec::new(),
+    };
     let stderr = err
         .join()
         .unwrap()
@@ -176,7 +183,9 @@ pub fn cancel(active: &ActiveNative) {
 
 pub struct OwnedProcess {
     pub child: ChildHandle,
-    log: std::path::PathBuf,
+    log: Option<std::path::PathBuf>,
+    stderr_reader: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stderr_tail: Vec<u8>,
     started: Instant,
     finished: bool,
     code: i32,
@@ -194,6 +203,20 @@ impl OwnedProcess {
         pipe_input: bool,
         active: ActiveNative,
     ) -> Result<Self> {
+        Self::spawn_registered(program, args, log, code, pipe_input, !pipe_input, true, active)
+    }
+
+    pub fn spawn_piped_active(
+        program: &Path, args: &[String], key: &Path, code: i32,
+        stdin: bool, stdout: bool, active: ActiveNative,
+    ) -> Result<Self> {
+        Self::spawn_registered(program, args, key, code, stdin, stdout, false, active)
+    }
+
+    fn spawn_registered(
+        program: &Path, args: &[String], key: &Path, code: i32,
+        stdin: bool, stdout: bool, log_on_disk: bool, active: ActiveNative,
+    ) -> Result<Self> {
         // Spawn and registration are atomic with respect to run cancellation.
         let mut state = active.lock().unwrap();
         if state.cancelled {
@@ -202,62 +225,62 @@ impl OwnedProcess {
                 "run cancelled before process registration",
             ));
         }
-        if state.children.contains_key(log) {
+        if state.children.contains_key(key) {
             return Err(Error::new(code, "duplicate process task identity"));
         }
         let mut process =
-            Self::spawn_inner(program, args, log, code, pipe_input, Some(active.clone()))?;
+            Self::spawn_inner(program, args, log_on_disk.then_some(key), code, stdin, stdout, active.clone())?;
         state
             .children
-            .insert(log.to_path_buf(), process.child.clone());
-        process.registration = Some((active.clone(), log.to_path_buf()));
+            .insert(key.to_path_buf(), process.child.clone());
+        process.registration = Some((active.clone(), key.to_path_buf()));
         Ok(process)
     }
     fn spawn_inner(
         program: &Path,
         args: &[String],
-        log: &Path,
+        log: Option<&Path>,
         code: i32,
         pipe_input: bool,
-        active: Option<ActiveNative>,
+        pipe_output: bool,
+        active: ActiveNative,
     ) -> Result<Self> {
         use std::io::Write;
         use std::process::Stdio;
         check_stop()?;
-        if let Some(parent) = log.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::new(code, e.to_string()))?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(log)
-            .map_err(|e| Error::new(code, format!("cannot create {}: {e}", log.display())))?;
-        writeln!(file, "command: {}\nstderr:", display_command(program, args))
-            .map_err(|e| Error::new(code, e.to_string()))?;
-        // Append mode keeps stderr and later summaries from overwriting one another.
-        let stderr = std::fs::OpenOptions::new()
-            .append(true)
-            .open(log)
-            .map_err(|e| Error::new(code, e.to_string()))?;
-        let child = Command::new(program)
+        let stderr = if let Some(log) = log {
+            if let Some(parent) = log.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| Error::new(code, e.to_string()))?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true).truncate(true).write(true).open(log)
+                .map_err(|e| Error::new(code, format!("cannot create {}: {e}", log.display())))?;
+            writeln!(file, "command: {}\nstderr:", display_command(program, args))
+                .map_err(|e| Error::new(code, e.to_string()))?;
+            Stdio::from(std::fs::OpenOptions::new().append(true).open(log)
+                .map_err(|e| Error::new(code, e.to_string()))?)
+        } else {
+            Stdio::piped()
+        };
+        let mut child = Command::new(program)
             .args(args)
             .stdin(if pipe_input {
                 Stdio::piped()
             } else {
                 Stdio::null()
             })
-            .stdout(if pipe_input {
-                Stdio::null()
-            } else {
-                Stdio::piped()
-            })
+            .stdout(if pipe_output { Stdio::piped() } else { Stdio::null() })
             .stderr(stderr)
             .spawn()
             .map_err(|e| Error::new(code, format!("failed to start {}: {e}", program.display())))?;
+        let stderr_reader = child.stderr.take().map(|stderr| std::thread::spawn(move || {
+            read_tail(stderr, 16 * 1024)
+        }));
         let mut process = Self {
             child: std::sync::Arc::new(std::sync::Mutex::new(child)),
-            log: log.to_path_buf(),
+            log: log.map(Path::to_path_buf),
+            stderr_reader,
+            stderr_tail: Vec::new(),
             started: Instant::now(),
             finished: false,
             code,
@@ -272,7 +295,7 @@ impl OwnedProcess {
             let mut sent = None;
             while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                 if check_stop().is_err()
-                    || active.as_ref().is_some_and(|a| a.lock().unwrap().cancelled)
+                    || active.lock().unwrap().cancelled
                 {
                     if sent.is_none() {
                         terminate(&child);
@@ -293,16 +316,28 @@ impl OwnedProcess {
             let _ = self.finish(true);
         }
     }
+    pub fn stderr(&self) -> String {
+        String::from_utf8_lossy(&self.stderr_tail).into_owned()
+    }
+    pub fn failure(&mut self, abort: bool) -> String {
+        if !self.finished { let _ = self.finish(abort); }
+        self.stderr()
+    }
     pub fn note(&self, text: &str) {
         use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&self.log) {
-            let _ = writeln!(file, "{text}");
+        if let Some(log) = &self.log {
+            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(log) {
+                let _ = writeln!(file, "{text}");
+            }
         }
     }
     pub fn finish(&mut self, abort: bool) -> Result<std::process::ExitStatus> {
         let status = wait_owned(&self.child, abort, self.code);
         if let Ok(status) = status {
             self.finished = true;
+            if let Some(reader) = self.stderr_reader.take() {
+                self.stderr_tail = reader.join().unwrap_or_default();
+            }
             self.stop_monitor
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             if let Some(monitor) = self.monitor.take() {
@@ -320,6 +355,23 @@ impl OwnedProcess {
         status
     }
 }
+fn read_tail(mut pipe: impl std::io::Read, limit: usize) -> Vec<u8> {
+    let mut tail = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        let n = match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let excess = (tail.len() + n).saturating_sub(limit);
+        tail.drain(..excess);
+        tail.extend_from_slice(&chunk[..n]);
+    }
+    tail
+}
+
 impl Drop for OwnedProcess {
     fn drop(&mut self) {
         if !self.finished {
@@ -349,7 +401,7 @@ pub fn check_stop() -> Result<()> {
     if STOP.load(std::sync::atomic::Ordering::SeqCst) {
         Err(Error::new(
             130,
-            "run cancelled; the run log names the retained scratch directory",
+            "run cancelled",
         ))
     } else {
         Ok(())

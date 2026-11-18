@@ -10,7 +10,7 @@
 mod digest;
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_EDGE: u32 = 1024;
@@ -43,8 +43,8 @@ struct Config {
     /// Emit an empty `source_sha256` in the metadata sidecar. Models a forged
     /// frame sidecar that fails the typed semantic contract.
     empty_source_sha256: bool,
-    /// Corrupt only final-frame metadata; analysis/application records stay valid.
-    frame_source_sha256_defect: Option<String>,
+    /// Corrupt only the final-frame ID; analysis records stay valid.
+    frame_id_defect: Option<String>,
     /// Omit `kind` from the analysis sidecar.
     analysis_omit_kind: bool,
     /// Report an analysis source hash that differs from the frame metadata.
@@ -110,6 +110,9 @@ fn main() {
 
 fn run() -> Result<(), (i32, String)> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().is_some_and(|s| matches!(s.as_str(), "--prepare-export" | "--prepare-export-early")) {
+        return run_prepare_export(&args);
+    }
     if args.first().is_some_and(|s| s == "--prepare-sequence") { return run_prepare_sequence(&args); }
     let options = parse_args()?;
     let config_path = env::var("FAKE_NATIVE_CONFIG")
@@ -118,9 +121,12 @@ fn run() -> Result<(), (i32, String)> {
     if let Some(prepare) = &options.prepare {
         return run_prepare(&config, &options, prepare);
     }
-    let context = match &options.prepared {
-        Some(path) => Some(FakeContext::load(path)?),
-        None => None,
+    let context = if args.get(1).is_some_and(|arg| matches!(arg.as_str(), "--export-frame" | "--export-early")) {
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text).map_err(|e| (26, e.to_string()))?;
+        Some(FakeContext::parse(&text)?)
+    } else {
+        options.prepared.as_ref().map(|path| FakeContext::load(path)).transpose()?
     };
     let source_path = match &context {
         Some(context) => context.source.clone(),
@@ -278,19 +284,25 @@ fn run() -> Result<(), (i32, String)> {
     } else {
         metadata
     };
-    let metadata = if matches!(options.stdout_mode.as_deref(), Some("--stdout-frame" | "--stdout-frame-f32")) {
-        let field = format!("\"source_sha256\":{},", json_string(&source_sha));
-        match config.frame_source_sha256_defect.as_deref() {
-            Some("omit") => metadata.replace(&field, ""),
-            Some("null") => metadata.replace(&field, "\"source_sha256\":null,"),
-            Some("non-string") => metadata.replace(&field, "\"source_sha256\":7,"),
-            Some("empty") => metadata.replace(&field, "\"source_sha256\":\"\","),
-            None => metadata,
-            Some(other) => return Err((2, format!("unknown frame source hash defect: {other}"))),
-        }
-    } else {
-        metadata
-    };
+    let mut metadata = metadata;
+    if let Some(id) = context.as_ref().and_then(|context| context.frame_id) {
+        let defect = if config.empty_source_sha256 {
+            Some("omit")
+        } else if matches!(options.stdout_mode.as_deref(), Some("--stdout-frame" | "--stdout-frame-f32")) {
+            config.frame_id_defect.as_deref()
+        } else {
+            None
+        };
+        let field = match defect {
+            Some("omit") => String::new(),
+            Some("null") => "\"frame_id\":null,".into(),
+            Some("non-string") => "\"frame_id\":\"wrong type\",".into(),
+            Some("empty") => "\"frame_id\":\"\",".into(),
+            Some(other) => return Err((2, format!("unknown export frame id defect: {other}"))),
+            None => format!("\"frame_id\":{id},"),
+        };
+        metadata.insert_str(1, &field);
+    }
     let is_f32 = options.stdout_mode.as_deref() == Some("--stdout-frame-f32");
     let mut metadata = metadata;
     let requested = options.highlight_recovery && is_f32;
@@ -486,6 +498,7 @@ fn run() -> Result<(), (i32, String)> {
 }
 
 struct FakeContext {
+    frame_id: Option<usize>,
     source: PathBuf,
     source_sha256: String,
     route: String,
@@ -500,10 +513,15 @@ impl FakeContext {
     fn load(path: &Path) -> Result<Self, (i32, String)> {
         let text = fs::read_to_string(path)
             .map_err(|error| (26, format!("cannot read prepared context: {error}")))?;
+        Self::parse(&text)
+    }
+    fn parse(text: &str) -> Result<Self, (i32, String)> {
         let mut lines = text.split('\n');
-        if lines.next() != Some("rawtl-prepared-frame/2") {
-            return Err((26, "unsupported prepared context header".to_string()));
-        }
+        let export = match lines.next() {
+            Some("rawtl-prepared-frame/2") => false,
+            Some("rawtl-export-frame/1") => true,
+            _ => return Err((26, "unsupported prepared context header".to_string())),
+        };
         let mut fields = std::collections::BTreeMap::new();
         for line in lines {
             if line.is_empty() {
@@ -536,11 +554,12 @@ impl FakeContext {
             _ => return Err((26, "invalid has_capture_time".to_string())),
         };
         Ok(Self {
+            frame_id: if export { Some(get("frame_id")?.parse().unwrap()) } else { None },
             source: PathBuf::from(get("source")?),
-            source_sha256: get("source_sha256")?,
+            source_sha256: if export { String::new() } else { get("source_sha256")? },
             route: get("route")?,
             dng: PathBuf::from(get("prepared_dng")?),
-            dng_sha256: get("prepared_sha256")?,
+            dng_sha256: if export { String::new() } else { get("prepared_sha256")? },
             generated,
             as_shot_neutral: get("as_shot_neutral")?,
             capture_time,
@@ -695,6 +714,53 @@ fn run_prepare(
 
 /// Test fixture adapter for the exact accepted request/result protocol. The
 /// native CTest/graph handshake tests exercise real sequence conversion separately.
+fn run_prepare_export(args: &[String]) -> Result<(), (i32, String)> {
+    let config = load_config(Path::new(&env::var("FAKE_NATIVE_CONFIG").unwrap()))?;
+    if config.prepare_fail {
+        return Err((3, "synthetic prepare failure".into()));
+    }
+    let mut request = String::new();
+    std::io::stdin().read_to_string(&mut request).map_err(|e| (26, e.to_string()))?;
+    let fields: std::collections::BTreeMap<_, _> = request.lines().skip(1).map(|line| {
+        let (key, value) = line.split_once('=').unwrap();
+        Ok((key, percent_decode(value)?))
+    }).collect::<Result<_, (i32, String)>>()?;
+    let scratch = fs::canonicalize(&args[3]).map_err(|e| (26, e.to_string()))?;
+    let count: usize = fields["count"].parse().unwrap();
+    for id in 0..count {
+        let source = PathBuf::from(&fields[format!("item{id}_source").as_str()]);
+        let name = source.file_name().unwrap().to_str().unwrap();
+        let spec = config.frames.iter().find(|frame| frame.name == name)
+            .ok_or_else(|| (4, format!("no fixture for {name}")))?;
+        let route = config.prepared_route.as_deref().unwrap_or_else(|| {
+            if name.to_ascii_lowercase().ends_with(".dng") {
+                "linearraw-sdk"
+            } else {
+                "vendor-raw-converter-linearraw-sdk"
+            }
+        });
+        let generated = route != "linearraw-sdk";
+        let dng = if generated {
+            let linear = scratch.join("linear");
+            fs::create_dir_all(&linear).map_err(|e| (26, e.to_string()))?;
+            let dng = linear.join(source.file_name().unwrap()).with_extension("dng");
+            fs::copy(&source, &dng).map_err(|e| (26, e.to_string()))?;
+            dng
+        } else {
+            source.clone()
+        };
+        let capture = match &spec.capture_time {
+            Some(time) => format!("has_capture_time=1\ncapture_time={}\n", percent_encode(time)),
+            None => "has_capture_time=0\n".into(),
+        };
+        print!("Frawtl-export-frame/1\nframe_id={id}\nsource={}\nroute={route}\nprepared_dng={}\nsource_version=1\nprepared_version=1\ngenerated={}\nmain_ifd_width={}\nmain_ifd_height={}\nas_shot_neutral={}\n{capture}converter_used={}\n\0",
+            percent_encode(source.to_str().unwrap()), percent_encode(dng.to_str().unwrap()),
+            u8::from(generated), config.width, config.height, spec.own_neutral, u8::from(generated));
+    }
+    eprintln!("prepare count={count} adc_calls=0 conversion_and_output_verification_s=0 metadata_verification_s=0 total_s=0");
+    Ok(())
+}
+
 fn run_prepare_sequence(args: &[String]) -> Result<(), (i32, String)> {
     let request = fs::read_to_string(&args[1]).map_err(|e| (26, e.to_string()))?;
     let fields: std::collections::BTreeMap<_, _> = request.lines().skip(1).map(|line| {
@@ -781,7 +847,9 @@ fn parse_args() -> Result<Options, (i32, String)> {
     let mut prepared = None;
     let (input, png, json, start) = if stdout_mode.is_some() {
         let first = args.get(1).ok_or((2, "missing input".to_string()))?;
-        if first == "--prepared" {
+        if matches!(first.as_str(), "--export-frame" | "--export-early") {
+            (PathBuf::new(), PathBuf::new(), PathBuf::new(), 2)
+        } else if first == "--prepared" {
             prepared = Some(PathBuf::from(
                 args.get(2).ok_or((2, "missing prepared context".to_string()))?,
             ));
@@ -908,7 +976,7 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
         fail_on: None,
         gain_scale: 1.0,
         empty_source_sha256: false,
-        frame_source_sha256_defect: None,
+        frame_id_defect: None,
         analysis_omit_kind: false,
         analysis_sha_mismatch: false,
         rev_defect: None,
@@ -982,7 +1050,7 @@ fn load_config(path: &Path) -> Result<Config, (i32, String)> {
             "gain_scale" => {
                 config.gain_scale = value.parse().map_err(|_| (2, "bad gain_scale".into()))?
             }
-            "frame_source_sha256_defect" => config.frame_source_sha256_defect = Some(value.into()),
+            "frame_id_defect" => config.frame_id_defect = Some(value.into()),
             "empty_source_sha256" => config.empty_source_sha256 = value == "1",
             "analysis_omit_kind" => config.analysis_omit_kind = value == "1",
             "analysis_sha_mismatch" => config.analysis_sha_mismatch = value == "1",

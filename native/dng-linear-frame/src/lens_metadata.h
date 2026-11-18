@@ -18,5 +18,5 @@ struct SourcePair {
 void validate_prepare_options(const PrepareOptions &);
 std::vector<Calibration> collect(const std::vector<SourcePair> &,
                                  const std::filesystem::path &scratch,
-                                 const PrepareOptions &);
+                                 const PrepareOptions &, bool in_memory = false);
 } // namespace frame::lens

@@ -92,17 +92,33 @@ pub struct NativeStream {
     f32: bool,
 }
 impl NativeStream {
-    pub(crate) fn open(tool: &Path, args: &[String], log: &Path, active: ActiveNative) -> Result<Self> {
-        let process = OwnedProcess::spawn_active(tool, args, log, EXIT_FRAME, false, active)?;
-        let stdout = process.child.lock().unwrap().stdout.take().unwrap();
-        let mut stream = Self {
-            process,
-            protocol: None,
-            pixel_bytes: 0,
-            f32: args.first().is_some_and(|a| a == "--stdout-frame-f32"),
+    pub(crate) fn open(tool: &Path, args: &[String], log: &Path, active: ActiveNative,
+                       input: Option<&[u8]>) -> Result<Self> {
+        let mut process = if input.is_some() {
+            OwnedProcess::spawn_piped_active(tool, args, log, EXIT_FRAME, true, true, active)?
+        } else {
+            OwnedProcess::spawn_active(tool, args, log, EXIT_FRAME, false, active)?
         };
-        stream.protocol = Some(Protocol::with_version(stdout, stream.f32)?);
-        Ok(stream)
+        if let Some(input) = input {
+            use std::io::Write;
+            let mut stdin = process.child.lock().unwrap().stdin.take().unwrap();
+            let written = stdin.write_all(input);
+            drop(stdin);
+            if let Err(e) = written {
+                return Err(failure(format!("native frame stdin: {e}; {}", process.failure(true))));
+            }
+        }
+        let stdout = process.child.lock().unwrap().stdout.take().unwrap();
+        let f32 = args.first().is_some_and(|a| a == "--stdout-frame-f32");
+        let protocol = match Protocol::with_version(stdout, f32) {
+            Ok(protocol) => protocol,
+            Err(error) => return Err(failure(format!("{}; {}", error.message, process.failure(true)))),
+        };
+        Ok(Self { process, protocol: Some(protocol), pixel_bytes: 0, f32 })
+    }
+    pub(crate) fn failure_detail(&mut self) -> String {
+        self.protocol.take();
+        self.process.failure(true)
     }
     pub fn pixels(&mut self, width: u32, height: u32) -> Result<Arc<[u8]>> {
         let length = (width as usize)

@@ -40,8 +40,8 @@ double numeric(const std::string &s) {
   }
   return end == s.size() && std::isfinite(v) && v > 0 ? v : 0;
 }
-std::map<std::string, Tags> metadata(const std::filesystem::path &path) {
-  auto d = xml::parse(xml::read(path));
+std::map<std::string, Tags> metadata(const std::string &text) {
+  auto d = xml::parse(text);
   std::map<std::string, Tags> result;
   for (auto *n = xmlDocGetRootElement(d.get())->children; n; n = n->next) {
     if (n->type != XML_ELEMENT_NODE || xml::name(n) != "Description")
@@ -173,12 +173,12 @@ void validate_prepare_options(const PrepareOptions &options) {
 }
 std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
                                  const std::filesystem::path &scratch,
-                                 const PrepareOptions &options) {
+                                 const PrepareOptions &options, bool in_memory) {
   std::vector<Calibration> out(sources.size());
   if (!options.collect)
     return out;
   const auto directory = scratch / "lens";
-  if (!std::filesystem::create_directory(directory))
+  if (!in_memory && !std::filesystem::create_directory(directory))
     throw Error(26, "lens metadata requires a fresh private scratch directory");
   auto xml_path = directory / "metadata.xml", log = directory / "metadata.log";
   std::vector<std::string> args = {
@@ -244,20 +244,23 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
     const auto transcript =
         part == 0 ? log
                   : directory / ("metadata-" + std::to_string(part) + ".log");
-    auto status = run_process(invocation, transcript, 120, output);
-    if (status.timed_out || status.exit_code != 0)
-      throw Error(26, "lens metadata extraction failed; see " +
-                          transcript.string());
+    const auto extract_xml = [&](const auto &args, const auto &log_path,
+                                 const auto &output_path) {
+      auto result = run_process(args, log_path, 120, output_path, {}, {},
+                                in_memory, 16 * 1024 * 1024);
+      if (result.timed_out || result.exit_code != 0)
+        throw Error(26, "lens metadata extraction failed: " +
+                            (in_memory ? result.errors : log_path.string()));
+      return metadata(in_memory ? result.output : xml::read(output_path));
+    };
+    auto values = extract_xml(invocation, transcript, output);
     std::vector<std::string> named = {options.exiftool, "-config", "", "-X", "-a", "-G1",
         "-LensID", "-LensType", "-Lens", "-LensSpec", "-Error", "-Warning"};
     named.insert(named.end(), invocation.begin() + args.size(), invocation.end());
     const auto named_output = directory / ("identities-" + std::to_string(part) + ".xml");
     const auto named_log = directory / ("identities-" + std::to_string(part) + ".log");
-    const auto named_status = run_process(named, named_log, 120, named_output);
-    if (named_status.timed_out || named_status.exit_code != 0)
-      throw Error(26, "lens identity extraction failed; see " + named_log.string());
-    auto labels = metadata(named_output);
-    for (auto &[path, tags] : metadata(output)) {
+    auto labels = extract_xml(named, named_log, named_output);
+    for (auto &[path, tags] : values) {
       const auto label = labels.find(path);
       if (label == labels.end())
         throw Error(26, "lens identity extraction omitted an input");

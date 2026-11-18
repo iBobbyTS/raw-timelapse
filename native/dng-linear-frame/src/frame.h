@@ -86,11 +86,13 @@ void calibrate_canon_cr3(const fs::path &, Decoded &);
 struct ProcessResult {
   int exit_code;
   bool timed_out;
+  std::string output, errors;
 };
 ProcessResult run_process(const std::vector<std::string> &, const fs::path &log,
                           int timeout_seconds, std::optional<fs::path> stdout_path = std::nullopt,
                           const std::function<void(int)> &observe = {},
-                          const fs::path &working_directory = {});
+                          const fs::path &working_directory = {}, bool capture = false,
+                          size_t output_limit = 0);
 // One verified output plus a reference to its shared invocation record.
 struct ConversionInfo {
   bool used = false;
@@ -133,7 +135,8 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
                          const fs::path &linear_dir,
                          const std::string &converter, std::optional<int> timeout_seconds,
                          bool temporary, bool sequence,
-                         const std::function<void(size_t, const fs::path &)> &ready = {});
+                         const std::function<void(size_t, const fs::path &)> &ready = {},
+                         bool in_memory = false);
 // Available argument bytes after accounting for environment and pointer overhead.
 size_t converter_argv_budget();
 std::string output_collision_key(const fs::path &source);
@@ -142,6 +145,7 @@ std::string output_collision_key(const fs::path &source);
 // The prepared path is a cache/scratch artifact and is never the source of
 // Canon calibration, white balance identity or capture metadata.
 struct PreparedFrame {
+  std::optional<uint32_t> frame_id; // export job index, absent from standalone contexts
   fs::path source;              // canonical original input
   std::string source_hash;      // sha256 of the original bytes
   std::string source_version;
@@ -170,10 +174,15 @@ PreparedFrame prepare_frame(const fs::path &source, const fs::path &scratch,
 std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
                             const fs::path &scratch, const std::string &converter,
                             std::optional<int> timeout_seconds, bool temporary, const lens::PrepareOptions &lens_options = {},
-                            const std::vector<fs::path> &early_contexts = {}, bool sequence = false);
+                            const std::vector<fs::path> &early_contexts = {}, bool sequence = false,
+                            bool in_memory = false,
+                            const std::function<void(size_t, const PreparedFrame &)> &early = {});
 void prepare_sequence(const fs::path &request, const fs::path &scratch,
                    const fs::path &result, const std::string &converter,
                    std::optional<int> timeout_seconds, const lens::PrepareOptions &lens_options = {});
+void prepare_export(const fs::path &scratch, const std::string &converter,
+                    std::optional<int> timeout, const lens::PrepareOptions &, bool early);
+PreparedFrame read_export_frame(bool provisional);
 // Deterministic versioned context document (not the metadata sidecar).
 void write_prepared(const PreparedFrame &, const fs::path &context_path, bool provisional = false);
 // Standalone consumers verify bytes. In-job consumers may use the file

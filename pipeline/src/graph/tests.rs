@@ -110,7 +110,7 @@ impl Backend for Fake {
         }
         Ok(())
     }
-    fn hash<'a>(&self, r: &'a String) -> &'a str {
+    fn reference_identity<'a>(&self, r: &'a String) -> &'a str {
         r
     }
     fn early_measure_task(&mut self, id: usize) -> Result<Option<FrameTask<()>>> {
@@ -169,7 +169,7 @@ impl Backend for Fake {
         let mut plan: Vec<_> = (0..count)
             .map(|id| Gain {
                 frame_id: if self.bad_plan { 0 } else { id },
-                source_sha256: format!("hash{id}"),
+                reference_identity: format!("hash{id}"),
                 ev: (id % 3) as f64,
             })
             .collect();
@@ -179,7 +179,7 @@ impl Backend for Fake {
             }
             Some("order") => plan.swap(0, 1),
             Some("nonfinite") => plan[0].ev = f64::NAN,
-            Some("hash") => plan[0].source_sha256 = "foreign".into(),
+            Some("hash") => plan[0].reference_identity = "foreign".into(),
             _ => (),
         }
         Ok(plan)
@@ -579,7 +579,7 @@ fn last_measurement_and_unread_sink_are_controlled_by_events() {
         fn commit_prepare(&mut self, _: usize, _: &String) -> Result<()> {
             Ok(())
         }
-        fn hash<'a>(&self, r: &'a String) -> &'a str {
+        fn reference_identity<'a>(&self, r: &'a String) -> &'a str {
             r
         }
         fn measure_task(&mut self, id: usize, _: &String) -> Result<FrameTask<usize>> {

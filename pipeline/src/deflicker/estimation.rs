@@ -2,7 +2,7 @@ use super::{
     graph::{solve_exposure_graph, GraphEdge, GraphResult},
     measurement::compatible,
     pairwise::{
-        build_edges, local_common_change, persistent_background, reference_tile_valid, DEFAULT_LAGS,
+        build_edges, local_common_change, persistent_background, reference_tile_valid, train_tiles, EdgeStats, PairwiseWindow, DEFAULT_LAGS,
     },
     stats::{finite, interpolate, mad, median, need},
     trends::{huber_whittaker, lambda_for_period, solve_weighted},
@@ -317,18 +317,15 @@ fn pairwise_path(
     s: &[f64],
     cfg: &ExposureConfig,
     st: &mut State,
+    evidence: Option<(Vec<GraphEdge>, EdgeStats)>,
 ) -> Result<(Vec<f64>, Json)> {
     let n = ms.len();
     let k = ms[0].valid.len();
-    let mut train = vec![true; k];
-    for (i, c) in ms[0].centers.iter().enumerate() {
-        for r in &cfg.exclude_rois {
-            if c[0] >= r[0] && c[0] < r[2] && c[1] >= r[1] && c[1] < r[3] {
-                train[i] = false;
-            }
-        }
-    }
-    let (edges, stats) = build_edges(ms, &[0], Some(&train), &DEFAULT_LAGS)?;
+    let train = train_tiles(&ms[0], &cfg.exclude_rois);
+    let (edges, stats) = match evidence {
+        Some(evidence) => evidence,
+        None => build_edges(ms, &[0], Some(&train), &DEFAULT_LAGS)?,
+    };
     let graph = solve_exposure_graph(n, &edges)?;
     let uniform = cfg.brightness == "uniform";
     let (bh, conservative) = aligned_brightness(ms, &graph, uniform, &train)?;
@@ -558,6 +555,20 @@ pub fn estimate_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Resul
 }
 
 pub fn solve_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Result<ExposureResult> {
+    solve_with_evidence(ms, cfg, None)
+}
+
+pub fn solve_windowed(
+    ms: &[FrameMeasurement], cfg: &ExposureConfig, window: PairwiseWindow,
+) -> Result<ExposureResult> {
+    let evidence = window.finish(ms.len())?;
+    solve_with_evidence(ms, cfg, Some(evidence))
+}
+
+fn solve_with_evidence(
+    ms: &[FrameMeasurement], cfg: &ExposureConfig,
+    evidence: Option<(Vec<GraphEdge>, EdgeStats)>,
+) -> Result<ExposureResult> {
     let k = compatible(ms)?;
     let n = ms.len();
     if k < 8 {
@@ -612,7 +623,7 @@ pub fn solve_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Result<E
             .collect();
         cuts = detect_scene_cuts_with(&a, &q, cfg.scene_cut_median_ev, cfg.scene_cut_tile_mad_ev)?;
         if cfg.estimator == "pairwise" {
-            let (req, sum) = pairwise_path(ms, &s, cfg, &mut st)?;
+            let (req, sum) = pairwise_path(ms, &s, cfg, &mut st, evidence)?;
             pairwise_requested = Some(req);
             summary = sum;
         } else if cfg.brightness == "uniform" {

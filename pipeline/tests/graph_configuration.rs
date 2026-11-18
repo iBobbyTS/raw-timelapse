@@ -185,9 +185,11 @@ fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
         retained_scratch.is_dir(),
         "a custom graph without delete must retain its generated cache"
     );
-    for id in 1..=3 {
-        assert!(retained_scratch.join(format!("cache/fixture-{}/conversion-0.record", id - 1)).is_file(), "provenance must survive with the retained DNG");
-    }
+    assert_eq!(
+        std::fs::read_dir(retained_scratch.join("cache")).unwrap().count(),
+        1,
+        "an explicit no-delete graph retains only its Linear DNG cache"
+    );
     let generated = cache_payloads(&retained_scratch.join("cache"));
     assert_eq!(
         generated.len(),

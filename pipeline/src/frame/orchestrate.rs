@@ -1,11 +1,9 @@
 //! Single-frame and sequence orchestration: prepare, analyze, develop, and the
 //! per-frame native run with full metadata contract checks.
 use super::contract::{frame_metadata, validate_prepared_metadata, validate_sidecar_contracts};
-use super::doc::{
-    ConversionRecords,
-    hex64, parse_document_fields, parse_u32, PreparedFrame, PreparedRoute,
-    read_document,
-};
+use super::doc::{PreparedFrame, PreparedRoute};
+#[cfg(test)]
+use super::doc::{ConversionRecords, hex64, parse_document_fields, parse_u32, read_document};
 use super::sidecar::{analysis_sidecar_envelope, format_axis, format_ev, format_wb, parse_json};
 #[cfg(test)]
 use super::sidecar::wb_close;
@@ -20,7 +18,9 @@ use crate::json::Json;
 use crate::order::SourceFrame;
 use crate::proc::{self, ActiveNative};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Either an original source file or a validated prepared context. Both reach
@@ -288,6 +288,7 @@ pub fn prepare_active(
 const SEQUENCE_DOCUMENT_LIMIT: usize = 64 * 1024 * 1024;
 
 /// One explicit source identity in the ordered sequence.
+#[cfg(test)]
 pub struct PrepareSequenceItem<'a> {
     pub frame_id: usize,
     pub source: &'a SourceFrame,
@@ -310,6 +311,7 @@ fn sequence_check_stop(active: &ActiveNative) -> Result<()> {
 }
 /// Returns the complete validated sequence in request order, or no frames. No
 /// caller may load individual contexts as a substitute for this success path.
+#[cfg(test)]
 pub fn prepare_sequence_active(
     tool: &Path,
     items: &[PrepareSequenceItem<'_>],
@@ -394,6 +396,107 @@ pub fn prepare_sequence_active(
     sequence_check_stop(&active)?; // Late success cannot revive cancelled work.
     Ok(prepared)
 }
+/// Publish tentative frames while the converter is running. A completed result
+/// is returned only after the child exits successfully with exact coverage.
+pub fn prepare_export_active(
+    tool: &Path,
+    sources: &[SourceFrame],
+    settings: &PrepareSequenceSettings<'_>,
+    active: ActiveNative,
+    mut early: Option<&mut dyn FnMut(usize, PreparedFrame)>,
+) -> Result<(Vec<PreparedFrame>, String)> {
+    use std::io::{BufRead, BufReader, Read, Write};
+
+    let scratch = fs::canonicalize(settings.scratch_dir)
+        .map_err(|e| failure(format!("export scratch: {e}")))?;
+    let paths = sources.iter().map(|source| fs::canonicalize(&source.path))
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| failure(format!("export sources: {e}")))?;
+    let mut request = format!("rawtl-export-request/1\ncount={}\n", paths.len());
+    for (i, path) in paths.iter().enumerate() {
+        request.push_str(&format!("item{i}_source={}\n", percent_encode(&path.display().to_string())));
+    }
+    if paths.is_empty() || paths.len() > u32::MAX as usize || request.len() > SEQUENCE_DOCUMENT_LIMIT {
+        return Err(failure("invalid export sequence size"));
+    }
+    let mut args = vec![
+        if early.is_some() { "--prepare-export-early" } else { "--prepare-export" }.into(),
+        "-".into(), "--scratch".into(), scratch.display().to_string(),
+    ];
+    if let Some(path) = settings.converter {
+        args.extend(["--converter".into(), path.into()]);
+    }
+    if let Some(seconds) = settings.converter_timeout {
+        args.extend(["--converter-timeout".into(), seconds.to_string()]);
+    }
+    settings.lens.prepare_args(&mut args);
+
+    let mut process = proc::OwnedProcess::spawn_piped_active(
+        tool, &args, &scratch.join("prepare"), EXIT_FRAME, true, true, active.clone(),
+    )?;
+    let (mut stdin, stdout) = {
+        let mut child = process.child.lock().unwrap();
+        (child.stdin.take().unwrap(), child.stdout.take().unwrap())
+    };
+    let written = stdin.write_all(request.as_bytes());
+    drop(stdin);
+    drop(request);
+    if let Err(e) = written {
+        drop(stdout);
+        return Err(failure(format!("export prepare stdin: {e}; {}", process.failure(true))));
+    }
+    let mut reader = BufReader::new(stdout);
+    let read_frames = (|| {
+        let mut result = Vec::with_capacity(paths.len());
+        let mut early_seen = vec![false; paths.len()];
+        loop {
+            let mut bytes = Vec::new();
+            if (&mut reader).take(256 * 1024 + 2).read_until(0, &mut bytes)
+                .map_err(|e| failure(format!("export prepare stdout: {e}")))? == 0
+            {
+                break;
+            }
+            if bytes.pop() != Some(0) || bytes.is_empty() {
+                return Err(failure("truncated or oversized export frame record"));
+            }
+            let kind = bytes.remove(0);
+            let prepared = PreparedFrame::load_export(bytes, &scratch)?;
+            let id = prepared.export.as_ref().unwrap().id;
+            if paths.get(id) != Some(&prepared.source) {
+                return Err(failure("export result frame id/source differs from request"));
+            }
+            match kind {
+                b'E' if result.is_empty() && !early_seen[id] && early.is_some() => {
+                    early_seen[id] = true;
+                    early.as_mut().unwrap()(id, prepared);
+                }
+                b'F' if result.len() == id => result.push(prepared),
+                _ => return Err(failure("duplicate or out-of-order export frame")),
+            }
+        }
+        Ok(result)
+    })();
+    drop(reader);
+    let status = process.finish(read_frames.is_err())?;
+    let diagnostics = process.stderr();
+    sequence_check_stop(&active)?;
+    if !status.success() {
+        let message = read_frames.as_ref().err().map_or("", |error| error.message.as_str());
+        return Err(failure(format!("export prepare failed: {}; {message}; {}",
+                                   proc::exit_description(&status), proc::tail(&diagnostics, 1600))));
+    }
+    let mut prepared = read_frames?;
+    if prepared.len() != paths.len() {
+        return Err(failure("export prepare did not return every frame"));
+    }
+    for frame in &mut prepared {
+        query_lens_area(tool, frame, &settings.lens, active.clone())?;
+    }
+    sequence_check_stop(&active)?;
+    Ok((prepared, diagnostics))
+}
+
+#[cfg(test)]
 fn load_sequence_result(
     result: &Path,
     expected: &[(usize, PathBuf, PathBuf)],
@@ -453,19 +556,54 @@ fn load_sequence_result(
 fn query_lens_area(tool:&Path,prepared:&mut PreparedFrame,settings:&crate::lens::Settings,active:ActiveNative)->Result<()> {
     if !settings.crop.is_safe() { return Ok(()); }
     let log=prepared.context.with_extension("lens-area.log");
-    let mut args=vec!["--lens-valid-area".into(),"--prepared".into(),prepared.context.display().to_string(),
-        "--camera-recipe".into(),"generic".into(),"--camera-color-method".into(),"dng-camera-to-pcs".into(),
-        "--camera-calibration".into(),"none".into(),"--highlight-recovery".into(),"off".into()];
-    prepared.file_check_args(&mut args);
-    settings.policy.args(settings.mode,&mut args);
-    let captured=proc::run_capture_active(tool,&args,EXIT_FRAME,&log,active)?;
-    write_prepare_log(&log,tool,&args,&captured)?;
+    let mut args = vec!["--lens-valid-area".into()];
+    let captured = if let Some(record) = &prepared.export {
+        args.push("--export-frame".into());
+        lens_area_args(prepared, settings, &mut args);
+        let mut process = proc::OwnedProcess::spawn_piped_active(
+            tool, &args, &prepared.source.with_extension("lens-area"), EXIT_FRAME, true, true, active,
+        )?;
+        use std::io::{Read, Write};
+        let (mut input, output) = {
+            let mut child = process.child.lock().unwrap();
+            (child.stdin.take().unwrap(), child.stdout.take().unwrap())
+        };
+        let written = input.write_all(&record.input()?);
+        drop(input);
+        if let Err(e) = written {
+            drop(output);
+            return Err(failure(format!("lens area stdin: {e}; {}", process.failure(true))));
+        }
+        let mut stdout = String::new();
+        output.take(16385).read_to_string(&mut stdout)
+            .map_err(|e| failure(format!("lens area stdout: {e}")))?;
+        let status = process.finish(stdout.len() > 16384)?;
+        proc::Captured { status, stdout, stderr: process.stderr() }
+    } else {
+        args.extend(["--prepared".into(), prepared.context.display().to_string()]);
+        lens_area_args(prepared, settings, &mut args);
+        let captured = proc::run_capture_active(tool, &args, EXIT_FRAME, &log, active)?;
+        write_prepare_log(&log,tool,&args,&captured)?;
+        captured
+    };
     proc::check_stop()?;
     if !captured.status.success() {return Err(failure(format!("lens valid-area query failed: {}; transcript {}: {}",proc::exit_description(&captured.status),log.display(),proc::tail(&captured.stderr,1200))));}
     if captured.stdout.len()>16384 {return Err(failure("lens valid-area response exceeds bound"));}
     let value=crate::json::parse(&captured.stdout).map_err(|e|failure(format!("lens valid-area JSON: {e}")))?;
+    if let Some(record) = &prepared.export {
+        if value.get("frame_id").and_then(Json::as_u64) != Some(record.id as u64) {
+            return Err(failure("lens valid-area export frame id mismatch"));
+        }
+    }
     prepared.lens_valid_area=Some(crate::lens::ValidArea::parse(&value,&prepared.source_sha256,&prepared.dng_sha256,settings)?);
     Ok(())
+}
+fn lens_area_args(prepared: &PreparedFrame, settings: &crate::lens::Settings, args: &mut Vec<String>) {
+    args.extend(["--camera-recipe".into(), "generic".into(), "--camera-color-method".into(),
+        "dng-camera-to-pcs".into(), "--camera-calibration".into(), "none".into(),
+        "--highlight-recovery".into(), "off".into()]);
+    prepared.file_check_args(args);
+    settings.policy.args(settings.mode,args);
 }
 fn write_prepare_log(
     log: &Path,
@@ -606,7 +744,7 @@ pub fn analyze_prepared_at(
         active,
         &mut |_, _| Ok(()),
     )
-    .map_err(|e| prepared_consumer_error(e, log))
+    .map_err(|e| if prepared.export.is_some() { e } else { prepared_consumer_error(e, log) })
 }
 pub fn develop_prepared_at(
     tool: &Path,
@@ -633,7 +771,7 @@ pub fn develop_prepared_at(
         active,
         consume,
     )
-    .map_err(|e| prepared_consumer_error(e, log))
+    .map_err(|e| if prepared.export.is_some() { e } else { prepared_consumer_error(e, log) })
 }
 
 
@@ -672,8 +810,14 @@ fn frame_args(
             } else {
                 "--prepared"
             };
-            args.push(mode.into());
-            args.push(prepared.context.display().to_string());
+            if prepared.export.is_some() {
+                args.push(if matches!(input, FrameInput::EarlyMeasurement(_)) {
+                    "--export-early".into()
+                } else { "--export-frame".into() });
+            } else {
+                args.push(mode.into());
+                args.push(prepared.context.display().to_string());
+            }
         }
     }
     if let Some(prepared) = input.prepared() {
@@ -747,50 +891,65 @@ fn run_frame(
     let lens_mode = if pixels { run.lens.mode } else { crate::lens::Mode::Off };
     let lens_policy = if pixels { run.lens.policy } else { crate::lens::Policy::default() };
     let args = frame_args(input, run, override_wb, exposure_ev, pixels, lens_mode, lens_policy)?;
-    let mut stream = NativeStream::open(tool, &args, &run.log, active)?;
-    let bytes = stream.json(1)?;
-    let sidecar = parse_json(&bytes)?;
-    validate_sidecar_contracts(&sidecar, &run.method, pixels, lens_mode, lens_policy)?;
-    let meta = frame_metadata(
-        &sidecar,
-        index,
-        total,
-        input.name(),
-        input.path(),
-        override_wb,
-        exposure_ev,
-    )?;
-    if let Some(prepared) = input.prepared() {
-        validate_prepared_metadata(
+    let record = input.prepared().and_then(|p| p.export.as_deref());
+    let bytes = record.map(|r| r.input()).transpose()?;
+    let mut stream = NativeStream::open(tool, &args, &run.log, active, bytes.as_deref())?;
+    drop(bytes);
+    let outcome = (|| {
+        let bytes = stream.json(1)?;
+        let sidecar = parse_json(&bytes)?;
+        validate_sidecar_contracts(&sidecar, &run.method, pixels, lens_mode, lens_policy)?;
+        let meta = frame_metadata(
             &sidecar,
-            prepared,
-            meta.source_sha256.as_deref(),
-            meta.as_shot_neutral,
-            meta.capture_time.as_deref(),
+            index,
+            total,
+            input.name(),
+            input.path(),
+            override_wb,
+            exposure_ev,
+            record.map(|r| r.id),
         )?;
-    }
-    let mut info = FrameInfo {
-        index,
-        source_name: input.name().to_string(),
-        camera_color: sidecar.get("color").cloned(),
-        highlight_recovery: sidecar.get("highlight_recovery").cloned(),
-        lens_correction: sidecar.get("lens_correction").cloned(),
-        source_sha256: meta.source_sha256,
-        width: meta.width,
-        height: meta.height,
-        applied_wb: meta.applied_wb,
-        wb_source: meta.wb_source,
-        as_shot_neutral: meta.as_shot_neutral,
-        exposure_ev: meta.reported_ev,
-        duration: Duration::ZERO,
-        analysis_envelope: None,
-        measurement: None,
-    };
-    attach_payload(&mut stream, &sidecar, &mut info, pixels)?;
-    consume(&info, &mut stream)?;
-    stream.finish()?;
-    info.duration = started.elapsed();
-    Ok(info)
+        if let Some(prepared) = input.prepared() {
+            validate_prepared_metadata(
+                &sidecar,
+                prepared,
+                meta.source_sha256.as_deref(),
+                meta.as_shot_neutral,
+                meta.capture_time.as_deref(),
+            )?;
+        }
+        let mut info = FrameInfo {
+            index,
+            source_name: input.name().to_string(),
+            camera_color: sidecar.get("color").cloned(),
+            highlight_recovery: sidecar.get("highlight_recovery").cloned(),
+            lens_correction: sidecar.get("lens_correction").cloned(),
+            source_sha256: meta.source_sha256,
+            width: meta.width,
+            height: meta.height,
+            applied_wb: meta.applied_wb,
+            wb_source: meta.wb_source,
+            as_shot_neutral: meta.as_shot_neutral,
+            exposure_ev: meta.reported_ev,
+            duration: Duration::ZERO,
+            analysis_envelope: None,
+            measurement: None,
+        };
+        attach_payload(&mut stream, &sidecar, &mut info, pixels, record.is_some())?;
+        consume(&info, &mut stream)?;
+        stream.finish()?;
+        info.duration = started.elapsed();
+        Ok(info)
+    })();
+    outcome.map_err(|error: Error| {
+        if record.is_some() {
+            let detail = stream.failure_detail();
+            if !detail.trim().is_empty() {
+                return Error::new(error.code, format!("{}; {}", error.message, proc::tail(&detail, 1200)));
+            }
+        }
+        error
+    })
 }
 
 fn attach_payload(
@@ -798,6 +957,7 @@ fn attach_payload(
     sidecar: &Json,
     info: &mut FrameInfo,
     pixels: bool,
+    export: bool,
 ) -> Result<()> {
     if pixels {
         let descriptor = parse_json(&stream.json(3)?)?;
@@ -829,10 +989,14 @@ fn attach_payload(
         }
     } else {
         let bytes = stream.json(2)?;
-        let (envelope, measurement) =
-            analysis_sidecar_envelope(bytes, info.source_sha256.as_deref(), info.exposure_ev)?;
-        info.analysis_envelope = Some(envelope);
-        info.measurement = Some(measurement);
+        if export {
+            info.measurement = Some(super::sidecar::parse_analysis(&bytes, None, info.exposure_ev)?);
+        } else {
+            let (envelope, measurement) =
+                analysis_sidecar_envelope(bytes, info.source_sha256.as_deref(), info.exposure_ev)?;
+            info.analysis_envelope = Some(envelope);
+            info.measurement = Some(measurement);
+        }
     }
     Ok(())
 }

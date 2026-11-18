@@ -74,7 +74,7 @@ impl Backend for Controlled {
     fn commit_prepare(&mut self, _: usize, _: &String) -> Result<()> {
         Ok(())
     }
-    fn hash<'a>(&self, r: &'a String) -> &'a str {
+    fn reference_identity<'a>(&self, r: &'a String) -> &'a str {
         r
     }
     fn measure_task(&mut self, id: usize, _: &String) -> Result<FrameTask<usize>> {

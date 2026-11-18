@@ -112,26 +112,20 @@ fn run(options: &Options) -> Result<()> {
     };
     let outcome = execute(options, &input, &video, &scratch, started, &mut log, graph_config);
     if let Err(err) = outcome {
-        let retained = scratch_has_content(&scratch);
-        if retained {
-            let _ = log.line(&format!(
-                "kind=run.error code={} message={} scratch={} retained=true",
-                err.code,
-                quote(&err.message),
-                quote(&scratch.display().to_string())
-            ));
-            eprintln!(
-                "note: partial/intermediate artifacts retained at {} (converted cache, \
-                 transcripts and any partial output); no video was published",
-                scratch.display()
-            );
-        } else {
-            let _ = log.line(&format!(
-                "kind=run.error code={} message={} retained=false",
-                err.code,
-                quote(&err.message)
-            ));
-            let _ = fs::remove_dir_all(&scratch);
+        let cleanup = fs::remove_dir_all(&scratch);
+        let retained = cleanup.as_ref().is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+        let _ = log.line(&format!(
+            "kind=run.error code={} message={} scratch={} retained={retained}",
+            err.code,
+            quote(&err.message),
+            quote(&scratch.display().to_string())
+        ));
+        if let Err(error) = cleanup {
+            if retained {
+                let message = format!("could not remove export scratch {}: {error}", scratch.display());
+                eprintln!("{message}");
+                log.line_best_effort(&format!("kind=warning message={}", quote(&message)));
+            }
         }
         return Err(err);
     }
@@ -256,7 +250,7 @@ fn execute(
         stage
             .probe
             .frames
-            .unwrap_or(result.sequence.frames.len() as u64),
+            .unwrap_or(result.sequence.count as u64),
         stage.probe.pix_fmt,
         stage.probe.color_range,
         match stage.resize {
@@ -327,13 +321,7 @@ fn execute(
     Ok(())
 }
 
-fn scratch_has_content(scratch: &Path) -> bool {
-    fs::read_dir(scratch)
-        .map(|mut entries| entries.next().is_some())
-        .unwrap_or(false)
-}
-
-fn print_sequence_summary(sequence: &frame::FrameSequence, white_balance: cli::WhiteBalance) {
+fn print_sequence_summary(sequence: &graph_run::SequenceSummary, white_balance: cli::WhiteBalance) {
     if white_balance.freezes_reference() {
         println!(
             "frozen white balance: {} from {} (applied to every later frame)",
@@ -348,7 +336,7 @@ fn print_sequence_summary(sequence: &frame::FrameSequence, white_balance: cli::W
     }
     println!(
         "frames complete: {} frames of {}x{} in {:.2}s",
-        sequence.frames.len(),
+        sequence.count,
         sequence.width,
         sequence.height,
         sequence.total_duration.as_secs_f64()

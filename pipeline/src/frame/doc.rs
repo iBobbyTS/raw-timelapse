@@ -45,6 +45,25 @@ impl PreparedRoute {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ExportRecord {
+    pub id: usize,
+    pub key: String,
+    bytes: std::sync::Mutex<Option<std::sync::Arc<[u8]>>>,
+    pub source_version: String,
+    pub dng_version: String,
+}
+
+impl ExportRecord {
+    pub fn input(&self) -> Result<std::sync::Arc<[u8]>> {
+        self.bytes.lock().unwrap().clone().ok_or_else(|| failure("export frame metadata already released"))
+    }
+
+    pub fn release(&self) {
+        self.bytes.lock().unwrap().take();
+    }
+}
+
 /// One validated prepared frame. `source` is always the original photograph;
 /// `dng` is the LinearRaw artifact the SDK decodes and is never used as the
 /// identity for Canon calibration, white balance or capture metadata.
@@ -52,6 +71,7 @@ impl PreparedRoute {
 #[allow(dead_code)] // consumed by the graph scheduling integration
 pub struct PreparedFrame {
     pub context: PathBuf,
+    pub(crate) export: Option<std::sync::Arc<ExportRecord>>,
     pub source: PathBuf,
     pub source_name: String,
     pub source_sha256: String,
@@ -72,7 +92,7 @@ impl PreparedFrame {
     /// Validate the document and check source and output associations before
     /// starting a native consumer.
     pub(crate) fn file_check_args(&self, args: &mut Vec<String>) {
-        if self.has_file_versions {
+        if self.has_file_versions && self.export.is_none() {
             args.extend(["--prepared-file-check".into(), "state".into()]);
         }
     }
@@ -81,6 +101,50 @@ impl PreparedFrame {
         Self::load_context(context, false, &mut ConversionRecords::default())
     }
 
+    pub(crate) fn load_export(bytes: Vec<u8>, scratch: &Path) -> Result<Self> {
+        let fields = parse_document_fields(&bytes, "rawtl-export-frame/1", PREPARED_CONTEXT_LIMIT)?;
+        let get = |key| field_value(&fields, key);
+        let id = parse_u32(get("frame_id")?, "frame_id")? as usize;
+        let source = PathBuf::from(get("source")?);
+        let dng = PathBuf::from(get("prepared_dng")?);
+        let route = PreparedRoute::from_token(get("route")?)
+            .ok_or_else(|| failure("invalid export frame route"))?;
+        let generated = parse_flag(get("generated")?, "generated")?;
+        let source_version = get("source_version")?.to_owned();
+        let dng_version = get("prepared_version")?.to_owned();
+        let main_ifd_width = parse_u32(get("main_ifd_width")?, "main_ifd_width")?;
+        let main_ifd_height = parse_u32(get("main_ifd_height")?, "main_ifd_height")?;
+        if !source.is_absolute() || !dng.is_absolute() || generated != route.generates()
+            || main_ifd_width == 0 || main_ifd_height == 0
+            || source_version.is_empty() || dng_version.is_empty()
+            || if generated {
+                dng == source || dng.parent() != Some(scratch.join("linear").as_path())
+            } else {
+                dng != source || dng_version != source_version
+            }
+        {
+            return Err(failure("export frame path, state, or geometry is inconsistent"));
+        }
+        let source_name = source.file_name().and_then(|name| name.to_str())
+            .ok_or_else(|| failure("invalid export frame name"))?.to_owned();
+        let as_shot_neutral = parse_neutral(get("as_shot_neutral")?)?;
+        let capture_time = if parse_flag(get("has_capture_time")?, "has_capture_time")? {
+            Some(get("capture_time")?.to_owned())
+        } else {
+            None
+        };
+        Ok(Self {
+            context: PathBuf::new(),
+            export: Some(std::sync::Arc::new(ExportRecord {
+                id, key: id.to_string(), bytes: std::sync::Mutex::new(Some(bytes.into())),
+                source_version, dng_version,
+            })),
+            source, source_name, source_sha256: String::new(), route, dng,
+            dng_sha256: String::new(), has_file_versions: true, generated,
+            main_ifd_width, main_ifd_height, as_shot_neutral, capture_time,
+            lens_valid_area: None,
+        })
+    }
     pub fn load_early_measurement(context: &Path) -> Result<Self> {
         Self::load_context(context, true, &mut ConversionRecords::default())
     }
@@ -187,6 +251,7 @@ impl PreparedFrame {
             .to_string();
         Ok(Self {
             context: context.to_path_buf(),
+            export: None,
             source,
             source_name,
             source_sha256,

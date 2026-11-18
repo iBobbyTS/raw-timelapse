@@ -1,5 +1,7 @@
 //! Frame metadata parsing, transport envelopes and white-balance formatting.
-use super::{failure, FrameInfo, JSON_MEDIA_TYPE};
+use super::{failure, JSON_MEDIA_TYPE};
+#[cfg(test)]
+use super::FrameInfo;
 use crate::deflicker::{measurement::AnalysisSidecar, FrameMeasurement};
 use crate::error::{Error, Result, EXIT_FRAME};
 use crate::json::{self, Json};
@@ -16,12 +18,10 @@ pub(crate) fn parse_json(bytes: &[u8]) -> Result<Json> {
         std::str::from_utf8(bytes).map_err(|e| failure(format!("invalid JSON UTF-8: {e}")))?;
     json::parse(text).map_err(|e| failure(format!("invalid JSON: {e}")))
 }
-pub fn analysis_sidecar_envelope(
-    bytes: Arc<[u8]>,
-    expected: Option<&str>,
-    ev: f64,
-) -> Result<(DataEnvelope, FrameMeasurement)> {
-    let sidecar = parse_json(&bytes)?;
+pub(crate) fn parse_analysis(bytes: &[u8], expected: Option<&str>, ev: f64)
+    -> Result<FrameMeasurement>
+{
+    let sidecar = parse_json(bytes)?;
     if sidecar.get("schema_version").and_then(Json::as_u64) != Some(2)
         || sidecar.get("kind").and_then(Json::as_str) != Some("rawtl-analysis-sidecar")
     {
@@ -30,11 +30,10 @@ pub fn analysis_sidecar_envelope(
     let hash = sidecar
         .get("source_sha256")
         .and_then(Json::as_str)
-        .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             failure("analysis sidecar source_sha256 does not match the frame metadata")
         })?;
-    if Some(hash) != expected {
+    if hash != expected.unwrap_or_default() {
         return Err(failure(
             "analysis sidecar source_sha256 does not match the frame metadata",
         ));
@@ -47,6 +46,16 @@ pub fn analysis_sidecar_envelope(
         return Err(failure("analysis sidecar exposure_ev mismatch"));
     }
     let measurement = AnalysisSidecar::from_json(&sidecar).map_err(failure)?.measurement;
+    Ok(measurement)
+}
+
+pub fn analysis_sidecar_envelope(
+    bytes: Arc<[u8]>,
+    expected: Option<&str>,
+    ev: f64,
+) -> Result<(DataEnvelope, FrameMeasurement)> {
+    let measurement = parse_analysis(&bytes, expected, ev)?;
+    let hash = expected.ok_or_else(|| failure("missing analysis source hash"))?;
     let metadata = MetadataDoc::new(vec![
         ("source.schema_version".into(), Json::Int(2)),
         (
@@ -73,6 +82,7 @@ pub fn analysis_sidecar_envelope(
     .map_err(|e| failure(e.to_string()))?;
     Ok((envelope, measurement))
 }
+#[cfg(test)]
 pub fn analysis_bytes(frame: &FrameInfo) -> Option<&[u8]> {
     match frame.analysis_envelope.as_ref()?.payload() {
         Payload::MemoryFile(file) => Some(file.bytes()),

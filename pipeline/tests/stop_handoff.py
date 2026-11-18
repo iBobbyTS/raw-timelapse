@@ -52,7 +52,12 @@ for mode in ['interrupt','terminate','operation-error','operation-error-with-enc
     wrapper=executable(root/'native-adapter',f'''
         import os,pathlib,sys
         args=sys.argv[1:]
-        if args[0]=='--stdout-frame-f32' and {('linear_2.dng' if late else 'linear_1.dng')!r} in pathlib.Path(args[2]).read_text():
+        if args[0]=='--stdout-frame-f32':
+            payload=sys.stdin.buffer.read()
+            if {('linear_2.dng' if late else 'linear_1.dng')!r} not in payload.decode():
+                reader,writer=os.pipe();assert os.write(writer,payload)==len(payload)
+                os.close(writer);os.dup2(reader,0);os.close(reader)
+                os.execv({str(native)!r},[{str(native)!r},*args])
             if os.fork()==0:
                 with open({str(control)!r},'rb',buffering=0) as f: f.read(1)
                 os.write(1,b'BADMAGIC');os._exit(0)
@@ -132,7 +137,8 @@ for stage in ['prepare','measure']:
         import os,pathlib,sys
         args=sys.argv[1:]
         if args[0]=='--stdout-analysis':
-            task=pathlib.Path(args[2]).parent.name+'-'+pathlib.Path(args[2]).stem
+            payload=sys.stdin.buffer.read().decode()
+            task=dict(line.split('=',1) for line in payload.splitlines()[1:])['frame_id']
             scratch=pathlib.Path({str(root)!r})/task;scratch.mkdir(exist_ok=True)
             args=['--prepare',{str(mosaic)!r},'--scratch',str(scratch),'--emit-prepared',str(scratch/'context'),'--converter',{str(converter)!r}]
         os.execv({str(native)!r},[{str(native)!r},*args])
@@ -202,8 +208,13 @@ for trigger in ['interrupt','terminate','error']:
     wrapper=executable(root/'native-adapter',f'''
         import os,pathlib,sys
         args=sys.argv[1:]
-        if args[0]=='--stdout-frame-f32' and 'frame_0.dng' not in pathlib.Path(args[2]).read_text():
-            task=pathlib.Path(args[2]).parent.name+'-'+pathlib.Path(args[2]).stem
+        if args[0]=='--stdout-frame-f32':
+            payload=sys.stdin.buffer.read()
+            task=dict(line.split('=',1) for line in payload.decode().splitlines()[1:])['frame_id']
+            if task=='0':
+                reader,writer=os.pipe();assert os.write(writer,payload)==len(payload)
+                os.close(writer);os.dup2(reader,0);os.close(reader)
+                os.execv({str(native)!r},[{str(native)!r},*args])
             scratch=pathlib.Path({str(root)!r})/('active-'+task);scratch.mkdir()
             args=['--prepare',{str(mosaic)!r},'--scratch',str(scratch),'--emit-prepared',str(scratch/'context'),'--converter',{str(converter)!r}]
         os.execv({str(native)!r},[{str(native)!r},*args])

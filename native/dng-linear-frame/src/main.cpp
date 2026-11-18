@@ -245,6 +245,7 @@ FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
       {"linear_pixel_format", f32 ? "rgbf32le" : "rgb48le"},
       {"source", prepared.source.string()},
       {"source_sha256", prepared.source_hash},
+      {"frame_id", prepared.frame_id ? Json(double(*prepared.frame_id)) : Json()},
       {"source_main_ifd_offset",
        prepared.routing ? Json(int(prepared.routing->ifd)) : Json()},
       {"source_photometric",
@@ -313,7 +314,8 @@ int main(int argc, char **argv) {
     // prepare mode, so the positional path slots stay paths even when a path
     // is spelled like a mode flag.
     const std::string mode = argc >= 2 ? std::string(argv[1]) : std::string();
-    const bool sequence_mode = mode == "--prepare-sequence";
+    const bool export_mode = mode == "--prepare-export" || mode == "--prepare-export-early";
+    const bool sequence_mode = mode == "--prepare-sequence" || export_mode;
     const bool prepare_mode = mode == "--prepare" || sequence_mode;
     const bool stdout_mode = mode == "--stdout-analysis" ||
                              mode == "--stdout-frame" ||
@@ -359,6 +361,13 @@ int main(int argc, char **argv) {
           timeout = parse_converter_timeout(value);
         } else
           throw Error(2, "unknown option: " + a);
+      }
+      if (export_mode) {
+        if (input != "-" || !scratch_set || context_set)
+          throw Error(2, mode + " requires stdin and --scratch");
+        std::signal(SIGPIPE, SIG_IGN);
+        prepare_export(scratch, converter, timeout, lens_options, mode == "--prepare-export-early");
+        return 0;
       }
       if (!scratch_set)
         throw Error(2, mode + " requires --scratch");
@@ -508,16 +517,20 @@ int main(int argc, char **argv) {
     lens::Policy lens_policy;
     if (argc < 3)
       throw Error(2, "option value missing");
-    const bool provisional = std::string(argv[2]) == "--early-measurement";
+    const std::string input_mode = argv[2];
+    const bool in_memory = input_mode == "--export-frame" || input_mode == "--export-early";
+    const bool provisional = input_mode == "--early-measurement" || input_mode == "--export-early";
     if (provisional && !want_analysis)
       throw Error(2, "--early-measurement requires --stdout-analysis");
-    const bool prepared_mode = provisional || std::string(argv[2]) == "--prepared";
-    bool use_file_versions = false;
+    const bool prepared_mode = in_memory || provisional || input_mode == "--prepared";
+    bool use_file_versions = in_memory;
     if ((mode == "--lens-valid-area" || mode == "--lens-status") && !prepared_mode)
       throw Error(2, mode + " requires a frozen prepared context");
     fs::path input, context;
     int option_start = 3;
-    if (prepared_mode) {
+    if (in_memory) {
+      // The frozen frame arrives through a private pipe.
+    } else if (prepared_mode) {
       if (argc < 4)
         throw Error(2, "--prepared requires a context path");
       context = argv[3];
@@ -618,7 +631,9 @@ int main(int argc, char **argv) {
     std::signal(SIGPIPE, SIG_IGN);
     std::optional<Temp> temp;
     PreparedFrame prepared;
-    if (prepared_mode) {
+    if (in_memory) {
+      prepared = read_export_frame(provisional);
+    } else if (prepared_mode) {
       prepared = read_prepared(context, provisional, use_file_versions);
     } else {
       temp.emplace();
@@ -652,7 +667,7 @@ int main(int argc, char **argv) {
       }
       const auto area=lens::safe_area(prepared.lens_calibration,width,height,lens_enabled,lens_policy,check_cancelled);
       std::cout << Json{{"revision",1},{"source_sha256",prepared.source_hash},
-          {"prepared_sha256",prepared.prepared_hash},{"width",double(width)},{"height",double(height)},
+          {"prepared_sha256",prepared.prepared_hash},{"frame_id",prepared.frame_id ? Json(double(*prepared.frame_id)) : Json()},{"width",double(width)},{"height",double(height)},
           {"area",std::vector<Json>{area[0],area[1],area[2],area[3]}},
           {"coordinate_system","normalized-pixel-centres"},{"certified",true},
           {"mode",lens_enabled ? "auto" : "off"},

@@ -169,6 +169,7 @@ pub(crate) fn frame_metadata(
     path: &Path,
     override_wb: Option<[f64; 3]>,
     exposure_ev: Option<f64>,
+    export_id: Option<usize>,
 ) -> Result<FrameMetadata> {
     let frame_width = sidecar
         .get("width")
@@ -202,25 +203,20 @@ pub(crate) fn frame_metadata(
         ));
     }
 
-    if sidecar
-        .get("source_sha256")
-        .and_then(Json::as_str)
-        .is_some_and(|s| !s.is_empty())
-        && !sidecar
-            .get("source_sha256")
-            .and_then(Json::as_str)
-            .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-    {
-        return Err(failure("invalid source_sha256 for FP32 frame"));
-    }
-    let source_sha256 = Some(
-        sidecar
-            .get("source_sha256")
-            .and_then(Json::as_str)
+    let source_sha256 = if let Some(id) = export_id {
+        if index != id + 1 || sidecar.get("frame_id").and_then(Json::as_u64) != Some(id as u64) {
+            return Err(failure("native export frame id does not match its task"));
+        }
+        None
+    } else {
+        let hash = sidecar.get("source_sha256").and_then(Json::as_str)
             .filter(|hash| !hash.is_empty())
-            .ok_or_else(|| missing_field(index, total, name, "source_sha256"))?
-            .to_string(),
-    );
+            .ok_or_else(|| missing_field(index, total, name, "source_sha256"))?;
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(failure("invalid source_sha256 for FP32 frame"));
+        }
+        Some(hash.to_owned())
+    };
     let applied_wb = parse_wb(
         &sidecar,
         "applied_white_balance",
@@ -383,8 +379,8 @@ pub(crate) fn validate_prepared_metadata(
             ))
         })?;
         if dng_path != prepared.dng
-            || block.get("sha256").and_then(Json::as_str)
-                != Some(prepared.dng_sha256.as_str())
+            || (prepared.export.is_none() && block.get("sha256").and_then(Json::as_str)
+                != Some(prepared.dng_sha256.as_str()))
         {
             return Err(failure(
                 "prepared metadata DNG identity does not match the context",
@@ -395,7 +391,7 @@ pub(crate) fn validate_prepared_metadata(
                 "prepared metadata route does not match the context",
             ));
         }
-        if source_sha256 != Some(prepared.source_sha256.as_str()) {
+        if prepared.export.is_none() && source_sha256 != Some(prepared.source_sha256.as_str()) {
             return Err(failure(
                 "prepared metadata source_sha256 does not match the context",
             ));

@@ -11,7 +11,6 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QRegularExpression>
-#include <QSaveFile>
 #include <QStandardPaths>
 #include <QTimer>
 #include <algorithm>
@@ -533,15 +532,10 @@ void Controller::runNextExport() {
         exportPercent_ = 0;
         exportPhase_ = tr("准备导出");
         emit progressChanged();
-        const auto profilePath = QDir(scratch_.path()).filePath(QString("job-%1.json").arg(job.id));
-        QSaveFile profileFile(profilePath);
-        const auto data = QJsonDocument(job.profile).toJson();
-        if (!profileFile.open(QIODevice::WriteOnly) || profileFile.write(data) != data.size()
-            || !profileFile.commit()) {
-            finishExport(false, tr("无法写入导出配置。"));
-            return;
-        }
-        encoder_.start(cliPath_, {"--input", job.input, "--profile", profilePath, "--output", job.output});
+        const auto data = QJsonDocument(job.profile).toJson(QJsonDocument::Compact);
+        encoder_.start(cliPath_, {"--desktop-export", "--input", job.input, "--output", job.output});
+        encoder_.write(data);
+        encoder_.closeWriteChannel();
         emit changed();
         return;
     }
@@ -581,11 +575,11 @@ void Controller::finishExport(bool success, const QString &error) {
             continue;
         const bool published = success && QFileInfo(job.output).isFile();
         job.state = published ? JobState::Done : JobState::Failed;
+        job.profile = {};
         if (!published)
             job.error = success ? tr("导出完成，但未找到输出文件。") : error;
         break;
     }
-    QFile::remove(QDir(scratch_.path()).filePath(QString("job-%1.json").arg(id)));
     emit changed();
     QTimer::singleShot(0, this, &Controller::runNextExport);
 }

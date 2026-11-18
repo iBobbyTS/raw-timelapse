@@ -8,6 +8,21 @@ use std::ffi::OsString;
 use std::path::Path;
 
 pub fn parse(args: &[String]) -> Result<Parsed> {
+    if let Some(("--desktop-export", rest)) = args.split_first().map(|(first, rest)| (first.as_str(), rest)) {
+        use std::io::Read;
+        const LIMIT: u64 = 1024 * 1024;
+        let mut contents = String::new();
+        std::io::stdin().lock().take(LIMIT + 1).read_to_string(&mut contents)
+            .map_err(|e| usage(format!("cannot read export settings: {e}")))?;
+        if contents.len() as u64 > LIMIT {
+            return Err(usage("desktop export settings exceed size limit"));
+        }
+        return parse_with_profile(rest, Some(&contents));
+    }
+    parse_with_profile(args, None)
+}
+
+fn parse_with_profile(args: &[String], desktop: Option<&str>) -> Result<Parsed> {
     match args {
         [arg] if arg == "--help" || arg == "-h" => return Ok(Parsed::Help),
         [arg] if arg == "--version" => return Ok(Parsed::Version),
@@ -45,9 +60,17 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     }
 
     let input = input.ok_or_else(|| usage("--input <DIR> is required"))?;
-    let profile = profile.ok_or_else(|| usage("--profile <default|ABSOLUTE_FILE> is required"))?;
-    let mut settings =
-        load(&profile).map_err(|message| usage(format!("profile {profile:?}: {message}")))?;
+    let (profile, loaded) = if let Some(contents) = desktop {
+        if profile.is_some() {
+            return Err(usage("desktop export receives its settings from stdin"));
+        }
+        ("desktop".into(), parse_contents(contents))
+    } else {
+        let profile = profile.ok_or_else(|| usage("--profile <default|ABSOLUTE_FILE> is required"))?;
+        let loaded = load(&profile);
+        (profile, loaded)
+    };
+    let mut settings = loaded.map_err(|message| usage(format!("profile {profile:?}: {message}")))?;
     settings.push(format!("--input={input}"));
     if let Some(output) = &output {
         settings.push(format!("--output={output}"));
@@ -97,7 +120,11 @@ fn load(source: &str) -> std::result::Result<Vec<String>, String> {
         }
         std::fs::read_to_string(path).map_err(|err| err.to_string())?
     };
-    let Json::Object(fields) = json::parse(&contents)? else {
+    parse_contents(&contents)
+}
+
+fn parse_contents(contents: &str) -> std::result::Result<Vec<String>, String> {
+    let Json::Object(fields) = json::parse(contents)? else {
         return Err("expected a JSON object".into());
     };
     let mut seen = BTreeSet::new();

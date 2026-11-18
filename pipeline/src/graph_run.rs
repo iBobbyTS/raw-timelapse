@@ -4,13 +4,13 @@
 use crate::encoder::{Container, ResolvedConfig};
 use crate::error::{Error, Result, EXIT_FRAME, EXIT_PREVIEW, EXIT_USAGE, EXIT_VALIDATION};
 use crate::frame::{
-    self, FrameInfo, FrameSequence, PreparedFrame, PreparedSettings,
+    self, FrameInfo, PreparedFrame, PreparedSettings,
 };
 use crate::run_log::{quote, RunLog};
 use crate::video::{self, ResizeRecord};
 use crate::{proc, EncodedStage, RunContext};
-use rawtl_linear_video::deflicker::estimation::ExposurePlan;
-use rawtl_linear_video::deflicker::measurement::AnalysisSidecar;
+use rawtl_linear_video::deflicker::estimation::{ExposurePlan, solve_windowed};
+use rawtl_linear_video::deflicker::pairwise::PairwiseWindow;
 use rawtl_linear_video::deflicker::{estimation::solve_exposure, ExposureConfig, FrameMeasurement};
 use rawtl_linear_video::graph::ordered_frames::FrameTask;
 use rawtl_linear_video::color_profile::AutoReferenceGain;
@@ -28,8 +28,17 @@ use std::time::Instant;
 #[path = "graph_run_stage_summary_tests.rs"]
 mod stage_summary_tests;
 
+pub struct SequenceSummary {
+    pub count: usize,
+    pub width: u32,
+    pub height: u32,
+    pub reference_wb: [f64; 3],
+    pub reference_frame: String,
+    pub total_duration: Duration,
+}
+
 pub struct Output {
-    pub sequence: FrameSequence,
+    pub sequence: SequenceSummary,
     pub stage: EncodedStage,
 }
 
@@ -60,12 +69,16 @@ struct Runner<'a, 'b> {
     context: &'a RunContext<'b>,
     log: &'a mut RunLog,
     measurements: Vec<FrameMeasurement>,
+    pairwise: Option<PairwiseWindow>,
     reference_wb: Option<[f64; 3]>,
-    early_contexts: Vec<Option<std::path::PathBuf>>,
+    early_frames: Arc<Mutex<Vec<Option<PreparedFrame>>>>,
+    early_results: Arc<Mutex<BTreeMap<usize, EarlyMeasurement>>>,
+    early_reference_wb: Option<[f64; 3]>,
     convert_progress_at: Instant,
     convert_progress: u32,
     capture_times: Vec<Option<String>>,
-    frames: Vec<FrameInfo>,
+    prepared_count: usize,
+    sequence: Option<SequenceSummary>,
     source_geometry: Option<(u32, u32)>,
     resize_target: Option<(u32, u32)>,
     resize: Option<ResizeRecord>,
@@ -77,7 +90,7 @@ struct Runner<'a, 'b> {
     encoder_inputs: video::EncoderInputs,
     active: proc::ActiveNative,
     encoder_config: ResolvedConfig,
-    develop_reference: Option<FrameInfo>,
+    camera_model: Option<String>,
     stage_stats: BTreeMap<String, graph::ordered_frames::StageStats>,
     worker_failure: Arc<Mutex<Option<Error>>>,
     failure: Option<Error>,
@@ -95,31 +108,12 @@ struct Runner<'a, 'b> {
     /// Worker count for the auto scan; mirrors the graph's develop concurrency.
     scan_workers: usize,
 }
-fn reuse_measurement(
-    path: &std::path::Path,
-    prepared: &PreparedFrame,
+struct EarlyMeasurement {
+    dng: std::path::PathBuf,
+    source_version: String,
+    dng_version: String,
     wb: Option<[f64; 3]>,
-) -> Option<FrameMeasurement> {
-    let candidate = PreparedFrame::load_early_measurement(path).ok()?;
-    if candidate.source != prepared.source
-        || candidate.source_sha256 != prepared.source_sha256
-        || candidate.route != prepared.route
-        || candidate.dng != prepared.dng
-        || candidate.dng_sha256 != prepared.dng_sha256
-        || candidate.main_ifd_width != prepared.main_ifd_width
-        || candidate.main_ifd_height != prepared.main_ifd_height
-        || candidate.as_shot_neutral != prepared.as_shot_neutral
-        || candidate.capture_time != prepared.capture_time
-    {
-        return None;
-    }
-    let content = fs::read_to_string(path.with_extension("analysis")).ok()?;
-    let (recorded_wb, json) = content.split_once('\n')?;
-    if recorded_wb != wb.map(frame::format_wb).unwrap_or_default() {
-        return None;
-    }
-    let measurement = AnalysisSidecar::parse(json).ok()?.measurement;
-    (measurement.source_sha256 == prepared.source_sha256).then_some(measurement)
+    measurement: FrameMeasurement,
 }
 
 fn frame_failure(id: usize, total: usize, name: &str, message: &str) -> String {
@@ -147,7 +141,7 @@ impl Runner<'_, '_> {
         } else {
             20.0
         };
-        let prepared = self.capture_times.len() as f64 / total;
+        let prepared = self.prepared_count as f64 / total;
         let measured = if self.exposure_plan_ready {
             1.0
         } else {
@@ -162,7 +156,7 @@ impl Runner<'_, '_> {
             0.0
         };
         let delivered =
-            (self.frames.len() + self.gain_scanned) as f64 / (total * (1.0 + scan_passes));
+            (self.sequence.as_ref().map_or(0, |sequence| sequence.count) + self.gain_scanned) as f64 / (total * (1.0 + scan_passes));
         let percent =
             conversion * prepared + deflicker * measured + (100.0 - conversion - deflicker) * delivered;
         // Keep 100% for a successfully published file, after verification.
@@ -183,12 +177,11 @@ impl Runner<'_, '_> {
             None
         }
     }
-    fn transcript(&self, stage: &str, id: usize) -> std::path::PathBuf {
+    fn task_key(&self, stage: &str, id: usize) -> std::path::PathBuf {
         self.context
             .scratch
-            .join("transcripts")
             .join(stage)
-            .join(format!("frame_{:06}.log", id + 1))
+            .join(id.to_string())
     }
     fn settings(&self) -> PreparedSettings {
         PreparedSettings {
@@ -252,13 +245,14 @@ impl Runner<'_, '_> {
         r: &PreparedFrame,
         ev: f64,
     ) -> graph::Result<FrameTask<Image>> {
-        let log = self.transcript(stage, id);
+        let log = self.task_key(stage, id);
+        let delivery = stage == "develop";
         let tool = self.context.options.native_tool.clone();
         let prepared = r.clone();
         let wb = self.wb(id);
         let settings = self.settings();
         let crop=if self.context.options.lens.crop.is_safe() {
-            if self.capture_times.len()!=self.context.sources.len() {return Err("graph: sequence crop requires the complete prepared inventory".into());}
+            if self.prepared_count!=self.context.sources.len() {return Err("graph: sequence crop requires the complete prepared inventory".into());}
             Some(self.lens_area.ok_or("graph: missing common sequence lens area")?)
         } else {None};
         let total = self.context.sources.len();
@@ -287,6 +281,9 @@ impl Runner<'_, '_> {
                 },
             )
             .map_err(|e| frame_failure(id, total, &prepared.source_name, &e.message))?;
+            if delivery {
+                prepared.export.as_ref().unwrap().release();
+            }
             Ok(Image {
                 info,
                 pixels: Pixels::Linear(pixels.ok_or("graph: develop returned no owned pixels")?),
@@ -309,7 +306,7 @@ impl Backend for Runner<'_, '_> {
                 "streaming encoder failed; scheduling cancelled",
             )));
         }
-        if self.capture_times.is_empty()
+        if self.prepared_count == 0
             && self.convert_progress_at.elapsed() >= Duration::from_millis(250)
         {
             self.convert_progress_at = Instant::now();
@@ -341,12 +338,10 @@ impl Backend for Runner<'_, '_> {
     ) -> graph::Result<FrameTask<graph::PreparedSequence<PreparedFrame>>> {
         let scratch = self.context.scratch.join("cache");
         let sources = self.context.sources.to_vec();
-        let streaming = self.context.options.deflicker.enabled();
-        if streaming {
-            for id in 0..count {
-                self.early_contexts[id] =
-                    Some(scratch.join("early").join(format!("frame_{id}.context")));
-            }
+        let streaming = !self.early_frames.lock().unwrap().is_empty();
+        let early_frames = self.early_frames.clone();
+        if count != sources.len() {
+            return Err("graph: export input count mismatch".into());
         }
         let tool = self.context.options.native_tool.clone();
         let converter = self.context.options.converter.clone();
@@ -355,12 +350,12 @@ impl Backend for Runner<'_, '_> {
         let active = self.active.clone();
         Ok(Box::new(move || {
             fs::create_dir(&scratch).map_err(|e| format!("private sequence scratch: {e}"))?;
-            let items: Vec<_> = sources.iter().enumerate()
-                .map(|(frame_id, source)| frame::PrepareSequenceItem { frame_id, source })
-                .collect();
-            let prepared = frame::prepare_sequence_active(
+            let mut provisional = |id, value| {
+                early_frames.lock().unwrap()[id] = Some(value);
+            };
+            let (prepared, diagnostics) = frame::prepare_export_active(
                 &tool,
-                &items,
+                &sources,
                 &frame::PrepareSequenceSettings {
                     scratch_dir: &scratch,
                     converter: converter.as_deref(),
@@ -368,10 +363,10 @@ impl Backend for Runner<'_, '_> {
                     lens,
                 },
                 active,
-                streaming,
+                streaming.then_some(&mut provisional),
             ).map_err(|e| e.message)?;
-            let diagnostics = prepare_diagnostics(&scratch.join("prepare-native.log"))?;
-            let frames = prepared.into_iter().map(|(frame_id, value)| graph::PreparedReference {
+            let diagnostics = prepare_diagnostics(&diagnostics)?;
+            let frames = prepared.into_iter().enumerate().map(|(frame_id, value)| graph::PreparedReference {
                 frame_id,
                 source: sources[frame_id].path.display().to_string(),
                 value,
@@ -397,17 +392,23 @@ impl Backend for Runner<'_, '_> {
         prepared: &PreparedFrame,
     ) -> graph::Result<()> {
         self.check()?; // A completed worker cannot revive a cancelled run.
-        if id != self.capture_times.len() {
+        if id != self.prepared_count {
             return Err("graph: prepare commit order mismatch".into());
         }
         if id == 0 {
+            // No more provisional records can arrive after Prepare is sealed.
+            *self.early_frames.lock().unwrap() = Vec::new();
+            self.early_reference_wb = None;
             self.reference_wb = Some(prepared.as_shot_neutral);
         }
         if self.context.options.lens.crop.is_safe() {
             let area=prepared.lens_valid_area.ok_or("graph: prepared frame has no certified lens area")?;
             self.lens_area=Some(crate::lens::intersect(self.lens_area.unwrap_or([0.,0.,1.,1.]),area.bounds).map_err(|e|e.message)?);
         }
-        self.capture_times.push(prepared.capture_time.clone());
+        if self.context.options.deflicker.enabled() {
+            self.capture_times.push(prepared.capture_time.clone());
+        }
+        self.prepared_count += 1;
         if prepared.generated {
             self.generated_paths.push(prepared.dng.clone());
         }
@@ -424,54 +425,51 @@ impl Backend for Runner<'_, '_> {
         ));
         self.result(written)
     }
-    fn hash<'a>(&self, r: &'a PreparedFrame) -> &'a str {
-        &r.source_sha256
+    fn reference_identity<'a>(&self, r: &'a PreparedFrame) -> &'a str {
+        &r.export.as_ref().expect("in-memory export frame").key
     }
     fn early_measure_task(&mut self, id: usize) -> graph::Result<Option<FrameTask<()>>> {
-        let Some(candidate) = self.early_contexts[id].as_ref() else {
+        let Some(prepared) = self.early_frames.lock().unwrap().get_mut(id).and_then(Option::take) else {
             return Ok(None);
         };
-        let Ok(prepared) = PreparedFrame::load_early_measurement(candidate) else {
-            return Ok(None);
-        };
-        if fs::canonicalize(&self.context.sources[id].path).ok().as_ref() != Some(&prepared.source) {
-            return Ok(None);
+        if id == 0 {
+            self.early_reference_wb = Some(prepared.as_shot_neutral);
         }
         let wb = if id > 0 && self.context.options.white_balance.freezes_reference() {
-            let reference = self.reference_wb.or_else(|| {
-                let path = self.early_contexts[0].as_ref()?;
-                Some(PreparedFrame::load_early_measurement(path).ok()?.as_shot_neutral)
-            });
-            let Some(reference) = reference else {
-                return Ok(None);
-            };
-            Some(reference)
+            Some(self.early_reference_wb.ok_or("missing provisional first-frame white balance")?)
         } else {
             None
         };
-        let log = self.transcript("measure-early", id);
+        let key = self.task_key("measure-early", id);
         let tool = self.context.options.native_tool.clone();
-        let output = candidate.with_extension("analysis");
         let roi = self.context.options.deflicker.roi;
         let settings = self.settings();
         let total = self.context.sources.len();
         let active = self.active.clone();
+        let results = self.early_results.clone();
+        let use_detail = self.pairwise.is_some();
         let written = self.log.line(&format!(
-            "kind=measure.early frame={} source={}",
-            id + 1,
-            quote(&prepared.source_name)
+            "kind=measure.early frame={} source={}", id + 1, quote(&prepared.source_name)
         ));
         self.result(written)?;
         Ok(Some(Box::new(move || {
             if let Ok(info) = frame::analyze_prepared_at(
-                &tool, &prepared, wb, roi, &settings, id, total, &log, active, true,
+                &tool, &prepared, wb, roi, &settings, id, total, &key, active, true,
             ) {
-                if let Some(bytes) = frame::analysis_bytes(&info) {
-                    let mut output_bytes = wb.map(frame::format_wb).unwrap_or_default().into_bytes();
-                    output_bytes.push(b'\n');
-                    output_bytes.extend_from_slice(bytes);
-                    // An early failure is retried through the sealed input.
-                    let _ = fs::write(output, output_bytes);
+                if let Some(mut measurement) = info.measurement {
+                    if !use_detail {
+                        measurement.log_pixel_samples = None;
+                        measurement.log_channel_means = None;
+                    }
+                    let record = prepared.export.as_ref().unwrap();
+                    let result = EarlyMeasurement {
+                        dng: prepared.dng,
+                        source_version: record.source_version.clone(),
+                        dng_version: record.dng_version.clone(),
+                        wb,
+                        measurement,
+                    };
+                    results.lock().unwrap().insert(id, result);
                 }
             }
             Ok(())
@@ -482,7 +480,7 @@ impl Backend for Runner<'_, '_> {
         id: usize,
         r: &PreparedFrame,
     ) -> graph::Result<FrameTask<MeasuredFrame>> {
-        let log = self.transcript("measure", id);
+        let log = self.task_key("measure", id);
         let tool = self.context.options.native_tool.clone();
         let prepared = r.clone();
         let wb = self.wb(id);
@@ -493,16 +491,16 @@ impl Backend for Runner<'_, '_> {
         let settings = self.settings();
         let total = self.context.sources.len();
         let active = self.active.clone();
-        let early = self.early_contexts[id].clone();
+        let early = self.early_results.lock().unwrap().remove(&id);
         Ok(Box::new(move || {
-            if let Some(measurement) = early
-                .as_deref()
-                .and_then(|path| reuse_measurement(path, &prepared, wb))
-            {
-                return Ok(MeasuredFrame {
-                    measurement,
-                    reused: true,
-                });
+            let record = prepared.export.as_ref().unwrap();
+            if let Some(candidate) = early {
+                if candidate.dng == prepared.dng
+                    && candidate.source_version == record.source_version
+                    && candidate.dng_version == record.dng_version && candidate.wb == wb
+                {
+                    return Ok(MeasuredFrame { measurement: candidate.measurement, reused: true });
+                }
             }
             let info = frame::analyze_prepared_at(
                 &tool, &prepared, wb, roi, &settings, id, total, &log, active, false,
@@ -522,10 +520,17 @@ impl Backend for Runner<'_, '_> {
         measured: MeasuredFrame,
         elapsed: Duration,
     ) -> graph::Result<()> {
-        let MeasuredFrame { measurement, reused } = measured;
-        if id != self.measurements.len() || measurement.source_sha256 != r.source_sha256 {
+        let MeasuredFrame { mut measurement, reused } = measured;
+        if id != self.measurements.len() || r.export.as_ref().is_none_or(|record| record.id != id) {
             return Err("graph: measurement commit identity/order mismatch".into());
         }
+        let measurement = if let Some(window) = &mut self.pairwise {
+            window.push(measurement)?
+        } else {
+            measurement.log_pixel_samples = None;
+            measurement.log_channel_means = None;
+            measurement
+        };
         self.measurements.push(measurement);
         self.progress("deflicker");
         let written = self.log.line(&format!(
@@ -552,14 +557,17 @@ impl Backend for Runner<'_, '_> {
             ..Default::default()
         };
         let started = Instant::now();
-        let result = solve_exposure(&self.measurements, &config)?;
+        let result = match self.pairwise.take() {
+            Some(window) => solve_windowed(&self.measurements, &config, window)?,
+            None => solve_exposure(&self.measurements, &config)?,
+        };
         let plan = ExposurePlan::from_result(&self.measurements, &result)?;
         let gains = plan
             .entries()
             .iter()
             .map(|p| Gain {
                 frame_id: p.frame_id,
-                source_sha256: p.source_sha256.clone(),
+                reference_identity: p.frame_id.to_string(),
                 ev: p.ev,
             })
             .collect();
@@ -569,6 +577,8 @@ impl Backend for Runner<'_, '_> {
             started.elapsed().as_secs_f64()
         ));
         self.result(written)?;
+        self.measurements = Vec::new();
+        self.capture_times = Vec::new();
         self.exposure_plan_ready = true;
         self.progress("deflicker");
         Ok(gains)
@@ -740,7 +750,7 @@ impl Backend for Runner<'_, '_> {
         elapsed: Duration,
     ) -> graph::Result<()> {
         let info = &image.info;
-        if info.index != id + 1 || info.source_sha256.as_deref().is_none() {
+        if info.index != id + 1 {
             return Err("graph: image identity mismatch".into());
         }
         if let Some(window)=image.crop_record {
@@ -764,25 +774,16 @@ impl Backend for Runner<'_, '_> {
                     return Err(message);
                 }
             }
-            if self.context.camera_recipe
-                .requires_canon_cr3()
-                && self.develop_reference.as_ref().is_some_and(|first_frame| {
-                    first_frame
-                        .camera_color
-                        .as_ref()
-                        .and_then(|c| c.get("camera_model"))
-                        != info
-                            .camera_color
-                            .as_ref()
-                            .and_then(|c| c.get("camera_model"))
-                })
+            let c = info.camera_color.as_ref().expect("validated color contract");
+            let model = c.get("camera_model").and_then(crate::json::Json::as_str);
+            if self.context.camera_recipe.requires_canon_cr3()
+                && id > 0 && self.camera_model.as_deref() != model
             {
                 return Err("Canon CR3 development rejects mixed camera models".into());
             }
 
             if id == 0 {
-                self.develop_reference = Some(info.clone());
-                let c = info.camera_color.as_ref().expect("validated color contract");
+                self.camera_model = model.map(str::to_owned);
                 let text = |key| c.get(key).and_then(crate::json::Json::as_str).unwrap_or("unknown");
                 let written = self.log.line(&format!(
                     "kind=camera.colour color_contract_version=2 algorithm_revision=4 recipe_requested={} recipe_effective={} profile_fingerprint={} camera_model={} hue_sat_map={} look_table={} tone_curve={} baseline_exposure={} calibration={} calibration_status={} input_cat=bradford-d50-d60",
@@ -806,8 +807,8 @@ impl Backend for Runner<'_, '_> {
                 self.result(written)?;
             }
             let written=self.log.line(&format!(
-                "kind=develop frame={} source={} ev={:.9} wb={} wb_source={} as_shot={} source_sha256={} pixels={} duration={:.3}",
-                info.index,quote(&info.source_name),info.exposure_ev,frame::format_wb(info.applied_wb),info.wb_source,frame::format_wb(info.as_shot_neutral),info.source_sha256.as_deref().unwrap_or("unknown"),
+                "kind=develop frame={} source={} ev={:.9} wb={} wb_source={} as_shot={} pixels={} duration={:.3}",
+                info.index,quote(&info.source_name),info.exposure_ev,frame::format_wb(info.applied_wb),info.wb_source,frame::format_wb(info.as_shot_neutral),
                 match &image.pixels {Pixels::Linear(p)=>p.len(),_=>0},elapsed.as_secs_f64()));
             self.result(written)?;
         } else {
@@ -884,7 +885,7 @@ impl Backend for Runner<'_, '_> {
         }))
     }
     fn commit_encode(&mut self, id: usize, image: Image, elapsed: Duration) -> graph::Result<()> {
-        if id != self.frames.len() {
+        if id != self.sequence.as_ref().map_or(0, |sequence| sequence.count) {
             return Err("graph: encode commit order mismatch".into());
         }
         if id == 0 {
@@ -902,7 +903,17 @@ impl Backend for Runner<'_, '_> {
             elapsed.as_secs_f64()
         ));
         self.result(written)?;
-        self.frames.push(image.info);
+        let info = image.info;
+        let summary = self.sequence.get_or_insert_with(|| SequenceSummary {
+            count: 0,
+            width: info.width,
+            height: info.height,
+            reference_wb: info.applied_wb,
+            reference_frame: info.source_name,
+            total_duration: Duration::ZERO,
+        });
+        summary.count += 1;
+        summary.total_duration += info.duration;
         self.progress("encode");
         Ok(())
     }
@@ -1013,8 +1024,7 @@ fn apply_color_crop(image: &mut Image) -> graph::Result<()> {
     Ok(())
 }
 
-fn prepare_diagnostics(path: &std::path::Path) -> graph::Result<String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("prepare transcript: {e}"))?;
+fn prepare_diagnostics(text: &str) -> graph::Result<String> {
     let mut calls = 0usize;
     let mut conversion = 0.0f64;
     let mut verification = 0.0f64;
@@ -1210,7 +1220,6 @@ pub fn run(
         &context.options.ffmpeg,
         explicit_resize,
         context.options.fps,
-        context.scratch,
     )?;
     let preflight_elapsed = preflight_started.elapsed();
     let output_name = context
@@ -1241,12 +1250,21 @@ pub fn run(
         context,
         log,
         measurements: vec![],
+        pairwise: (context.options.deflicker.enabled()
+            && context.options.deflicker.estimator.as_str() == "pairwise"
+            && (context.options.deflicker.brightness.as_str() != "smooth" || context.sources.len() >= 8))
+            .then(|| PairwiseWindow::new(context.sources.len(), context.options.deflicker.exclude_rois.clone())),
         reference_wb: None,
-        early_contexts: vec![None; context.sources.len()],
+        early_frames: Arc::new(Mutex::new(if graph.early_measure_concurrency().is_some() {
+            vec![None; context.sources.len()]
+        } else { Vec::new() })),
+        early_results: Default::default(),
+        early_reference_wb: None,
         convert_progress_at: Instant::now(),
         convert_progress: 0,
         capture_times: vec![],
-        frames: vec![],
+        prepared_count: 0,
+        sequence: None,
         source_geometry: None,
         resize_target: explicit_resize,
         resize: None,
@@ -1268,7 +1286,7 @@ pub fn run(
         },
         active,
         encoder_config: config.clone(),
-        develop_reference: None,
+        camera_model: None,
         stage_stats: BTreeMap::new(),
         worker_failure: Default::default(),
         failure: None,
@@ -1323,18 +1341,8 @@ pub fn run(
         return Err(error);
     }
     proc::check_stop()?;
-    let first = runner
-        .frames
-        .first()
+    let sequence = runner.sequence.take()
         .ok_or_else(|| Error::new(EXIT_FRAME, "graph produced no frames"))?;
-    let sequence = FrameSequence {
-        width: first.width,
-        height: first.height,
-        reference_wb: first.applied_wb,
-        reference_frame: first.source_name.clone(),
-        total_duration: runner.frames.iter().map(|f| f.duration).sum(),
-        frames: std::mem::take(&mut runner.frames),
-    };
     let mut timings = BTreeMap::new();
     timings.insert("graph".into(), graph_started.elapsed());
     timings.insert("preflight".into(), preflight_elapsed);
@@ -1349,7 +1357,7 @@ pub fn run(
             profile,
             width: sequence.width,
             height: sequence.height,
-            frames: sequence.frames.len(),
+            frames: sequence.count,
             fps: context.options.fps,
         },
         if context.options.verify_output {
@@ -1382,7 +1390,7 @@ pub fn run(
         &output,
         config.media_type(),
         &probe.codec_name,
-        probe.frames.unwrap_or(sequence.frames.len() as u64),
+        probe.frames.unwrap_or(sequence.count as u64),
         "graph streaming encoder",
         profile,
         runner.reference_gain,

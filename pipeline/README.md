@@ -99,7 +99,7 @@ The log is line-oriented; every entry carries `wall=<epoch seconds>` and
 - `timing`, `video` (including `verify=metadata|full`), `publish`,
   `retained-cache` (custom graph left generated cache behind), `run.complete`
 - on failure: `node.error` / `run.error` with the error family, a bounded
-  Converter/FFmpeg stderr tail and the retained scratch path
+  Converter/FFmpeg stderr tail and the scratch cleanup status
 
 The log never contains per-frame metadata documents, matrices, pixel payloads or
 a deflicker quality verdict. `stdout`/`stderr` carry the same operational scope:
@@ -109,15 +109,14 @@ frame inventory, the white-balance mode, the final video/log paths, and errors.
 
 Each run creates a hidden run-specific scratch directory next to the video
 (`.rawtl-<name>-<pid>-<nonce>`). It holds the converted LinearRaw DNG cache and
-child-process transcripts. After a successful publication the whole scratch
+the video pending verification. After a successful publication the whole scratch
 directory is removed when the graph's delete nodes consumed every run-generated
 cache file (the default graph does). A valid custom graph that omits deletion
 keeps the generated cache: the scratch is retained, the log records
 `kind=retained-cache count=… path=…`, and the original RAW/DNG sources stay
 untouched. On failure or a stop request the run stops dispatch, reaps its owned
-native/encoder children, keeps the remaining cache, transcripts and any partial
-output, names that directory in the single log, and exits non-zero without
-publishing a formal video.
+native/encoder children, removes the scratch data and any partial output, and
+records the reason in the run log.
 
 A failed run must be re-run from the source. There is no checkpoint, resume or
 automatic recovery, and a new run never picks up an earlier run's cache. A long
@@ -137,7 +136,7 @@ source -> convert-cache --prepared references--> measure-solve -> apply-ev
 ```
 
 - `prepare` (`convert-cache`) prepares the full sequence with
-  `dng-linear-frame --prepare-sequence`. Adobe DNG Converter runs once for all
+  `dng-linear-frame --prepare-export` or its early-measurement variant. Adobe DNG Converter runs once for all
   inputs that need it. Validated references are published in source order.
 - `measure-solve` measures independent frames concurrently, then seals the full
   frame inventory and publishes one EV table. `strength 0` replaces it with a zero plan.
@@ -190,16 +189,14 @@ When Prepare directly feeds Solve on macOS, it can make frames available for
 early measurement while Converter is still running. After a writable
 descriptor disappears, the file must stay unchanged with no observed writer
 for five seconds. Solve admits only the ready prefix in frame order and shares
-its worker limit between early and final measurements. The paths and
-provisional results are stored in scratch. Prepare validates the full sequence
-before final publication. Matching source identity, DNG hash and white balance
-allow reuse of early measurements. The log records early admission and reuse.
-
-Prepare hashes RAW inputs and sealed Converter outputs once. Internal consumers
-check file identity, length and modification/change times without rereading the
-contents for integrity. An early candidate is hashed once before publication
-and compared with the sealed hash before reuse. Native checks its captured file
-state before and after decode to catch writes or replacement during measurement.
+its worker limit between early and final measurements. References and provisional
+results cross process pipes and stay in memory. Prepare validates the full
+sequence before final publication. Matching frame number, file versions and
+white balance allow reuse of early measurements. Native checks state before and
+after decode, using the device, inode, size and modification/change timestamps.
+Export associates measurements and exposure corrections by frame number.
+The rolling pairwise window releases detailed samples after the last relevant
+comparison. The global solve uses compact tile statistics and frame-pair edges.
 
 Heavy frames across the chain are bounded by the sum of stage capacities, plus
 native worksets and each transformation's temporary buffers.
@@ -213,17 +210,16 @@ defaults to 15 seconds multiplied by the number of frames sent to Converter and
 can be overridden with `converter_timeout`.
 Filename collisions or long paths use short aliases inside the run scratch.
 If even the alias list exceeds the OS command-line limit, Prepare fails before
-starting Converter. The scratch keeps one `cache/linear` directory, the exact
-`cache/converter.argv` invocation, per-frame provenance records and the
-`cache/prepare-native.log` transcript.
+starting Converter. The temporary aliases are removed after Converter finishes.
+The converted frames share one `cache/linear` directory.
 
 All prepare, measure, develop and FFmpeg processes share the run's multi-task
 process owner. Encode runs as a capacity-1 task with one writer to one FFmpeg
 stream, so a blocked stdin write leaves the coordinator able to cancel and
 collect other completions. Sequence completion requires sealed input, all tasks
 finished, ordered commits and all output delivery. Errors or stop signals cancel and reap active tasks; late successes are
-not committed. FFmpeg failure cancels every registered producer. Each task has
-its own transcript in retained scratch on failure. The existing run log records
+not committed. FFmpeg failure cancels every registered producer. Child diagnostics
+are bounded in memory and relevant error tails are copied to the run log. It records
 `kind=stage` summaries (capacity, accepted/committed/delivered counts and peak
 in-flight frames) and `kind=image`/`kind=encode` compute durations. Stage duration
 sums include overlapping tasks and must not be interpreted as pipeline wall time.
@@ -532,7 +528,7 @@ consumes the typed payload it validates.
 | 50 | graph/encoder configuration or typed artifact validation failure |
 | 60 | streaming encoder/validation failure; cancelled encoder |
 | 70 | run-log or publication/rename failure |
-| 130 | stop request (SIGINT/SIGTERM); scratch retained |
+| 130 | stop request (SIGINT/SIGTERM); scratch cleaned |
 
 ## Tests
 
@@ -541,7 +537,7 @@ tests, the graph scheduler tests, and CLI integrations with real FFmpeg, a
 standalone fake native producer and one guarded real-CR3 journey (it is skipped
 with a printed note when the staged material, Converter or native build is
 absent). Coverage includes the one-video/one-log surface, scratch cleanup,
-retained failure scratch, overwrite refusal, Converter/FFmpeg failure reporting,
+failure cleanup, overwrite refusal, Converter/FFmpeg failure reporting,
 container/extension mismatch, removed quality flags, WB modes, graph
 configuration/deletion ordering, resolved EV plans, degraded photometry and
 typed handoff defects.

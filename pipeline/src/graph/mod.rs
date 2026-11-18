@@ -346,6 +346,12 @@ impl Graph {
             .map_or(1, |node| node.concurrency)
     }
 
+    pub fn early_measure_concurrency(&self) -> Option<usize> {
+        self.nodes.iter().find(|node| {
+            node.kind == Kind::Solve && self.nodes[node.inputs["frames"]].kind == Kind::Prepare
+        }).map(|node| node.concurrency)
+    }
+
     /// Encoder configuration declared by the single encode node, when present.
     pub fn encoder_patch(&self) -> Option<&EncoderPatch> {
         self.nodes.iter().find_map(|node| node.encoder.as_ref())
@@ -626,7 +632,7 @@ impl<T> Seal<T> {
 #[derive(Clone, Debug)]
 pub struct Gain {
     pub frame_id: usize,
-    pub source_sha256: String,
+    pub reference_identity: String,
     pub ev: f64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -664,7 +670,7 @@ pub trait Backend {
     }
     fn commit_prepare(&mut self, id: usize, r: &Self::Reference) -> Result<()>;
     fn cancel(&mut self) {}
-    fn hash<'a>(&self, r: &'a Self::Reference) -> &'a str;
+    fn reference_identity<'a>(&self, r: &'a Self::Reference) -> &'a str;
     fn measure_task(
         &mut self,
         id: usize,
@@ -805,14 +811,8 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                 .then(|| OrderedStage::<B::Measurement>::new(n.concurrency, wake.clone()))
         })
         .collect();
-    let mut early_measurements = graph
-        .nodes
-        .iter()
-        .find(|node| {
-            node.kind == Kind::Solve
-                && graph.nodes[node.inputs["frames"]].kind == Kind::Prepare
-        })
-        .map(|node| OrderedStage::<usize>::new(node.concurrency, wake.clone()));
+    let mut early_measurements = graph.early_measure_concurrency()
+        .map(|concurrency| OrderedStage::<usize>::new(concurrency, wake.clone()));
     let mut early_pending = BTreeSet::new();
     let mut early_next = 0;
     let mut images: Vec<_> = graph
@@ -917,7 +917,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                         let id = output.key.frame_id;
                         let p = graph.nodes[i].inputs["frames"];
                         let r = &states[p].refs[id];
-                        if id != states[i].next || output.key.source != b.hash(r) {
+                        if id != states[i].next || output.key.source != b.reference_identity(r) {
                             return Err(
                                 "graph: measurement completion identity/order mismatch".into()
                             );
@@ -1040,7 +1040,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                                             ordered_frames::TaskKey {
                                                 node: node.id.clone(),
                                                 frame_id: id,
-                                                source: b.hash(r).into(),
+                                                source: b.reference_identity(r).into(),
                                             },
                                             task,
                                         )?;
@@ -1092,7 +1092,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                                     .enumerate()
                                     .map(|(frame_id, r)| Gain {
                                         frame_id,
-                                        source_sha256: b.hash(r).into(),
+                                        reference_identity: b.reference_identity(r).into(),
                                         ev: 0.,
                                     })
                                     .collect()
@@ -1100,7 +1100,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                             if plan.len() != count
                                 || plan.iter().enumerate().any(|(id, g)| {
                                     g.frame_id != id
-                                        || g.source_sha256 != b.hash(&states[p].refs[id])
+                                        || g.reference_identity != b.reference_identity(&states[p].refs[id])
                                         || !g.ev.is_finite()
                                         || !g.ev.exp2().is_finite()
                                         || g.ev.exp2() <= 0.
@@ -1123,7 +1123,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                             if let Some(r) = states[p].refs.get(id) {
                                 let gain =
                                     &states[plan].plan.as_ref().ok_or("graph: missing plan")?[id];
-                                if gain.source_sha256 != b.hash(r) {
+                                if gain.reference_identity != b.reference_identity(r) {
                                     return Err("graph: EV join identity mismatch".into());
                                 }
                                 let task = b.develop_task(id, r, gain.ev)?;
@@ -1131,7 +1131,7 @@ pub fn execute_sealed<B: Backend>(graph: &Graph, inventory: &Seal<()>, b: &mut B
                                     ordered_frames::TaskKey {
                                         node: node.id.clone(),
                                         frame_id: id,
-                                        source: b.hash(r).into(),
+                                        source: b.reference_identity(r).into(),
                                     },
                                     task,
                                 )?;

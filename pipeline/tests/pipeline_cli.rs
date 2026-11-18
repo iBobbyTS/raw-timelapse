@@ -481,22 +481,13 @@ fn stops_at_the_first_failing_frame_without_video() {
     assert!(text.contains("frame 2/3"), "{text}");
     assert!(text.contains("IMG_2.DNG"), "{text}");
     assert!(text.contains("synthetic frame failure"), "{text}");
-    assert!(text.contains("retained"), "{text}");
     assert!(!video_in(&directory).exists());
 
     let log = read_log(&directory);
     assert!(log.contains("kind=run.error code=30"), "{log}");
     assert!(log.contains("synthetic frame failure"), "{log}");
-    assert!(log.contains("retained=true"), "{log}");
-    let scratch = scratch_from_log(&log);
-    assert!(scratch.is_dir(), "failure keeps the scratch for diagnosis");
-    assert!(scratch.join("cache").is_dir());
-    // The built-in prepare adapter owns one transcript for the sequence.
-    let transcript = scratch.join("cache/prepare-native.log");
-    assert!(
-        fs::read_to_string(&transcript).unwrap().contains("--prepare-sequence"),
-        "sequence converter transcript is retained in scratch"
-    );
+    assert!(log.contains("retained=false"), "{log}");
+    assert!(!scratch_from_log(&log).exists());
     // No later frame was committed; concurrent computation may have started.
     assert!(!log.contains("kind=develop frame=3"), "{log}");
 }
@@ -518,11 +509,6 @@ fn encoder_failure_publishes_nothing_and_records_bounded_stderr() {
     args.extend(["--ffmpeg", encoder.to_str().expect("utf8")]);
     let result = run_cli(&args);
     assert_eq!(result.status.code(), Some(60), "{}", stderr(&result));
-    assert!(
-        stderr(&result).contains("partial/intermediate artifacts retained"),
-        "{}",
-        stderr(&result)
-    );
     assert!(!video_in(&directory).exists());
     let log = read_log(&directory);
     assert!(log.contains("kind=run.error code=60"), "{log}");
@@ -531,10 +517,7 @@ fn encoder_failure_publishes_nothing_and_records_bounded_stderr() {
         "the encoder stderr tail enters the single log:\n{log}"
     );
     let scratch = scratch_from_log(&log);
-    assert!(
-        scratch.join(VIDEO_NAME).is_file(),
-        "the partial output stays in scratch"
-    );
+    assert!(!scratch.exists(), "the failed export cleans its scratch");
 }
 
 #[test]
@@ -670,25 +653,8 @@ fn protocol_and_child_failures_reap_live_counterparts_and_never_publish() {
 
         let log = read_log(&directory);
         let scratch = scratch_from_log(&log);
-        assert!(scratch.is_dir(), "{label}: scratch retained");
-        let mut pids = fs::read_to_string(root.join("owned.pids")).unwrap_or_default();
-        fn collect_transcripts(dir: &Path, out: &mut String) {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    if entry.path().is_dir() {
-                        collect_transcripts(&entry.path(), out);
-                    } else if let Ok(text) = fs::read_to_string(entry.path()) {
-                        for line in text.lines() {
-                            if let Some(pid) = line.strip_prefix("pid: ") {
-                                out.push_str(pid);
-                                out.push('\n');
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        collect_transcripts(&scratch, &mut pids);
+        assert!(!scratch.exists(), "{label}: scratch cleaned");
+        let pids = fs::read_to_string(root.join("owned.pids")).unwrap_or_default();
         assert!(
             !pids.trim().is_empty(),
             "{label}: the fixture must instrument owned children"
@@ -1236,8 +1202,8 @@ fn rejects_invalid_white_balance_mode_values() {
 // Typed handoff defects
 // ---------------------------------------------------------------------------
 
-fn assert_final_source_hash_rejected(defect: &str) {
-    let root = test_dir(&format!("final-source-hash-{defect}"));
+fn assert_final_frame_id_rejected(defect: &str) {
+    let root = test_dir(&format!("final-frame-id-{defect}"));
     let input = root.join("material");
     let frames = synthetic_sequence(&[0.0, 0.1, -0.1]);
     let names: Vec<&str> = frames.iter().map(|frame| frame.name.as_str()).collect();
@@ -1251,7 +1217,7 @@ fn assert_final_source_hash_rejected(defect: &str) {
         WIDTH,
         HEIGHT,
     );
-    append_config(&fixtures, &format!("frame_source_sha256_defect={defect}"));
+    append_config(&fixtures, &format!("frame_id_defect={defect}"));
     let directory = run_directory(&root, "run");
     let video = video_in(&directory);
     let result = run_cli(&base_args(&input, &video, &tool));
@@ -1264,24 +1230,15 @@ fn assert_final_source_hash_rejected(defect: &str) {
         stderr(&result)
     );
     let error = stderr(&result);
-    let failed_id = assert_failed_input_frame(&error, &frames);
+    assert_failed_input_frame(&error, &frames);
     assert!(
-        error.contains("metadata is missing or invalid field \"source_sha256\""),
+        error.contains("native export frame id does not match its task"),
         "{error}"
     );
     assert!(!video_in(&directory).exists());
     let log = read_log(&directory);
     assert!(log.contains("kind=run.error code=30"), "{log}");
-    let scratch = scratch_from_log(&log);
-    let transcript = fs::read_to_string(scratch.join(format!(
-        "transcripts/develop/frame_{:06}.log",
-        failed_id + 1
-    )))
-    .expect("reported final-frame transcript");
-    let length = transcript.lines()
-        .find_map(|line| line.strip_prefix("JSON 0x01: ")?.strip_suffix(" bytes"))
-        .and_then(|bytes| bytes.parse::<usize>().ok());
-    assert!(length.is_some_and(|bytes| bytes > 0), "{transcript}");
+    assert!(!scratch_from_log(&log).exists());
     assert!(!log.contains("kind=develop frame=3"), "{log}");
     assert!(
         log_kind(&log, "develop").is_empty(),
@@ -1294,23 +1251,23 @@ fn assert_final_source_hash_rejected(defect: &str) {
 }
 
 #[test]
-fn stdout_frame_missing_source_sha256_is_rejected_after_valid_analysis() {
-    assert_final_source_hash_rejected("omit");
+fn stdout_frame_missing_frame_id_is_rejected_after_valid_analysis() {
+    assert_final_frame_id_rejected("omit");
 }
 
 #[test]
-fn stdout_frame_null_source_sha256_is_rejected_after_valid_analysis() {
-    assert_final_source_hash_rejected("null");
+fn stdout_frame_null_frame_id_is_rejected_after_valid_analysis() {
+    assert_final_frame_id_rejected("null");
 }
 
 #[test]
-fn stdout_frame_non_string_source_sha256_is_rejected_after_valid_analysis() {
-    assert_final_source_hash_rejected("non-string");
+fn stdout_frame_wrong_type_frame_id_is_rejected_after_valid_analysis() {
+    assert_final_frame_id_rejected("non-string");
 }
 
 #[test]
-fn stdout_frame_empty_source_sha256_is_rejected_after_valid_analysis() {
-    assert_final_source_hash_rejected("empty");
+fn stdout_frame_empty_frame_id_is_rejected_after_valid_analysis() {
+    assert_final_frame_id_rejected("empty");
 }
 
 fn run_sidecar_defect(name: &str, defects: FakeSidecarDefects) -> (Output, PathBuf) {
@@ -1328,9 +1285,9 @@ fn run_sidecar_defect(name: &str, defects: FakeSidecarDefects) -> (Output, PathB
 }
 
 #[test]
-fn forged_metadata_source_hash_is_rejected_by_the_typed_boundary() {
+fn forged_metadata_frame_id_is_rejected_by_the_typed_boundary() {
     let (result, _) = run_sidecar_defect(
-        "forged-metadata-hash",
+        "forged-frame-id",
         FakeSidecarDefects {
             empty_source_sha256: true,
             ..FakeSidecarDefects::default()
@@ -1340,7 +1297,7 @@ fn forged_metadata_source_hash_is_rejected_by_the_typed_boundary() {
     let text = stderr(&result);
     assert_failed_input_frame(&text, &synthetic_sequence(&[0.0, 0.1]));
     assert!(
-        text.contains("metadata is missing or invalid field \"source_sha256\""),
+        text.contains("native export frame id does not match its task"),
         "{text}"
     );
 }
@@ -1831,7 +1788,7 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
             ("rev_defect=non-canon", "camera color contract"),
             ("rev_defect=mixed-model", "mixed camera models"),
             ("rev_defect=format", "pixel_format"),
-            ("empty_source_sha256=1", "source_sha256"),
+            ("empty_source_sha256=1", "export frame id"),
             ("rev_defect=nan", "nonfinite FP32"),
             (
                 "rev_defect=old-calibration",

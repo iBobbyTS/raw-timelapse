@@ -540,7 +540,6 @@ pub fn preflight(
     ffmpeg: &Path,
     explicit_geometry: Option<(u32, u32)>,
     fps: Fps,
-    scratch: &Path,
 ) -> Result<()> {
     if let Some((width, height)) = explicit_geometry {
         if let Err(message) = config.validate_geometry(width, height) {
@@ -572,11 +571,13 @@ pub fn preflight(
     let geometry = explicit_geometry.unwrap_or_else(|| {
         if config.export().is_some() { (640, 480) } else { (32, 32) }
     });
-    let output = scratch.join(format!("preflight.{}", config.container.extension()));
-    let _ = fs::remove_file(&output);
-    let args = config.preflight_args(profile, geometry, &fps.arg(), &output);
-    let captured = proc::run_capture(ffmpeg, &args, EXIT_PREVIEW)?;
-    let _ = fs::remove_file(&output);
+    let mut args = config.preflight_args(profile, geometry, &fps.arg(), Path::new("pipe:1"));
+    if let Some(index) = args.iter().rposition(|arg| arg == "-movflags") {
+        // MOV needs fragmentation on a non-seekable test pipe. The actual
+        // export still uses the normal seekable-file muxer settings.
+        args[index + 1] = "+frag_keyframe+empty_moov+write_colr".into();
+    }
+    let captured = proc::run_capture_errors(ffmpeg, &args, EXIT_PREVIEW)?;
     if !captured.status.success() {
         return Err(Error::new(
             EXIT_PREVIEW,
@@ -622,12 +623,13 @@ impl StreamingEncoder {
         active: proc::ActiveNative,
     ) -> Result<Self> {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let process = proc::OwnedProcess::spawn_active(
+        let process = proc::OwnedProcess::spawn_piped_active(
             program,
             args,
             log,
             EXIT_PREVIEW,
             true,
+            false,
             active.clone(),
         )?;
         let input = process.child.lock().unwrap().stdin.take();
@@ -807,7 +809,7 @@ pub struct GraphEncoder {
     output_name: String,
     encoder: Option<StreamingEncoder>,
     output: Option<std::path::PathBuf>,
-    transcript: Option<std::path::PathBuf>,
+
     command: Option<String>,
     pub active: proc::ActiveNative,
 }
@@ -819,7 +821,7 @@ impl GraphEncoder {
             output_name: output_name.to_string(),
             encoder: None,
             output: None,
-            transcript: None,
+
             command: None,
             active: Default::default(),
         }
@@ -872,14 +874,13 @@ impl GraphEncoder {
                 inputs.depth,
                 &output,
             );
-            let transcript = scratch.join("transcripts/encode.log");
+            let key = scratch.join("encode");
             self.command = Some(proc::display_command(&inputs.ffmpeg, &args));
             self.output = Some(output);
-            self.transcript = Some(transcript.clone());
             self.encoder = Some(StreamingEncoder::spawn(
                 &inputs.ffmpeg,
                 &args,
-                &transcript,
+                &key,
                 self.active.clone(),
             )?);
         }
@@ -921,13 +922,9 @@ impl GraphEncoder {
             return Err(Error::new(
                 EXIT_PREVIEW,
                 format!(
-                    "streaming encoder failed: {}; transcript {}: {}",
+                    "streaming encoder failed: {}; {}",
                     proc::exit_description(&status),
-                    self.transcript.as_ref().map_or_else(
-                        || "unavailable".to_string(),
-                        |path| path.display().to_string()
-                    ),
-                    self.transcript_tail()
+                    proc::tail(&encoder.process.stderr(), 1200)
                 ),
             ));
         }
@@ -948,20 +945,10 @@ impl GraphEncoder {
 
     /// Bounded encoder transcript tail for the single run log when the encoder
     /// is the failing node.
-    pub fn failure_detail(&self) -> String {
-        self.transcript_tail()
-    }
-
-    /// Bounded tail of the FFmpeg transcript, so the single run log carries the
-    /// necessary encoder error without a second log file.
-    fn transcript_tail(&self) -> String {
-        let Some(path) = &self.transcript else {
-            return String::new();
-        };
-        match fs::read_to_string(path) {
-            Ok(text) => proc::tail(&text, 1200),
-            Err(err) => format!("unreadable: {err}"),
-        }
+    pub fn failure_detail(&mut self) -> String {
+        let Some(encoder) = &mut self.encoder else { return String::new(); };
+        let _ = encoder.finish(true);
+        proc::tail(&encoder.process.stderr(), 1200)
     }
 }
 

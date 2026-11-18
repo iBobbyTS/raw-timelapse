@@ -88,7 +88,6 @@ fn real_cli_orders_concurrent_native_stages_and_freezes_source_zero_white_balanc
             "source",
             "ev",
             "wb",
-            "source_sha256",
             "pixels",
         ] {
             assert_eq!(

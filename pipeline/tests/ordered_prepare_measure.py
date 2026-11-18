@@ -8,10 +8,12 @@ wrapper = root/'gated-native'
 wrapper.write_text(f'''#!/usr/bin/python3
 import json,os,pathlib,socket,subprocess,sys
 args=sys.argv[1:]
-result=subprocess.run([{str(tool)!r},*args])
+payload=sys.stdin.buffer.read()
+result=subprocess.run([{str(tool)!r},*args],input=payload)
 if result.returncode: sys.exit(result.returncode)
-if args[0] in ['--prepare-sequence','--stdout-analysis','--stdout-frame-f32']:
-    source=pathlib.Path(args[1]).stem if args[0]=='--prepare-sequence' else pathlib.Path(dict(line.split('=',1) for line in pathlib.Path(args[2]).read_text().splitlines()[1:])['source']).stem
+if args[0] in ['--prepare-export-early','--stdout-analysis','--stdout-frame-f32']:
+    from urllib.parse import unquote
+    source='sequence' if args[0]=='--prepare-export-early' else pathlib.Path(unquote(dict(line.split('=',1) for line in payload.decode().splitlines()[1:])['source'])).stem
     s=socket.socket(socket.AF_UNIX);s.connect({str(sock)!r});s.sendall((json.dumps({{'stage':args[0],'source':source,'args':args}})+'\\n').encode());s.recv(1);s.close()
 sys.exit(0)
 ''')
@@ -27,7 +29,7 @@ try:
     conn,_=server.accept()
     with conn,conn.makefile('rb',buffering=0) as stream:
         event=json.loads(stream.readline())
-        assert event['stage']=='--prepare-sequence',event
+        assert event['stage']=='--prepare-export-early',event
         trace.append(event)
         conn.sendall(b'!'); assert conn.recv(1)==b''
     for stage in ['--stdout-analysis','--stdout-frame-f32']:

@@ -16,17 +16,19 @@ pub use doc::PreparedFrame;
 #[cfg(test)]
 pub use doc::PreparedRoute;
 pub use orchestrate::{
-    analyze_prepared_at, develop_prepared_at, prepare_sequence_active,
-    PrepareSequenceItem, PrepareSequenceSettings, PreparedSettings,
+    analyze_prepared_at, develop_prepared_at, prepare_export_active,
+    PrepareSequenceSettings, PreparedSettings,
 };
 #[allow(unused_imports)] // desktop preview and single-frame tests
 pub use orchestrate::{prepare_active, PrepareSettings};
-pub use sidecar::{analysis_bytes, format_wb};
+pub use sidecar::format_wb;
+#[cfg(test)]
+pub use sidecar::analysis_bytes;
 #[cfg(test)]
 pub use stream::Protocol;
 
 #[cfg(test)]
-pub use orchestrate::{analyze_prepared, develop_prepared, prepare};
+pub use orchestrate::{analyze_prepared, develop_prepared, prepare, prepare_sequence_active, PrepareSequenceItem};
 #[cfg(test)]
 pub use orchestrate::{produce_with_evs, stream_frames};
 pub(crate) use doc::percent_encode;
@@ -66,7 +68,9 @@ pub struct FrameInfo {
     pub analysis_envelope: Option<DataEnvelope>,
     pub measurement: Option<crate::deflicker::FrameMeasurement>,
 }
+#[cfg(test)]
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FrameSequence {
     pub frames: Vec<FrameInfo>,
     pub width: u32,
