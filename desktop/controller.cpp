@@ -259,6 +259,8 @@ void Controller::onWorkerReply(const QJsonObject &reply) {
             if (colorIds_.contains("srgb-preview"))
                 colorIds_.insert(colorIds_.indexOf("srgb-preview") + 1, "auto-log");
             colorIndex_ = std::max<qsizetype>(0, colorIds_.indexOf(baseProfile_.value("output_color").toString()));
+            whiteBalanceIndex_ = baseProfile_.value("white_balance").toString() == "first-frame" ? 0 : 1;
+            deflickerIndex_ = baseProfile_.value("brightness").toString() == "smooth" ? 1 : 0;
             fps_ = QString::number(baseProfile_.value("fps").toInt(60));
             for (const auto &entry : result.value("export_presets").toArray()) {
                 const auto id = entry.toString();
@@ -394,6 +396,13 @@ void Controller::selectWhiteBalance(int index) {
     }
 }
 
+void Controller::selectDeflicker(int index) {
+    if ((index == 0 || index == 1) && index != deflickerIndex_) {
+        deflickerIndex_ = index;
+        emit changed();
+    }
+}
+
 void Controller::selectColor(int index) {
     if (index >= 0 && index < colorIds_.size() && index != colorIndex_) {
         colorIndex_ = index;
@@ -487,6 +496,7 @@ QJsonObject Controller::exportProfile(const QJsonValue &fps) const {
         profile.insert("export_hardware_variant", hardwareVariants_.value(preset));
     profile.insert("fps", fps);
     profile.insert("white_balance", whiteBalanceIndex_ == 0 ? "first-frame" : "per-frame");
+    profile.insert("brightness", deflickerIndex_ == 0 ? "uniform" : "smooth");
     profile.insert("lens_correction", lensEnabled_ ? "auto" : "off");
     profile.insert("output_color", selectedColor());
     profile.insert("dng_linear_frame", nativePath_);

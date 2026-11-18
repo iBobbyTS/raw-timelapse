@@ -249,12 +249,12 @@ hard error with no video produced.
 
 ## White balance modes
 
-- `first-frame` (default): the first numerically ordered frame is decoded with
+- `first-frame`: the first numerically ordered frame is decoded with
   its own AsShotNeutral (`as-shot`). Its applied triple is passed to every later
   frame as the native `--white-balance R,G,B` override; each later sidecar must report `override`
   and exactly that triple. The log's `develop` entries show the frozen value and
   `wb_source=override`.
-- `per-frame`: every frame is decoded with its own RAW as-shot neutral and the
+- `per-frame` (built-in `default` profile): every frame is decoded with its own RAW as-shot neutral and the
   pipeline passes no `white_balance` override. Every `develop` entry must show
   `wb_source=as-shot` with applied equal to the frame's own neutral.
 
@@ -289,7 +289,8 @@ exit. Legacy `ffprobe` settings are accepted for compatibility and ignored.
 ## Colour/Log profiles
 
 The profile’s `output_color` field selects the output colour/Log rendering. The
-built-in `default` profile uses sRGB (`srgb-preview`). Canon Cinema Gamut/CLog profiles
+built-in `default` profile uses `auto-log` to select the output Log from the first
+frame’s camera. Canon Cinema Gamut/CLog profiles
 are signalled per field and are
 never disguised as BT.2020 transfer/primaries. ProRes delivery is limited range
 because MOV `colr/nclc` cannot carry a range field and ProRes decoders assume

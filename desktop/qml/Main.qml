@@ -394,13 +394,19 @@ ApplicationWindow {
             width: 1
             color: window.borderColor
         }
-        Rectangle {
+        ScrollView {
+            id: settingsPanel
             Layout.fillHeight: true
             Layout.preferredWidth: Math.min(350, Math.max(260, window.width * 0.29))
-            color: window.surface
+            padding: 16
+            contentWidth: availableWidth
+            contentHeight: settings.implicitHeight
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            background: Rectangle { color: window.surface }
+
             ColumnLayout {
-                anchors.fill: parent
-                anchors.margins: 16
+                id: settings
+                width: settingsPanel.availableWidth
                 spacing: 8
                 SectionHeading {
                     text: qsTr("预处理")
@@ -430,6 +436,20 @@ ApplicationWindow {
                     wrapMode: Text.Wrap
                     text: window.workspace.lensModel.length === 0 ? qsTr("无镜头信息")
                         : window.workspace.lensModel + (window.workspace.lensSupported ? "" : qsTr("（不支持校正）"))
+                }
+                SectionHeading {
+                    text: qsTr("去闪烁")
+                    Layout.topMargin: 8
+                    Layout.bottomMargin: 4
+                }
+                ComboBox {
+                    objectName: "deflicker"
+                    Layout.fillWidth: true
+                    enabled: window.hasSource
+                    model: [qsTr("统一曝光"), qsTr("平滑曝光")]
+                    currentIndex: window.workspace.deflickerIndex
+                    Accessible.name: qsTr("去闪烁")
+                    onActivated: index => window.workspace.selectDeflicker(index)
                 }
                 Rectangle {
                     Layout.fillWidth: true
@@ -488,7 +508,6 @@ ApplicationWindow {
                     wrapMode: Text.Wrap
                     color: "#ffaaa2"
                 }
-                Item { Layout.fillHeight: true }
             }
         }
     }

@@ -40,6 +40,7 @@ class Controller final : public QObject {
     Q_PROPERTY(QVariantList exportPresets READ exportPresets NOTIFY exportPresetsChanged)
     Q_PROPERTY(int exportPresetIndex READ exportPresetIndex NOTIFY changed)
     Q_PROPERTY(int whiteBalanceIndex READ whiteBalanceIndex NOTIFY changed)
+    Q_PROPERTY(int deflickerIndex READ deflickerIndex NOTIFY changed)
     Q_PROPERTY(QString lensModel READ lensModel NOTIFY changed)
     Q_PROPERTY(bool lensSupported READ lensSupported NOTIFY changed)
     Q_PROPERTY(bool lensEnabled READ lensEnabled NOTIFY changed)
@@ -72,6 +73,7 @@ public:
     QVariantList exportPresets() const { return exportPresets_; }
     int exportPresetIndex() const { return exportPresetIndex_; }
     int whiteBalanceIndex() const { return whiteBalanceIndex_; }
+    int deflickerIndex() const { return deflickerIndex_; }
     QString lensModel() const { return lensModel_; }
     bool lensSupported() const { return lensSupported_; }
     bool lensEnabled() const { return lensEnabled_ && !lensModel_.isEmpty(); }
@@ -89,6 +91,7 @@ public:
     Q_INVOKABLE void closeSource();
     Q_INVOKABLE void selectFrame(int frame);
     Q_INVOKABLE void selectWhiteBalance(int index);
+    Q_INVOKABLE void selectDeflicker(int index);
     Q_INVOKABLE void selectColor(int index);
     Q_INVOKABLE void selectExportPreset(int index);
     Q_INVOKABLE void setLensEnabled(bool enabled);
@@ -144,7 +147,8 @@ private:
     int frame_ = 1;
     int colorIndex_ = 0;
     int exportPresetIndex_ = -1;
-    int whiteBalanceIndex_ = 0;
+    int whiteBalanceIndex_ = 1;
+    int deflickerIndex_ = 0;
     bool lensSupported_ = false;
     bool lensEnabled_ = true;
     QString fps_ = QStringLiteral("60");
