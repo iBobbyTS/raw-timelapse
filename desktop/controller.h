@@ -118,10 +118,11 @@ private:
     QProcess worker_;
     QProcess hardwareProbe_;
     QProcess encoder_;
-    QString cliPath_, nativePath_, exiftool_, converter_, ffmpeg_, ffprobe_;
+    QString cliPath_, nativePath_, exiftool_, converter_, ffmpeg_;
     QJsonObject baseProfile_;
     QStringList colorIds_;
     QStringList exportPresetIds_;
+    QJsonObject hardwareVariants_;
     QVariantList exportPresets_;
     QByteArray previewReplies_, workerError_, encoderError_;
     Request activeRequest_ = Request::None;

@@ -64,13 +64,13 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     options.profile_source = Some(profile.clone());
     if output.is_none() {
         let input = crate::guard::canonical_input(&options.input)?;
-        let (_, encoder) = crate::graph_run::resolve_processing(&options)?;
+        let container = crate::graph_run::output_container(&options)?;
         let stem = input
             .file_name()
             .ok_or_else(|| usage("the input directory has no name; specify --output"))?;
         let mut video_name = OsString::from(stem);
         video_name.push(".");
-        video_name.push(encoder.container.extension());
+        video_name.push(container.extension());
         let mut log_name = OsString::from(stem);
         log_name.push(".log");
         options.video = input.with_file_name(video_name);
@@ -130,7 +130,7 @@ fn load(source: &str) -> std::result::Result<Vec<String>, String> {
                 settings.push(format!("--preview-profile={value}"))
             }
             (
-                "white_balance" | "output_cat" | "camera_color" | "export_profile" | "encoder"
+                "white_balance" | "output_cat" | "camera_color" | "export_profile" | "export_hardware_variant" | "encoder"
                 | "pix_fmt" | "container" | "codec_profile" | "resize" | "lens_correction" | "lens_vignette"
                 | "lens_distortion" | "lens_ca" | "lens_resampling" | "lens_crop" | "brightness"
                 | "estimator" | "ev_limits" | "roi" | "dng_linear_frame" | "ffmpeg" | "ffprobe"

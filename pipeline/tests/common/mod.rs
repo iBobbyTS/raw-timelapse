@@ -683,10 +683,10 @@ pub fn fake_failing_encoder(dir: &Path) -> PathBuf {
     path
 }
 
-pub fn fake_ffprobe_wrong_codec(dir: &Path) -> PathBuf {
-    let path = dir.join("fake-ffprobe-wrong-codec");
+pub fn fake_ffmpeg_wrong_output_codec(dir: &Path) -> PathBuf {
+    let path = dir.join("fake-ffmpeg-wrong-output-codec");
     let script = format!(
-        "#!/bin/sh\ncat <<EOF\ncodec_name=ffv1\npix_fmt=yuv420p\nwidth={WIDTH}\nheight={HEIGHT}\nnb_read_frames=2\navg_frame_rate=60/1\nEOF\nexit 0\n"
+        "#!/bin/sh\ncase \" $* \" in *\" -progress \"*) echo 'Stream #0:0: Video: ffv1, yuv420p, {WIDTH}x{HEIGHT}, 60 fps' >&2; exit 0;; esac\nexec {FFMPEG} \"$@\"\n"
     );
     write_executable(&path, &script);
     path

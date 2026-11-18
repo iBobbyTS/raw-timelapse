@@ -8,7 +8,6 @@
 mod common;
 
 use common::*;
-use rawtl_linear_video::json::Json;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -547,12 +546,12 @@ fn probe_rejection_publishes_nothing() {
     fs::create_dir_all(&fixtures).expect("fixtures");
     let frames = standard_frames(&fixtures);
     let tool = fake_native_tool(&fixtures, &frames, None, false);
-    let ffprobe = fake_ffprobe_wrong_codec(&fixtures);
+    let ffmpeg = fake_ffmpeg_wrong_output_codec(&fixtures);
     let directory = run_directory(&root, "run");
 
     let video = video_in(&directory);
     let mut args = base_args(&input, &video, &tool);
-    args.extend(["--ffprobe", ffprobe.to_str().expect("utf8")]);
+    args.extend(["--ffmpeg", ffmpeg.to_str().expect("utf8")]);
     let result = run_cli(&args);
     assert_eq!(result.status.code(), Some(60), "{}", stderr(&result));
     let text = stderr(&result);
@@ -1237,14 +1236,6 @@ fn rejects_invalid_white_balance_mode_values() {
 // Typed handoff defects
 // ---------------------------------------------------------------------------
 
-fn metadata_from_transcript(text: &str) -> Json {
-    let value = text
-        .lines()
-        .find_map(|line| line.strip_prefix("JSON 0x01: "))
-        .expect("metadata JSON in transcript");
-    rawtl_linear_video::json::parse(value).unwrap()
-}
-
 fn assert_final_source_hash_rejected(defect: &str) {
     let root = test_dir(&format!("final-source-hash-{defect}"));
     let input = root.join("material");
@@ -1287,7 +1278,10 @@ fn assert_final_source_hash_rejected(defect: &str) {
         failed_id + 1
     )))
     .expect("reported final-frame transcript");
-    metadata_from_transcript(&transcript);
+    let length = transcript.lines()
+        .find_map(|line| line.strip_prefix("JSON 0x01: ")?.strip_suffix(" bytes"))
+        .and_then(|bytes| bytes.parse::<usize>().ok());
+    assert!(length.is_some_and(|bytes| bytes > 0), "{transcript}");
     assert!(!log.contains("kind=develop frame=3"), "{log}");
     assert!(
         log_kind(&log, "develop").is_empty(),

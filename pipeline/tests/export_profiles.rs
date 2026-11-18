@@ -171,6 +171,11 @@ fn hardware_catalog_probes_every_candidate_and_tries_eight_bit_when_main10_fails
             ("hevc_videotoolbox", InputFormat::Yuv420p),
         ]
     );
+    for profile in &profiles {
+        let variant = profile.hardware_variant().expect("discovered format");
+        assert_eq!(ExportProfile::from_hardware_variant(&profile.name, &variant).as_ref(), Some(profile));
+    }
+    assert!(ExportProfile::from_hardware_variant("h264_videotoolbox", "h264:yuv420p:rgb24").is_none());
     assert!(calls.contains(&("hevc_videotoolbox".into(), true)));
     assert!(calls.contains(&("h264_vulkan".into(), false)));
     assert!(!calls.iter().any(|(encoder, _)| encoder == "libx264"));

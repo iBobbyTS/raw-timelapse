@@ -188,7 +188,6 @@ fn execute(
 
     proc::require_executable(&options.native_tool, "--dng-linear-frame")?;
     proc::require_executable(&options.ffmpeg, "--ffmpeg")?;
-    proc::require_executable(&options.ffprobe, "--ffprobe")?;
 
     let sources = order::enumerate_dng(input)?;
     let first = sources.first().expect("inventory is nonempty");

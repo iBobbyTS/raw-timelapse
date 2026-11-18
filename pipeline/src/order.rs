@@ -72,8 +72,8 @@ pub struct SourceFrame {
 
 /// Enumerate candidate source frames in one input directory.
 ///
-/// Hidden files and `.xmp` sidecars are skipped; every other regular file is a
-/// candidate. Candidates must share a single extension (case-insensitive),
+/// Hidden files and known non-RAW companions are skipped; every other regular
+/// file is a candidate. Candidates must share a single extension (case-insensitive),
 /// because the directory is one time-lapse sequence and the format decision
 /// belongs to the converter downstream.
 pub fn enumerate_dng(dir: &Path) -> Result<Vec<SourceFrame>> {
@@ -102,6 +102,16 @@ pub fn enumerate_dng(dir: &Path) -> Result<Vec<SourceFrame>> {
             continue;
         }
         let path = entry.path();
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if matches!(extension.as_str(),
+            "xmp" | "txt" | "md" | "jpg" | "jpeg" | "png" | "heic" | "heif" | "thm"
+        ) {
+            continue;
+        }
         let metadata = fs::metadata(&path).map_err(|err| {
             Error::new(EXIT_INPUT, format!("cannot stat {}: {err}", path.display()))
         })?;
@@ -120,16 +130,6 @@ pub fn enumerate_dng(dir: &Path) -> Result<Vec<SourceFrame>> {
                 ))
             }
         };
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(|extension| extension.to_ascii_lowercase())
-            .unwrap_or_default();
-        if matches!(extension.as_str(),
-            "xmp" | "txt" | "md" | "jpg" | "jpeg" | "png" | "heic" | "heif" | "thm"
-        ) {
-            continue;
-        }
         names.push((name, path, extension));
     }
 
@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_hidden_files_and_xmp_sidecars() {
+    fn skips_hidden_files_and_known_non_raw_companions() {
         let dir = temp_root("skip-hidden");
         for name in [
             "IMG_0001.dng",
@@ -300,6 +300,9 @@ mod tests {
             ".hidden_0003.dng",
             "IMG_0001.xmp",
             "IMG_0002.XMP",
+            "notes.txt",
+            "IMG_0001.JPG",
+            "preview.HEIC",
         ] {
             touch(&dir, name);
         }

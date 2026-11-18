@@ -120,11 +120,6 @@ Controller::Controller(PreviewProvider &provider) : provider_(provider) {
                         , "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
 #endif
     );
-    ffprobe_ = executable("RAW_TIMELAPSE_FFPROBE", "ffprobe"
-#ifdef Q_OS_MACOS
-                         , "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe"
-#endif
-    );
     converter_ = qEnvironmentVariable("RAW_TIMELAPSE_CONVERTER");
 
     const QString workerPath = executable("RAW_TIMELAPSE_WORKER", "rawtl-desktop-worker", RAWTL_WORKER_FALLBACK);
@@ -139,9 +134,10 @@ Controller::Controller(PreviewProvider &provider) : provider_(provider) {
         for (const auto &entry : presets) {
             const auto preset = entry.toObject();
             const auto id = preset.value("id").toString();
-            const auto codec = id.startsWith("h264_") ? "H.264" : "H.265";
+            const auto codec = preset.value("variant").toString().startsWith("h264:") ? "H.264" : "H.265";
             const auto backend = id.section('_', 1);
             const auto bits = preset.value("bits").toInt();
+            hardwareVariants_.insert(id, preset.value("variant"));
             exportPresetIds_.append(id);
             exportPresets_.append(tr("%1 · %2 · %3-bit").arg(codec, backend).arg(bits));
         }
@@ -484,7 +480,10 @@ QJsonObject Controller::exportProfile(const QJsonValue &fps) const {
     profile.remove("signal_bits");
     profile.remove("encoder");
     profile.remove("pix_fmt");
-    profile.insert("export_profile", exportPresetIds_.value(exportPresetIndex_));
+    const auto preset = exportPresetIds_.value(exportPresetIndex_);
+    profile.insert("export_profile", preset);
+    if (hardwareVariants_.contains(preset))
+        profile.insert("export_hardware_variant", hardwareVariants_.value(preset));
     profile.insert("fps", fps);
     profile.insert("white_balance", whiteBalanceIndex_ == 0 ? "first-frame" : "per-frame");
     profile.insert("lens_correction", lensEnabled_ ? "auto" : "off");
@@ -492,7 +491,6 @@ QJsonObject Controller::exportProfile(const QJsonValue &fps) const {
     profile.insert("dng_linear_frame", nativePath_);
     profile.insert("exiftool", exiftool_);
     profile.insert("ffmpeg", ffmpeg_);
-    profile.insert("ffprobe", ffprobe_);
     if (!converter_.isEmpty())
         profile.insert("converter", QFileInfo(converter_).absoluteFilePath());
     return profile;

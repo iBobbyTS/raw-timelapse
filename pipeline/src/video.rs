@@ -6,7 +6,7 @@
 use crate::cli::Fps;
 use crate::color_profile::ColorProfile;
 use crate::encoder::ResolvedConfig;
-use crate::error::{Error, Result, EXIT_PREVIEW, EXIT_PUBLISH, EXIT_VALIDATION};
+use crate::error::{Error, Result, EXIT_PREVIEW, EXIT_PUBLISH};
 use crate::json::Json;
 use crate::proc;
 #[cfg(test)]
@@ -175,8 +175,7 @@ pub struct ProbeInfo {
     pub bits_per_raw_sample: Option<u32>,
     pub width: u32,
     pub height: u32,
-    /// Decoded/counted frame total. `None` when the probe did not decode (no
-    /// `-count_frames`) and the container declares no `nb_frames`.
+    /// Number of frames decoded by full verification.
     pub frames: Option<u64>,
     pub avg_frame_rate: String,
     pub color_space: String,
@@ -232,101 +231,94 @@ impl ProbeInfo {
     }
 }
 
-pub fn probe_stream(ffprobe: &Path, file: &Path, count_frames: bool) -> Result<ProbeInfo> {
-    // `-count_frames` makes ffprobe decode the entire stream just to count it.
-    // Without it only the container-declared count (if any) is available.
-    let mut args = vec![
-        "-v".to_string(),
-        "error".to_string(),
-        "-select_streams".to_string(),
-        "v:0".to_string(),
-    ];
-    if count_frames {
-        args.push("-count_frames".to_string());
+fn inspect_output(ffmpeg: &Path, file: &Path, verify: OutputVerify) -> Result<ProbeInfo> {
+    let full = verify == OutputVerify::Full;
+    let mut args: Vec<String> = ["-hide_banner", "-nostdin", "-v", "info", "-nostats", "-xerror",
+        "-abort_on", "empty_output", "-progress", "pipe:1", "-i"]
+        .into_iter().map(str::to_owned).collect();
+    args.push(file.display().to_string());
+    args.extend(["-map", "0:v:0"].into_iter().map(str::to_owned));
+    if full {
+        args.extend(["-fps_mode", "passthrough"].into_iter().map(str::to_owned));
+    } else {
+        args.extend(["-c:v", "copy", "-frames:v", "1"].into_iter().map(str::to_owned));
     }
-    args.extend([
-        "-show_entries".to_string(),
-        "stream=codec_name,profile,pix_fmt,bits_per_raw_sample,width,height,nb_read_frames,avg_frame_rate,color_space,color_primaries,color_transfer,color_range".to_string(),
-        "-of".to_string(),
-        "default=noprint_wrappers=1".to_string(),
-        file.display().to_string(),
-    ]);
-    let captured = proc::run_capture(ffprobe, &args, EXIT_VALIDATION)?;
+    args.extend(["-f", "null", "-"].into_iter().map(str::to_owned));
+    let captured = proc::run_capture(ffmpeg, &args, EXIT_PREVIEW)?;
     if !captured.status.success() {
-        return Err(Error::new(
-            EXIT_VALIDATION,
-            format!(
-                "ffprobe failed for {}: {}; stderr: {}",
-                file.display(),
-                proc::exit_description(&captured.status),
-                proc::tail(&captured.stderr, 1200)
-            ),
-        ));
+        return Err(Error::new(EXIT_PREVIEW, format!(
+            "output verification failed for {}: {}; stderr: {}",
+            file.display(), proc::exit_description(&captured.status), proc::tail(&captured.stderr, 1200)
+        )));
     }
-    let mut fields = std::collections::BTreeMap::new();
-    for line in captured.stdout.lines() {
-        if let Some((key, value)) = line.split_once('=') {
-            fields.insert(key.trim().to_string(), value.trim().to_string());
+    let mut probe = parse_video_description(&captured.stderr)
+        .ok_or_else(|| Error::new(EXIT_PREVIEW, format!(
+            "FFmpeg did not report a video stream for {}: {}",
+            file.display(), proc::tail(&captured.stderr, 1200)
+        )))?;
+    if full {
+        probe.frames = captured.stdout.lines()
+            .filter_map(|line| line.strip_prefix("frame=")?.trim().parse().ok())
+            .last();
+    }
+    Ok(probe)
+}
+
+/// Parse the first input video summary. Parenthesized annotations can contain
+/// commas, including the pixel range, colour tags and field order.
+fn parse_video_description(stderr: &str) -> Option<ProbeInfo> {
+    let line = stderr.lines().map(str::trim)
+        .take_while(|line| !line.starts_with("Stream mapping:") && !line.starts_with("Output #"))
+        .filter(|line| line.starts_with("Stream #0:"))
+        .find_map(|line| line.split_once(": Video: ").map(|(_, video)| video))?;
+    let mut depth = 0;
+    let fields: Vec<_> = line.split(|ch| match ch {
+        '(' => { depth += 1; false }
+        ')' => { depth -= 1; false }
+        ',' => depth == 0,
+        _ => false,
+    }).map(str::trim).collect();
+
+    let codec = *fields.first()?;
+    let codec_name = codec.split_whitespace().next()?.into();
+    let codec_profile = codec.split_once('(').and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(name, _)| name).filter(|name| !name.contains(" / ")).unwrap_or("unknown");
+    let format = *fields.get(1)?;
+    let pix_fmt = format.split(['(', ' ']).next()?.to_owned();
+    let mut range = if pix_fmt.starts_with("yuvj") { "pc" } else { "unknown" };
+    let mut tags = ["unknown"; 3];
+    if let Some((_, options)) = format.split_once('(') {
+        for option in options.trim_end_matches(')').split(',').map(str::trim) {
+            if matches!(option, "tv" | "pc") {
+                range = option;
+            } else if let [matrix, primaries, transfer] = option.split('/').collect::<Vec<_>>().as_slice() {
+                tags = [matrix, primaries, transfer];
+            } else if !matches!(option, "progressive" | "top first" | "bottom first" | "unknown" | "chroma location: left" | "") &&
+                !option.contains(' ') && !option.contains(':') {
+                // FFmpeg collapses three identical tags to one name.
+                tags = [option; 3];
+            }
         }
     }
-    let required = |key: &str| -> Result<String> {
-        fields.get(key).cloned().ok_or_else(|| {
-            Error::new(
-                EXIT_VALIDATION,
-                format!(
-                    "ffprobe output for {} has no {key} field; output: {}",
-                    file.display(),
-                    proc::tail(&captured.stdout, 600)
-                ),
-            )
-        })
-    };
-    let width: u32 = required("width")?.parse().map_err(|_| {
-        Error::new(
-            EXIT_VALIDATION,
-            format!(
-                "ffprobe returned a non-integer width for {}",
-                file.display()
-            ),
-        )
+    let (width, height) = fields.iter().find_map(|field| {
+        let dimensions = field.split_whitespace().next()?;
+        let (width, height) = dimensions.split_once('x')?;
+        Some((width.parse().ok()?, height.parse().ok()?))
     })?;
-    let height: u32 = required("height")?.parse().map_err(|_| {
-        Error::new(
-            EXIT_VALIDATION,
-            format!(
-                "ffprobe returned a non-integer height for {}",
-                file.display()
-            ),
-        )
-    })?;
-    // Whether a missing count is acceptable is the caller's verify-depth choice.
-    let frames = fields
-        .get("nb_read_frames")
-        .or_else(|| fields.get("nb_frames"))
-        .and_then(|text| text.parse::<u64>().ok());
-    let color = |key: &str| {
-        fields
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string())
-    };
-    let bits_per_raw_sample = fields
-        .get("bits_per_raw_sample")
-        .and_then(|text| text.parse::<u32>().ok())
-        .filter(|bits| *bits > 0);
-    Ok(ProbeInfo {
-        codec_name: required("codec_name")?,
-        profile: color("profile"),
-        pix_fmt: required("pix_fmt")?,
-        bits_per_raw_sample,
+    let rate = fields.iter().find_map(|field| field.strip_suffix(" fps")).unwrap_or("unknown");
+    Some(ProbeInfo {
+        codec_name,
+        profile: codec_profile.into(),
+        pix_fmt,
+        bits_per_raw_sample: None,
         width,
         height,
-        frames,
-        avg_frame_rate: required("avg_frame_rate")?,
-        color_space: color("color_space"),
-        color_primaries: color("color_primaries"),
-        color_transfer: color("color_transfer"),
-        color_range: color("color_range"),
+        frames: None,
+        avg_frame_rate: rate.into(),
+        color_space: tags[0].into(),
+        color_primaries: tags[1].into(),
+        color_transfer: tags[2].into(),
+        color_range: range.into(),
     })
 }
 
@@ -341,22 +333,15 @@ pub struct OutputContract<'a> {
     pub fps: Fps,
 }
 
-/// Depth of the post-encode output check. `Metadata` compares ffprobe
-/// container metadata against the configured contract without decoding;
-/// `Full` additionally counts frames by decoding and decodes the whole
-/// deliverable to prove it is playable.
+/// Metadata mode reads one encoded packet. Full mode decodes and counts the
+/// entire video with the same FFmpeg invocation that describes its stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputVerify {
     Metadata,
     Full,
 }
 
-/// Validate the encoded file generically: codec/profile/pixel format/geometry/
-/// frame count/rate and the profile's per-field colour tags against ffprobe
-/// metadata; `OutputVerify::Full` also counts frames by decoding and runs a
-/// complete decode of the deliverable.
 pub fn validate_output(
-    ffprobe: &Path,
     ffmpeg: &Path,
     file: &Path,
     contract: &OutputContract<'_>,
@@ -368,7 +353,7 @@ pub fn validate_output(
     if let Err(message) = config.validate_geometry(contract.width, contract.height) {
         return Err(Error::new(EXIT_PREVIEW, message));
     }
-    let probe = probe_stream(ffprobe, file, verify == OutputVerify::Full)?;
+    let probe = inspect_output(ffmpeg, file, verify)?;
     if config.codec_name() != "unknown" && probe.codec_name != config.codec_name() {
         return Err(Error::new(
             EXIT_PREVIEW,
@@ -429,7 +414,7 @@ pub fn validate_output(
         }
         _ => {}
     }
-    if !rate_matches(&probe.avg_frame_rate, contract.fps) {
+    if probe.avg_frame_rate != "unknown" && !rate_matches(&probe.avg_frame_rate, contract.fps) {
         return Err(Error::new(
             EXIT_PREVIEW,
             format!(
@@ -475,7 +460,9 @@ pub fn validate_output(
     let range_matches = probe.color_range == expected_range
         || (!config.writes_range_tag()
             && matches!(probe.color_range.as_str(), "" | "unknown" | "unspecified"));
-    if rgb.is_some() && !range_matches {
+    // FFmpeg may omit the range from the input summary even for a
+    // stream whose decoder defaults to limited range.
+    if rgb.is_some() && probe.color_range != "unknown" && !range_matches {
         return Err(Error::new(
             EXIT_PREVIEW,
             format!(
@@ -485,31 +472,6 @@ pub fn validate_output(
         ));
     }
 
-    if verify == OutputVerify::Full {
-        // Full decode proves the file is actually playable, not merely indexable.
-        let args = vec![
-            "-hide_banner".to_string(),
-            "-nostdin".to_string(),
-            "-v".to_string(),
-            "error".to_string(),
-            "-i".to_string(),
-            file.display().to_string(),
-            "-f".to_string(),
-            "null".to_string(),
-            "-".to_string(),
-        ];
-        let captured = proc::run_capture(ffmpeg, &args, EXIT_PREVIEW)?;
-        if !captured.status.success() {
-            return Err(Error::new(
-                EXIT_PREVIEW,
-                format!(
-                    "output failed a full decode: {}; stderr: {}",
-                    proc::exit_description(&captured.status),
-                    proc::tail(&captured.stderr, 1200)
-                ),
-            ));
-        }
-    }
     Ok(probe)
 }
 
@@ -584,6 +546,10 @@ pub fn preflight(
         if let Err(message) = config.validate_geometry(width, height) {
             return Err(Error::new(EXIT_USAGE_FOR_PREFLIGHT, message));
         }
+    }
+    // Discovery already exercised this variant on the selected FFmpeg/device.
+    if config.export().is_some_and(|profile| profile.is_hardware()) {
+        return Ok(());
     }
     let declared_formats = if config.export().is_none() {
         supported_encoder_pixel_formats(ffmpeg, &config.encoder)?
@@ -784,7 +750,8 @@ fn rate_matches(observed: &str, fps: Fps) -> bool {
     match parsed {
         Some(value) if value.is_finite() => {
             let expected = fps.as_f64();
-            (value - expected).abs() <= 1e-6 * expected.max(1.0)
+            // FFmpeg prints decimal frame rates to two decimal places.
+            (value - expected).abs() <= if observed.contains('/') { 1e-6 * expected.max(1.0) } else { 0.00501 }
         }
         _ => false,
     }
@@ -1062,54 +1029,22 @@ mod output_verify_tests {
             path
         }
 
-        /// Fake ffprobe: records argv and reports exactly the fields the
-        /// configured contract expects, so the metadata checks pass by
-        /// construction and only the verify depth changes behaviour.
-        fn ffprobe(
-            &self,
-            config: &ResolvedConfig,
-            profile: &ColorProfile,
-            frames: Option<u64>,
-        ) -> std::path::PathBuf {
+        fn ffmpeg(&self, config: &ResolvedConfig, profile: &ColorProfile, frames: Option<u64>) -> std::path::PathBuf {
             let mut lines = vec![format!(
-                "printf '%s\\n' \"$@\" > {}",
-                self.root.join("ffprobe.argv").display()
-            )];
-            lines.push(format!("echo codec_name={}", config.codec_name()));
-            lines.push(format!("echo pix_fmt={}", config.pix_fmt));
-            if let Some(name) = config.probe_profile() {
-                lines.push(format!("echo profile={name}"));
-            }
-            lines.push("echo width=64".to_string());
-            lines.push("echo height=48".to_string());
-            if let Some(count) = frames {
-                lines.push(format!("echo nb_read_frames={count}"));
-            }
-            lines.push(format!("echo avg_frame_rate={}", Fps::DEFAULT.arg()));
-            lines.push(format!(
-                "echo color_space={}",
-                profile.tag_policy.matrix_token()
-            ));
-            lines.push(format!(
-                "echo color_primaries={}",
-                profile.tag_policy.primaries_token()
-            ));
-            lines.push(format!(
-                "echo color_transfer={}",
-                profile.tag_policy.transfer_token()
-            ));
-            lines.push(format!(
-                "echo color_range={}",
-                config.effective_range(profile).as_str()
-            ));
-            self.script("ffprobe", &lines)
-        }
-
-        fn ffmpeg(&self) -> std::path::PathBuf {
-            let lines = vec![format!(
-                "printf '%s\\n' \"$@\" > {}",
+                "printf '%s\n' \"$@\" > {}",
                 self.root.join("ffmpeg.argv").display()
             )];
+            let name = config.probe_profile().unwrap_or("unknown");
+            let tags = profile.tag_policy;
+            let range = config.effective_range(profile).as_str();
+            lines.push(format!(
+                "echo '  Stream #0:0: Video: {} ({}), {}({}, {}/{}/{}), 64x48, 60 fps' >&2",
+                config.codec_name(), name, config.pix_fmt, range,
+                tags.matrix_token(), tags.primaries_token(), tags.transfer_token()
+            ));
+            if let Some(count) = frames {
+                lines.push(format!("printf 'frame={count}\nprogress=end\n'"));
+            }
             self.script("ffmpeg", &lines)
         }
 
@@ -1154,97 +1089,45 @@ mod output_verify_tests {
     }
 
     #[test]
-    fn metadata_mode_skips_frame_counting_and_the_full_decode() {
-        let (harness, config, profile) = scene("metadata", Some(3));
-        let ffprobe = harness.ffprobe(&config, profile, Some(3));
-        let ffmpeg = harness.ffmpeg();
+    fn metadata_mode_reads_one_packet_without_decoding() {
+        let (harness, config, profile) = scene("metadata", None);
+        let ffmpeg = harness.ffmpeg(&config, profile, None);
         let output = harness.root.join("video.mov");
-        fs::write(&output, b"encoded").unwrap();
-        let probe = validate_output(
-            &ffprobe,
-            &ffmpeg,
-            &output,
-            &contract(&config, profile, 3),
-            OutputVerify::Metadata,
-        )
-        .unwrap();
-        assert_eq!(probe.frames, Some(3));
-        assert!(!harness
-            .argv("ffprobe.argv")
-            .contains(&"-count_frames".to_string()));
-        assert!(!harness.root.join("ffmpeg.argv").exists());
+        let probe = validate_output(&ffmpeg, &output, &contract(&config, profile, 3),
+            OutputVerify::Metadata).unwrap();
+        assert_eq!(probe.frames, None);
+        let argv = harness.argv("ffmpeg.argv");
+        assert!(argv.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(argv.windows(2).any(|pair| pair == ["-frames:v", "1"]));
     }
 
     #[test]
-    fn full_mode_counts_frames_and_decodes_the_deliverable() {
+    fn full_mode_decodes_and_counts_once() {
         let (harness, config, profile) = scene("full", Some(3));
-        let ffprobe = harness.ffprobe(&config, profile, Some(3));
-        let ffmpeg = harness.ffmpeg();
+        let ffmpeg = harness.ffmpeg(&config, profile, Some(3));
         let output = harness.root.join("video.mov");
-        fs::write(&output, b"encoded").unwrap();
-        validate_output(
-            &ffprobe,
-            &ffmpeg,
-            &output,
-            &contract(&config, profile, 3),
-            OutputVerify::Full,
-        )
-        .unwrap();
-        assert!(harness
-            .argv("ffprobe.argv")
-            .contains(&"-count_frames".to_string()));
-        let ffmpeg_argv = harness.argv("ffmpeg.argv");
-        assert!(ffmpeg_argv.contains(&"-f".to_string()));
-        assert!(ffmpeg_argv.contains(&"null".to_string()));
+        let probe = validate_output(&ffmpeg, &output, &contract(&config, profile, 3),
+            OutputVerify::Full).unwrap();
+        assert_eq!(probe.frames, Some(3));
+        let argv = harness.argv("ffmpeg.argv");
+        assert!(argv.iter().any(|arg| arg == "-xerror"));
+        assert!(argv.windows(2).any(|pair| pair == ["-fps_mode", "passthrough"]));
+        assert!(!argv.iter().any(|arg| arg == "copy" || arg == "-frames:v"));
     }
 
     #[test]
-    fn a_container_without_a_count_passes_metadata_and_fails_full() {
-        let (harness, config, profile) = scene("missing-count", None);
-        let ffprobe = harness.ffprobe(&config, profile, None);
-        let ffmpeg = harness.ffmpeg();
-        let output = harness.root.join("video.mov");
-        fs::write(&output, b"encoded").unwrap();
-        validate_output(
-            &ffprobe,
-            &ffmpeg,
-            &output,
-            &contract(&config, profile, 3),
-            OutputVerify::Metadata,
-        )
-        .unwrap();
-        let error = validate_output(
-            &ffprobe,
-            &ffmpeg,
-            &output,
-            &contract(&config, profile, 3),
-            OutputVerify::Full,
-        )
-        .unwrap_err();
-        assert_eq!(error.code, EXIT_PREVIEW);
-        assert!(error.message.contains("could not count frames"));
-    }
-
-    #[test]
-    fn a_declared_count_mismatch_is_rejected_in_both_modes() {
-        let (harness, config, profile) = scene("mismatch", Some(5));
-        let ffprobe = harness.ffprobe(&config, profile, Some(5));
-        let ffmpeg = harness.ffmpeg();
-        let output = harness.root.join("video.mov");
-        fs::write(&output, b"encoded").unwrap();
-        for verify in [OutputVerify::Metadata, OutputVerify::Full] {
-            let error = validate_output(
-                &ffprobe,
-                &ffmpeg,
-                &output,
-                &contract(&config, profile, 3),
-                verify,
-            )
-            .unwrap_err();
+    fn full_mode_requires_the_exact_decoded_count() {
+        for (count, expected) in [(None, "could not count frames"), (Some(5), "output has 5 frames, expected 3")] {
+            let (harness, config, profile) = scene("count", count);
+            let ffmpeg = harness.ffmpeg(&config, profile, count);
+            let output = harness.root.join("video.mov");
+            let error = validate_output(&ffmpeg, &output, &contract(&config, profile, 3),
+                OutputVerify::Full).unwrap_err();
             assert_eq!(error.code, EXIT_PREVIEW);
-            assert!(error.message.contains("output has 5 frames, expected 3"));
+            assert!(error.message.contains(expected), "{}", error.message);
         }
     }
+
 }
 
 #[cfg(all(test, unix))]

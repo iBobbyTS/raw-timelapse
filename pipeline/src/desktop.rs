@@ -363,8 +363,9 @@ pub fn serve() -> Result<()> {
                 .into_iter()
                 .map(|profile| {
                     Json::obj(vec![
-                        ("id", Json::Str(profile.name)),
+                        ("variant", Json::Str(profile.hardware_variant().expect("discovered layout"))),
                         ("bits", Json::Int(i64::from(profile.input.bits()))),
+                        ("id", Json::Str(profile.name)),
                     ])
                 })
                 .collect();

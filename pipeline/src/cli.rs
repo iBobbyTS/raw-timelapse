@@ -10,7 +10,6 @@ use std::path::PathBuf;
 
 pub const DEFAULT_NATIVE_TOOL: &str = "native/build/dng-linear-frame";
 pub const DEFAULT_FFMPEG: &str = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg";
-pub const DEFAULT_FFPROBE: &str = "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe";
 pub const USAGE: &str = "\
 rawtl-linear-video --input <DIR> --profile <default|ABSOLUTE_FILE> [--output <VIDEO_FILE>]
 
@@ -48,7 +47,6 @@ OPTIONS:
                                per-frame decodes every frame with its own RAW as-shot neutral
     --dng-linear-frame <PATH>  Native frame producer (default: native/build/dng-linear-frame)
     --ffmpeg <PATH>            ffmpeg executable (default: /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg)
-    --ffprobe <PATH>           ffprobe executable (default: /opt/homebrew/opt/ffmpeg-full/bin/ffprobe)
     --preview-profile <ID>     Output colour/Log profile (default: srgb-preview)
                                one of: srgb-preview, dji-dlog-dgamut,
                                dji-dlog2-dgamut2,
@@ -89,8 +87,8 @@ OPTIONS:
     --lens-profile-dir <DIR>   Installed LCP root, repeatable; replaces default Adobe roots
     --converter <PATH>         Adobe DNG Converter override passed to the native tool
     --converter-timeout <SEC>  Total timeout per ADC call, including batches (1-3600 seconds)
-    --verify-output           Verify the encoded output in full after encoding: frame-count
-                               decode plus a complete decode (default: container metadata only)
+    --verify-output           Strictly decode and count all frames with FFmpeg
+                               (default: read stream metadata and one encoded packet)
     --strength <0..1>          Correction strength (default: 1.0; 0 disables deflicker)
     --period <N>               Smooth-trend period in frames, >= 6 (default: 60)
     --brightness <MODE>        smooth | uniform (default: smooth)
@@ -110,8 +108,8 @@ CONFIGURATION PRIORITY:
 
 OUTPUT SURFACE:
     <VIDEO_FILE>               deliverable, published by a single rename; checked against
-                               container metadata by default (--verify-output adds frame
-                               counting and a complete decode)
+                               FFmpeg stream metadata by default (--verify-output decodes
+                               and counts all frames in one pass)
     <name>.log                 one run log: wall-clock + monotonic elapsed, node/frame
                                events, per-frame timings, cache-deletion events and
                                bounded error summaries (Converter/FFmpeg stderr tails)
@@ -373,7 +371,6 @@ pub struct Options {
     pub white_balance: WhiteBalance,
     pub native_tool: PathBuf,
     pub ffmpeg: PathBuf,
-    pub ffprobe: PathBuf,
     pub camera_color: CameraColor,
     pub output_color: OutputColor,
     /// Depth of the single YCbCr quantization handoff into the encoder.
@@ -386,8 +383,7 @@ pub struct Options {
     pub encoder: Patch,
     /// Explicit CLI resize; `None` keeps the graph's geometry (source by default).
     pub resize: Option<(u32, u32)>,
-    /// Opt in to the full output verification pass (frame-count decode plus a
-    /// complete decode of the deliverable). Default: container metadata only.
+    /// Opt in to a strict full decode that also counts the delivered frames.
     pub verify_output: bool,
 }
 
@@ -407,7 +403,6 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
     let mut white_balance = WhiteBalance::DEFAULT;
     let mut native_tool = PathBuf::from(DEFAULT_NATIVE_TOOL);
     let mut ffmpeg = PathBuf::from(DEFAULT_FFMPEG);
-    let mut ffprobe = PathBuf::from(DEFAULT_FFPROBE);
     let mut preview_profile = Some(color_profile::default_profile());
     let mut output_cat: Option<color_profile::OutputCatSelection> = None;
     let mut log_reference_gain: Option<ReferenceGain> = None;
@@ -423,6 +418,7 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
     let mut rate_flag: Option<&'static str> = None;
     let mut resize: Option<(u32, u32)> = None;
     let mut verify_output = false;
+    let mut hardware_variant = None;
     let mut seen_input = false;
     let mut seen_output = false;
 
@@ -477,8 +473,9 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
                 native_tool = PathBuf::from(take_value(args, &mut index, flag, inline_value)?)
             }
             "--ffmpeg" => ffmpeg = PathBuf::from(take_value(args, &mut index, flag, inline_value)?),
+            // Accept old profiles and internal invocations after removing the dependency.
             "--ffprobe" => {
-                ffprobe = PathBuf::from(take_value(args, &mut index, flag, inline_value)?)
+                take_value(args, &mut index, flag, inline_value)?;
             }
             "--preview-profile" => {
                 let value = take_value(args, &mut index, flag, inline_value)?;
@@ -694,6 +691,9 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
                     "--steps (file form) was removed; repeat --step START:EV",
                 ));
             }
+            "--export-hardware-variant" => {
+                hardware_variant = Some(take_value(args, &mut index, flag, inline_value)?);
+            }
             "--export-profile" => {
                 let name = take_value(args, &mut index, flag, inline_value)?;
                 if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
@@ -811,6 +811,15 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
                 .map_err(|message| Error::new(EXIT_USAGE, message))?,
         );
     }
+    if let Some(variant) = hardware_variant {
+        use rawtl_linear_video::export::{ExportProfile, Selection};
+        let Some(Selection::Named(name)) = encoder.export.as_ref() else {
+            return Err(Error::new(EXIT_USAGE, "hardware variant requires a named hardware export profile"));
+        };
+        let preset = ExportProfile::from_hardware_variant(name, &variant)
+            .ok_or_else(|| Error::new(EXIT_USAGE, format!("invalid variant {variant:?} for hardware export {name:?}")))?;
+        encoder.export = Some(Selection::Discovered(preset));
+    }
     if encoder.export.is_some()
         && (encoder.encoder.is_some()
             || encoder.pix_fmt.is_some()
@@ -834,7 +843,6 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
         white_balance,
         native_tool,
         ffmpeg,
-        ffprobe,
         output_color,
         camera_color: camera_color.unwrap_or(CameraColor::Auto),
         signal_depth,

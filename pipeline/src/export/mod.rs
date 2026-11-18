@@ -10,6 +10,7 @@ pub use hardware::hardware_profiles;
 pub enum Selection {
     Named(String),
     Manual(ExportProfile),
+    Discovered(ExportProfile),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +26,7 @@ pub struct ExportProfile {
     pub(crate) device_args: Vec<String>,
     /// The layout FFmpeg must convert to before uploading hardware frames.
     pub(crate) upload_format: Option<&'static str>,
+    pub(crate) hardware: bool,
 }
 
 pub const SOFTWARE_PROFILES: [&str; 7] = [
@@ -145,6 +147,7 @@ impl ExportProfile {
             args,
             device_args: vec![],
             upload_format: None,
+            hardware: false,
         })
     }
 
@@ -174,6 +177,7 @@ impl ExportProfile {
             args: parameters,
             device_args: vec![],
             upload_format: None,
+            hardware: false,
         }
     }
 }

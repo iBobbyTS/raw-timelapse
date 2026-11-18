@@ -142,6 +142,7 @@ fn candidates(
                 &format!("+{layout}"),
                 quality,
             );
+            profile.hardware = true;
             if let Some((device_type, _)) = device {
                 profile.device_args = vec![
                     "-init_hw_device".into(),
@@ -159,6 +160,39 @@ fn candidates(
 }
 
 impl ExportProfile {
+    pub fn hardware_variant(&self) -> Option<String> {
+        if !self.hardware {
+            return None;
+        }
+        Some(format!("{}:{}:{}", self.codec?, self.input.name(), self.encoder_format.as_deref()?))
+    }
+
+    pub fn from_hardware_variant(name: &str, variant: &str) -> Option<Self> {
+        let (_, backend) = name.split_once('_')?;
+        if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') || backend.is_empty() {
+            return None;
+        }
+        let (codec, variant) = variant.split_once(':')?;
+        let codec = match codec {
+            "h264" => "h264",
+            "hevc" => "hevc",
+            _ => return None,
+        };
+        let (input, layout) = variant.split_once(':')?;
+        let input = match (codec, input) {
+            (_, "yuv420p") => InputFormat::Yuv420p,
+            ("hevc", "yuv420p10le") => InputFormat::Yuv420p10,
+            _ => return None,
+        };
+        candidates(name, backend, codec, input, Some(layout))
+            .into_iter()
+            .find(|profile| profile.encoder_format.as_deref() == Some(layout))
+    }
+
+    pub fn is_hardware(&self) -> bool {
+        self.hardware
+    }
+
     pub(crate) fn hardware_filter(&self) -> Option<String> {
         self.upload_format.map(|format| {
             let upload = if self.device_args.is_empty() {

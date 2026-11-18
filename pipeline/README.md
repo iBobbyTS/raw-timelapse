@@ -276,8 +276,8 @@ stop/error behaviour, encoder contract and log format in more detail.
 ## Input formats and ordering
 
 The input directory is one sequence and must contain a single file extension
-per directory (case-insensitive). Hidden files (dot-prefixed) and `.xmp`
-sidecars are skipped. Frame names are tokenised into alternating text and digit
+per directory (case-insensitive). Hidden files and known non-RAW companions
+(XMP, text/Markdown notes, JPEG/PNG/HEIF previews and THM thumbnails) are skipped. Frame names are tokenised into alternating text and digit
 runs; text compares case-insensitively and digit runs compare numerically, so
 `IMG_2` sorts before `IMG_10`. Names without a digit run, names differing only by
 case and names differing only in digit spelling (`IMG_1` vs `IMG_01`) are
@@ -320,13 +320,13 @@ are rejected. Unsupported encoder/pixel-format/container combinations and
 configuration conflicts are rejected before any RAW preparation; no encoder or
 pixel format is silently substituted.
 
-Publication is one rename after the output check. By default the check reads
-ffprobe container metadata only: codec/profile/pixel format/geometry/rate,
-per-field colour tags, range where the container can express it, and the frame
-count when the container declares one (MOV/ProRes declares none, so the logged
-count is then the encoder's own). `verify_output` additionally counts frames
-by decoding and decodes the entire deliverable to prove it is playable. Check
-failure leaves only the scratch partial and a non-zero exit.
+Publication is one rename after output verification. By default FFmpeg reads
+the input stream description and one encoded packet without a full decode.
+Codec, pixel format, dimensions and available conforming metadata are checked.
+The default mode reports the pipeline frame total. With `verify_output` enabled,
+the same FFmpeg invocation strictly decodes the whole video and verifies the
+decoded frame count. Check failure leaves the scratch partial and a non-zero
+exit. Legacy `ffprobe` settings are accepted for compatibility and ignored.
 
 ## Colour/Log profiles
 
@@ -564,7 +564,7 @@ consumes the typed payload it validates.
 | 10 | input enumeration/ordering error |
 | 11 | output/input overlap or invalid output path |
 | 12 | existing video or log would be overwritten |
-| 20 | required executable (native tool/ffmpeg/ffprobe) unavailable |
+| 20 | required executable (native tool/FFmpeg) unavailable |
 | 30 | frame production or frame-metadata verification failure |
 | 50 | graph/encoder configuration or typed artifact validation failure |
 | 60 | streaming encoder/validation failure; cancelled encoder |

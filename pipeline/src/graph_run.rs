@@ -1132,7 +1132,7 @@ pub fn resolve_configuration(options: &crate::cli::Options) -> Result<(Graph, Re
     Ok((graph, config))
 }
 
-pub(crate) fn resolve_processing(options: &crate::cli::Options) -> Result<(Graph, ResolvedConfig)> {
+fn processing_graph(options: &crate::cli::Options) -> Result<Graph> {
     let mut graph =
         if let Some(path) = &options.graph {
             Graph::parse(&fs::read_to_string(path).map_err(|e| {
@@ -1150,6 +1150,24 @@ pub(crate) fn resolve_processing(options: &crate::cli::Options) -> Result<(Graph
             .apply_resize(width, height)
             .map_err(|e| Error::new(EXIT_VALIDATION, e))?;
     }
+    Ok(graph)
+}
+
+// The internal graph runner always receives an explicit output path.
+#[allow(dead_code)]
+pub(crate) fn output_container(options: &crate::cli::Options) -> Result<Container> {
+    let graph = processing_graph(options)?;
+    let patch = graph.encoder_patch();
+    if options.encoder.export.is_some() || patch.is_some_and(|patch| patch.export.is_some()) {
+        return Ok(options.encoder.container.or_else(|| patch.and_then(|patch| patch.container))
+            .unwrap_or(Container::Mov));
+    }
+    Ok(ResolvedConfig::resolve(patch, &options.encoder, options.signal_depth)
+        .map_err(|error| Error::new(EXIT_VALIDATION, error))?.container)
+}
+
+fn resolve_processing(options: &crate::cli::Options) -> Result<(Graph, ResolvedConfig)> {
+    let graph = processing_graph(options)?;
     let patch = graph.encoder_patch();
     let selection = options
         .encoder
@@ -1159,7 +1177,7 @@ pub(crate) fn resolve_processing(options: &crate::cli::Options) -> Result<(Graph
     let config = match selection {
         Some(selection) => {
             let export = match selection {
-                Selection::Manual(profile) => profile.clone(),
+                Selection::Manual(profile) | Selection::Discovered(profile) => profile.clone(),
                 Selection::Named(name) => match ExportProfile::software(name) {
                     Some(profile) => profile,
                     None => video::available_hardware_profiles(&options.ffmpeg)?
@@ -1374,7 +1392,6 @@ pub fn run(
     let validation_started = Instant::now();
     let output = context.scratch.join(&output_name);
     let probe = video::validate_output(
-        &context.options.ffprobe,
         &context.options.ffmpeg,
         &output,
         &video::OutputContract {
