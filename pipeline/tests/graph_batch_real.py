@@ -1,5 +1,5 @@
 """Same-camera real graph equality at identities/measurement/EV/pre-encode pixels.
-The native wrapper archives only analysis protocol records, forwarding bytes unchanged.
+The native wrapper records analysis and FP32 payload hashes for test comparison.
 Generated caches are retained via a legal no-Delete graph for context inspection.
 """
 import hashlib,json,os,pathlib,shlex,struct,subprocess,sys,textwrap,time
@@ -20,10 +20,10 @@ def run(profile,mode):
     analysis=root/'analysis';analysis.mkdir()
     wrapper=root/'native-adapter'
     wrapper.write_text('#!/usr/bin/python3\n'+textwrap.dedent(f'''
-        import json,pathlib,struct,subprocess,sys,os
+        import hashlib,pathlib,struct,subprocess,sys,os
         from urllib.parse import unquote
         args=sys.argv[1:]
-        if args[0]!='--stdout-analysis':os.execv({str(native)!r},[{str(native)!r},*args])
+        if args[0] not in ('--stdout-analysis','--stdout-frame-f32'):os.execv({str(native)!r},[{str(native)!r},*args])
         p=subprocess.run([{str(native)!r},*args],capture_output=True)
         context={{k:unquote(v) for k,v in (line.split('=',1) for line in pathlib.Path(args[2]).read_text().splitlines()[1:])}}
         name=pathlib.Path(context['source']).name
@@ -32,7 +32,10 @@ def run(profile,mode):
             kind,length=struct.unpack('<IQ',data[offset:offset+12]);offset+=12
             records.append((kind,data[offset:offset+length]));offset+=length
         for kind,payload in records:
-            if kind in [1,2]:pathlib.Path({str(analysis)!r},name+'.'+str(kind)+'.json').write_bytes(payload)
+            if args[0]=='--stdout-analysis' and kind in [1,2]:
+                pathlib.Path({str(analysis)!r},name+'.'+str(kind)+'.json').write_bytes(payload)
+            if kind==4:
+                pathlib.Path({str(analysis)!r},name+'.pixels.sha256').write_text(hashlib.sha256(payload).hexdigest())
         sys.stdout.buffer.write(p.stdout);sys.stdout.buffer.flush();sys.stderr.buffer.write(p.stderr);sys.exit(p.returncode)
     '''));wrapper.chmod(0o755)
     video=root/'output/timelapse.mov'
@@ -46,7 +49,7 @@ def run(profile,mode):
     contexts.sort(key=lambda c:c['source'])
     assert len(contexts)==len(list(incoming.iterdir()))
     originals=[{k:c.get(k) for k in ['source','source_sha256','route','generated','main_ifd_width','main_ifd_height','as_shot_neutral','has_capture_time','capture_time']} for c in contexts]
-    develops=[{k:d[k] for k in ['frame','source','source_sha256','ev','wb','wb_source','as_shot','pixels','pixels_sha256']} for d in selected(trace,'develop')]
+    develops=[{k:d[k] for k in ['frame','source','source_sha256','ev','wb','wb_source','as_shot','pixels']} for d in selected(trace,'develop')]
     measurements={p.name:json.loads(p.read_text()) for p in analysis.glob('*.2.json')}
     assert len(measurements)==len(contexts),list(analysis.iterdir())
     # Compare actual analysis and capture-time/WB metadata, not MOV byte hashes.
@@ -57,7 +60,9 @@ def run(profile,mode):
     # Real native provenance remains readable after earlier generated DNG deletion
     # in the separate graph-batch shared-lifetime test; no-Delete keeps all here.
     assert all(pathlib.Path(c['prepared_dng']).is_file() for c in contexts)
-    result={'originals':originals,'develops':develops,'measurements':measurements,'metadata':metadata}
+    pixels={p.name:p.read_text() for p in analysis.glob('*.pixels.sha256')}
+    assert len(pixels)==len(contexts)
+    result={'originals':originals,'develops':develops,'measurements':measurements,'metadata':metadata,'pixels':pixels}
     (root/'oracle.json').write_text(json.dumps(result,indent=2,sort_keys=True))
     return result
 

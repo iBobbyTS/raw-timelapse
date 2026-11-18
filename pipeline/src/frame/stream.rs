@@ -90,7 +90,6 @@ pub struct NativeStream {
     protocol: Option<Protocol<std::process::ChildStdout>>,
     pixel_bytes: usize,
     f32: bool,
-    pub(crate) expected_digest: Option<String>,
 }
 impl NativeStream {
     pub(crate) fn open(tool: &Path, args: &[String], log: &Path, active: ActiveNative) -> Result<Self> {
@@ -100,7 +99,6 @@ impl NativeStream {
             process,
             protocol: None,
             pixel_bytes: 0,
-            expected_digest: None,
             f32: args.first().is_some_and(|a| a == "--stdout-frame-f32"),
         };
         stream.protocol = Some(Protocol::with_version(stdout, stream.f32)?);
@@ -129,11 +127,6 @@ impl NativeStream {
                 .any(|b| !f32::from_le_bytes(b.try_into().unwrap()).is_finite())
         {
             return Err(failure("nonfinite FP32 pixel"));
-        }
-        if let Some(expected) = &self.expected_digest {
-            if crate::digest::sha256(&pixels) != expected.to_ascii_lowercase() {
-                return Err(failure("FP32 pixels_sha256 mismatch"));
-            }
         }
         self.pixel_bytes = pixels.len();
         self.process

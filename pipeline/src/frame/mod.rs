@@ -54,7 +54,6 @@ pub struct FrameInfo {
     pub highlight_recovery: Option<Json>,
     pub lens_correction: Option<Json>,
     pub source_sha256: Option<String>,
-    pub pixels_sha256: Option<String>,
     pub width: u32,
     pub height: u32,
     pub applied_wb: [f64; 3],

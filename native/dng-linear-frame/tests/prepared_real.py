@@ -163,8 +163,7 @@ for index, item in enumerate(prepared):
         assert meta_ctx["prepared"]["sha256"] == fields["prepared_sha256"]
         if magic == b"RAWTLST2":
             assert got[2][1] == old[2][1], (index, label, "FP32 payload")
-            assert json.loads(got[1][1])["pixels_sha256"] == \
-                json.loads(old[1][1])["pixels_sha256"]
+            assert got[1][1] == old[1][1]
         else:
             assert got[1][1] == old[1][1], (index, label, "analysis sidecar")
         print(json.dumps({"frame": index, "case": label, "ev": ev,

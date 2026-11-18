@@ -155,7 +155,7 @@ for options, label in (([], "plain"), (["--exposure-ev", "0.25"], "ev")):
     source = records(stream([exe, "--stdout-frame-f32", base, *options]).stdout, b"RAWTLST2")
     consumed = records(stream([exe, "--stdout-frame-f32", "--prepared", context, *options]).stdout, b"RAWTLST2")
     assert source[2][1] == consumed[2][1], label
-    assert json.loads(source[1][1])["pixels_sha256"] == json.loads(consumed[1][1])["pixels_sha256"]
+    assert source[1][1] == consumed[1][1]
     a, b = json.loads(source[0][1]), json.loads(consumed[0][1])
     for key in ("source", "source_sha256", "applied_white_balance", "as_shot_neutral",
                 "exposure_ev", "color", "quantization", "observed_scene_min",

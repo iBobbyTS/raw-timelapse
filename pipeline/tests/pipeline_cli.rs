@@ -1837,7 +1837,6 @@ fn all_profiles_reject_corrupt_f32_contracts_and_canon_keeps_its_constraints() {
             ("rev_defect=non-canon", "camera color contract"),
             ("rev_defect=mixed-model", "mixed camera models"),
             ("rev_defect=format", "pixel_format"),
-            ("rev_defect=hash", "pixels_sha256 mismatch"),
             ("empty_source_sha256=1", "source_sha256"),
             ("rev_defect=nan", "nonfinite FP32"),
             (
@@ -2276,22 +2275,22 @@ fn output_cat_selection_reaches_the_pixels_and_the_run_log() {
         field(&default_log, "output_cat_fingerprint")
     );
 
-    // The upstream develop pixels are identical: only the output CAT changed.
-    let develop_pixels = |log: &str| {
+    // Output CAT leaves upstream develop exposure and frame size alone.
+    let develop_settings = |log: &str| {
         log_kind(log, "develop")
             .iter()
             .map(|line| {
                 (
                     log_field(line, "ev").expect("ev").to_string(),
-                    log_field(line, "pixels_sha256").expect("sha").to_string(),
+                    log_field(line, "pixels").expect("pixel bytes").to_string(),
                 )
             })
             .collect::<Vec<_>>()
     };
-    let reference_develop = develop_pixels(&default_log);
+    let reference_develop = develop_settings(&default_log);
     assert_eq!(reference_develop.len(), 2);
-    assert_eq!(reference_develop, develop_pixels(&same_log));
-    assert_eq!(reference_develop, develop_pixels(&custom_log));
+    assert_eq!(reference_develop, develop_settings(&same_log));
+    assert_eq!(reference_develop, develop_settings(&custom_log));
 
     // Same-value selection keeps the reference pixels bit-for-bit; a different
     // CAT changes them by a decisive margin (label-only implementations fail).

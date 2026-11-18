@@ -234,7 +234,7 @@ for method in ('legacy-inverse-cm','dng-camera-to-pcs'):
         assert meta['quantization']['negative_policy']=='preserve'
         assert meta['quantization']['upper_policy']=='preserve'
         assert (desc['pixel_format'],desc['byte_length'],desc['space'],desc['transfer'])==('rgbf32le',64*64*12,'AP1/D60','linear')
-        assert desc['pixels_sha256']==hashlib.sha256(parsed[2][1]).hexdigest()
+        assert 'pixels_sha256' not in desc
         expected=[row[1]*32 for row in meta['color']['camera_to_acescg']]
         expected_bytes=struct.pack('<3f',*expected)*4096
         assert parsed[2][1]==expected_bytes

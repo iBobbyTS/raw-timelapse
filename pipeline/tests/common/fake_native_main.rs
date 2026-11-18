@@ -443,11 +443,6 @@ fn run() -> Result<(), (i32, String)> {
                     Some("infinity") => pixels[..4].copy_from_slice(&f32::INFINITY.to_le_bytes()),
                     _ => (),
                 }
-                let hash = if config.rev_defect.as_deref() == Some("hash") {
-                    "0".repeat(64)
-                } else {
-                    digest::sha256(&pixels)
-                };
                 let format = if config.rev_defect.as_deref() == Some("format") {
                     "rgb48le"
                 } else {
@@ -458,7 +453,7 @@ fn run() -> Result<(), (i32, String)> {
                 } else {
                     config.width
                 };
-                let desc = format!("{{\"width\":{width},\"height\":{},\"pixel_format\":\"{format}\",\"byte_length\":{},\"color_contract_version\":2,\"space\":\"AP1/D60\",\"transfer\":\"linear\",\"pixels_sha256\":\"{hash}\"}}", config.height, pixels.len());
+                let desc = format!("{{\"width\":{width},\"height\":{},\"pixel_format\":\"{format}\",\"byte_length\":{},\"color_contract_version\":2,\"space\":\"AP1/D60\",\"transfer\":\"linear\"}}", config.height, pixels.len());
                 record(&mut out, 3, desc.as_bytes())?;
             }
             if config.stall_pixels {

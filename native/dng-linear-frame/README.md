@@ -196,8 +196,7 @@ The native standalone default remains the historical `legacy-test` recipe with
 
 FP32 mode emits `RAWTLST2`, ordered 0x01/0x03/0x04 records, IEEE binary32 LE HWC
 AP1/D60 (12 bytes/pixel), with `space=AP1/D60`, `transfer=linear`,
-`color_contract_version=2`, `byte_length` and actual pixel SHA256 in the
-descriptor. Scene values include any requested camera calibration and `2^EV`
+`color_contract_version=2` and `byte_length` in the descriptor. Scene values include any requested camera calibration and `2^EV`
 once, before legacy quantization; negative values and values above 4 remain
 intact. Analysis retains `RAWTLST1` framing and no full-frame pixel payload.
 Color contract version 2 is independent of these framing versions and of the

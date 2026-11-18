@@ -167,7 +167,6 @@ use std::path::{Path, PathBuf};
         })
         .expect("develop");
         assert_eq!(pixel_bytes, 8 * 6 * 12);
-        assert!(developed.pixels_sha256.is_some());
         assert_eq!(developed.exposure_ev, 0.25);
 
         let overridden = analyze_prepared(
@@ -607,7 +606,6 @@ use std::path::{Path, PathBuf};
                 })
                 .expect("prepared develop");
                 assert_eq!(digest, legacy_digests[index], "frame {index} EV {ev} FP32 hash");
-                assert_eq!(info.pixels_sha256, legacy_infos[index].pixels_sha256);
                 assert_eq!(info.applied_wb, legacy_infos[index].applied_wb);
                 assert_eq!(info.as_shot_neutral, legacy_infos[index].as_shot_neutral);
                 assert_eq!(info.camera_color, legacy_infos[index].camera_color);

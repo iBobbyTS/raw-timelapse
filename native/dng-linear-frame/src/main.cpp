@@ -694,12 +694,9 @@ int main(int argc, char **argv) {
           sink(bytes.data(), bytes.size());
         }
       };
-      Sha256 hash;
-      chunks([&](const auto *data, size_t n) { hash.update(data, n); });
       Json descriptor{{"width", int(frame.width)}, {"height", int(frame.height)},
         {"pixel_format", "rgbf32le"}, {"byte_length", double(frame.floats.size()*4)},
-        {"color_contract_version", 2}, {"space", "AP1/D60"}, {"transfer", "linear"},
-        {"pixels_sha256", hash.hex()}};
+        {"color_contract_version", 2}, {"space", "AP1/D60"}, {"transfer", "linear"}};
       write_record_text(kRecordFrame, descriptor.text);
       write_record_header(kRecordPixels, uint64_t(frame.floats.size())*4);
       chunks([](const auto *data, size_t n) { write_all(data, n); });

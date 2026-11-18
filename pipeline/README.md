@@ -89,7 +89,7 @@ The log is line-oriented; every entry carries `wall=<epoch seconds>` and
 
 - `run.start`, `profile`, `settings`, `inventory`, `graph`, `encoder`, `colour`
 - `prepare`, `measure`, `develop` (frame, EV, applied/own white balance,
-  pixel count and digest, duration; prepare timing depends on its mode)
+  pixel byte count and duration; prepare timing depends on its mode)
 - `prepare.batch` (batch ID, first/last frame, count, actual ADC calls, conversion,
   verification and total wall time)
 - `node` completion events for every declared node and frame
@@ -543,7 +543,7 @@ consumes the typed payload it validates.
 - **Native pixels → encoder:** frame mode requires metadata (0x01), descriptor
   (0x03) and signed FP32 AP1/D60 pixels (0x04, `RAWTLST2`). Types, reserved
   fields, ordering, geometry length, truncation, trailing bytes, non-finite
-  samples and the descriptor's pixel digest are all rejected. Pixels become one
+  samples are rejected. Pixels become one
   owned FP32 frame, then the colour node fills the 10-bit target signal.
 - **Encoded video → publication:** the sole encoded file becomes
   `rawtl.video-artifact@1`; validation and the final rename consume that same

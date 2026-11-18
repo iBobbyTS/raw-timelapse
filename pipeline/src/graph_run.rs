@@ -879,9 +879,9 @@ impl Backend for Runner<'_, '_> {
                 self.result(written)?;
             }
             let written=self.log.line(&format!(
-                "kind=develop frame={} source={} ev={:.9} wb={} wb_source={} as_shot={} source_sha256={} pixels={} pixels_sha256={} duration={:.3}",
+                "kind=develop frame={} source={} ev={:.9} wb={} wb_source={} as_shot={} source_sha256={} pixels={} duration={:.3}",
                 info.index,quote(&info.source_name),info.exposure_ev,frame::format_wb(info.applied_wb),info.wb_source,frame::format_wb(info.as_shot_neutral),info.source_sha256.as_deref().unwrap_or("unknown"),
-                match &image.pixels {Pixels::Linear(p)=>p.len(),_=>0},info.pixels_sha256.as_deref().unwrap_or("unknown"),elapsed.as_secs_f64()));
+                match &image.pixels {Pixels::Linear(p)=>p.len(),_=>0},elapsed.as_secs_f64()));
             self.result(written)?;
         } else {
             if let Kind::Resize { width, height } = kind {
@@ -1046,7 +1046,6 @@ fn apply_linear_transform(kind: Kind, image: &mut Image) -> graph::Result<()> {
                 }
                 p.copy_from_slice(&value.to_le_bytes());
             }
-            image.info.pixels_sha256 = Some(crate::digest::sha256(pixels));
             image.info.exposure_ev += ev;
         }
         Kind::Resize { width, height } => {
@@ -1066,7 +1065,6 @@ fn apply_linear_transform(kind: Kind, image: &mut Image) -> graph::Result<()> {
                 bounds,
             )
             .map_err(|e| format!("graph: resize: {e}"))?;
-            image.info.pixels_sha256 = Some(crate::digest::sha256(&resized));
             image.pixels = Pixels::Linear(Arc::from(resized));
             image.info.width = width;
             image.info.height = height;
@@ -1083,7 +1081,6 @@ fn apply_color_crop(image: &mut Image) -> graph::Result<()> {
         let Pixels::Linear(pixels)=&image.pixels else {return Err("graph: lens crop requires linear pixels".into());};
         image.crop_record=Some(crate::resample::crop_window(image.info.width,image.info.height,image.info.width,image.info.height,area)?);
         let cropped=crate::resample::resize_scene_linear_region(pixels,image.info.width,image.info.height,image.info.width,image.info.height,Some(area))?;
-        image.info.pixels_sha256=Some(crate::digest::sha256(&cropped));
         image.pixels=Pixels::Linear(Arc::from(cropped));
     }
     Ok(())

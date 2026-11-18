@@ -20,7 +20,6 @@ def run(f,ev=0,analysis=False,extra=(),code=0):
     meta=json.loads(records[0][1]);assert meta['color_contract_version']==2
     if analysis:return meta,json.loads(records[1][1])
     desc=json.loads(records[1][1]);assert desc['color_contract_version']==2
-    assert desc['pixels_sha256']==hashlib.sha256(records[2][1]).hexdigest()
     return meta,struct.unpack('<'+'f'*(len(records[2][1])//4),records[2][1])
 fwd=[.7,.1,.1643,.2,.7,.1,.01,.1,.7151]
 hsm=([2,2,1],[0,1.2,1.3]*4)

@@ -784,7 +784,6 @@ fn run_frame(
         highlight_recovery: sidecar.get("highlight_recovery").cloned(),
         lens_correction: sidecar.get("lens_correction").cloned(),
         source_sha256: meta.source_sha256,
-        pixels_sha256: None,
         width: meta.width,
         height: meta.height,
         applied_wb: meta.applied_wb,
@@ -818,12 +817,6 @@ fn attach_payload(
         {
             return Err(failure("frame descriptor geometry/pixel_format mismatch"));
         }
-        let digest = descriptor
-            .get("pixels_sha256")
-            .and_then(Json::as_str)
-            .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-            .ok_or_else(|| failure("invalid pixels_sha256"))?;
-        info.pixels_sha256 = Some(digest.into());
         {
             let expected_bytes = u64::from(info.width)
                 .checked_mul(u64::from(info.height))
@@ -840,7 +833,6 @@ fn attach_payload(
             {
                 return Err(failure("invalid FP32 descriptor contract/allocation bound"));
             }
-            stream.expected_digest = Some(digest.into());
         }
     } else {
         let bytes = stream.json(2)?;
