@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <libproc.h>
 #include <sys/proc_info.h>
 #include <sys/stat.h>
@@ -99,33 +100,20 @@ std::string output_collision_key(const fs::path &source) {
   out.resize(strlen(out.c_str()));
   return out;
 }
-bool FileState::operator==(const FileState &other) const {
-  return device == other.device && inode == other.inode && size == other.size &&
-         modified.tv_sec == other.modified.tv_sec && modified.tv_nsec == other.modified.tv_nsec &&
-         changed.tv_sec == other.changed.tv_sec && changed.tv_nsec == other.changed.tv_nsec;
-}
-std::string FileState::token() const {
-  std::ostringstream text;
-  text << device << ',' << inode << ',' << size << ','
-       << modified.tv_sec << ',' << modified.tv_nsec << ','
-       << changed.tv_sec << ',' << changed.tv_nsec;
-  return text.str();
-}
-std::optional<FileState> file_state(const fs::path &path) {
-  struct stat info {};
-  if (lstat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) return {};
-  return FileState{info.st_dev, info.st_ino, info.st_size, info.st_mtimespec, info.st_ctimespec};
-}
 std::string file_version(const fs::path &path) {
-  const auto state = file_state(path);
-  if (!state) throw Error(26, "cannot read file state: " + path.string());
-  return state->token();
+  struct stat info {};
+  if (lstat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode))
+    throw Error(26, "cannot read file state: " + path.string());
+  std::ostringstream token;
+  token << info.st_dev << ',' << info.st_ino << ',' << info.st_size << ','
+        << info.st_mtimespec.tv_sec << ',' << info.st_mtimespec.tv_nsec << ','
+        << info.st_ctimespec.tv_sec << ',' << info.st_ctimespec.tv_nsec;
+  return token.str();
 }
 
 namespace {
 using Clock = std::chrono::steady_clock;
-using FileIdentity = std::pair<dev_t, ino_t>;
-std::optional<std::set<FileIdentity>> writable_files(int pid) {
+std::optional<std::set<fs::path>> writable_files(int pid) {
   // A helper process could still own a writer. Use the sealed sequence path
   // whenever this Converter invocation cannot be observed unambiguously.
   pid_t child;
@@ -133,17 +121,15 @@ std::optional<std::set<FileIdentity>> writable_files(int pid) {
   struct proc_fdinfo descriptors[4096];
   int bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, descriptors, sizeof descriptors);
   if (bytes <= 0 || bytes >= int(sizeof descriptors)) return {};
-  std::set<FileIdentity> writers;
+  std::set<fs::path> writers;
   for (size_t i = 0; i < size_t(bytes) / sizeof descriptors[0]; ++i) {
     if (descriptors[i].proc_fdtype != PROX_FDTYPE_VNODE) continue;
     struct vnode_fdinfowithpath info {};
     if (proc_pidfdinfo(pid, descriptors[i].proc_fd, PROC_PIDFDVNODEPATHINFO,
                        &info, sizeof info) != sizeof info)
       return {};
-    if (info.pfi.fi_openflags & FWRITE) {
-      const auto &stat = info.pvip.vip_vi.vi_stat;
-      writers.emplace(stat.vst_dev, stat.vst_ino);
-    }
+    if (info.pfi.fi_openflags & FWRITE)
+      writers.emplace(info.pvip.vip_path);
   }
   return writers;
 }
@@ -209,39 +195,36 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
     if (!trace) throw Error(24, "could not record the Converter invocation");
   }
   auto conversion_start = std::chrono::steady_clock::now();
-  struct Candidate {
-    std::optional<FileState> state;
-    std::optional<Clock::time_point> quiet_since;
-    bool saw_writer = false;
-    bool offered = false;
-  };
-  std::vector<Candidate> candidates(ready ? inputs.size() : 0);
+  std::map<fs::path, size_t> eligible;
+  if (ready)
+    for (size_t i = 0; i < paths.size(); ++i)
+      eligible.emplace(paths[i], i);
+  // Only track timers for outputs whose writer has actually been observed.
+  std::map<size_t, std::optional<Clock::time_point>> pending;
   const auto observe = [&](int pid) {
     auto writers = writable_files(pid);
-    auto now = Clock::now();
-    for (size_t i = 0; i < candidates.size(); ++i) {
-      auto &candidate = candidates[i];
-      if (candidate.offered) continue;
-      auto state = file_state(paths[i]);
-      if (!state) {
-        candidate = {};
-        continue;
-      }
-      if (candidate.state && (candidate.state->device != state->device ||
-                              candidate.state->inode != state->inode))
-        candidate = {};
-      if (!candidate.state || *candidate.state != *state) candidate.quiet_since.reset();
-      candidate.state = state;
-      if (!writers || writers->contains({state->device, state->inode})) {
-        candidate.saw_writer |= writers.has_value();
-        candidate.quiet_since.reset();
-      } else if (candidate.saw_writer && state->size > 0) {
-        if (!candidate.quiet_since) candidate.quiet_since = now;
-        if (now - *candidate.quiet_since >= std::chrono::seconds(5)) {
-          candidate.offered = true;
-          ready(i, paths[i]);
+    if (!writers) {
+      for (auto &[index, quiet_since] : pending) quiet_since.reset();
+      return;
+    }
+    const auto now = Clock::now();
+    for (const auto &path : *writers) {
+      if (auto found = eligible.find(path); found != eligible.end())
+        pending[found->second].reset();
+    }
+    for (auto it = pending.begin(); it != pending.end();) {
+      const auto index = it->first;
+      auto &quiet_since = it->second;
+      if (!writers->contains(paths[index])) {
+        if (!quiet_since) quiet_since = now;
+        if (now - *quiet_since >= std::chrono::seconds(5)) {
+          eligible.erase(paths[index]);
+          it = pending.erase(it);
+          ready(index, paths[index]);
+          continue;
         }
       }
+      ++it;
     }
   };
   auto result = run_process(command, log, timeout, std::nullopt,
@@ -272,15 +255,15 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
     check_cancelled();
     const auto &output = paths[i];
     const auto version = file_version(output);
-    auto check = inspect(output);
-    if (!check || check->photometric != 34892 || !check->width || !check->height)
-      throw Error(23, identity + ": output is not nonzero LinearRaw (34892): " + output.string());
     if (in_memory) {
       ConversionInfo info;
       info.used = true;
       outputs.push_back({output, version, std::move(info)});
       continue;
     }
+    auto check = inspect(output);
+    if (!check || check->photometric != 34892 || !check->width || !check->height)
+      throw Error(23, identity + ": output is not nonzero LinearRaw (34892): " + output.string());
     ConversionInfo info;
     info.used = true;
     info.executable = command.front();

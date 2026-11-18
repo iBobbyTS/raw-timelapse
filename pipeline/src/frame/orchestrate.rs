@@ -403,6 +403,7 @@ pub fn prepare_export_active(
     sources: &[SourceFrame],
     settings: &PrepareSequenceSettings<'_>,
     active: ActiveNative,
+    capture_time: bool,
     mut early: Option<&mut dyn FnMut(usize, PreparedFrame)>,
 ) -> Result<(Vec<PreparedFrame>, String)> {
     use std::io::{BufRead, BufReader, Read, Write};
@@ -413,6 +414,7 @@ pub fn prepare_export_active(
         .collect::<std::io::Result<Vec<_>>>()
         .map_err(|e| failure(format!("export sources: {e}")))?;
     let mut request = format!("rawtl-export-request/1\ncount={}\n", paths.len());
+    if capture_time { request.push_str("capture_time=1\n"); }
     for (i, path) in paths.iter().enumerate() {
         request.push_str(&format!("item{i}_source={}\n", percent_encode(&path.display().to_string())));
     }
@@ -460,7 +462,7 @@ pub fn prepare_export_active(
                 return Err(failure("truncated or oversized export frame record"));
             }
             let kind = bytes.remove(0);
-            let prepared = PreparedFrame::load_export(bytes, &scratch)?;
+            let prepared = PreparedFrame::load_export(bytes, &scratch, kind == b'E')?;
             let id = prepared.export.as_ref().unwrap().id;
             if paths.get(id) != Some(&prepared.source) {
                 return Err(failure("export result frame id/source differs from request"));
@@ -636,6 +638,7 @@ fn prepared_native_run(
         lens: settings.lens.clone(),
         log: log.to_path_buf(),
         analysis_roi,
+        analysis_detail: None,
         preview_edge: settings.preview_edge,
         #[cfg(test)]
         converter: None,
@@ -725,8 +728,10 @@ pub fn analyze_prepared_at(
     log: &Path,
     active: ActiveNative,
     provisional: bool,
+    detail: &'static str,
 ) -> Result<FrameInfo> {
-    let run = prepared_native_run(settings, Some(roi), log);
+    let mut run = prepared_native_run(settings, Some(roi), log);
+    run.analysis_detail = Some(detail);
     let input = if provisional {
         FrameInput::EarlyMeasurement(prepared)
     } else {
@@ -820,6 +825,9 @@ fn frame_args(
             }
         }
     }
+    if let Some(detail) = run.analysis_detail {
+        args.extend(["--analysis-detail".into(), detail.into()]);
+    }
     if let Some(prepared) = input.prepared() {
         prepared.file_check_args(&mut args);
         #[cfg(test)]
@@ -909,7 +917,7 @@ fn run_frame(
             exposure_ev,
             record.map(|r| r.id),
         )?;
-        if let Some(prepared) = input.prepared() {
+        if let Some(prepared) = input.prepared().filter(|_| record.is_none()) {
             validate_prepared_metadata(
                 &sidecar,
                 prepared,

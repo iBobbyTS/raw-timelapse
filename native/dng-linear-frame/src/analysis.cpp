@@ -81,7 +81,7 @@ double trimmed_linear_mean(std::vector<double> values, double fraction) {
 }
 bool analysis_highlight(float value) { return value >= kHighlightThreshold; }
 Analysis measure(const Decoded &d, const std::vector<float> &gained_scene,
-                 const Roi &roi, double exposure_ev) {
+                 const Roi &roi, double exposure_ev, bool detail, bool diagnostics) {
   const size_t pixels = size_t(d.width) * size_t(d.height);
   if (d.width < 1 || d.height < 1 ||
       d.camera.size() != pixels * size_t(3) ||
@@ -102,7 +102,7 @@ Analysis measure(const Decoded &d, const std::vector<float> &gained_scene,
         return kLumaR * double(p[0]) + kLumaG * double(p[1]) +
                kLumaB * double(p[2]);
       });
-  for (int c = 0; c < 3; ++c)
+  for (int c = 0; detail && c < 3; ++c)
     channels[size_t(c)] = box_downsample(
         int(d.width), int(d.height), width, height,
         [&](size_t i) { return double(gained_scene[i * 3 + size_t(c)]); });
@@ -117,7 +117,8 @@ Analysis measure(const Decoded &d, const std::vector<float> &gained_scene,
                    : 0.0;
       });
   // Analysis-only AP1 highlight mask. Does not predict final profile clipping.
-  auto clipping = box_downsample(
+  std::vector<double> clipping;
+  if (diagnostics) clipping = box_downsample(
       int(d.width), int(d.height), width, height, [&](size_t i) {
         const float *p = &gained_scene[i * 3];
         return (analysis_highlight(p[0]) || analysis_highlight(p[1]) ||
@@ -143,7 +144,7 @@ Analysis measure(const Decoded &d, const std::vector<float> &gained_scene,
           finite = finite && std::isfinite(v);
           block.push_back(v);
           saturation_sum += saturation[size_t(y) * width + x];
-          clipping_sum += clipping[size_t(y) * width + x];
+          if (diagnostics) clipping_sum += clipping[size_t(y) * width + x];
         }
       }
       const double count = double(block.size());
@@ -160,11 +161,11 @@ Analysis measure(const Decoded &d, const std::vector<float> &gained_scene,
         tile.has_log_luminance = true;
       }
       // Deterministic strided structure probe in the log2 domain.
-      for (int y = y0; y < y1; y += kStructureStride)
+      for (int y = y0; detail && y < y1; y += kStructureStride)
         for (int x = x0; x < x1; x += kStructureStride)
           tile.structure_samples.push_back(
               std::log2(std::max(luminance[size_t(y) * width + x], 1e-9)));
-      for (int c = 0; c < 3; ++c) {
+      for (int c = 0; detail && c < 3; ++c) {
         std::vector<double> plane;
         plane.reserve(size_t(x1 - x0) * size_t(y1 - y0));
         for (int y = y0; y < y1; ++y)

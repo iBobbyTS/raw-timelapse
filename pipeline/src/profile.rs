@@ -134,6 +134,8 @@ fn parse_contents(contents: &str) -> std::result::Result<Vec<String>, String> {
             return Err(format!("duplicate field {key:?}"));
         }
         match (key.as_str(), value) {
+            ("deflicker_diagnostics", Json::Bool(true)) => settings.push("--deflicker-diagnostics".into()),
+            ("deflicker_diagnostics", Json::Bool(false)) => {}
             ("verify_output", Json::Bool(true)) => settings.push("--verify-output".into()),
             ("verify_output", Json::Bool(false)) => {}
             (

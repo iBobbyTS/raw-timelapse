@@ -50,8 +50,6 @@ pub(crate) struct ExportRecord {
     pub id: usize,
     pub key: String,
     bytes: std::sync::Mutex<Option<std::sync::Arc<[u8]>>>,
-    pub source_version: String,
-    pub dng_version: String,
 }
 
 impl ExportRecord {
@@ -101,7 +99,7 @@ impl PreparedFrame {
         Self::load_context(context, false, &mut ConversionRecords::default())
     }
 
-    pub(crate) fn load_export(bytes: Vec<u8>, scratch: &Path) -> Result<Self> {
+    pub(crate) fn load_export(bytes: Vec<u8>, scratch: &Path, provisional: bool) -> Result<Self> {
         let fields = parse_document_fields(&bytes, "rawtl-export-frame/1", PREPARED_CONTEXT_LIMIT)?;
         let get = |key| field_value(&fields, key);
         let id = parse_u32(get("frame_id")?, "frame_id")? as usize;
@@ -110,20 +108,23 @@ impl PreparedFrame {
         let route = PreparedRoute::from_token(get("route")?)
             .ok_or_else(|| failure("invalid export frame route"))?;
         let generated = parse_flag(get("generated")?, "generated")?;
-        let source_version = get("source_version")?.to_owned();
-        let dng_version = get("prepared_version")?.to_owned();
-        let main_ifd_width = parse_u32(get("main_ifd_width")?, "main_ifd_width")?;
-        let main_ifd_height = parse_u32(get("main_ifd_height")?, "main_ifd_height")?;
+        let (main_ifd_width, main_ifd_height) = if provisional {
+            (0, 0)
+        } else {
+            (
+                parse_u32(get("main_ifd_width")?, "main_ifd_width")?,
+                parse_u32(get("main_ifd_height")?, "main_ifd_height")?,
+            )
+        };
         if !source.is_absolute() || !dng.is_absolute() || generated != route.generates()
-            || main_ifd_width == 0 || main_ifd_height == 0
-            || source_version.is_empty() || dng_version.is_empty()
+            || (!provisional && (main_ifd_width == 0 || main_ifd_height == 0))
             || if generated {
                 dng == source || dng.parent() != Some(scratch.join("linear").as_path())
             } else {
-                dng != source || dng_version != source_version
+                dng != source
             }
         {
-            return Err(failure("export frame path, state, or geometry is inconsistent"));
+            return Err(failure("export frame path or geometry is inconsistent"));
         }
         let source_name = source.file_name().and_then(|name| name.to_str())
             .ok_or_else(|| failure("invalid export frame name"))?.to_owned();
@@ -137,7 +138,6 @@ impl PreparedFrame {
             context: PathBuf::new(),
             export: Some(std::sync::Arc::new(ExportRecord {
                 id, key: id.to_string(), bytes: std::sync::Mutex::new(Some(bytes.into())),
-                source_version, dng_version,
             })),
             source, source_name, source_sha256: String::new(), route, dng,
             dng_sha256: String::new(), has_file_versions: true, generated,

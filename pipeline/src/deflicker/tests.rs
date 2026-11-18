@@ -2123,3 +2123,20 @@ mod exposure_continuity {
         }
     }
 }
+
+#[test]
+fn export_diagnostics_do_not_change_exposure_gains() {
+    for count in [4, 16, 40] {
+        let frames = sequence(count);
+        for estimator in ["pairwise", "legacy"] {
+            for brightness in ["smooth", "uniform"] {
+                let mut config = cfg(brightness, estimator);
+                config.steps = vec![ExposureStep { start_frame: 2, delta_ev: 0.25 }];
+                config.ev_limits = Some((-0.125, 0.125));
+                let (export_gains, report) = solve_for_export(&frames, &config, None, false).unwrap();
+                assert!(report.is_none());
+                assert_eq!(export_gains, evs(&solve_exposure(&frames, &config).unwrap()));
+            }
+        }
+    }
+}

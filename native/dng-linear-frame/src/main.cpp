@@ -205,7 +205,8 @@ FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
                    const std::optional<fs::path> &analysis_sidecar,
                    const analysis::Roi &roi, double exposure_ev,
                    bool want_analysis, bool need_pixels, bool f32 = false,
-                   bool consumed_context = false, bool wb_override = false) {
+                   bool consumed_context = false, bool wb_override = false,
+                   bool detail = true, bool diagnostics = true) {
   const double gain = std::exp2(exposure_ev);
   std::vector<uint16_t> pixels;
   if (need_pixels && !f32)
@@ -213,7 +214,8 @@ FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
   std::vector<float> gained_scene;
   if (want_analysis || f32)
     gained_scene.resize(d.camera.size());
-  double low = INFINITY, high = -INFINITY;
+  const bool report_scene = !prepared.frame_id || (want_analysis && diagnostics);
+  double low = report_scene ? INFINITY : 0., high = report_scene ? -INFINITY : 0.;
   size_t negatives = 0, upper = 0;
   const auto &camera_pixels = d.delivery_camera.empty() ? d.camera : d.delivery_camera;
   for (size_t i = 0; i < d.camera.size(); i += 3) {
@@ -226,10 +228,12 @@ FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
       float x = static_cast<float>(scene[c] * d.reference_gain * gain);
       if (!std::isfinite(x))
         throw Error(40, "nonfinite color result");
-      low = std::min(low, double(x));
-      high = std::max(high, double(x));
-      negatives += x < 0;
-      upper += x > 65535.0f / 16384.0f;
+      if (report_scene) {
+        low = std::min(low, double(x));
+        high = std::max(high, double(x));
+        negatives += x < 0;
+        upper += x > 65535.0f / 16384.0f;
+      }
       if (want_analysis || f32)
         gained_scene[i + c] = x;
       if (need_pixels && !f32)
@@ -238,7 +242,7 @@ FrameOutput render(const PreparedFrame &prepared, const Decoded &d,
   }
   std::optional<analysis::Analysis> measured;
   if (want_analysis)
-    measured = analysis::measure(d, gained_scene, roi, exposure_ev);
+    measured = analysis::measure(d, gained_scene, roi, exposure_ev, detail, diagnostics);
   Json metadata{
       {"schema_version", 1},
       {"color_contract_version", 2},
@@ -510,6 +514,7 @@ int main(int argc, char **argv) {
     // argv[1] is the mode flag. argv[2] is either the source path or the
     // literal --prepared followed by a prepared-context path; options follow.
     const bool want_analysis = mode == "--stdout-analysis";
+    bool detail = true, diagnostics = true;
     const bool f32 = mode == "--stdout-frame-f32";
     CameraRecipe recipe;
     lens::PrepareOptions lens_options;
@@ -523,7 +528,7 @@ int main(int argc, char **argv) {
     if (provisional && !want_analysis)
       throw Error(2, "--early-measurement requires --stdout-analysis");
     const bool prepared_mode = in_memory || provisional || input_mode == "--prepared";
-    bool use_file_versions = in_memory;
+    bool use_file_versions = in_memory && !provisional;
     if ((mode == "--lens-valid-area" || mode == "--lens-status") && !prepared_mode)
       throw Error(2, mode + " requires a frozen prepared context");
     fs::path input, context;
@@ -602,6 +607,11 @@ int main(int argc, char **argv) {
         if (value == "none") recipe.calibration = CameraCalibration::none;
         else if (value == "canon-normal-white-fixed-v1") recipe.calibration = CameraCalibration::canon_normal_white_fixed_v1;
         else throw Error(2, "unknown camera calibration policy");
+      } else if (a == "--analysis-detail") {
+        if (!want_analysis || (value != "basic" && value != "pairwise" && value != "diagnostic" && value != "basic-diagnostic"))
+          throw Error(2, "invalid analysis detail");
+        detail = value == "pairwise" || value == "diagnostic";
+        diagnostics = value == "diagnostic" || value == "basic-diagnostic";
       } else if (a == "--analysis-roi") {
         if (!want_analysis)
           throw Error(2, "--analysis-roi requires --stdout-analysis");
@@ -678,12 +688,12 @@ int main(int argc, char **argv) {
     }
     Decoded decoded = decode_prepared(prepared, wb, recipe, lens_enabled, lens_policy, preview_edge);
     if (use_file_versions) check_prepared_versions(prepared);
-    else if (provisional && sha256(prepared.prepared_dng) != prepared.prepared_hash)
+    else if (!in_memory && provisional && sha256(prepared.prepared_dng) != prepared.prepared_hash)
       throw Error(26, "DNG changed during early measurement");
     FrameOutput frame =
         render(prepared, decoded, std::optional<fs::path>(), roi, exposure_ev,
                want_analysis, !want_analysis, f32, prepared_mode,
-               wb.has_value());
+               wb.has_value(), detail, diagnostics);
     if (temp)
       temp->clear();
     check_cancelled();

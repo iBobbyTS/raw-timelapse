@@ -47,13 +47,24 @@ pub struct GraphResult {
 /// Matrix-vector products use only edges. Relative L2 residual <= 1e-12;
 /// at most 4*N+64 iterations. Every inner solve is recorded, including failures.
 pub fn solve_exposure_graph(n: usize, edges: &[GraphEdge]) -> Result<GraphResult> {
-    solve_graph_with(n, edges, 0.02, 8)
+    solve_exposure_graph_with_diagnostics(n, edges, true)
+}
+pub(super) fn solve_exposure_graph_with_diagnostics(
+    n: usize, edges: &[GraphEdge], diagnostics: bool,
+) -> Result<GraphResult> {
+    solve_graph(n, edges, 0.02, 8, diagnostics)
 }
 pub fn solve_graph_with(
+    n: usize, edges: &[GraphEdge], delta: f64, max_iterations: usize,
+) -> Result<GraphResult> {
+    solve_graph(n, edges, delta, max_iterations, true)
+}
+fn solve_graph(
     n: usize,
     edges: &[GraphEdge],
     delta: f64,
     max_iterations: usize,
+    diagnostics: bool,
 ) -> Result<GraphResult> {
     if !delta.is_finite() || delta <= 0. || max_iterations == 0 {
         return Err("invalid graph solver configuration".into());
@@ -193,13 +204,15 @@ pub fn solve_graph_with(
                 .sqrt()
                 / rhsnorm;
             let converged = x.iter().all(|v| v.is_finite()) && rel <= 1e-10;
-            r.linear_solves.push(LinearSolveRecord {
-                component: id,
-                irls_round: round,
-                iterations: it,
-                relative_residual: rel,
-                converged,
-            });
+            if diagnostics {
+                r.linear_solves.push(LinearSolveRecord {
+                    component: id,
+                    irls_round: round,
+                    iterations: it,
+                    relative_residual: rel,
+                    converged,
+                });
+            }
             r.converged &= converged;
             r.brightness[gauge] = 0.;
             for (&t, &v) in free.iter().zip(&x) {
@@ -221,14 +234,16 @@ pub fn solve_graph_with(
             }
         }
     }
-    r.edge_residuals = edges
-        .iter()
-        .map(|e| r.brightness[e.j] - r.brightness[e.i] - e.delta_ev)
-        .collect();
-    r.edge_p95_abs_residual_ev = finite(percentile(
-        &r.edge_residuals.iter().map(|v| v.abs()).collect::<Vec<_>>(),
-        95.,
-    ));
+    if diagnostics {
+        r.edge_residuals = edges
+            .iter()
+            .map(|e| r.brightness[e.j] - r.brightness[e.i] - e.delta_ev)
+            .collect();
+        r.edge_p95_abs_residual_ev = finite(percentile(
+            &r.edge_residuals.iter().map(|v| v.abs()).collect::<Vec<_>>(),
+            95.,
+        ));
+    }
     Ok(r)
 }
 fn dot(a: &[f64], b: &[f64]) -> f64 {

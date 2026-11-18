@@ -385,6 +385,7 @@ pub struct Options {
     pub resize: Option<(u32, u32)>,
     /// Opt in to a strict full decode that also counts the delivered frames.
     pub verify_output: bool,
+    pub deflicker_diagnostics: bool,
 }
 
 #[derive(Debug)]
@@ -418,6 +419,7 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
     let mut rate_flag: Option<&'static str> = None;
     let mut resize: Option<(u32, u32)> = None;
     let mut verify_output = false;
+    let mut deflicker_diagnostics = false;
     let mut hardware_variant = None;
     let mut seen_input = false;
     let mut seen_output = false;
@@ -762,6 +764,7 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
             "--resize" => {
                 resize = Some(parse_resize(&take_value(args, &mut index, flag, inline_value)?)?)
             }
+            "--deflicker-diagnostics" if inline_value.is_none() => deflicker_diagnostics = true,
             "--verify-output" => {
                 if inline_value.is_some() {
                     return Err(Error::new(
@@ -853,6 +856,7 @@ pub(crate) fn parse_settings(args: &[String], require_output: bool) -> Result<Pa
         encoder,
         resize,
         verify_output,
+        deflicker_diagnostics,
     }))
 }
 

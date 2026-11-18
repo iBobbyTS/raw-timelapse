@@ -9,14 +9,14 @@ use crate::frame::{
 use crate::run_log::{quote, RunLog};
 use crate::video::{self, ResizeRecord};
 use crate::{proc, EncodedStage, RunContext};
-use rawtl_linear_video::deflicker::estimation::{ExposurePlan, solve_windowed};
+use rawtl_linear_video::deflicker::estimation::solve_for_export;
 use rawtl_linear_video::deflicker::pairwise::PairwiseWindow;
-use rawtl_linear_video::deflicker::{estimation::solve_exposure, ExposureConfig, FrameMeasurement};
+use rawtl_linear_video::deflicker::{ExposureConfig, FrameMeasurement};
 use rawtl_linear_video::graph::ordered_frames::FrameTask;
 use rawtl_linear_video::color_profile::AutoReferenceGain;
 use rawtl_linear_video::export::{ExportProfile, Selection};
 use rawtl_linear_video::graph::{self, Backend, Event, Gain, Graph, Kind, Scope};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -72,7 +72,7 @@ struct Runner<'a, 'b> {
     pairwise: Option<PairwiseWindow>,
     reference_wb: Option<[f64; 3]>,
     early_frames: Arc<Mutex<Vec<Option<PreparedFrame>>>>,
-    early_results: Arc<Mutex<BTreeMap<usize, EarlyMeasurement>>>,
+    early_results: Arc<Mutex<BTreeMap<usize, FrameMeasurement>>>,
     early_reference_wb: Option<[f64; 3]>,
     convert_progress_at: Instant,
     convert_progress: u32,
@@ -83,7 +83,7 @@ struct Runner<'a, 'b> {
     resize_target: Option<(u32, u32)>,
     resize: Option<ResizeRecord>,
     lens_area: Option<[f64;4]>,
-    generated_paths: Vec<std::path::PathBuf>,
+    generated_paths: BTreeSet<std::path::PathBuf>,
     exposure_plan_ready: bool,
     gain_scanned: usize,
     encoder: Arc<Mutex<video::GraphEncoder>>,
@@ -107,13 +107,6 @@ struct Runner<'a, 'b> {
     linear_chain: Option<Vec<Kind>>,
     /// Worker count for the auto scan; mirrors the graph's develop concurrency.
     scan_workers: usize,
-}
-struct EarlyMeasurement {
-    dng: std::path::PathBuf,
-    source_version: String,
-    dng_version: String,
-    wb: Option<[f64; 3]>,
-    measurement: FrameMeasurement,
 }
 
 fn frame_failure(id: usize, total: usize, name: &str, message: &str) -> String {
@@ -188,6 +181,14 @@ impl Runner<'_, '_> {
             lens: self.context.options.lens.clone(),
             camera_recipe: self.context.camera_recipe,
             preview_edge: None,
+        }
+    }
+    fn analysis_detail(&self) -> &'static str {
+        match (self.pairwise.is_some(), self.context.options.deflicker_diagnostics) {
+            (true, true) => "diagnostic",
+            (true, false) => "pairwise",
+            (false, true) => "basic-diagnostic",
+            (false, false) => "basic",
         }
     }
     fn scan_task(
@@ -348,6 +349,7 @@ impl Backend for Runner<'_, '_> {
         let converter_timeout = self.context.options.converter_timeout;
         let lens = self.context.options.lens.clone();
         let active = self.active.clone();
+        let capture_time = self.context.options.deflicker_diagnostics;
         Ok(Box::new(move || {
             fs::create_dir(&scratch).map_err(|e| format!("private sequence scratch: {e}"))?;
             let mut provisional = |id, value| {
@@ -363,6 +365,7 @@ impl Backend for Runner<'_, '_> {
                     lens,
                 },
                 active,
+                capture_time,
                 streaming.then_some(&mut provisional),
             ).map_err(|e| e.message)?;
             let diagnostics = prepare_diagnostics(&diagnostics)?;
@@ -405,12 +408,12 @@ impl Backend for Runner<'_, '_> {
             let area=prepared.lens_valid_area.ok_or("graph: prepared frame has no certified lens area")?;
             self.lens_area=Some(crate::lens::intersect(self.lens_area.unwrap_or([0.,0.,1.,1.]),area.bounds).map_err(|e|e.message)?);
         }
-        if self.context.options.deflicker.enabled() {
+        if self.context.options.deflicker.enabled() && self.context.options.deflicker_diagnostics {
             self.capture_times.push(prepared.capture_time.clone());
         }
         self.prepared_count += 1;
         if prepared.generated {
-            self.generated_paths.push(prepared.dng.clone());
+            self.generated_paths.insert(prepared.dng.clone());
         }
         if id + 1 == self.context.sources.len() && !self.generated_paths.is_empty() {
             self.progress("convert");
@@ -447,29 +450,17 @@ impl Backend for Runner<'_, '_> {
         let total = self.context.sources.len();
         let active = self.active.clone();
         let results = self.early_results.clone();
-        let use_detail = self.pairwise.is_some();
+        let detail = self.analysis_detail();
         let written = self.log.line(&format!(
             "kind=measure.early frame={} source={}", id + 1, quote(&prepared.source_name)
         ));
         self.result(written)?;
         Ok(Some(Box::new(move || {
             if let Ok(info) = frame::analyze_prepared_at(
-                &tool, &prepared, wb, roi, &settings, id, total, &key, active, true,
+                &tool, &prepared, wb, roi, &settings, id, total, &key, active, true, detail,
             ) {
-                if let Some(mut measurement) = info.measurement {
-                    if !use_detail {
-                        measurement.log_pixel_samples = None;
-                        measurement.log_channel_means = None;
-                    }
-                    let record = prepared.export.as_ref().unwrap();
-                    let result = EarlyMeasurement {
-                        dng: prepared.dng,
-                        source_version: record.source_version.clone(),
-                        dng_version: record.dng_version.clone(),
-                        wb,
-                        measurement,
-                    };
-                    results.lock().unwrap().insert(id, result);
+                if let Some(measurement) = info.measurement {
+                    results.lock().unwrap().insert(id, measurement);
                 }
             }
             Ok(())
@@ -491,19 +482,14 @@ impl Backend for Runner<'_, '_> {
         let settings = self.settings();
         let total = self.context.sources.len();
         let active = self.active.clone();
+        let detail = self.analysis_detail();
         let early = self.early_results.lock().unwrap().remove(&id);
         Ok(Box::new(move || {
-            let record = prepared.export.as_ref().unwrap();
-            if let Some(candidate) = early {
-                if candidate.dng == prepared.dng
-                    && candidate.source_version == record.source_version
-                    && candidate.dng_version == record.dng_version && candidate.wb == wb
-                {
-                    return Ok(MeasuredFrame { measurement: candidate.measurement, reused: true });
-                }
+            if let Some(measurement) = early {
+                return Ok(MeasuredFrame { measurement, reused: true });
             }
             let info = frame::analyze_prepared_at(
-                &tool, &prepared, wb, roi, &settings, id, total, &log, active, false,
+                &tool, &prepared, wb, roi, &settings, id, total, &log, active, false, detail,
             )
             .map_err(|e| frame_failure(id, total, &prepared.source_name, &e.message))?;
             let measurement = info.measurement.ok_or("graph: missing measurement")?;
@@ -544,6 +530,7 @@ impl Backend for Runner<'_, '_> {
     }
     fn solve(&mut self) -> graph::Result<Vec<Gain>> {
         let cfg = &self.context.options.deflicker;
+        let diagnostics = self.context.options.deflicker_diagnostics;
         let continuity = crate::continuity::time_gaps(&self.capture_times);
         let config = ExposureConfig {
             period: cfg.period,
@@ -557,28 +544,26 @@ impl Backend for Runner<'_, '_> {
             ..Default::default()
         };
         let started = Instant::now();
-        let result = match self.pairwise.take() {
-            Some(window) => solve_windowed(&self.measurements, &config, window)?,
-            None => solve_exposure(&self.measurements, &config)?,
-        };
-        let plan = ExposurePlan::from_result(&self.measurements, &result)?;
-        let gains = plan
-            .entries()
-            .iter()
-            .map(|p| Gain {
-                frame_id: p.frame_id,
-                reference_identity: p.frame_id.to_string(),
-                ev: p.ev,
-            })
-            .collect();
+        let (evs, report) = solve_for_export(&self.measurements, &config, self.pairwise.take(), diagnostics)?;
+        self.capture_times = Vec::new();
+        if let Some(report) = report {
+            let document = crate::json::to_pretty_string(&report.diagnostics(&self.measurements)).replace('\n', "");
+            let written = self.log.line(&format!("kind=deflicker.diagnostics report={document}"));
+            self.result(written)?;
+        }
+        self.measurements = Vec::new();
+        let count = evs.len();
+        let gains = evs.into_iter().enumerate().map(|(id, ev)| Gain {
+            frame_id: id,
+            reference_identity: id.to_string(),
+            ev,
+        }).collect();
         let written = self.log.line(&format!(
             "kind=solve frames={} duration={:.3}",
-            plan.entries().len(),
+            count,
             started.elapsed().as_secs_f64()
         ));
         self.result(written)?;
-        self.measurements = Vec::new();
-        self.capture_times = Vec::new();
         self.exposure_plan_ready = true;
         self.progress("deflicker");
         Ok(gains)
@@ -935,6 +920,7 @@ impl Backend for Runner<'_, '_> {
                 Error::new(EXIT_FRAME, format!("delete cache {}: {e}", r.dng.display()))
             });
             self.result(result)?;
+            self.generated_paths.remove(&r.dng);
             let written = self.log.line(&format!(
                 "kind=delete frame={} source={} path={}",
                 id + 1,
@@ -1253,7 +1239,10 @@ pub fn run(
         pairwise: (context.options.deflicker.enabled()
             && context.options.deflicker.estimator.as_str() == "pairwise"
             && (context.options.deflicker.brightness.as_str() != "smooth" || context.sources.len() >= 8))
-            .then(|| PairwiseWindow::new(context.sources.len(), context.options.deflicker.exclude_rois.clone())),
+            .then(|| PairwiseWindow::with_diagnostics(
+                context.sources.len(), context.options.deflicker.exclude_rois.clone(),
+                context.options.deflicker_diagnostics,
+            )),
         reference_wb: None,
         early_frames: Arc::new(Mutex::new(if graph.early_measure_concurrency().is_some() {
             vec![None; context.sources.len()]
@@ -1269,7 +1258,7 @@ pub fn run(
         resize_target: explicit_resize,
         resize: None,
         lens_area: None,
-        generated_paths: vec![],
+        generated_paths: BTreeSet::new(),
         exposure_plan_ready: false,
         gain_scanned: 0,
         encoder: {
@@ -1399,14 +1388,7 @@ pub fn run(
     // The graph owns cache deletion. Files that a custom graph did not delete
     // are retained (and named by the success log); the default graph deletes
     // every generated cache DNG, leaving this list empty.
-    let mut retained_cache: Vec<std::path::PathBuf> = runner
-        .generated_paths
-        .iter()
-        .filter(|path| fs::symlink_metadata(path).is_ok())
-        .cloned()
-        .collect();
-    retained_cache.sort();
-    retained_cache.dedup();
+    let retained_cache = std::mem::take(&mut runner.generated_paths).into_iter().collect();
     Ok(Output {
         sequence,
         stage: EncodedStage {

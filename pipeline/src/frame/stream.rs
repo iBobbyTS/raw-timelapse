@@ -183,6 +183,7 @@ pub(crate) struct NativeRun {
     pub(crate) lens: crate::lens::Settings,
     pub(crate) log: PathBuf,
     pub(crate) analysis_roi: Option<[f64; 4]>,
+    pub(crate) analysis_detail: Option<&'static str>,
     pub(crate) preview_edge: Option<u32>,
     #[cfg(test)]
     pub(crate) converter: Option<String>,
@@ -200,6 +201,7 @@ impl NativeRun {
             converter: config.converter.map(str::to_string),
             converter_timeout: config.converter_timeout,
             analysis_roi: config.analysis_roi,
+            analysis_detail: None,
             preview_edge: None,
         }
     }

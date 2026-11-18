@@ -411,7 +411,8 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
                             const fs::path &scratch_in, const std::string &converter,
                             std::optional<int> timeout, bool temporary, const lens::PrepareOptions &lens_options,
                             const std::vector<fs::path> &early_contexts, bool sequence, bool in_memory,
-                            const std::function<void(size_t, const PreparedFrame &)> &early) {
+                            const std::function<void(size_t, const PreparedFrame &)> &early,
+                            bool capture_time) {
   auto started = std::chrono::steady_clock::now();
   if (sources.empty()) throw Error(26, "prepare requires at least one source");
   lens::validate_prepare_options(lens_options);
@@ -445,18 +446,20 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
   const auto offer = [&](size_t index, const fs::path &dng) {
     try {
       auto candidate = frames[index];
-      candidate.prepared_version = candidate.kind == Route::direct ? candidate.source_version : file_version(dng);
-      auto check = inspect(dng);
-      if (!check || check->photometric != 34892 || !check->width || !check->height) return;
       candidate.generated = candidate.kind != Route::direct;
       candidate.prepared_dng = dng;
-      if (!in_memory) candidate.prepared_hash = candidate.generated ? sha256(dng) : candidate.source_hash;
-      candidate.main_ifd_width = check->width;
-      candidate.main_ifd_height = check->height;
+      if (!in_memory) {
+        candidate.prepared_version = candidate.generated ? file_version(dng) : candidate.source_version;
+        auto check = inspect(dng);
+        if (!check || check->photometric != 34892 || !check->width || !check->height) return;
+        candidate.prepared_hash = candidate.generated ? sha256(dng) : candidate.source_hash;
+        candidate.main_ifd_width = check->width;
+        candidate.main_ifd_height = check->height;
+      }
       if (candidate.kind == Route::vendor_raw) candidate.own = read_neutral(dng);
-      candidate.capture_time = read_capture_time(candidate.kind == Route::vendor_raw ? dng : candidate.source);
+      if (!in_memory && capture_time) candidate.capture_time = read_capture_time(candidate.kind == Route::vendor_raw ? dng : candidate.source);
       if (early) {
-        check_prepared_versions(candidate);
+        if (!in_memory) check_prepared_versions(candidate);
         early(index, candidate);
       } else {
         write_prepared(candidate, early_contexts[index], true);
@@ -496,7 +499,7 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
   for (auto &out : frames) {
     check_cancelled();
     if (out.kind == Route::vendor_raw) out.own = read_neutral(out.prepared_dng);
-    auto check = inspect(out.prepared_dng);
+    auto check = in_memory && !out.generated ? out.routing : inspect(out.prepared_dng);
     if (!check || check->photometric != 34892 || !check->width || !check->height)
       throw Error(23, "prepared DNG is not nonzero LinearRaw (34892): " + out.source.string());
     if (!out.generated) {
@@ -505,8 +508,8 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
     }
     out.main_ifd_width = check->width;
     out.main_ifd_height = check->height;
-    out.capture_time = read_capture_time(out.kind == Route::vendor_raw ? out.prepared_dng : out.source);
-    check_prepared_versions(out);
+    if (capture_time) out.capture_time = read_capture_time(out.kind == Route::vendor_raw ? out.prepared_dng : out.source);
+    if (!in_memory) check_prepared_versions(out);
   }
   std::vector<lens::SourcePair> lens_sources;
   for (const auto &f : frames) lens_sources.push_back({f.source, f.prepared_dng, f.generated, f.main_ifd_width, f.main_ifd_height});
@@ -606,11 +609,13 @@ static std::string prepared_document(const PreparedFrame &prepared, bool provisi
   field(out, "route", route_name(prepared.kind));
   field(out, "prepared_dng", prepared.prepared_dng.string());
   if (!prepared.frame_id) field(out, "prepared_sha256", prepared.prepared_hash);
-  field(out, "source_version", prepared.source_version);
-  field(out, "prepared_version", prepared.prepared_version);
   field(out, "generated", prepared.generated ? "1" : "0");
-  field(out, "main_ifd_width", std::to_string(prepared.main_ifd_width));
-  field(out, "main_ifd_height", std::to_string(prepared.main_ifd_height));
+  if (!(prepared.frame_id && provisional)) {
+    field(out, "source_version", prepared.source_version);
+    field(out, "prepared_version", prepared.prepared_version);
+    field(out, "main_ifd_width", std::to_string(prepared.main_ifd_width));
+    field(out, "main_ifd_height", std::to_string(prepared.main_ifd_height));
+  }
   field(out, "as_shot_neutral", number(prepared.own[0]) + "," +
                                number(prepared.own[1]) + "," +
                                number(prepared.own[2]));
@@ -657,8 +662,6 @@ static PreparedFrame parse_prepared_document(const std::string &text, bool provi
                                    "route",
                                    "prepared_dng",
                                    "generated",
-                                   "main_ifd_width",
-                                   "main_ifd_height",
                                    "as_shot_neutral",
                                    "has_capture_time",
                                    "converter_used"};
@@ -685,9 +688,14 @@ static PreparedFrame parse_prepared_document(const std::string &text, bool provi
   }
   out.kind = route_from_name(context.at("route"));
   out.generated = parse_bool(context.at("generated"), "generated");
-  out.main_ifd_width = parse_u32(context.at("main_ifd_width"), "main_ifd_width");
-  out.main_ifd_height =
-      parse_u32(context.at("main_ifd_height"), "main_ifd_height");
+  if (!(in_memory && provisional)) {
+    allowed.insert("main_ifd_width");
+    allowed.insert("main_ifd_height");
+    out.main_ifd_width = parse_u32(context.at("main_ifd_width"), "main_ifd_width");
+    out.main_ifd_height = parse_u32(context.at("main_ifd_height"), "main_ifd_height");
+    if (out.main_ifd_width == 0 || out.main_ifd_height == 0)
+      throw Error(26, "prepared context geometry must be non-zero");
+  }
   auto neutral_text = context.at("as_shot_neutral");
   std::vector<std::string> parts;
   size_t start = 0;
@@ -741,8 +749,13 @@ static PreparedFrame parse_prepared_document(const std::string &text, bool provi
   if (!fs::path(context.at("source")).is_absolute() ||
       !fs::path(context.at("prepared_dng")).is_absolute())
     throw Error(26, "prepared context paths must be absolute");
-  if (out.main_ifd_width == 0 || out.main_ifd_height == 0)
-    throw Error(26, "prepared context geometry must be non-zero");
+  // The private pipe receives the paths and geometry already resolved by Prepare.
+  if (in_memory) {
+    out.source = context.at("source");
+    out.prepared_dng = context.at("prepared_dng");
+    if (use_file_versions) check_prepared_versions(out);
+    return out;
+  }
   // Original identity: never replaced by the cache path.
   out.source = canonical_existing(context.at("source"), "original source");
   out.prepared_dng =
@@ -813,7 +826,7 @@ static std::string read_stdin(size_t limit) {
 }
 
 PreparedFrame read_export_frame(bool provisional) {
-  return parse_prepared_document(read_stdin(kContextLimit), provisional, true, true);
+  return parse_prepared_document(read_stdin(kContextLimit), provisional, !provisional, true);
 }
 
 void prepare_export(const fs::path &scratch_in, const std::string &converter,
@@ -825,7 +838,8 @@ void prepare_export(const fs::path &scratch_in, const std::string &converter,
   auto request = parse_context(read_stdin(kSequenceDocumentLimit),
                                "rawtl-export-request/1", kSequenceDocumentLimit);
   const auto count = parse_u32(request.at("count"), "count");
-  if (!count || count != request.fields.size() - 1)
+  const bool capture_time = request.has("capture_time") && parse_bool(request.at("capture_time"), "capture_time");
+  if (!count || count != request.fields.size() - 1 - size_t(request.has("capture_time")))
     throw Error(26, "export request count disagrees with its input entries");
   std::vector<fs::path> sources;
   sources.reserve(count);
@@ -844,7 +858,7 @@ void prepare_export(const fs::path &scratch_in, const std::string &converter,
   std::function<void(size_t, const PreparedFrame &)> provisional;
   if (early) provisional = [&](size_t, const PreparedFrame &frame) { emit('E', frame); };
   auto frames = prepare_frames(sources, scratch, converter, timeout, false,
-                               lens_options, {}, true, true, provisional);
+                               lens_options, {}, true, true, provisional, capture_time);
   for (const auto &frame : frames) {
     check_cancelled();
     check_prepared_versions(frame);

@@ -918,6 +918,10 @@ fn parse_args() -> Result<Options, (i32, String)> {
                 emit_analysis = Some(PathBuf::from(value(&args, &mut index)?));
                 index += 1;
             }
+            "--analysis-detail" => {
+                let _ = value(&args, &mut index)?;
+                index += 1;
+            }
             "--analysis-roi" => {
                 let text = value(&args, &mut index)?;
                 let parts: Vec<&str> = text.split(',').collect();

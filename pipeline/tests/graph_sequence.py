@@ -18,7 +18,7 @@ def absent(pid):
 def run_case(mode):
     root=work/mode;root.mkdir()
     incoming=root/'input';incoming.mkdir()
-    count=65 if mode=='long-sequence' else (6 if mode=='mapping' else (5 if mode in ['out-of-order','measure-error','shared-lifetime'] else 4))
+    count=18 if mode=='early-mutation' else 65 if mode=='long-sequence' else (6 if mode=='mapping' else (5 if mode in ['out-of-order','measure-error','shared-lifetime'] else 4))
     for i in range(count):
         make_dng(incoming,f'frame_{i}',pi=32803,w=64,h=64,neutral=[.5+i*.01,1,.75+i*.01],datetime_original=f'2026:11:10 12:{i//60:02}:{i%60:02}')
     originals={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in incoming.iterdir()}
@@ -37,7 +37,7 @@ def run_case(mode):
         import json,os,pathlib,signal,socket,subprocess,sys,time
         args=sys.argv[1:];out=pathlib.Path(args[args.index('-d')+1]);inputs=args[args.index('-mp')+1:]
         with open({str(calls)!r},'a') as f:f.write(json.dumps(inputs)+'\\n')
-        mode={mode!r};s=None
+        mode={mode!r};s=None;writers=[]
         first='frame_0' in pathlib.Path(inputs[0]).stem
         blocked=mode in ['interrupt','terminate','timeout']
         if blocked:
@@ -57,21 +57,24 @@ def run_case(mode):
             if mode=='partial' and i==0:
                 target.write_bytes(data[:32]);s.sendall(b'{{"kind":"partial"}}\\n');s.recv(1)
                 with target.open('ab') as f:f.write(data[32:])
-            elif mode=='early-mutation' and i<2:
-                with target.open('wb') as f:
-                    f.write(data);f.flush();time.sleep(.25)
+            elif mode=='early-mutation':
+                writer=target.open('wb')
+                writer.write(data);writer.flush()
+                writers.append(writer)
             else:target.write_bytes(data)
             if mode=='out-of-order' and first:
                 s.sendall((json.dumps({{'kind':'written','id':i}})+'\\n').encode());s.recv(1)
         if mode=='extra':(out/'unexpected.dng').write_bytes(data)
         if mode=='early-mutation':
+            time.sleep(.75)
+            for writer in writers:writer.close()
             marker=pathlib.Path({str(early)!r})
-            deadline=time.monotonic()+9
-            while not marker.exists() or len(marker.read_text().splitlines())<2:
+            deadline=time.monotonic()+14
+            while not marker.exists() or len(marker.read_text().splitlines())<len(inputs):
                 if time.monotonic()>deadline:sys.exit(11)
                 time.sleep(.02)
-            # Identical bytes, different file identity. The second result must
-            # be rejected even though a content hash comparison would match.
+            # The same frame number still refers to the successful measurement
+            # when the Converter replaces the file with identical pixels.
             target=out/'frame_1.dng'
             replacement=out/'replacement'
             replacement.write_bytes(target.read_bytes())
@@ -122,7 +125,7 @@ def run_case(mode):
     if mode=='shared-lifetime':graph['nodes'][3]['concurrency']=1
     config=root/'graph.json';config.write_text(json.dumps(graph))
     video=root/'output'/'timelapse.mov';log=video.with_suffix('.log')
-    args=[str(cli),'--input',str(incoming),'--output',str(video),'--graph',str(config),'--dng-linear-frame',str(wrapper),'--converter',str(converter),'--converter-timeout','1' if mode=='timeout' else '10','--resize','64x64']
+    args=[str(cli),'--input',str(incoming),'--output',str(video),'--graph',str(config),'--dng-linear-frame',str(wrapper),'--converter',str(converter),'--converter-timeout','1' if mode=='timeout' else '20' if mode=='early-mutation' else '10','--resize','64x64']
     if mode=='out-of-order':args+=['--verify-output']
     p=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     def packet():
@@ -169,10 +172,10 @@ def run_case(mode):
             assert trace.count('kind=solve frames=')==1
             assert trace.count('kind=node node=convert-cache frame=sequence ')==1
             if mode=='early-mutation':
-                assert set(early.read_text().splitlines())=={'0','1'}
+                assert set(early.read_text().splitlines())=={str(i) for i in range(count)}
                 completed=[line for line in trace.splitlines() if 'kind=measure frame=' in line]
-                assert 'frame=1 ' in completed[0] and 'reused_early=true' in completed[0], completed
-                assert 'frame=2 ' in completed[1] and 'reused_early=false' in completed[1], completed
+                assert len(completed)==count
+                assert all('reused_early=true' in line for line in completed), completed
             if mode=='shared-lifetime':assert (root/'shared-survived-delete').is_file()
             if mode=='mapping':
                 import shlex

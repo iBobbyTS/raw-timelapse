@@ -122,7 +122,8 @@ struct Analysis {
 // pre white balance / color transform). gained_scene is the post-gain ACEScg
 // FP32 analysis data, size width*height*3.
 Analysis measure(const Decoded &d, const std::vector<float> &gained_scene,
-                 const Roi &roi, double exposure_ev);
+                 const Roi &roi, double exposure_ev, bool detail = true,
+                 bool diagnostics = true);
 Json sidecar_json(const Analysis &analysis, const std::string &source_sha256);
 } // namespace analysis
 } // namespace frame

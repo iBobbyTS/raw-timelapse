@@ -183,7 +183,7 @@ pub fn build_edges(
                 continue;
             }
             let edge = pair_difference_validated(&ms[i], &ms[j], lag, train);
-            if let Some(edge) = accept_edge(&mut stats, edge, i, j) {
+            if let Some(edge) = accept_edge(Some(&mut stats), edge, i, j) {
                 edges.push(edge);
             }
         }
@@ -208,21 +208,27 @@ fn edge_stats(lags: &[usize]) -> EdgeStats {
     stats
 }
 
-fn accept_edge(stats: &mut EdgeStats, mut edge: GraphEdge, i: usize, j: usize) -> Option<GraphEdge> {
-    stats.candidate_edges += 1;
-    let counts = stats.by_lag.get_mut(&edge.lag).unwrap();
-    if !edge.delta_ev.is_finite() || !edge.reliable() {
-        stats.rejected_edges += 1;
-        counts.1 += 1;
-        for reason in edge.rejects.keys() {
-            *stats.reject_reasons.entry(reason.clone()).or_default() += 1;
+fn accept_edge(stats: Option<&mut EdgeStats>, mut edge: GraphEdge, i: usize, j: usize) -> Option<GraphEdge> {
+    let reliable = edge.delta_ev.is_finite() && edge.reliable();
+    if let Some(stats) = stats {
+        stats.candidate_edges += 1;
+        let counts = stats.by_lag.get_mut(&edge.lag).unwrap();
+        if reliable {
+            counts.0 += 1;
+        } else {
+            stats.rejected_edges += 1;
+            counts.1 += 1;
+            for reason in edge.rejects.keys() {
+                *stats.reject_reasons.entry(reason.clone()).or_default() += 1;
+            }
         }
-        None
-    } else {
-        counts.0 += 1;
+    }
+    if reliable {
         edge.i = i;
         edge.j = j;
         Some(edge)
+    } else {
+        None
     }
 }
 
@@ -239,14 +245,18 @@ pub struct PairwiseWindow {
     received: usize,
     window: VecDeque<FrameMeasurement>,
     edges: BTreeMap<usize, Vec<GraphEdge>>,
-    stats: EdgeStats,
+    stats: Option<EdgeStats>,
     excludes: Vec<[f64; 4]>,
     train: Vec<bool>,
 }
 impl PairwiseWindow {
     pub fn new(count: usize, excludes: Vec<[f64; 4]>) -> Self {
+        Self::with_diagnostics(count, excludes, true)
+    }
+
+    pub fn with_diagnostics(count: usize, excludes: Vec<[f64; 4]>, diagnostics: bool) -> Self {
         let lags = active_lags(count, &DEFAULT_LAGS);
-        let stats = edge_stats(&lags);
+        let stats = diagnostics.then(|| edge_stats(&lags));
         Self {
             count, received: 0, window: VecDeque::new(), stats, excludes, train: Vec::new(),
             edges: lags.into_iter().map(|lag| (lag, Vec::new())).collect(),
@@ -270,7 +280,7 @@ impl PairwiseWindow {
         for (&lag, edges) in &mut self.edges {
             if lag <= window_len {
                 let edge = pair_difference_validated(&self.window[window_len - lag], &frame, lag, Some(&self.train));
-                if let Some(edge) = accept_edge(&mut self.stats, edge, j - lag, j) {
+                if let Some(edge) = accept_edge(self.stats.as_mut(), edge, j - lag, j) {
                     edges.push(edge);
                 }
             }
@@ -294,7 +304,7 @@ impl PairwiseWindow {
         if self.received != count || self.count != count {
             return Err("incomplete pairwise measurements".into());
         }
-        Ok((self.edges.into_values().flatten().collect(), self.stats))
+        Ok((self.edges.into_values().flatten().collect(), self.stats.unwrap_or_default()))
     }
 }
 

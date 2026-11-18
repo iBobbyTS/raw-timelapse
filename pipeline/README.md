@@ -186,14 +186,13 @@ reference directory, features, EV plan and on-disk cache can grow with sequence
 length; the concurrency bound is a frame bound, not a byte or disk limit.
 Prepare waits for the sealed source inventory and launches one sequence task.
 When Prepare directly feeds Solve on macOS, it can make frames available for
-early measurement while Converter is still running. After a writable
-descriptor disappears, the file must stay unchanged with no observed writer
-for five seconds. Solve admits only the ready prefix in frame order and shares
-its worker limit between early and final measurements. References and provisional
-results cross process pipes and stay in memory. Prepare validates the full
-sequence before final publication. Matching frame number, file versions and
-white balance allow reuse of early measurements. Native checks state before and
-after decode, using the device, inode, size and modification/change timestamps.
+early measurement while Converter is still running. Once an observed write
+descriptor has been absent for five seconds, the frame is ready. Solve admits
+the ready prefix in frame order and shares its worker limit between early and
+final measurements. Successful early measurements stay in memory until they
+are consumed by frame number. Measurements missing from the early pass run
+after final publication. Prepare still verifies the complete output inventory
+and final native readers check their file state before and after decoding.
 Export associates measurements and exposure corrections by frame number.
 The rolling pairwise window releases detailed samples after the last relevant
 comparison. The global solve uses compact tile statistics and frame-pair edges.

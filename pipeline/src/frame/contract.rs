@@ -266,34 +266,34 @@ pub(crate) fn frame_metadata(
         ));
     }
 
-    let source_field = sidecar
-        .get("source")
-        .and_then(Json::as_str)
-        .ok_or_else(|| missing_field(index, total, name, "source"))?;
-    // The native producer resolves the input path (symlinks included), so
-    // compare canonical identities rather than the literal argument text.
-    let (expected_source, reported_source) =
-        canonical_source_pair(source_field, path).map_err(|err| {
-            Error::new(
+    if export_id.is_none() {
+        let source_field = sidecar
+            .get("source")
+            .and_then(Json::as_str)
+            .ok_or_else(|| missing_field(index, total, name, "source"))?;
+        // The native producer resolves the input path (symlinks included), so
+        // compare canonical identities rather than the literal argument text.
+        let (expected_source, reported_source) =
+            canonical_source_pair(source_field, path).map_err(|err| {
+                Error::new(
+                    EXIT_FRAME,
+                    format!(
+                        "frame {index}/{total} ({}) metadata source {source_field:?} cannot be resolved against the requested input: {err}",
+                        name
+                    ),
+                )
+            })?;
+        if reported_source != expected_source {
+            return Err(Error::new(
                 EXIT_FRAME,
                 format!(
-                    "frame {index}/{total} ({}) metadata source {source_field:?} cannot be resolved against the requested input: {err}",
-                    name
+                    "frame {index}/{total} ({}) metadata source {source_field:?} does not resolve to the requested input {}",
+                    name,
+                    expected_source.display()
                 ),
-            )
-        })?;
-    if reported_source != expected_source {
-        return Err(Error::new(
-            EXIT_FRAME,
-            format!(
-                "frame {index}/{total} ({}) metadata source {source_field:?} does not resolve to the requested input {}",
-                name,
-                expected_source.display()
-            ),
-        ));
+            ));
+        }
     }
-
-
     let reported_ev = sidecar
         .get("exposure_ev")
         .and_then(Json::as_f64)

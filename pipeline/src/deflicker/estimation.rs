@@ -1,5 +1,5 @@
 use super::{
-    graph::{solve_exposure_graph, GraphEdge, GraphResult},
+    graph::{solve_exposure_graph_with_diagnostics, GraphEdge, GraphResult},
     measurement::compatible,
     pairwise::{
         build_edges, local_common_change, persistent_background, reference_tile_valid, train_tiles, EdgeStats, PairwiseWindow, DEFAULT_LAGS,
@@ -91,6 +91,45 @@ pub struct ExposureResult {
     pub pairwise_summary: Json,
     pub plan_quality: super::validation::PlanQuality,
 }
+impl ExposureResult {
+    pub fn diagnostics(&self, measurements: &[FrameMeasurement]) -> Json {
+        let number = |value: f64| finite(value).map_or(Json::Null, Json::Float);
+        let matrix = |rows: &[Vec<f64>]| Json::Array(rows.iter().map(|row| {
+            Json::Array(row.iter().copied().map(number).collect())
+        }).collect());
+        let mask = |rows: &[Vec<bool>]| Json::Array(rows.iter().map(|row| {
+            Json::Array(row.iter().copied().map(Json::Bool).collect())
+        }).collect());
+        Json::obj(vec![
+            ("frame_number_base", Json::Int(1)),
+            ("frames", Json::Array(self.frames.iter().map(|frame| Json::obj(vec![
+                ("frame", Json::Int((frame.index + 1) as i64)),
+                ("status", Json::Str(frame.status.clone())),
+                ("requested_ev", frame.requested_ev.map_or(Json::Null, number)),
+                ("applied_ev", frame.applied_ev.map_or(Json::Null, number)),
+                ("measured_ev", frame.measured_level_ev.map_or(Json::Null, number)),
+                ("desired_ev", frame.desired_level_ev.map_or(Json::Null, number)),
+                ("warnings", Json::Array(frame.warnings.iter().cloned().map(Json::Str).collect())),
+            ])).collect())),
+            ("tile_log_luminance", matrix(&self.tile_log_luminance)),
+            ("tile_valid", mask(&self.tile_valid)),
+            ("consensus_mask", mask(&self.consensus_mask)),
+            ("frozen_target", matrix(&self.frozen_target)),
+            ("analysis_highlight_fraction", Json::Array(measurements.iter().map(|m| {
+                Json::Array(m.analysis_highlight_fraction.iter().copied().map(number).collect())
+            }).collect())),
+            ("scene_cuts", Json::Array(self.scene_cuts.iter().map(|cut| Json::obj(vec![
+                ("frame", Json::Int((cut.index + 1) as i64)),
+                ("median_ev", number(cut.median_ev)),
+                ("tile_mad_ev", number(cut.tile_mad_ev)),
+                ("common_tiles", Json::Int(cut.common_tiles as i64)),
+            ])).collect())),
+            ("time_gaps", Json::Array(self.time_gaps.iter().map(|i| Json::Int((i + 1) as i64)).collect())),
+            ("pairwise", self.pairwise_summary.clone()),
+        ])
+    }
+}
+
 /// A frozen, complete handoff for render/graph consumers. Fields are private;
 /// callers receive an ordered slice and cannot mutate the published gains.
 #[derive(Debug, Clone)]
@@ -218,9 +257,9 @@ struct State {
     desired: Vec<f64>,
 }
 impl State {
-    fn new(n: usize, k: usize) -> Self {
+    fn new(n: usize, k: usize, diagnostics: bool) -> Self {
         Self {
-            consensus: vec![vec![false; k]; n],
+            consensus: if diagnostics { vec![vec![false; k]; n] } else { Vec::new() },
             residual: vec![f64::NAN; n],
             mad: vec![f64::NAN; n],
             fractions: vec![f64::NAN; n],
@@ -303,7 +342,7 @@ pub(super) fn aligned_brightness(
             rejects: Default::default(),
         });
     }
-    let offsets = solve_exposure_graph(graph.components.len(), &bridges)?;
+    let offsets = solve_exposure_graph_with_diagnostics(graph.components.len(), &bridges, false)?;
     if !offsets.converged {
         return Ok((vec![0.; n], bridges.len()));
     }
@@ -318,6 +357,7 @@ fn pairwise_path(
     cfg: &ExposureConfig,
     st: &mut State,
     evidence: Option<(Vec<GraphEdge>, EdgeStats)>,
+    diagnostics: bool,
 ) -> Result<(Vec<f64>, Json)> {
     let n = ms.len();
     let k = ms[0].valid.len();
@@ -326,12 +366,12 @@ fn pairwise_path(
         Some(evidence) => evidence,
         None => build_edges(ms, &[0], Some(&train), &DEFAULT_LAGS)?,
     };
-    let graph = solve_exposure_graph(n, &edges)?;
+    let graph = solve_exposure_graph_with_diagnostics(n, &edges, diagnostics)?;
     let uniform = cfg.brightness == "uniform";
     let (bh, conservative) = aligned_brightness(ms, &graph, uniform, &train)?;
     // Gauge placement must precede persistence. A genuinely nonpersistent
     // sequence remains untrusted; local evidence still gives a usable plan.
-    let persistent = persistent_background(ms, &bh)?;
+    let persistent = if diagnostics { persistent_background(ms, &bh)? } else { Vec::new() };
     let badj: Vec<_> = bh.iter().zip(s).map(|(b, s)| b - s).collect();
     let valid: Vec<_> = ms
         .iter()
@@ -372,7 +412,7 @@ fn pairwise_path(
                 });
             }
         }
-        for group in solve_exposure_graph(n, &connectivity)?.components {
+        for group in solve_exposure_graph_with_diagnostics(n, &connectivity, false)?.components {
             if group.iter().filter(|&&t| valid[t]).count() < 8 {
                 continue;
             }
@@ -404,15 +444,18 @@ fn pairwise_path(
             }
         }
     }
-    let target = median(
+    let target = if uniform { median(
         &bh.iter()
             .zip(&valid)
             .filter(|(_, q)| **q)
             .map(|(b, _)| *b)
             .collect::<Vec<_>>(),
-    );
+    ) } else { 0. };
     let mut requested = vec![0.; n];
     for t in 0..n {
+        let desired = if uniform { target } else { trend[t] + s[t] };
+        requested[t] = finite(cfg.strength * (desired - bh[t])).unwrap_or(0.);
+        if !diagnostics { continue; }
         st.counts[t] = (0..k)
             .filter(|&i| train[i] && ms[t].valid[i] && persistent[i])
             .count();
@@ -424,11 +467,9 @@ fn pairwise_path(
             && graph.brightness[t].is_finite()
             && graph.converged
             && !st.trend_nonconverged[t];
-        let desired = if uniform { target } else { trend[t] + s[t] };
         st.measured[t] = bh[t];
         st.desired[t] = desired;
         st.residual[t] = bh[t] - desired;
-        requested[t] = finite(cfg.strength * (desired - bh[t])).unwrap_or(0.);
         // Render feedback must target the requested strength, not silently
         // drive a deliberately partial correction toward full strength.
         if cfg.strength != 1. {
@@ -451,9 +492,10 @@ fn pairwise_path(
         let anchor = median(&requested);
         for t in 0..n {
             requested[t] -= anchor;
-            st.desired[t] -= anchor;
+            if diagnostics { st.desired[t] -= anchor; }
         }
     }
+    if !diagnostics { return Ok((requested, Json::Null)); }
     let mut summary=Json::obj(vec![
         ("target_provenance",Json::obj(vec![("intent",Json::Str(cfg.brightness.clone())),("reference_scope",Json::Str(if uniform{"global"}else{"trend"}.into())),("defined_before_iteration",Json::Bool(true)),("measured",Json::Str(if uniform{"graph brightness in a shared local temporal reference"}else{"b minus confirmed steps"}.into())),("desired",Json::Str(if uniform{"constant level (global median of the stitched graph brightness)".into()}else{format!("Huber-Whittaker trend, period={} (lambda=1/(16 sin(pi/P)^4))",cfg.period)}))])),
         ("cross_boundary_anchors",Json::obj(vec![("method",Json::Str("joint component offsets from adjacent shared-tile changes; low-weight explicit continuity fallback".into())),("conservative_pairs",Json::Int(conservative as i64))])),
@@ -527,8 +569,8 @@ fn robust_segment(
         if spread <= 0.06 && fraction >= 0.60 && quadrants >= 3 {
             st.reliable[t] = true;
             st.labels[t] = "OK".into();
-            for i in agree {
-                st.consensus[t][i] = true;
+            if let Some(row) = st.consensus.get_mut(t) {
+                for i in agree { row[i] = true; }
             }
         } else {
             st.residual[t] = f64::NAN;
@@ -555,20 +597,28 @@ pub fn estimate_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Resul
 }
 
 pub fn solve_exposure(ms: &[FrameMeasurement], cfg: &ExposureConfig) -> Result<ExposureResult> {
-    solve_with_evidence(ms, cfg, None)
+    solve_with_evidence(ms, cfg, None, true).map(|(_, report)| report.unwrap())
 }
 
 pub fn solve_windowed(
     ms: &[FrameMeasurement], cfg: &ExposureConfig, window: PairwiseWindow,
 ) -> Result<ExposureResult> {
-    let evidence = window.finish(ms.len())?;
-    solve_with_evidence(ms, cfg, Some(evidence))
+    solve_for_export(ms, cfg, Some(window), true).map(|(_, report)| report.unwrap())
+}
+
+pub fn solve_for_export(
+    ms: &[FrameMeasurement], cfg: &ExposureConfig, window: Option<PairwiseWindow>,
+    diagnostics: bool,
+) -> Result<(Vec<f64>, Option<ExposureResult>)> {
+    let evidence = window.map(|window| window.finish(ms.len())).transpose()?;
+    solve_with_evidence(ms, cfg, evidence, diagnostics)
 }
 
 fn solve_with_evidence(
     ms: &[FrameMeasurement], cfg: &ExposureConfig,
     evidence: Option<(Vec<GraphEdge>, EdgeStats)>,
-) -> Result<ExposureResult> {
+    diagnostics: bool,
+) -> Result<(Vec<f64>, Option<ExposureResult>)> {
     let k = compatible(ms)?;
     let n = ms.len();
     if k < 8 {
@@ -597,9 +647,7 @@ fn solve_with_evidence(
     }
     let (low, high) = limits(cfg.ev_limits)?;
     let s = step_vector(n, &cfg.steps)?;
-    let x: Vec<_> = ms.iter().map(|m| m.log_luminance.clone()).collect();
-    let q: Vec<_> = ms.iter().map(|m| m.valid.clone()).collect();
-    let mut st = State::new(n, k);
+    let mut st = State::new(n, k, diagnostics);
     let mut cuts = vec![];
     let mut summary = Json::obj(vec![]);
     let mut failed = 0;
@@ -616,35 +664,41 @@ fn solve_with_evidence(
             .into(),
         );
     } else {
-        let a: Vec<Vec<_>> = x
-            .iter()
-            .zip(&s)
-            .map(|(r, s)| r.iter().map(|x| x - s).collect())
-            .collect();
-        cuts = detect_scene_cuts_with(&a, &q, cfg.scene_cut_median_ev, cfg.scene_cut_tile_mad_ev)?;
+        if diagnostics || cfg.estimator != "pairwise" {
+            let a: Vec<Vec<_>> = ms.iter().zip(&s)
+                .map(|(m, step)| m.log_luminance.iter().map(|x| x - step).collect())
+                .collect();
+            let q: Vec<_> = ms.iter().map(|m| m.valid.clone()).collect();
+            if diagnostics {
+                cuts = detect_scene_cuts_with(&a, &q, cfg.scene_cut_median_ev, cfg.scene_cut_tile_mad_ev)?;
+            }
+            if cfg.estimator != "pairwise" && cfg.brightness == "uniform" {
+                for t in 0..n {
+                    st.counts[t] = q[t].iter().filter(|v| **v).count();
+                    if st.counts[t] >= need(k) {
+                        st.residual[t] = median(
+                            &a[t]
+                                .iter()
+                                .zip(&q[t])
+                                .filter(|(_, q)| **q)
+                                .map(|(x, _)| *x)
+                                .collect::<Vec<_>>(),
+                        );
+                        st.reliable[t] = true;
+                        if diagnostics {
+                        st.consensus[t] = q[t].clone();
+                    }
+                        st.labels[t] = "UNIFORM".into();
+                    }
+                }
+            } else if cfg.estimator != "pairwise" {
+                failed = robust_segment(&a, &q, &ms[0].centers, cfg.period, &mut st)?;
+            }
+        }
         if cfg.estimator == "pairwise" {
-            let (req, sum) = pairwise_path(ms, &s, cfg, &mut st, evidence)?;
+            let (req, sum) = pairwise_path(ms, &s, cfg, &mut st, evidence, diagnostics)?;
             pairwise_requested = Some(req);
             summary = sum;
-        } else if cfg.brightness == "uniform" {
-            for t in 0..n {
-                st.counts[t] = q[t].iter().filter(|v| **v).count();
-                if st.counts[t] >= need(k) {
-                    st.residual[t] = median(
-                        &a[t]
-                            .iter()
-                            .zip(&q[t])
-                            .filter(|(_, q)| **q)
-                            .map(|(x, _)| *x)
-                            .collect::<Vec<_>>(),
-                    );
-                    st.reliable[t] = true;
-                    st.consensus[t] = q[t].clone();
-                    st.labels[t] = "UNIFORM".into();
-                }
-            }
-        } else {
-            failed = robust_segment(&a, &q, &ms[0].centers, cfg.period, &mut st)?;
         }
     }
     let accepted: Vec<_> = (0..n)
@@ -700,6 +754,15 @@ fn solve_with_evidence(
             st.interpolated[t] = true;
         }
     }
+    let gains: Vec<_> = requested.iter().map(|ev| ev.clamp(low, high)).collect();
+    if gains.iter().any(|ev| !ev.is_finite() || !ev.exp2().is_finite() || ev.exp2() <= 0.) {
+        return Err("exposure plan requires a finite representable gain".into());
+    }
+    if !diagnostics {
+        return Ok((gains, None));
+    }
+    let x: Vec<_> = ms.iter().map(|m| m.log_luminance.clone()).collect();
+    let q: Vec<_> = ms.iter().map(|m| m.valid.clone()).collect();
     let mut frozen = vec![vec![f64::NAN; k]; n];
     let mut frames = vec![];
     for t in 0..n {
@@ -778,7 +841,7 @@ fn solve_with_evidence(
         .collect();
     gaps.sort_unstable();
     gaps.dedup();
-    Ok(ExposureResult {
+    Ok((gains, Some(ExposureResult {
         frames,
         tile_log_luminance: x,
         tile_valid: q,
@@ -791,5 +854,5 @@ fn solve_with_evidence(
         time_gaps: gaps,
         pairwise_summary: summary,
         plan_quality: Default::default(),
-    })
+    })))
 }

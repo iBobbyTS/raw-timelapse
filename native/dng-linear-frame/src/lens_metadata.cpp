@@ -234,6 +234,8 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
   for (const auto &arg : args)
     base_bytes += arg.size() + 1 + sizeof(char *);
   const size_t budget = std::min<size_t>(65536, converter_argv_budget());
+  // Short paths can otherwise pack hundreds of network reads into one timeout.
+  constexpr size_t max_paths_per_invocation = 96;
   std::map<std::string, Tags> records;
   std::vector<std::string> invocation = args;
   size_t bytes = base_bytes, part = 0;
@@ -249,7 +251,8 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
       auto result = run_process(args, log_path, 120, output_path, {}, {},
                                 in_memory, 16 * 1024 * 1024);
       if (result.timed_out || result.exit_code != 0)
-        throw Error(26, "lens metadata extraction failed: " +
+        throw Error(26, (result.timed_out ? "lens metadata extraction timed out: "
+                                      : "lens metadata extraction failed: ") +
                             (in_memory ? result.errors : log_path.string()));
       return metadata(in_memory ? result.output : xml::read(output_path));
     };
@@ -277,7 +280,7 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
     const size_t size = path.size() + 1 + sizeof(char *);
     if (base_bytes + size > budget)
       throw Error(26, "lens metadata source exceeds argv budget");
-    if (bytes + size > budget)
+    if (bytes + size > budget || invocation.size() - args.size() == max_paths_per_invocation)
       extract();
     invocation.push_back(path);
     bytes += size;

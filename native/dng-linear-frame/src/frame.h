@@ -112,17 +112,6 @@ struct ConversionInfo {
   fs::path invocation;
   Json record() const;
 };
-// Change detection for local files across the stages of one job.
-struct FileState {
-  dev_t device;
-  ino_t inode;
-  off_t size;
-  timespec modified;
-  timespec changed;
-  bool operator==(const FileState &) const;
-  std::string token() const;
-};
-std::optional<FileState> file_state(const fs::path &);
 std::string file_version(const fs::path &);
 
 struct Conversion {
@@ -176,7 +165,8 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
                             std::optional<int> timeout_seconds, bool temporary, const lens::PrepareOptions &lens_options = {},
                             const std::vector<fs::path> &early_contexts = {}, bool sequence = false,
                             bool in_memory = false,
-                            const std::function<void(size_t, const PreparedFrame &)> &early = {});
+                            const std::function<void(size_t, const PreparedFrame &)> &early = {},
+                            bool capture_time = true);
 void prepare_sequence(const fs::path &request, const fs::path &scratch,
                    const fs::path &result, const std::string &converter,
                    std::optional<int> timeout_seconds, const lens::PrepareOptions &lens_options = {});
