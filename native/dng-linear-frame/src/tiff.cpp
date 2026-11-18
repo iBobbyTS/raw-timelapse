@@ -1,4 +1,6 @@
 #include "frame.h"
+#include <bit>
+#include <cmath>
 #include <fstream>
 #include <map>
 #include <set>
@@ -8,7 +10,9 @@ namespace frame {
 // Anything else is not a DNG and is left to the converter. BigTIFF (magic 43)
 // is rejected explicitly rather than guessed; a recognized DNG then goes
 // through the full validation below byte-for-byte unchanged.
-std::optional<Routing> inspect(const fs::path &path) {
+std::optional<Routing> inspect(const fs::path &path, std::array<bool, 3> *lens_coverage) {
+  if (lens_coverage)
+    lens_coverage->fill(false);
   std::ifstream f(path, std::ios::binary);
   if (!f)
     throw Error(20, "cannot open DNG: " + path.string());
@@ -132,6 +136,67 @@ std::optional<Routing> inspect(const fs::path &path) {
   auto c = candidates.front();
   if (!c.pi)
     throw Error(21, "main RAW IFD PhotometricInterpretation missing");
+  if (lens_coverage) {
+    auto &coverage = *lens_coverage;
+    const auto count = read(c.offset, 2);
+    std::set<uint32_t> lists;
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint64_t entry = uint64_t(c.offset) + 2 + 12 * i;
+      const auto tag = read(entry, 2);
+      if (tag != 51008 && tag != 51009 && tag != 51022)
+        continue;
+      const uint64_t length = read(entry + 4, 4);
+      uint64_t pos = length <= 4 ? entry + 8 : read(entry + 8, 4);
+      if (!lists.insert(tag).second || read(entry + 2, 2) != 7 ||
+          length < 4 || pos > size || length > size - pos)
+        throw Error(20, "invalid DNG opcode list");
+      const auto end = pos + length;
+      const bool tiff_order = little;
+      little = false; // OpcodeList payloads are always big-endian.
+      const auto ops = read(pos, 4);
+      pos += 4;
+      for (uint32_t j = 0; j < ops; ++j) {
+        if (end - pos < 16)
+          throw Error(20, "truncated DNG opcode header");
+        const auto id = read(pos, 4);
+        const auto bytes = read(pos + 12, 4);
+        pos += 16;
+        if (bytes > end - pos)
+          throw Error(20, "truncated DNG opcode parameters");
+        if (id == 1 && (bytes == 68 || bytes == 164)) { // WarpRectilinear
+          const auto planes = read(pos, 4);
+          if ((planes != 1 && planes != 3) || bytes != 20 + 48 * planes)
+            throw Error(20, "invalid WarpRectilinear plane count");
+          using Coefficients = std::array<double, 6>;
+          std::array<Coefficients, 3> coefficients{};
+          for (uint32_t plane = 0; plane < planes; ++plane) {
+            for (size_t k = 0; k < coefficients[plane].size(); ++k) {
+              const auto at = pos + 4 + 48 * plane + 8 * k;
+              const auto bits = (uint64_t(read(at, 4)) << 32) | read(at + 4, 4);
+              coefficients[plane][k] = std::bit_cast<double>(bits);
+              if (!std::isfinite(coefficients[plane][k]))
+                throw Error(20, "nonfinite WarpRectilinear coefficient");
+            }
+          }
+          const auto &green = coefficients[planes == 1 ? 0 : 1];
+          coverage[1] |= green != Coefficients{1, 0, 0, 0, 0, 0};
+          coverage[2] |= planes == 3 && (coefficients[0] != green || coefficients[2] != green);
+        } else if (id == 1 || id == 2 || id == 6 || id == 14) {
+          // Other warps and trims can change the domain of downstream models.
+          coverage[1] = coverage[2] = true;
+        } else if (id == 3 || id == 9) {
+          // A GainMap's purpose is ambiguous. Reserve only the gain dimension.
+          coverage[0] = true;
+        } else if (id == 0 || id > 14) {
+          coverage.fill(true);
+        }
+        pos += bytes;
+      }
+      if (pos != end)
+        throw Error(20, "trailing DNG opcode data");
+      little = tiff_order;
+    }
+  }
   return Routing{c.offset, *c.pi, c.width, c.height};
 }
 Route route(uint32_t p) {

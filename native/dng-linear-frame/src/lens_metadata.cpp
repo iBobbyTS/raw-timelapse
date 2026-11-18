@@ -192,6 +192,7 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
       "-Make",
       "-Model",
       "-LensModel",
+      "-LensInfo",
       "-LensType", "-LensID", "-Lens", "-LensSpec",
       "-FocalLength",
       "-FocalLengthIn35mmFormat",
@@ -303,6 +304,11 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
     c.focus =
         numeric(first(original, {"Nikon:FocusDistance", "Sony:FocusDistance2",
                                  "Composite:FocusDistance"}));
+    std::array<bool, 3> source_coverage{}, prepared_coverage{};
+    if (!inspect(s.source, &source_coverage) && opcodes(original))
+      source_coverage.fill(true); // Vendor RAW whose opcode data cannot be inspected.
+    if (s.prepared != s.source)
+      inspect(s.prepared, &prepared_coverage);
     std::ostringstream evidence;
     evidence << "identity-source=" << lens_identity.second << char(10);
     for (const auto &[k, v] : original)
@@ -322,7 +328,9 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
       c.upstream[j] = s.converted ? Upstream::not_reported : Upstream::unknown;
       if (truth(original, key) || truth(prepared, key))
         c.upstream[j] = Upstream::applied;
-      else if (opcodes(original) || opcodes(prepared))
+      else if (prepared_coverage[j])
+        c.upstream[j] = Upstream::sdk;
+      else if (source_coverage[j])
         c.upstream[j] = s.converted ? Upstream::embedded : Upstream::sdk;
       else if (get(original, key) == "0" || get(original, key) == "False" ||
                get(original, key) == "false")
@@ -352,7 +360,8 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
                    c.embedded[j].kind == Kind::none;
     if (needs_lcp)
       c.fallback = catalog.resolve(c, sensor_crop(original, c.focal),
-                                   double(s.width) / s.height, c.selection);
+                                   double(s.width) / s.height, c.selection,
+                                   get(original, "ExifIFD:LensInfo"));
     else
       c.selection = "embedded-or-upstream-owned";
     validate(c);

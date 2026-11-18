@@ -400,7 +400,7 @@ std::array<Decision, 3> decide(const Calibration &c, bool enabled, const Policy 
         d.source = m->source;
         d.fingerprint = m->fingerprint;
         d.status = identity(*m, i) ? "identity" : "applied";
-        if (i == 0 && d.status == "applied" &&
+        if (i != 1 && d.status == "applied" &&
             (c.upstream[1] == Upstream::applied ||
              c.upstream[1] == Upstream::sdk ||
              c.upstream[1] == Upstream::embedded))

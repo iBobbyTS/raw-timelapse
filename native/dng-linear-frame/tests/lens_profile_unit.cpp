@@ -175,6 +175,23 @@ int main(int argc, char **argv) {
     ProfileCatalog ambiguous_alias({alias_directory});
     require(ambiguous_alias.resolve(c, 1, 1.5, reason)[1].kind == Kind::none &&
                 reason == "ambiguous-lcp-match", "alias bypassed ambiguity protection");
+    const auto fixed_directory = work / "fixed-lens";
+    fs::create_directories(fixed_directory);
+    auto fixed_xml = document(-.1);
+    const std::string original_identity = "c:Make='Test' c:Model='Camera' c:Lens='Known Lens'";
+    fixed_xml.replace(fixed_xml.find(original_identity), original_identity.size(),
+        "c:Make='DJI' c:Model='AC004' c:Lens='3.3 mm f/2.8' "
+        "c:LensInfo='333/100 333/100 28/10 28/10' c:LensPrettyName='DJI Osmo Action 5 Pro'");
+    std::ofstream(fixed_directory / "fixed.lcp") << fixed_xml;
+    ProfileCatalog fixed_catalog({fixed_directory});
+    Calibration fixed;
+    fixed.make = "DJI";
+    fixed.camera = "AC004";
+    fixed.focal = 3.33;
+    require(fixed_catalog.resolve(fixed, 1, 1.5, reason, "3.33 3.33 4 4")[1].kind == Kind::none
+                && fixed.lens.empty(), "fixed lens matched a different optical specification");
+    require(fixed_catalog.resolve(fixed, 1, 1.5, reason, "3.33 3.33 2.8 2.8")[1].kind == Kind::perspective
+                && fixed.lens == "DJI Osmo Action 5 Pro", "fixed lens match or display name missing");
     auto invalid = work / "version.xml";
     std::ofstream(invalid) << document(-.1, 99);
     require(read_profile(invalid).unsupported,

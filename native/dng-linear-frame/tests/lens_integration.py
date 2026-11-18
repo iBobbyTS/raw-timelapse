@@ -69,6 +69,20 @@ assert not (conflict_scratch/"frame.context").exists()
 hsm_source=make_dng(work,"lens-hsm",w=64,h=48,white=2000,pixels=rgb,hue_sat=([2,2,1],[0,1,2]*4))
 hsm_scratch=work/"hsm";hsm_scratch.mkdir();hsm_context=hsm_scratch/"frame.context"
 command(["--prepare",hsm_source.resolve(),"--scratch",hsm_scratch,"--emit-prepared",hsm_context,*prepare_options])
+# The TIFF opcode payload decides coverage, even when the metadata adapter
+# exposes no opcode fields. An identity warp leaves all LCP components usable.
+for name, radial in [('identity-warp', 0.), ('effective-warp', -.05)]:
+    params = struct.pack('>I8d', 1, 1., radial, 0., 0., 0., 0., .5, .5)
+    opcode = struct.pack('>5I', 1, 1, 0x01030000, 0, len(params)) + params
+    warp_source = make_dng(work, name, w=64, h=48, white=2000, pixels=rgb, opcodes={51022: opcode})
+    warp_scratch = work / (name + '-scratch')
+    warp_scratch.mkdir()
+    warp_context = warp_scratch / 'frame.context'
+    command(['--prepare', warp_source.resolve(), '--scratch', warp_scratch, '--emit-prepared', warp_context, *prepare_options])
+    warp_report = stream(warp_context)[0]['lens_correction']
+    assert [x['status'] for x in warp_report['components']] == (
+        ['upstream-geometry-unmapped', 'sdk-owned', 'upstream-geometry-unmapped']
+        if radial else ['applied'] * 3), warp_report
 # Develop consumes frozen parameters, not metadata tools or installed profile files.
 metadata.write_text('#!/bin/sh'+chr(10)+'exit 99'+chr(10)); profile.write_text('INVALID AFTER PREPARE')
 on,a=stream(context); off,b=stream(context,'off'); assert a[4]!=b[4]

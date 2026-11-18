@@ -33,7 +33,9 @@ struct Routing {
 // Recognized DNG (classic TIFF structure declaring DNGVersion) metadata.
 // nullopt means the file is not a recognized DNG; it is resolved by the
 // configured converter instead. Malformed recognized DNGs still throw.
-std::optional<Routing> inspect(const fs::path &);
+// Coverage uses the lens component order: vignette, distortion, lateral CA.
+// True also covers operations whose effect on a component cannot be excluded.
+std::optional<Routing> inspect(const fs::path &, std::array<bool, 3> *lens_coverage = nullptr);
 Vec read_neutral(const fs::path &);
 // EXIF DateTimeOriginal from the main IFD or its Exif sub-IFD; null when absent.
 std::optional<std::string> read_capture_time(const fs::path &);

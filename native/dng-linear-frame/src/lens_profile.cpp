@@ -2,12 +2,14 @@
 #include "frame.h"
 #include "lens_xml.h"
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <functional>
 #include <libxml/xmlreader.h>
 #include <set>
+#include <sstream>
 namespace frame::lens {
 namespace {
 const std::string camera_ns =
@@ -60,6 +62,35 @@ double number(const Fields &f, const std::string &k, double fallback = 0) {
 std::string text(const Fields &f, const std::string &k) {
   auto it = f.find(k);
   return it == f.end() ? "" : it->second;
+}
+std::optional<std::array<double, 4>> lens_spec(const std::string &value) {
+  std::istringstream input(value);
+  auto positive = [](std::string_view token) {
+    double number = 0;
+    const auto end = token.data() + token.size();
+    const auto result = std::from_chars(token.data(), end, number);
+    return result.ec == std::errc{} && result.ptr == end && std::isfinite(number) && number > 0
+        ? number : 0.;
+  };
+  std::array<double, 4> spec;
+  for (double &part : spec) {
+    std::string token;
+    if (!(input >> token))
+      return std::nullopt;
+    const auto slash = token.find('/');
+    const std::string_view text = token;
+    const auto numerator = positive(text.substr(0, slash));
+    const auto denominator = slash == std::string::npos ? 1 : positive(text.substr(slash + 1));
+    if (numerator == 0 || denominator == 0)
+      return std::nullopt;
+    part = numerator / denominator;
+    if (!std::isfinite(part))
+      return std::nullopt;
+  }
+  std::string extra;
+  if (input >> extra)
+    return std::nullopt;
+  return spec;
 }
 xmlNode *descendant(xmlNode *n, const std::string &name) {
   for (auto *c = n->children; c; c = c->next)
@@ -231,6 +262,8 @@ Profile read_profile(const std::filesystem::path &path) {
           p.make = text(f, "Make");
           p.camera = text(f, "Model");
           p.lens = text(f, "Lens");
+          p.lens_info = text(f, "LensInfo");
+          p.pretty_name = text(f, "LensPrettyName");
           if (auto *alternates = descendant(n, "AlternateLensNames")) {
             std::function<void(xmlNode *)> names = [&](xmlNode *node) {
               for (; node; node = node->next) {
@@ -362,10 +395,16 @@ std::vector<std::filesystem::path> default_profile_roots() {
 }
 ProfileCatalog::ProfileCatalog(std::vector<std::filesystem::path> roots)
     : roots_(std::move(roots)) {}
-std::array<Model, 3> ProfileCatalog::resolve(const Calibration &c, double crop,
-                                             double aspect,
-                                             std::string &reason) {
-  if (c.lens.empty() || c.make.empty() || c.focal <= 0) {
+std::array<Model, 3> ProfileCatalog::resolve(Calibration &c, double crop,
+                                             double aspect, std::string &reason,
+                                             const std::string &lens_info) {
+  const auto make = normalized(c.make);
+  const auto camera = normalized(c.camera);
+  // Use body identity only for verified fixed-lens models. The same optics
+  // specification can describe several lenses on an interchangeable body.
+  const bool fixed = c.lens.empty() && make == "dji" && camera == "ac004";
+  const auto original_spec = fixed ? lens_spec(lens_info) : std::nullopt;
+  if ((c.lens.empty() && !original_spec) || c.make.empty() || c.focal <= 0) {
     reason = "missing-lens-or-focal-metadata";
     return {};
   }
@@ -387,6 +426,8 @@ std::array<Model, 3> ProfileCatalog::resolve(const Calibration &c, double crop,
         auto f = identity_header(path, aliases);
         if (text(f, "CameraRawProfile") != "True")
           continue;
+        index_[normalized(text(f, "Make")) + "/body/" +
+               normalized(text(f, "Model"))].push_back(path);
         aliases.push_back(text(f, "Lens"));
         std::set<std::string> keys;
         for (const auto &name : aliases) {
@@ -398,7 +439,7 @@ std::array<Model, 3> ProfileCatalog::resolve(const Calibration &c, double crop,
     }
     indexed_ = true;
   }
-  auto it = index_.find(normalized(c.make) + "/" + normalized(c.lens));
+  auto it = index_.find(make + (fixed ? "/body/" + camera : "/" + normalized(c.lens)));
   if (it == index_.end()) {
     reason = "no-matching-lcp";
     return {};
@@ -413,14 +454,19 @@ std::array<Model, 3> ProfileCatalog::resolve(const Calibration &c, double crop,
         std::any_of(p.aliases.begin(), p.aliases.end(), [&](const auto &alias) {
           return normalized(alias) == lens_key;
         });
+    const auto profile_spec = fixed ? lens_spec(p.lens_info) : std::nullopt;
+    const bool fixed_match = original_spec && profile_spec &&
+        normalized(p.camera) == camera &&
+        std::equal(original_spec->begin(), original_spec->end(), profile_spec->begin(),
+                   [](double a, double b) { return std::abs(a - b) < .001; });
     if (!p.raw || p.unsupported || p.samples.empty() ||
-        normalized(p.make) != normalized(c.make) || !named)
+        normalized(p.make) != make || !(fixed ? fixed_match : named))
       continue;
     // Calibration axes are sensor axes, not EXIF display orientation. Without
     // an explicit axis transform, a transposed aspect is not compatible.
     if (crop <= 0 || std::abs(aspect - p.aspect) > .03)
       continue;
-    int score = normalized(c.camera) == normalized(p.camera) ? 1 : 0;
+    int score = camera == normalized(p.camera) ? 1 : 0;
     if (score > best) {
       candidates.clear();
       hashes.clear();
@@ -437,10 +483,16 @@ std::array<Model, 3> ProfileCatalog::resolve(const Calibration &c, double crop,
     reason = "ambiguous-lcp-match";
     return {};
   }
-  reason = normalized(candidates.front().lens) == normalized(c.lens)
-      ? "match=primary-lens; " : "match=official-alias; ";
+  const auto &selected = candidates.front();
+  if (fixed) {
+    c.lens = selected.pretty_name.empty() ? selected.lens : selected.pretty_name;
+    reason = "match=fixed-camera-lens-spec; ";
+  } else {
+    reason = normalized(selected.lens) == normalized(c.lens)
+        ? "match=primary-lens; " : "match=official-alias; ";
+  }
   reason += "lcp-image-field-log-focal-apex-aperture-log-focus; missing-focus=far";
-  return interpolate_profile(candidates.front(), c.focal, c.aperture, c.focus,
+  return interpolate_profile(selected, c.focal, c.aperture, c.focus,
                              crop);
 }
 } // namespace frame::lens

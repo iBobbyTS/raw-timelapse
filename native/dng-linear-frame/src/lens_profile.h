@@ -11,7 +11,7 @@ struct ProfileSample {
   std::array<Model, 3> model;
 };
 struct Profile {
-  std::string make, camera, lens, path, fingerprint;
+  std::string make, camera, lens, lens_info, pretty_name, path, fingerprint;
   std::vector<std::string> aliases;
   double crop = 1, aspect = 1.5;
   bool raw = false, unsupported = false;
@@ -27,8 +27,8 @@ std::vector<std::filesystem::path> default_profile_roots();
 class ProfileCatalog {
 public:
   explicit ProfileCatalog(std::vector<std::filesystem::path> roots);
-  std::array<Model, 3> resolve(const Calibration &, double crop, double aspect,
-                               std::string &reason);
+  std::array<Model, 3> resolve(Calibration &, double crop, double aspect,
+                               std::string &reason, const std::string &lens_info = {});
 
 private:
   std::vector<std::filesystem::path> roots_;
