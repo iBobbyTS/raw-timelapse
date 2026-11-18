@@ -14,8 +14,7 @@ def selected(trace,kind):return [tokens(line) for line in trace.splitlines() if 
 def run(profile,mode):
     root=work/(profile+'-'+mode);root.mkdir()
     graph=json.loads((repo/'pipeline/src/graph/default.json').read_text());graph['nodes'].pop()
-    graph['nodes'][1]['concurrency']=4 if mode=='single' else 1
-    graph['nodes'][1]['batch_size']=1 if mode=='single' else 2
+    graph['nodes'][2]['concurrency']=1 if mode=='serial' else 8
     (root/'graph.json').write_text(json.dumps(graph))
     analysis=root/'analysis';analysis.mkdir()
     wrapper=root/'native-adapter'
@@ -69,8 +68,8 @@ def run(profile,mode):
 receipts=[]
 profiles=['srgb-preview','clog2'] if list(incoming.glob('*.CR3')) else ['srgb-preview']
 for profile in profiles:
-    single=run(profile,'single');batch=run(profile,'batch')
-    assert single==batch,profile
-    receipt={'profile':profile,'frames':len(single['develops']),'identity_wb_capture_time_measurement_ev_pixels_equal':True}
+    serial=run(profile,'serial');parallel=run(profile,'parallel')
+    assert serial==parallel,profile
+    receipt={'profile':profile,'frames':len(serial['develops']),'identity_wb_capture_time_measurement_ev_pixels_equal':True}
     receipts.append(receipt);print(json.dumps(receipt),flush=True)
 (work/'equivalence.json').write_text(json.dumps(receipts,indent=2))

@@ -58,7 +58,6 @@ fn real_cli_orders_concurrent_native_stages_and_freezes_source_zero_white_balanc
     fs::write(
         &serial_graph,
         include_str!("../src/graph/default.json")
-            .replace("\"batch_size\":32", "\"batch_size\":1")
             .replace("\"concurrency\":4", "\"concurrency\":1")
             .replace("\"concurrency\":8", "\"concurrency\":1"),
     )

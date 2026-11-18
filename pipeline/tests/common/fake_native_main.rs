@@ -110,7 +110,7 @@ fn main() {
 
 fn run() -> Result<(), (i32, String)> {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.first().is_some_and(|s| s == "--prepare-batch") { return run_prepare_batch(&args); }
+    if args.first().is_some_and(|s| s == "--prepare-sequence") { return run_prepare_sequence(&args); }
     let options = parse_args()?;
     let config_path = env::var("FAKE_NATIVE_CONFIG")
         .map_err(|_| (2, "FAKE_NATIVE_CONFIG is not set".to_string()))?;
@@ -694,8 +694,8 @@ fn run_prepare(
 }
 
 /// Test fixture adapter for the exact accepted request/result protocol. The
-/// native CTest/graph handshake tests exercise real ADC batching separately.
-fn run_prepare_batch(args: &[String]) -> Result<(), (i32, String)> {
+/// native CTest/graph handshake tests exercise real sequence conversion separately.
+fn run_prepare_sequence(args: &[String]) -> Result<(), (i32, String)> {
     let request = fs::read_to_string(&args[1]).map_err(|e| (26, e.to_string()))?;
     let fields: std::collections::BTreeMap<_, _> = request.lines().skip(1).map(|line| {
         let (key, value) = line.split_once('=').unwrap();
@@ -720,7 +720,7 @@ fn run_prepare_batch(args: &[String]) -> Result<(), (i32, String)> {
         }
     }
     fs::write(result,text).map_err(|e|(26,e.to_string()))?;
-    eprintln!("prepare batch count={count} adc_calls=0 conversion_and_output_verification_s=0 metadata_verification_s=0 total_s=0");
+    eprintln!("prepare count={count} adc_calls=0 conversion_and_output_verification_s=0 metadata_verification_s=0 total_s=0");
     Ok(())
 }
 

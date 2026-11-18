@@ -342,92 +342,59 @@ after decode instead. Contexts without version fields still use content hashes.
 Converted contexts store `converter_record` (absolute path) and
 `converter_record_sha256`, plus `converter_output_name`,
 `converter_output_sha256`, `converter_photometric=34892` and
-`converter_cleanup`. The referenced `rawtl-conversion/1` document stores one
-actual invocation: `executable`, `version`, `argc`, `arg0`…`argN`,
-`exit_code=0`, bounded `transcript`, `directory`, `count`, and for each output
-`itemN_source`, `itemN_source_sha256`, `itemN_output_name`,
-`itemN_output_sha256`. Native and Rust check the record hash, command and the
-current frame's source/output association. Other outputs need not still exist:
-per-frame Delete removes only that frame's generated DNG; records remain until
-the caller releases the run scratch. Full converter output stays in
-`linear[-N]-converter.log`; only a UTF-8 diagnostic excerpt of at most 64 KiB
-plus a truncation marker is transported. Contexts are bounded to 64 KiB;
-conversion records, batch requests and results to 1 MiB. Version 1 contexts
-are rejected explicitly; old scratch is neither migrated nor removed.
+`converter_cleanup`. Standalone preparation uses a `rawtl-conversion/1` provenance record.
+Sequence preparation records the exact arguments once in the NUL-delimited
+`converter.argv`. Each `rawtl-sequence-conversion/1` record binds one original
+source, its actual argument, and the verified DNG to that invocation. Per-frame
+deletion leaves provenance in scratch. Full Converter output stays in
+`linear-converter.log`.
 
-### Native batch preparation
+### Native sequence preparation
 
 ```
-dng-linear-frame --prepare-batch /absolute/batch/request \
-  --scratch /absolute/batch --emit-result /absolute/batch/result \
+dng-linear-frame --prepare-sequence /absolute/cache/prepare.request \
+  --scratch /absolute/cache --emit-result /absolute/cache/prepare.result \
   [--converter PATH] [--converter-timeout SECONDS]
 ```
 
-The caller allocates a private scratch directory. The versioned, LF-terminated
-request uses the same percent encoding as contexts (encode `%` as `%25`,
-control bytes as `%hh`; paths are UTF-8 and absolute):
+The caller allocates private scratch. Requests and results are UTF-8 line
+documents limited to 64 MiB. They use the same percent encoding as contexts.
 
 ```text
 rawtl-prepare-request/1
 count=2
 item0_id=0
 item0_source=/input/IMG_0001.CR3
-item0_context=/absolute/batch/frame_0.context
+item0_context=/absolute/cache/frame_0.context
 item1_id=1
 item1_source=/input/IMG_0002.CR3
-item1_context=/absolute/batch/frame_1.context
+item1_context=/absolute/cache/frame_1.context
 ```
 
-IDs are unique unsigned 32-bit integers; count is 1..64. Context/result targets
-must be distinct, absent, inside scratch, and outside the reserved `linear*`
-and `conversion-*` paths. Recognized LinearRaw inputs pass through; CFA DNGs
-and vendor RAWs share `-c -l -d DIR -mp INPUT...` calls. Unicode-normalized,
-case-insensitive stem collisions start another serial call in a separate
-output directory. Each argv is bounded by the platform ARG_MAX minus inherited
-environment/pointer overhead and a safety margin, capped at 64 KiB; an oversized
-single input fails explicitly. Inputs are never renamed or copied for mapping.
+IDs are unique unsigned 32-bit integers. Context/result targets are distinct,
+absent, inside scratch and outside the conversion paths. LinearRaw inputs pass
+through. CFA DNGs and vendor RAWs go to one `-c -l -d DIR -mp INPUT...`
+invocation. Short private symlinks provide distinct names under case and
+Unicode normalization or when absolute arguments are too long.
 
-The timeout is **per actual sub-call**, defaults to 120 seconds, and accepts
-1..3600 seconds; it does not grow with frame count. Cancellation/timeout sends
-TERM to the owned converter group, waits up to 500 ms, then sends KILL and reaps
-the leader. Success requires the leader's successful exit and termination of
-the entire writer group. Native then verifies the exact regular-file output
-set, expected stems, nonzero LinearRaw geometry and hashes. It performs no
-additional full SDK decode during preparation.
-
-All calls and checks must succeed before writing any contexts. Each context is
-renamed into place, then the complete result is published by the final rename:
+The default timeout is 15 seconds per input sent to Converter. Cancellation or timeout
+terminates and reaps the owned Converter group. Once it exits successfully,
+Prepare verifies the exact set of regular LinearRaw outputs and their hashes.
+It writes the frame contexts and publishes one result by rename:
 
 ```text
 rawtl-prepare-result/1
-count=2
+count=1
 item0_id=0
 item0_source=/input/IMG_0001.CR3
 item0_source_sha256=<64 hex digits>
-item0_context=/absolute/batch/frame_0.context
-item1_id=1
-item1_source=/input/IMG_0002.CR3
-item1_source_sha256=<64 hex digits>
-item1_context=/absolute/batch/frame_1.context
+item0_context=/absolute/cache/frame_0.context
 ```
 
-Contexts alone are never a successful batch. On any error the caller consumes
-zero frames; retained outputs/contexts/logs are diagnostic scratch. This is
-consumer visibility atomicity, without an fsync or multi-file transaction.
-Consumers require native exit 0, the complete matching result identity set,
-and a final cancellation check. Native stderr reports frame count, actual ADC
-call count, shared conversion/output-verification time, metadata-verification
-time and total wall time (including publication in the final batch summary).
-These shared durations must not be summed as per-frame durations.
-
-Rust exposes `prepare_batch_active(tool, items, settings, active)` in
-`pipeline/src/frame.rs`: `PrepareBatchItem { frame_id, source }`,
-`PrepareBatchSettings { scratch_dir, converter, converter_timeout }`. Its
-scratch must be empty. It owns `prepare.request`, `prepare.result`,
-`frame_ID.context` and the unique `batch-native.log` ActiveNative registration.
-It returns the entire `Vec<(usize, PreparedFrame)>` in request order or an error;
-there is no partial return. The existing graph still uses single-frame prepare
-until the scheduler integration connects this adapter.
+The Rust adapter checks native success, exact coverage and source identity.
+When optional early measurement is enabled, provisional contexts in the
+`early` scratch directory are eligible only for analysis and still require
+reconciliation against the final contexts.
 
 Every consumer revalidates the context before decoding: absolute paths, both
 hashes, the route recomputed from the original source, `generated` versus route,
@@ -470,7 +437,7 @@ three-channel LinearRaw decode is supported.
   `null` (they describe a recognized DNG's main IFD).
 
 Default Converter: `/Applications/Adobe DNG Converter.app/Contents/MacOS/Adobe DNG Converter`.
-The timeout defaults to 120 seconds; allowed override 1–3600 seconds. Execution
+The single-image timeout defaults to 15 seconds; allowed override 1–3600 seconds. Execution
 uses an argv vector and a process group, with no shell. Failures and timeout are
 explicit errors; the run-owned temporary directory is removed on success and
 retained on failure for diagnostics, with cleanup or retention logged to stderr.

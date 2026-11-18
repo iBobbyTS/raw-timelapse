@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
     use std::os::unix::fs::PermissionsExt;
     fn work(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "rawtl-batch-{name}-{}-{}",
+            "rawtl-sequence-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -59,28 +59,29 @@ if mode.startswith('late:'):
             .collect()
     }
     #[test]
-    fn batch_adapter_checks_complete_result_identity_sets() {
+    fn sequence_adapter_checks_complete_result_identity_sets() {
         let dir = work("sets");
         let sources = sources(&dir);
         let items: Vec<_> = sources
             .iter()
             .enumerate()
-            .map(|(frame_id, source)| PrepareBatchItem { frame_id, source })
+            .map(|(frame_id, source)| PrepareSequenceItem { frame_id, source })
             .collect();
         for mode in ["ok", "missing", "extra", "duplicate", "source"] {
             let tool = fake(&dir, mode);
             let scratch = dir.join(mode);
             fs::create_dir(&scratch).unwrap();
-            let result = prepare_batch_active(
+            let result = prepare_sequence_active(
                 &tool,
                 &items,
-                &PrepareBatchSettings {
+                &PrepareSequenceSettings {
                     lens: Default::default(),
                     scratch_dir: &scratch,
                     converter: None,
                     converter_timeout: None,
                 },
                 Default::default(),
+                false,
             );
             if mode == "ok" {
                 assert_eq!(
@@ -98,30 +99,31 @@ if mode.startswith('late:'):
         let scratch = dir.join("duplicate-request");
         fs::create_dir(&scratch).unwrap();
         let duplicate = [
-            PrepareBatchItem {
+            PrepareSequenceItem {
                 frame_id: 1,
                 source: &sources[0],
             },
-            PrepareBatchItem {
+            PrepareSequenceItem {
                 frame_id: 1,
                 source: &sources[1],
             },
         ];
-        assert!(prepare_batch_active(
+        assert!(prepare_sequence_active(
             &fake(&dir, "ok"),
             &duplicate,
-            &PrepareBatchSettings {
+            &PrepareSequenceSettings {
                 lens: Default::default(),
                 scratch_dir: &scratch,
                 converter: None,
                 converter_timeout: None
             },
-            Default::default()
+            Default::default(),
+            false,
         )
         .is_err());
     }
     #[test]
-    fn batch_adapter_rejects_late_success_after_cancel() {
+    fn sequence_adapter_rejects_late_success_after_cancel() {
         use std::io::Write;
         let dir = work("late");
         let sources = sources(&dir);
@@ -139,18 +141,19 @@ if mode.startswith('late:'):
             let items: Vec<_> = sources
                 .iter()
                 .enumerate()
-                .map(|(frame_id, source)| PrepareBatchItem { frame_id, source })
+                .map(|(frame_id, source)| PrepareSequenceItem { frame_id, source })
                 .collect();
-            prepare_batch_active(
+            prepare_sequence_active(
                 &tool,
                 &items,
-                &PrepareBatchSettings {
+                &PrepareSequenceSettings {
                     lens: Default::default(),
                     scratch_dir: &scratch,
                     converter: None,
                     converter_timeout: None,
                 },
                 worker_active,
+                false,
             )
         });
         let start = Instant::now();
@@ -183,9 +186,9 @@ if mode.startswith('late:'):
     /// Executed with RAWTL_BATCH_REAL_WORK and RAWTL_NATIVE_TOOL in S01. With no
     /// external materials configured, ordinary cargo tests exercise mocks only.
     #[test]
-    fn batch_real_native_roundtrip_and_single_frame_equivalence() {
+    fn sequence_real_native_roundtrip_and_single_frame_equivalence() {
         let Some(work) = std::env::var_os("RAWTL_BATCH_REAL_WORK") else {
-            eprintln!("real batch materials not configured");
+            eprintln!("real sequence materials not configured");
             return;
         };
         let dir = PathBuf::from(work);
@@ -200,26 +203,27 @@ if mode.startswith('late:'):
                 key: Vec::new(),
             })
             .collect();
-        let batch_dir = dir.join("batch");
-        fs::create_dir(&batch_dir).unwrap();
+        let sequence_dir = dir.join("sequence");
+        fs::create_dir(&sequence_dir).unwrap();
         let items: Vec<_> = sources
             .iter()
             .enumerate()
-            .map(|(frame_id, source)| PrepareBatchItem { frame_id, source })
+            .map(|(frame_id, source)| PrepareSequenceItem { frame_id, source })
             .collect();
-        let batch = prepare_batch_active(
+        let sequence = prepare_sequence_active(
             &tool,
             &items,
-            &PrepareBatchSettings {
+            &PrepareSequenceSettings {
                 lens: Default::default(),
-                scratch_dir: &batch_dir,
+                scratch_dir: &sequence_dir,
                 converter: None,
                 converter_timeout: Some(120),
             },
             Default::default(),
+            false,
         )
-        .expect("real batch");
-        for ((id, frame), source) in batch.iter().zip(&sources) {
+        .expect("real sequence");
+        for ((id, frame), source) in sequence.iter().zip(&sources) {
             let single_dir = dir.join(format!("single-{id}"));
             fs::create_dir(&single_dir).unwrap();
             let single = prepare(
@@ -259,7 +263,7 @@ if mode.startswith('late:'):
                     Some(0.),
                     None,
                     &settings,
-                    &dir.join(format!("analysis-batch-{id}-{method:?}.log")),
+                    &dir.join(format!("analysis-sequence-{id}-{method:?}.log")),
                 )
                 .unwrap();
                 let b = analyze_prepared(
@@ -274,7 +278,7 @@ if mode.startswith('late:'):
                 .unwrap();
                 assert_eq!(analysis_bytes(&a), analysis_bytes(&b));
                 let mut digests = Vec::new();
-                for (label, f) in [("batch", frame), ("single", &single)] {
+                for (label, f) in [("sequence", frame), ("single", &single)] {
                     develop_prepared(
                         &tool,
                         f,
@@ -298,7 +302,7 @@ if mode.startswith('late:'):
                 );
             }
         }
-        let context = &batch.iter().find(|(_, f)| f.generated).unwrap().1.context;
+        let context = &sequence.iter().find(|(_, f)| f.generated).unwrap().1.context;
         let valid = fs::read_to_string(context).unwrap();
         for text in [
             valid.replace("rawtl-prepared-frame/2", "rawtl-prepared-frame/1"),
@@ -332,9 +336,9 @@ if mode.startswith('late:'):
             PreparedFrame::load(&wrong_context).is_err(),
             "wrong record with matching byte hash"
         );
-        if let Some((_, deleted)) = batch.iter().find(|(_, f)| f.generated) {
+        if let Some((_, deleted)) = sequence.iter().find(|(_, f)| f.generated) {
             fs::remove_file(&deleted.dng).unwrap();
-            let f = batch
+            let f = sequence
                 .iter()
                 .find(|(_, f)| f.dng != deleted.dng)
                 .map(|(_, f)| PreparedFrame::load(&f.context).unwrap())
@@ -357,9 +361,9 @@ if mode.startswith('late:'):
     }
 
     #[test]
-    fn native_batch_context_fixtures_load_and_consume() {
+    fn native_sequence_context_fixtures_load_and_consume() {
         let Some(root) = std::env::var_os("RAWTL_BATCH_FIXTURE_ROOT") else {
-            eprintln!("native batch context fixtures not configured");
+            eprintln!("native sequence context fixtures not configured");
             return;
         };
         let root = PathBuf::from(root);

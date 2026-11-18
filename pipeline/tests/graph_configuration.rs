@@ -76,10 +76,8 @@ fn cache_payloads(directory: &Path) -> Vec<PathBuf> {
             if path.is_dir() {
                 walk(&path, files);
             } else {
-                match path.file_name().and_then(|name| name.to_str()) {
-                    Some("prepared.context") => {},
-                    Some("conversion-0.record") => assert!(fs::read_to_string(&path).unwrap().starts_with("rawtl-conversion/1\n")),
-                    _ => files.push(path),
+                if path.extension().is_some_and(|ext| ext == "dng") {
+                    files.push(path);
                 }
             }
         }
@@ -128,10 +126,9 @@ fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
     for node in nodes(&mut identity) {
         if matches!(
             node.get("kind").and_then(Json::as_str),
-            Some("prepare" | "develop" | "identity" | "color")
+            Some("develop" | "identity" | "color")
         ) {
             set(node, "concurrency", Json::Int(4));
-            if node.get("kind").and_then(Json::as_str) == Some("prepare") { set(node, "batch_size", Json::Int(1)); }
         }
     }
     let kept = run(&root, "identity", &input, &tool, &identity);
@@ -172,10 +169,9 @@ fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
     for node in nodes(&mut retained) {
         if matches!(
             node.get("kind").and_then(Json::as_str),
-            Some("prepare" | "develop" | "color")
+            Some("develop" | "color")
         ) {
             set(node, "concurrency", Json::Int(4));
-            if node.get("kind").and_then(Json::as_str) == Some("prepare") { set(node, "batch_size", Json::Int(1)); }
         }
     }
     let retained = run(&root, "retained", &input, &tool, &retained);
@@ -190,7 +186,7 @@ fn actual_graph_controls_identity_exposure_cleanup_and_source_protection() {
         "a custom graph without delete must retain its generated cache"
     );
     for id in 1..=3 {
-        assert!(retained_scratch.join(format!("cache/frame_{id:06}/conversion-0.record")).is_file(), "provenance must survive with the retained DNG");
+        assert!(retained_scratch.join(format!("cache/fixture-{}/conversion-0.record", id - 1)).is_file(), "provenance must survive with the retained DNG");
     }
     let generated = cache_payloads(&retained_scratch.join("cache"));
     assert_eq!(
@@ -350,20 +346,17 @@ fn strength_zero_normalizes_parallel_solve_and_logs_effective_configuration() {
     let root = test_dir("parallel-zero");
     let (input, tool) = cr3_material(&root, &root.join("fixtures"));
     let mut config = graph();
-    set(&mut nodes(&mut config)[1], "concurrency", Json::Int(4));
-    set(&mut nodes(&mut config)[1], "batch_size", Json::Int(1));
     set(&mut nodes(&mut config)[2], "concurrency", Json::Int(8));
     let output = run(&root, "output", &input, &tool, &config);
     let trace = read_log(&output);
     assert!(
-        trace.contains("convert-cache:4,measure-solve:1,apply-ev:4"),
+        trace.contains("convert-cache:1,measure-solve:1,apply-ev:4"),
         "{trace}"
     );
     assert!(log_kind(&trace, "measure").is_empty());
     let prepares = log_kind(&trace, "prepare");
     assert_eq!(prepares.len(), 3);
-    assert!(prepares.iter().all(|line| line.contains("mode=single duration_scope=single_frame_wall")));
-    assert!(log_kind(&trace, "prepare.batch").is_empty());
+    assert_eq!(log_kind(&trace, "prepare.sequence").len(), 1);
     assert!(ffprobe(&output.join(VIDEO_NAME)).contains("nb_read_frames=3"));
 }
 
@@ -436,10 +429,9 @@ fn invalid_batch_configuration_never_creates_output_or_starts_native() {
     let marker = root.join("native-started");
     write_executable(&native, "#!/bin/sh\ntouch \"$(dirname \"$0\")/native-started\"\nexit 99\n");
     let text = include_str!("../src/graph/default.json");
-    let mut cases: Vec<String> = ["null", "true", "false", "\"32\"", "0", "-1", "1.0", "1e0", "65", "18446744073709551616", "2,\"batch_size\":3"]
-        .into_iter().map(|value| text.replace("\"batch_size\":32", &format!("\"batch_size\":{value}"))).collect();
-    cases.push(text.replace("\"kind\":\"prepare\", \"concurrency\":1", "\"kind\":\"prepare\", \"concurrency\":4"));
-    cases.push(text.replace("\"kind\":\"source\",", "\"kind\":\"source\",\"batch_size\":1,"));
+    let cases = ["1", "32"].map(|size| {
+        text.replace(r#""kind":"prepare","#, &format!(r#""kind":"prepare","batch_size":{size},"#))
+    });
     for (case, config) in cases.iter().enumerate() {
         let path = root.join(format!("case-{case}.json"));
         fs::write(&path, config).unwrap();

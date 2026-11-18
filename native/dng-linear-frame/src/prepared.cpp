@@ -25,6 +25,7 @@ constexpr const char *kContextMagic = "rawtl-prepared-frame/2";
 // Calibration/2 can carry eight image-field endpoints per component.
 constexpr size_t kContextLimit = 256 * 1024;
 constexpr size_t kDocumentLimit = 1024 * 1024;
+constexpr size_t kSequenceDocumentLimit = 64 * 1024 * 1024;
 
 std::string escape(const std::string &text) {
   static const char digits[] = "0123456789abcdef";
@@ -230,12 +231,8 @@ void field(std::ostream &out, const std::string &key, const std::string &value) 
 std::string item(size_t i, const std::string &key) {
   return "item" + std::to_string(i) + "_" + key;
 }
-// No reader checks other frames' artifact existence: Delete owns individual
-// DNGs; this immutable record lives for the entire scratch lifetime.
-void write_conversion_record(std::vector<PreparedFrame> &frames,
-                             const std::vector<size_t> &group,
-                             const fs::path &record) {
-  auto &info = frames[group.front()].conversion;
+void write_standalone_conversion(PreparedFrame &frame, const fs::path &record) {
+  auto &info = frame.conversion;
   std::ostringstream out;
   out << "rawtl-conversion/1\n";
   field(out, "executable", info.executable);
@@ -246,22 +243,70 @@ void write_conversion_record(std::vector<PreparedFrame> &frames,
   field(out, "exit_code", "0");
   field(out, "transcript", info.transcript);
   field(out, "directory", info.directory);
-  field(out, "count", std::to_string(group.size()));
-  for (size_t i = 0; i < group.size(); ++i) {
-    check_cancelled();
-    auto &f = frames[group[i]];
-    field(out, item(i, "source"), f.source.string());
-    field(out, item(i, "source_sha256"), f.source_hash);
-    field(out, item(i, "output_name"), f.conversion.output_name);
-    field(out, item(i, "output_sha256"), f.prepared_hash);
-  }
+  field(out, "count", "1");
+  field(out, "item0_source", frame.source.string());
+  field(out, "item0_source_sha256", frame.source_hash);
+  field(out, "item0_output_name", info.output_name);
+  field(out, "item0_output_sha256", frame.prepared_hash);
   atomic_document(record, out.str(), kDocumentLimit);
-  auto hash = sha256(record);
-  for (size_t i : group) {
-    frames[i].conversion.record_path = record;
-    frames[i].conversion.record_hash = hash;
+  info.record_path = record;
+  info.record_hash = sha256(record);
+}
+
+void write_sequence_conversion(PreparedFrame &frame, const fs::path &record) {
+  auto &info = frame.conversion;
+  std::ostringstream out;
+  out << "rawtl-sequence-conversion/1\n";
+  field(out, "executable", info.executable);
+  field(out, "version", info.version);
+  field(out, "directory", info.directory);
+  field(out, "working_directory", info.working_directory.string());
+  field(out, "invocation", info.invocation.string());
+  field(out, "argument", info.command.back());
+  field(out, "source", frame.source.string());
+  field(out, "source_sha256", frame.source_hash);
+  field(out, "output_name", info.output_name);
+  field(out, "output_sha256", frame.prepared_hash);
+  const std::string text = out.str();
+  atomic_document(record, text, kContextLimit);
+  Sha256 hash;
+  hash.update(text.data(), text.size());
+  info.record_path = record;
+  info.record_hash = hash.hex();
+}
+
+void read_sequence_conversion(PreparedFrame &frame, const Context &context,
+                              const std::string &text) {
+  const auto record = parse_context(text, "rawtl-sequence-conversion/1");
+  record.require_only({"executable", "version", "directory", "working_directory",
+                       "invocation", "argument", "source", "source_sha256",
+                       "output_name", "output_sha256"});
+  auto &info = frame.conversion;
+  info.executable = record.at("executable");
+  info.version = record.at("version");
+  info.directory = record.at("directory");
+  info.working_directory = record.at("working_directory");
+  info.invocation = record.at("invocation");
+  const fs::path dir = info.directory;
+  const fs::path source = record.at("source");
+  const fs::path argument = record.at("argument");
+  const fs::path expected_input = info.working_directory / argument;
+  if (!fs::path(info.executable).is_absolute() || !dir.is_absolute() ||
+      info.invocation != dir.parent_path() / "converter.argv" ||
+      source != frame.source || record.at("source_sha256") != frame.source_hash ||
+      record.at("output_name") != info.output_name ||
+      record.at("output_sha256") != frame.prepared_hash ||
+      argument.stem().string() + ".dng" != info.output_name ||
+      dir / info.output_name != fs::path(context.at("prepared_dng")) ||
+      (info.working_directory.empty()
+           ? argument != source
+           : (info.working_directory != dir.parent_path() / "converter-input" ||
+              argument.parent_path() != "." ||
+              canonical_existing(expected_input, "Converter input alias") != source))) {
+    throw Error(26, "sequence conversion record does not describe prepared source/output");
   }
 }
+
 void read_conversion_record(PreparedFrame &frame, const Context &context) {
   auto &info = frame.conversion;
   info.record_path = context.at("converter_record");
@@ -270,6 +315,10 @@ void read_conversion_record(PreparedFrame &frame, const Context &context) {
   std::string text = read_bounded(info.record_path, kDocumentLimit);
   Sha256 hash; hash.update(text.data(), text.size());
   if (hash.hex() != info.record_hash) throw Error(26, "conversion record hash mismatch");
+  if (text.starts_with("rawtl-sequence-conversion/1\n")) {
+    read_sequence_conversion(frame, context, text);
+    return;
+  }
   auto record = parse_context(text, "rawtl-conversion/1", kDocumentLimit);
   auto count = parse_u32(record.at("count"), "count");
   auto argc = parse_u32(record.at("argc"), "argc");
@@ -334,6 +383,11 @@ const char *route_name(Route route) {
 Json ConversionInfo::record() const {
   if (!used)
     return Json{{"used", false}};
+  if (!invocation.empty())
+    return Json{{"used", true}, {"executable", executable}, {"version", version},
+                {"argv_file", invocation.string()}, {"working_directory", working_directory.string()},
+                {"exit_code", 0.0}, {"output", output_name}, {"photometric", double(photometric)},
+                {"cleanup", cleanup}};
   std::vector<Json> args;
   for (const auto &argument : command)
     args.emplace_back(argument);
@@ -354,10 +408,10 @@ Json ConversionInfo::record() const {
 
 std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
                             const fs::path &scratch_in, const std::string &converter,
-                            int timeout, bool temporary, const lens::PrepareOptions &lens_options,
-                            const std::vector<fs::path> &early_contexts) {
+                            std::optional<int> timeout, bool temporary, const lens::PrepareOptions &lens_options,
+                            const std::vector<fs::path> &early_contexts, bool sequence) {
   auto started = std::chrono::steady_clock::now();
-  if (sources.empty() || sources.size() > 64) throw Error(26, "batch count must be 1..64");
+  if (sources.empty()) throw Error(26, "prepare requires at least one source");
   lens::validate_prepare_options(lens_options);
   auto scratch = canonical_existing(scratch_in, "scratch directory");
   if (!fs::is_directory(scratch)) throw Error(26, "prepare scratch is not a directory");
@@ -375,30 +429,16 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
     out.prepared_dng = out.source;
     frames.push_back(out);
   }
-  std::vector<std::vector<size_t>> groups;
-  const size_t budget = converter_argv_budget();
-  // Greedy ordered partition. Any collision or exhausted byte budget starts a
-  // new serial call, with a different output directory and independent timeout.
-  std::set<std::string> names;
-  size_t bytes = 0;
-  auto base_bytes = [&](size_t index) {
-    auto dir = scratch / (index == 0 ? "linear" : "linear-" + std::to_string(index));
-    size_t n = 0;
-    for (const auto &arg : std::vector<std::string>{converter,"-c","-l","-d",dir.string(),"-mp"}) n += arg.size()+1+sizeof(char *);
-    return n;
-  };
+  std::vector<size_t> indices;
+  std::vector<fs::path> inputs;
   for (size_t i = 0; i < frames.size(); ++i) {
-    if (frames[i].kind == Route::direct) continue;
-    auto key = output_collision_key(frames[i].source);
-    size_t n = frames[i].source.string().size()+1+sizeof(char *);
-    if (groups.empty() || names.count(key) || bytes+n > budget) {
-      groups.emplace_back(); names.clear(); bytes = base_bytes(groups.size()-1);
+    if (frames[i].kind != Route::direct) {
+      indices.push_back(i);
+      inputs.push_back(frames[i].source);
     }
-    if (bytes+n > budget) throw Error(26, "single source exceeds Converter argv byte budget: " + frames[i].source.string());
-    groups.back().push_back(i); names.insert(key); bytes += n;
   }
   // Publish only measurement inputs here. The final context and associated
-  // Converter provenance are written through the normal sealed batch path.
+  // Converter provenance are written through the sealed sequence path.
   const auto offer = [&](size_t index, const fs::path &dng) {
     try {
       auto candidate = frames[index];
@@ -415,41 +455,34 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
       write_prepared(candidate, early_contexts[index], true);
     } catch (const Error &e) {
       if (e.code == 130) throw;
-      // Failed or unavailable observations fall back to validated batch output.
+      // Failed or unavailable observations fall back to validated sequence output.
     } catch (const fs::filesystem_error &) {
       // The file may have been replaced while collecting a provisional input.
     }
   };
-  if (!early_contexts.empty() && !groups.empty())
+  if (!early_contexts.empty() && !inputs.empty())
     for (size_t i = 0; i < frames.size(); ++i)
       if (frames[i].kind == Route::direct) offer(i, frames[i].source);
   auto conversion_start = std::chrono::steady_clock::now();
-  for (size_t g = 0; g < groups.size(); ++g) {
-    check_cancelled();
-    auto dir = scratch / (g == 0 ? "linear" : "linear-" + std::to_string(g));
-    if (!fs::create_directory(dir)) throw Error(26, "prepare scratch already contains a linear directory: " + dir.string());
-    std::vector<fs::path> inputs;
-    for (size_t i : groups[g]) inputs.push_back(frames[i].source);
+  if (!inputs.empty()) {
+    const auto dir = scratch / "linear";
+    if (!fs::create_directory(dir))
+      throw Error(26, "prepare scratch already contains a linear directory: " + dir.string());
     std::function<void(size_t, const fs::path &)> ready;
     if (!early_contexts.empty())
-      ready = [&](size_t item, const fs::path &path) { offer(groups[g][item], path); };
-    auto converted = convert_inputs(inputs, dir, converter, timeout, temporary, ready);
-    if (ready && g + 1 < groups.size()) {
-      for (size_t item = 0; item < converted.size(); ++item) {
-        std::error_code error;
-        if (!fs::exists(early_contexts[groups[g][item]], error) && !error)
-          ready(item, converted[item].output);
-      }
-    }
-    for (size_t j = 0; j < groups[g].size(); ++j) {
-      auto &out = frames[groups[g][j]];
-      out.prepared_dng = canonical_existing(converted[j].output, "prepared DNG");
-      out.conversion = converted[j].info;
+      ready = [&](size_t item, const fs::path &path) { offer(indices[item], path); };
+    auto converted = convert_inputs(inputs, dir, converter, timeout, temporary, sequence, ready);
+    for (size_t i = 0; i < indices.size(); ++i) {
+      auto &out = frames[indices[i]];
+      out.prepared_dng = canonical_existing(converted[i].output, "prepared DNG");
+      out.conversion = std::move(converted[i].info);
       out.generated = true;
       out.prepared_hash = out.conversion.output_sha256;
-      out.prepared_version = converted[j].output_version;
+      out.prepared_version = converted[i].output_version;
+      if (sequence)
+        write_sequence_conversion(out, scratch / ("conversion-" + std::to_string(indices[i]) + ".record"));
     }
-    write_conversion_record(frames, groups[g], scratch / ("conversion-" + std::to_string(g) + ".record"));
+    if (!sequence) write_standalone_conversion(frames.front(), scratch / "conversion-0.record");
   }
   auto verification_start = std::chrono::steady_clock::now();
   for (auto &out : frames) {
@@ -457,7 +490,7 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
     if (out.kind == Route::vendor_raw) out.own = read_neutral(out.prepared_dng);
     auto check = inspect(out.prepared_dng);
     if (!check || check->photometric != 34892 || !check->width || !check->height)
-      throw Error(23, "batch prepared DNG is not nonzero LinearRaw (34892): " + out.source.string());
+      throw Error(23, "prepared DNG is not nonzero LinearRaw (34892): " + out.source.string());
     if (!out.generated) {
       out.prepared_hash = out.source_hash;
       out.prepared_version = out.source_version;
@@ -476,49 +509,50 @@ std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
   catch (const std::exception &e) { throw Error(26, std::string("lens calibration acquisition failed: ") + e.what()); }
   auto end = std::chrono::steady_clock::now();
   auto seconds = [](auto a, auto b) { return std::chrono::duration<double>(b-a).count(); };
-  std::cerr << "prepare batch count=" << frames.size() << " adc_calls=" << groups.size()
+  std::cerr << "prepare count=" << frames.size() << " adc_calls=" << (inputs.empty() ? 0 : 1)
             << " conversion_and_output_verification_s=" << seconds(conversion_start,verification_start)
             << " metadata_verification_s=" << seconds(verification_start,end)
             << " total_s=" << seconds(started,end) << '\n';
   return frames;
 }
 PreparedFrame prepare_frame(const fs::path &source, const fs::path &scratch,
-                            const std::string &converter, int timeout, bool temporary, const lens::PrepareOptions &lens_options) {
+                            const std::string &converter, std::optional<int> timeout, bool temporary, const lens::PrepareOptions &lens_options) {
   return prepare_frames({source}, scratch, converter, timeout, temporary, lens_options).front();
 }
 
-void prepare_batch(const fs::path &request, const fs::path &scratch_in,
-                   const fs::path &result_in, const std::string &converter, int timeout, const lens::PrepareOptions &lens_options) {
+void prepare_sequence(const fs::path &request, const fs::path &scratch_in,
+                   const fs::path &result_in, const std::string &converter, std::optional<int> timeout, const lens::PrepareOptions &lens_options) {
   auto started = std::chrono::steady_clock::now();
-  auto scratch = canonical_existing(scratch_in, "batch scratch");
-  auto doc = parse_context(read_bounded(request,kDocumentLimit), "rawtl-prepare-request/1", kDocumentLimit);
+  auto scratch = canonical_existing(scratch_in, "sequence scratch");
+  auto doc = parse_context(read_bounded(request,kSequenceDocumentLimit), "rawtl-prepare-request/1", kSequenceDocumentLimit);
   size_t count = parse_u32(doc.at("count"), "count");
-  if (!count || count > 64) throw Error(26, "batch count must be 1..64");
+  if (!count || count > doc.fields.size() / 3)
+    throw Error(26, "sequence request count disagrees with its input entries");
   std::set<std::string> allowed{"count"}, targets;
   std::set<uint32_t> ids;
   std::vector<fs::path> sources, contexts, early_contexts;
   const auto early = scratch / "early";
   const bool stream_measurements = fs::is_directory(fs::symlink_status(early));
   auto output_path = [&](const fs::path &p) {
-    if (!p.is_absolute()) throw Error(26, "batch output paths must be absolute");
+    if (!p.is_absolute()) throw Error(26, "sequence output paths must be absolute");
     auto resolved = fs::weakly_canonical(p);
     auto relative = resolved.lexically_relative(scratch);
     if (relative.empty() || *relative.begin() == ".." || resolved == scratch)
-      throw Error(26, "batch outputs must be inside scratch");
+      throw Error(26, "sequence outputs must be inside scratch");
     auto first = relative.begin()->string();
-    if (first == "lens" || first == "linear" || first.starts_with("linear-") || first.starts_with("conversion-"))
-      throw Error(26, "batch output overlaps reserved conversion scratch");
+    if (first == "lens" || first == "linear" || first == "converter-input" || first == "converter.argv" || first.starts_with("conversion-"))
+      throw Error(26, "sequence output overlaps reserved conversion scratch");
     if (!targets.insert(resolved.string()).second || fs::exists(resolved))
-      throw Error(26, "batch output target already exists or is duplicated: " + resolved.string());
+      throw Error(26, "sequence output target already exists or is duplicated: " + resolved.string());
     return resolved;
   };
   auto result = output_path(result_in);
   for (size_t i = 0; i < count; ++i) {
     for (auto key : {"id","source","context"}) allowed.insert(item(i,key));
     auto id = parse_u32(doc.at(item(i,"id")), "id");
-    if (!ids.insert(id).second) throw Error(26, "batch request repeats frame id");
+    if (!ids.insert(id).second) throw Error(26, "sequence request repeats frame id");
     fs::path source = doc.at(item(i,"source"));
-    if (!source.is_absolute()) throw Error(26, "batch source must be absolute");
+    if (!source.is_absolute()) throw Error(26, "sequence source must be absolute");
     sources.push_back(canonical_existing(source,"original source"));
     contexts.push_back(output_path(doc.at(item(i,"context"))));
     if (stream_measurements)
@@ -527,10 +561,10 @@ void prepare_batch(const fs::path &request, const fs::path &scratch_in,
   doc.require_only(allowed);
   for (const auto &source : sources)
     if (targets.count(source.string()) || fs::weakly_canonical(request) == source)
-      throw Error(26, "batch output/request must be distinct from source");
+      throw Error(26, "sequence output/request must be distinct from source");
   for (const auto &path : contexts)
-    if (fs::weakly_canonical(request) == path) throw Error(26, "batch context must differ from request");
-  auto frames = prepare_frames(sources,scratch,converter,timeout,false,lens_options,early_contexts);
+    if (fs::weakly_canonical(request) == path) throw Error(26, "sequence context must differ from request");
+  auto frames = prepare_frames(sources,scratch,converter,timeout,false,lens_options,early_contexts,true);
   std::ostringstream out;
   out << "rawtl-prepare-result/1\ncount=" << count << '\n';
   for (size_t i = 0; i < count; ++i) {
@@ -541,10 +575,10 @@ void prepare_batch(const fs::path &request, const fs::path &scratch_in,
     field(out,item(i,"source_sha256"),frames[i].source_hash);
     field(out,item(i,"context"),contexts[i].string());
   }
-  // This rename is the only batch success marker; contexts alone are not results.
-  atomic_document(result,out.str(),kDocumentLimit);
+  // This rename is the only sequence success marker; contexts alone are not results.
+  atomic_document(result,out.str(),kSequenceDocumentLimit);
   check_cancelled();
-  std::cerr << "prepared batch result=" << result << " count=" << count
+  std::cerr << "prepared sequence result=" << result << " count=" << count
             << " total_including_publication_s=" << std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count() << '\n';
 }
 

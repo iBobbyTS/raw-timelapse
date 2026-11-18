@@ -89,7 +89,8 @@ struct ProcessResult {
 };
 ProcessResult run_process(const std::vector<std::string> &, const fs::path &log,
                           int timeout_seconds, std::optional<fs::path> stdout_path = std::nullopt,
-                          const std::function<void(int)> &observe = {});
+                          const std::function<void(int)> &observe = {},
+                          const fs::path &working_directory = {});
 // One verified output plus a reference to its shared invocation record.
 struct ConversionInfo {
   bool used = false;
@@ -105,6 +106,8 @@ struct ConversionInfo {
   uint32_t photometric = 0;
   std::string directory;
   std::string cleanup;
+  fs::path working_directory;
+  fs::path invocation;
   Json record() const;
 };
 // Change detection for local files across the stages of one job.
@@ -128,10 +131,10 @@ struct Conversion {
 // Inputs have distinct normalized stem names. The caller owns the empty dir.
 std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
                          const fs::path &linear_dir,
-                         const std::string &converter, int timeout_seconds,
-                         bool temporary,
+                         const std::string &converter, std::optional<int> timeout_seconds,
+                         bool temporary, bool sequence,
                          const std::function<void(size_t, const fs::path &)> &ready = {});
-// Actual platform argv/environment budget, capped for bounded record transport.
+// Available argument bytes after accounting for environment and pointer overhead.
 size_t converter_argv_budget();
 std::string output_collision_key(const fs::path &source);
 // A PreparedFrame is one source file resolved to the LinearRaw DNG the SDK may
@@ -161,16 +164,16 @@ const char *route_name(Route);
 // `scratch/linear/` for the caller to delete. `temporary` only controls the
 // provenance cleanup wording.
 PreparedFrame prepare_frame(const fs::path &source, const fs::path &scratch,
-                            const std::string &converter, int timeout_seconds,
+                            const std::string &converter, std::optional<int> timeout_seconds,
                             bool temporary, const lens::PrepareOptions &lens_options = {});
-// Batch and single-frame commands use this same routing/conversion core.
+// Sequence and single-frame commands use this same routing/conversion core.
 std::vector<PreparedFrame> prepare_frames(const std::vector<fs::path> &sources,
                             const fs::path &scratch, const std::string &converter,
-                            int timeout_seconds, bool temporary, const lens::PrepareOptions &lens_options = {},
-                            const std::vector<fs::path> &early_contexts = {});
-void prepare_batch(const fs::path &request, const fs::path &scratch,
+                            std::optional<int> timeout_seconds, bool temporary, const lens::PrepareOptions &lens_options = {},
+                            const std::vector<fs::path> &early_contexts = {}, bool sequence = false);
+void prepare_sequence(const fs::path &request, const fs::path &scratch,
                    const fs::path &result, const std::string &converter,
-                   int timeout_seconds, const lens::PrepareOptions &lens_options = {});
+                   std::optional<int> timeout_seconds, const lens::PrepareOptions &lens_options = {});
 // Deterministic versioned context document (not the metadata sidecar).
 void write_prepared(const PreparedFrame &, const fs::path &context_path, bool provisional = false);
 // Standalone consumers verify bytes. In-job consumers may use the file

@@ -22,7 +22,7 @@ def absent(pid):
 def run_case(mode):
     root=work/mode;root.mkdir()
     incoming=root/'input';incoming.mkdir()
-    count=65 if mode=='default-b32' else (6 if mode=='mapping' else (5 if mode in ['out-of-order','measure-error','shared-lifetime'] else 4))
+    count=65 if mode=='long-sequence' else (6 if mode=='mapping' else (5 if mode in ['out-of-order','measure-error','shared-lifetime'] else 4))
     for i in range(count):
         make_dng(incoming,f'frame_{i}',pi=32803,w=64,h=64,neutral=[.5+i*.01,1,.75+i*.01],datetime_original=f'2026:11:10 12:{i//60:02}:{i%60:02}')
     originals={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in incoming.iterdir()}
@@ -43,7 +43,7 @@ def run_case(mode):
         with open({str(calls)!r},'a') as f:f.write(json.dumps(inputs)+'\\n')
         mode={mode!r};s=None
         first='frame_0' in pathlib.Path(inputs[0]).stem
-        blocked=mode in ['interrupt','terminate','timeout'] or (mode=='measure-error' and not first)
+        blocked=mode in ['interrupt','terminate','timeout']
         if blocked:
             child=subprocess.Popen([sys.executable,'-c','import signal; signal.pause()'])
             def term(sig,frame):
@@ -54,7 +54,7 @@ def run_case(mode):
             s=socket.socket();s.connect({address!r})
             if mode=='descendant-complete':
                 if os.fork():sys.exit(0)
-        order=[3,1,0,2] if mode=='out-of-order' and first else range(len(inputs))
+        order=[3,1,0,2,4] if mode=='out-of-order' and first else range(len(inputs))
         for i in order:
             if mode=='missing' and i==len(inputs)-1:continue
             target=out/(pathlib.Path(inputs[i]).stem+'.dng');data=pathlib.Path({str(cfa if mode=='wrong' else base)!r}).read_bytes()
@@ -82,7 +82,7 @@ def run_case(mode):
             with open({str(measure)!r},'a') as f:f.write(args[2]+'\\n')
             if mode=='measure-error':
                 s=socket.socket();s.connect({address!r});s.sendall(b'{{"kind":"measurement"}}\\n');s.recv(1);sys.stderr.write('chosen measurement failure');sys.exit(9)
-        if args[0]=='--prepare-batch' and mode in ['missing-id','extra-id','duplicate-id','source-id','last-context']:
+        if args[0]=='--prepare-sequence' and mode in ['missing-id','extra-id','duplicate-id','source-id','last-context']:
             result=pathlib.Path(args[args.index('--emit-result')+1])
             if mode=='last-context':
                 request=pathlib.Path(args[1]);text=request.read_text();last=[l for l in text.splitlines() if l.startswith('item3_context=')][0];request.write_text(text.replace(last,'item3_context='+str(result.parent/'absent'/'last.context')))
@@ -97,7 +97,6 @@ def run_case(mode):
         os.execv({str(native)!r},[{str(native)!r},*args])
     ''')
     graph=json.loads((repo/'pipeline/src/graph/default.json').read_text())
-    graph['nodes'][1]['batch_size']=32 if mode=='default-b32' else (8 if mode in ['mapping','shared-lifetime'] else 4)
     if mode=='mapping':graph['nodes'].pop()
     if mode=='shared-lifetime':graph['nodes'][3]['concurrency']=1
     config=root/'graph.json';config.write_text(json.dumps(graph))
@@ -122,7 +121,7 @@ def run_case(mode):
                 assert msg['kind']=='partial';paused();conn.sendall(b'x');msg=json.loads(stream.readline())
             if mode=='out-of-order':
                 written=[]
-                for expected in [3,1,0,2]:
+                for expected in [3,1,0,2,4]:
                     assert msg=={'kind':'written','id':expected},msg;written.append(expected);paused();conn.sendall(b'x');msg=json.loads(stream.readline())
                 (root/'adc-order.json').write_text(json.dumps(written))
             assert msg['kind']=='complete';paused();conn.sendall(b'x')
@@ -132,27 +131,20 @@ def run_case(mode):
             paused()
             if mode!='timeout':p.send_signal(signal.SIGINT if mode=='interrupt' else signal.SIGTERM)
         elif mode=='measure-error':
-            messages=[]
-            while not any(m[2]['kind']=='blocked' for m in messages) or not any(m[2]['kind']=='measurement' for m in messages):messages.append(packet())
-            for conn,stream,msg in messages:
-                if msg['kind']=='blocked':owned=[msg[k] for k in ['native','converter','worker']]
-                if msg['kind']=='measurement':conn.sendall(b'!')
+            conn,stream,msg=packet()
+            assert msg['kind']=='measurement',msg
+            conn.sendall(b'!')
         stdout,stderr=p.communicate(timeout=25)
         trace=log.read_text()
-        success=mode in ['partial','complete','descendant-complete','out-of-order','mapping','shared-lifetime','default-b32']
+        success=mode in ['partial','complete','descendant-complete','out-of-order','mapping','shared-lifetime','long-sequence']
         assert (p.returncode==0)==success,(mode,p.returncode,stderr.decode())
         assert video.exists()==success
         if success:
             ids=[int(line.split('frame=')[1].split()[0]) for line in trace.splitlines() if 'kind=prepare frame=' in line]
             assert ids==list(range(1,count+1)),ids
-            batches=[line for line in trace.splitlines() if 'kind=prepare.batch ' in line]
-            assert len(batches)==(3 if mode=='default-b32' else (2 if mode=='out-of-order' else 1)),batches
-            if mode=='default-b32':assert [int(line.split('count=')[1].split()[0]) for line in batches]==[32,32,1]
-            assert all(('adc_calls=4' if mode=='mapping' else 'adc_calls=1') in line for line in batches),batches
-            assert all('mode=batch duration_scope=reference_materialization_excludes_shared_native' in line for line in trace.splitlines() if 'kind=prepare frame=' in line)
-            independent=sum(float(line.split('duration=')[1].split()[0]) for line in trace.splitlines() if 'kind=prepare frame=' in line)
-            shared=sum(float(line.split('total_wall=')[1].split()[0]) for line in batches)
-            assert independent<shared, 'shared ADC wall was copied into per-frame durations'
+            prepared=[line for line in trace.splitlines() if 'kind=prepare.sequence ' in line]
+            assert len(prepared)==1 and f'count={count} adc_calls=1 ' in prepared[0],prepared
+            assert len(calls.read_text().splitlines())==1
             assert trace.count('kind=solve frames=')==1
             assert trace.count('kind=node node=convert-cache frame=sequence ')==1
             if mode=='shared-lifetime':assert (root/'shared-survived-delete').is_file()
@@ -160,7 +152,7 @@ def run_case(mode):
                 import shlex
                 start=next(line for line in trace.splitlines() if 'kind=run.start' in line)
                 scratch=pathlib.Path(next(t.split('=',1)[1] for t in shlex.split(start) if t.startswith('scratch=')))
-                contexts=[fields(p) for p in scratch.glob('cache/batch_*/*.context')]
+                contexts=[fields(p) for p in scratch.glob('cache/*.context')]
                 assert len(contexts)==6
                 assert len({c['prepared_dng'] for c in contexts})==6
                 assert all(pathlib.Path(c['prepared_dng']).is_file() and pathlib.Path(c['converter_record']).is_file() for c in contexts)
@@ -176,7 +168,7 @@ def run_case(mode):
             if mode=='measure-error':assert b'chosen measurement failure' in stderr,stderr
             if mode in ['interrupt','terminate']:assert p.returncode==130,p.returncode
             if mode=='timeout':assert b'timed out' in stderr or b'timeout' in stderr,stderr
-        if mode in ['interrupt','terminate','timeout']:assert len(calls.read_text().splitlines())==1,'next collision sub-call started after cancellation'
+        if mode in ['interrupt','terminate','timeout']:assert len(calls.read_text().splitlines())==1,'Converter restarted after cancellation'
         for name,digest in originals.items():assert hashlib.sha256((incoming/name).read_bytes()).hexdigest()==digest
         receipt={'command':args,'exit':p.returncode,'success':success,'owned_absent':owned,'adc_calls':len(calls.read_text().splitlines()) if calls.exists() else 0}
         (root/'result.json').write_text(json.dumps(receipt,indent=2));print(json.dumps(receipt),flush=True)
@@ -193,5 +185,5 @@ def run_case(mode):
                 try:os.kill(pid,signal.SIGKILL)
                 except ProcessLookupError:pass
 
-for mode in ['partial','complete','descendant-complete','nonzero','missing','wrong','extra','missing-id','extra-id','duplicate-id','source-id','last-context','interrupt','terminate','timeout','out-of-order','measure-error','mapping','shared-lifetime','default-b32']:
+for mode in ['partial','complete','descendant-complete','nonzero','missing','wrong','extra','missing-id','extra-id','duplicate-id','source-id','last-context','interrupt','terminate','timeout','out-of-order','measure-error','mapping','shared-lifetime','long-sequence']:
     run_case(mode)

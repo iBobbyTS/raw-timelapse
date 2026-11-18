@@ -233,7 +233,7 @@ std::vector<Calibration> collect(const std::vector<SourcePair> &sources,
   size_t base_bytes = 0;
   for (const auto &arg : args)
     base_bytes += arg.size() + 1 + sizeof(char *);
-  const size_t budget = converter_argv_budget();
+  const size_t budget = std::min<size_t>(65536, converter_argv_budget());
   std::map<std::string, Tags> records;
   std::vector<std::string> invocation = args;
   size_t bytes = base_bytes, part = 0;

@@ -80,6 +80,19 @@ Vec parse_wb(std::string s) {
     throw Error(2, "unexpected white balance suffix");
   return v;
 }
+int parse_converter_timeout(const std::string &value) {
+  size_t end = 0;
+  int timeout;
+  try {
+    timeout = std::stoi(value, &end);
+  } catch (...) {
+    throw Error(2, "invalid timeout");
+  }
+  if (end != value.size() || timeout < 1 || timeout > 3600)
+    throw Error(2, "timeout must be 1..3600 seconds");
+  return timeout;
+}
+
 double parse_ev(const std::string &s) {
   size_t end = 0;
   double value = 0;
@@ -300,8 +313,8 @@ int main(int argc, char **argv) {
     // prepare mode, so the positional path slots stay paths even when a path
     // is spelled like a mode flag.
     const std::string mode = argc >= 2 ? std::string(argv[1]) : std::string();
-    const bool batch_mode = mode == "--prepare-batch";
-    const bool prepare_mode = mode == "--prepare" || batch_mode;
+    const bool sequence_mode = mode == "--prepare-sequence";
+    const bool prepare_mode = mode == "--prepare" || sequence_mode;
     const bool stdout_mode = mode == "--stdout-analysis" ||
                              mode == "--stdout-frame" ||
                              mode == "--stdout-frame-f32" || mode == "--lens-valid-area" ||
@@ -312,7 +325,7 @@ int main(int argc, char **argv) {
 
     if (prepare_mode) {
       if (argc < 3)
-        throw Error(2, "usage: dng-linear-frame --prepare <source> / --prepare-batch <request> --scratch "
+        throw Error(2, "usage: dng-linear-frame --prepare <source> / --prepare-sequence <request> --scratch "
                        "DIR --emit-prepared PATH [--converter PATH] "
                        "[--converter-timeout SECONDS]");
       fs::path input = argv[2];
@@ -320,7 +333,7 @@ int main(int argc, char **argv) {
       bool scratch_set = false, context_set = false;
       lens::PrepareOptions lens_options;
       std::string converter = default_converter;
-      int timeout = 120;
+      std::optional<int> timeout;
       for (int i = 3; i < argc; ++i) {
         std::string a = argv[i];
         if (i + 1 >= argc)
@@ -329,7 +342,7 @@ int main(int argc, char **argv) {
         if (a == "--scratch") {
           scratch = value;
           scratch_set = true;
-        } else if (a == (batch_mode ? "--emit-result" : "--emit-prepared")) {
+        } else if (a == (sequence_mode ? "--emit-result" : "--emit-prepared")) {
           context = value;
           context_set = true;
         } else if (parse_lens_policy(a,value,lens_options.policy)) {
@@ -343,23 +356,16 @@ int main(int argc, char **argv) {
         else if (a == "--converter")
           converter = value;
         else if (a == "--converter-timeout") {
-          size_t end = 0;
-          try {
-            timeout = std::stoi(value, &end);
-          } catch (...) {
-            throw Error(2, "invalid timeout");
-          }
-          if (end != value.size() || timeout < 1 || timeout > 3600)
-            throw Error(2, "timeout must be 1..3600 seconds");
+          timeout = parse_converter_timeout(value);
         } else
           throw Error(2, "unknown option: " + a);
       }
       if (!scratch_set)
         throw Error(2, mode + " requires --scratch");
       if (!context_set)
-        throw Error(2, mode + (batch_mode ? " requires --emit-result" : " requires --emit-prepared"));
-      if (batch_mode) {
-        prepare_batch(input, scratch, context, converter, timeout, lens_options);
+        throw Error(2, mode + (sequence_mode ? " requires --emit-result" : " requires --emit-prepared"));
+      if (sequence_mode) {
+        prepare_sequence(input, scratch, context, converter, timeout, lens_options);
         return 0;
       }
       PreparedFrame prepared =
@@ -393,7 +399,7 @@ int main(int argc, char **argv) {
         throw Error(2, "input and output paths must be distinct");
       std::optional<Vec> wb;
       std::string converter = default_converter;
-      int timeout = 120;
+      std::optional<int> timeout;
       double exposure_ev = 0;
       fs::path analysis_path;
       analysis::Roi roi;
@@ -420,14 +426,7 @@ int main(int argc, char **argv) {
           roi = parse_roi(value);
           roi_set = true;
         } else if (a == "--converter-timeout") {
-          size_t end = 0;
-          try {
-            timeout = std::stoi(value, &end);
-          } catch (...) {
-            throw Error(2, "invalid timeout");
-          }
-          if (end != value.size() || timeout < 1 || timeout > 3600)
-            throw Error(2, "timeout must be 1..3600 seconds");
+          timeout = parse_converter_timeout(value);
         } else
           throw Error(2, "unknown option: " + a);
       }
@@ -528,7 +527,7 @@ int main(int argc, char **argv) {
     }
     std::optional<Vec> wb;
     std::string converter = default_converter;
-    int timeout = 120;
+    std::optional<int> timeout;
     double exposure_ev = 0;
     uint32_t preview_edge = 0;
     analysis::Roi roi;
@@ -601,14 +600,7 @@ int main(int argc, char **argv) {
         if (a == "--converter")
           converter = value;
         else {
-          size_t end = 0;
-          try {
-            timeout = std::stoi(value, &end);
-          } catch (...) {
-            throw Error(2, "invalid timeout");
-          }
-          if (end != value.size() || timeout < 1 || timeout > 3600)
-            throw Error(2, "timeout must be 1..3600 seconds");
+          timeout = parse_converter_timeout(value);
         }
       } else
         throw Error(2, "unknown option: " + a);

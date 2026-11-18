@@ -139,15 +139,14 @@ for stage in ['prepare','measure']:
     ''')
     graph=json.loads((repo/'pipeline/src/graph/default.json').read_text())
     for node in graph['nodes']:
-        node['concurrency']=4 if node['kind'] in ['prepare','solve'] else 1
-        if node['kind']=='prepare':node['batch_size']=1
+        node['concurrency']=4 if node['kind']=='solve' else 1
     config=root/'graph.json';config.write_text(json.dumps(graph))
     video=root/'output/timelapse.mov'
     args=[str(cli),'--input',str(incoming),'--output',str(video),'--graph',str(config),'--dng-linear-frame',str(wrapper if stage=='measure' else native),'--converter',str(converter),'--strength','1' if stage=='measure' else '0']
     proc=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     owned={};ready=[];peers=[]
     try:
-        for task in range(4):
+        for task in range(1 if stage=='prepare' else 4):
             conn,_=server.accept();peers.append(conn)
             packet=b''
             while not packet.endswith(b'\n'): packet+=conn.recv(4096)
@@ -233,7 +232,7 @@ for trigger in ['interrupt','terminate','error']:
     proc=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     ready=[];owned={};peers=[]
     try:
-        for task in range(4):
+        for task in range(1 if stage=='prepare' else 4):
             conn,_=server.accept();peers.append(conn)
             packet=b''
             while not packet.endswith(b'\n'):packet+=conn.recv(4096)

@@ -56,7 +56,7 @@ batch=work/'batch';batch.mkdir(exist_ok=True);batch_context=batch/'frame.context
 request=batch/'request'; result=batch/'result'
 def encode(s):return urllib.parse.quote(str(s),safe='/ :,._-')
 request.write_text('rawtl-prepare-request/1'+chr(10)+'count=1'+chr(10)+''.join(k+'='+encode(v)+chr(10) for k,v in [('item0_id',0),('item0_source',source.resolve()),('item0_context',batch_context.resolve())]))
-command(['--prepare-batch',request,'--scratch',batch,'--emit-result',result,*prepare_options])
+command(['--prepare-sequence',request,'--scratch',batch,'--emit-result',result,*prepare_options])
 def fields(p):return dict((k,urllib.parse.unquote(v)) for k,v in (line.split('=',1) for line in p.read_text().splitlines()[1:]))
 assert fields(context)['lens_calibration']==fields(batch_context)['lens_calibration'],'single/batch calibration mismatch'
 # A conflicting authoritative capture value must still fail rather than pick one.

@@ -34,8 +34,9 @@ def manifest(root, sources, ids=None):
     (root/'request').write_text(text)
     return root/'request'
 def args(root, converter, timeout=5):
-    return [exe,'--prepare-batch',root/'request','--scratch',root,'--emit-result',root/'result',
-            '--converter',converter,'--converter-timeout',str(timeout)]
+    command = [exe,'--prepare-sequence',root/'request','--scratch',root,'--emit-result',root/'result',
+               '--converter',converter]
+    return command if timeout is None else command + ['--converter-timeout',str(timeout)]
 
 base=make_dng(work,'base',w=64,h=64,pixels=[500]*3*4096)
 cfa=make_dng(work,'cfa',pi=32803,w=64,h=64,pixels=[500]*3*4096)
@@ -122,7 +123,7 @@ def gated(name, mode, sig=None):
         assert p.returncode==expected,(p.returncode,err)
         assert (root/'result').exists()==(expected==0)
         if expected in (25,130): assert (root/'term').read_text()=='TERM', 'missing TERM before KILL escalation'
-        if sig: assert len((work/'calls').read_text().splitlines())==previous_calls+1, 'started later collision sub-call after cancel'
+        if sig: assert len((work/'calls').read_text().splitlines())==previous_calls+1, 'Converter restarted after cancellation'
         if msg.startswith(b'PID '):
             pid=int(msg.split()[1])
             try:
@@ -142,21 +143,25 @@ for mode in ['fail','missing','wrong','extra']:
     root=work/mode; manifest(root,sources)
     p=run(args(root,fake),24 if mode=='fail' else 23)
     assert not (root/'result').exists() and not list(root.glob('*.ctx'))
-    assert b'batch' in p.stderr.lower() and b'one.CR3' in p.stderr
+    assert b'one.CR3' in p.stderr
 for sig in [signal.SIGINT,signal.SIGTERM]: gated('cancel-'+str(sig), 'blocked',sig)
 gated('timeout','blocked')
 gated('descendant','descendant',signal.SIGTERM)
-# Same-stem, case and Unicode canonical equivalents force serial output dirs.
+# Same-stem, case and Unicode canonical equivalents use distinct input aliases.
 os.environ['BATCH_MODE']='ok'
 mapped=[]
 for i,name in enumerate(['same.CR3','same.CR3','SAME.CR3','caf\u00e9.CR3','cafe\u0301.CR3','space 非 % name.CR3']):
     d=work/('source-'+str(i)); d.mkdir(); p=d/name; p.write_bytes(b'raw'+bytes([i])); mapped.append(p)
-root=work/'mapping'; manifest(root,mapped); run(args(root,fake))
+root=work/'mapping'; manifest(root,mapped)
+previous_calls=len((work/'calls').read_text().splitlines()); run(args(root,fake))
+assert len((work/'calls').read_text().splitlines())==previous_calls+1
 contexts=[fields(root/('%d.ctx'%i)) for i in range(len(mapped))]
 assert len({c['prepared_dng'] for c in contexts})==len(mapped)
-assert len({str(pathlib.Path(c['prepared_dng']).parent) for c in contexts})>=3
-# Delete one output; the common conversion record and the other consumers survive.
-root=work/'mixed'; manifest(root,[base,cfa,*sources]); run(args(root,fake))
+assert len({str(pathlib.Path(c['prepared_dng']).parent) for c in contexts})==1
+run([exe,'--stdout-analysis','--prepared',root/'0.ctx'])
+# Delete one output; the surviving conversion record and the other consumers survive.
+root=work/'mixed'; manifest(root,[base,cfa,*sources])
+assert b'timeout_s=45 ' in run(args(root,fake,timeout=None)).stderr
 f=[fields(root/('%d.ctx'%i)) for i in range(4)]
 assert [c['route'] for c in f]==['linearraw-sdk','cfa-converter-linearraw-sdk',*(['vendor-raw-converter-linearraw-sdk']*2)]
 pathlib.Path(f[1]['prepared_dng']).unlink()
@@ -167,15 +172,15 @@ many=[]
 for i in range(20):
     p=work/('many%d.CR3'%i); p.write_bytes(b'raw'); many.append(p)
 root=work/'many'; manifest(root,many); run(args(root,fake))
-assert fields(pathlib.Path(fields(root/'0.ctx')['converter_record']))['argc']=='26'
+assert fields(pathlib.Path(fields(root/'0.ctx')['converter_record']))['argument']==str(many[0])
 for name,ids in [('duplicate',[1,1])]:
     root=work/name; manifest(root,sources,ids); run(args(root,fake),26); assert not (root/'result').exists()
 root=work/'context-failure'; manifest(root,sources); (root/'request').write_text((root/'request').read_text().replace(str(root/'1.ctx'),str(root/'missing'/'1.ctx')))
 run(args(root,fake),26); assert not (root/'result').exists()
 assert (root/'0.ctx').exists(), 'failure must occur on last context write'
-print('PASS: batch gates, failures, cancellation, mapping, shared records, mixed routes and identity')
+print('PASS: sequence gates, failures, cancellation, mapping, isolated records, mixed routes and identity')
 
-# Exercise actual platform byte partition with 64 near-PATH_MAX absolute inputs.
+# Exercise one invocation beyond ARG_MAX with short input aliases.
 longdir=work/'long-paths'
 while len(str(longdir).encode()) < 1006:
     remaining=1006-len(str(longdir).encode())-1
@@ -183,16 +188,19 @@ while len(str(longdir).encode()) < 1006:
     longdir=longdir/('x'*min(190,remaining))
 longdir.mkdir(parents=True)
 long_sources=[]
-for i in range(64):
+for i in range(1100):
     p=longdir/('f%03d.CR3'%i);p.write_bytes(b'raw');long_sources.append(p)
-root=work/'argv-budget';manifest(root,long_sources);run(args(root,fake))
-assert len({fields(root/('%d.ctx'%i))['converter_record'] for i in range(64)})>1
-assert len(list(root.glob('linear*/*.dng')))==64
+root=work/'argv-budget';manifest(root,long_sources)
+previous_calls=len((work/'calls').read_text().splitlines())
+assert b'timeout_s=16500 ' in run(args(root,fake,timeout=None)).stderr
+assert len((work/'calls').read_text().splitlines())==previous_calls+1
+assert (root/'converter-input'/'0.CR3').is_symlink()
+assert len(list(root.glob('linear/*.dng')))==1100
 
 # A reference with a matching byte hash still must describe this source/output.
 root=work/'many';ctx=root/'0.ctx';original=ctx.read_text();f=fields(ctx)
 r=pathlib.Path(f['converter_record']);bad=work/'wrong.record'
-bad.write_text(r.read_text().replace('item0_source=', 'item0_source=/wrong-source',1))
+bad.write_text(r.read_text().replace('source=', 'source=/wrong-source',1))
 tampered=original.replace(f['converter_record'],str(bad)).replace(f['converter_record_sha256'],hashlib.sha256(bad.read_bytes()).hexdigest())
 wrong=work/'wrong-record.ctx';wrong.write_text(tampered)
 run([exe,'--stdout-analysis','--prepared',wrong],26)
@@ -202,7 +210,7 @@ root=work/'noisy';manifest(root,sources);run(args(root,fake))
 f=fields(root/'0.ctx');record_path=pathlib.Path(f['converter_record'])
 assert (root/'0.ctx').stat().st_size < 65536 and record_path.stat().st_size < 1024*1024
 assert (root/'linear-converter.log').stat().st_size > 200000
-assert 'truncated' in fields(record_path)['transcript']
+assert 'transcript' not in fields(record_path)
 run([exe,'--stdout-analysis','--prepared',root/'0.ctx'])
 os.environ['BATCH_MODE']='root-error';os.environ['BATCH_PID']=str(work/'root-error.pid')
 root=work/'root-error';manifest(root,sources)
@@ -212,7 +220,7 @@ pid=int((work/'root-error.pid').read_text())
 status=subprocess.run(['ps','-o','stat=','-p',str(pid)],capture_output=True,text=True).stdout.strip()
 assert not status or status.startswith('Z'),(pid,status)
 
-# Direct batches never spawn the configured (deliberately missing) executable.
+# Direct-only sequences never spawn the configured (deliberately missing) executable.
 root=work/'all-direct';manifest(root,[base]);run(args(root,work/'does-not-exist'))
 assert fields(root/'0.ctx')['generated']=='0'
 assert not list(root.glob('linear*')) and not list(root.glob('conversion-*.record'))
@@ -228,7 +236,7 @@ for mode in ['same-context','context-is-source','truncated','old-version']:
     run(args(root,fake),26);assert not (root/'result').exists()
 # Record digest/version/truncation errors are rejected by real native readers.
 f=fields(work/'many'/'0.ctx');original=(work/'many'/'0.ctx').read_text();r=pathlib.Path(f['converter_record'])
-for name,text in [('record-version',r.read_text().replace('rawtl-conversion/1','rawtl-conversion/0')),('record-truncated',r.read_text()[:-1])]:
+for name,text in [('record-version',r.read_text().replace('rawtl-sequence-conversion/1','rawtl-sequence-conversion/0')),('record-truncated',r.read_text()[:-1])]:
     record_path=work/(name+'.record');record_path.write_text(text)
     ctx=work/(name+'.ctx');ctx.write_text(original.replace(str(r),str(record_path)).replace(f['converter_record_sha256'],hashlib.sha256(record_path.read_bytes()).hexdigest()))
     run([exe,'--stdout-analysis','--prepared',ctx],26)
@@ -243,7 +251,7 @@ assert (root/'linear-converter.log').read_bytes()==b'warning before\x00after\n'
 context_nul=work/'context-nul.ctx'
 context_nul.write_text((root/'0.ctx').read_text().replace('converter_cleanup=','converter_cleanup=%00',1))
 record_nul=work/'record-nul.record'
-record_nul.write_text(record_path.read_text().replace('transcript=','transcript=%00',1))
+record_nul.write_text(record_path.read_text().replace('version=','version=%00',1))
 record_nul_context=work/'record-nul.ctx'
 record_nul_context.write_text((root/'0.ctx').read_text().replace(str(record_path),str(record_nul)).replace(f['converter_record_sha256'],hashlib.sha256(record_nul.read_bytes()).hexdigest()))
 for forged in [context_nul,record_nul_context]:
@@ -251,5 +259,5 @@ for forged in [context_nul,record_nul_context]:
     assert b'prepared document contains NUL' in rejected.stderr
 # Red-first: the unfixed writer publishes success, but this real consumer fails.
 run([exe,'--stdout-analysis','--prepared',root/'0.ctx'])
-assert fields(record_path)['transcript']=='warning before?after\n'
+assert 'transcript' not in fields(record_path)
 assert '%00' not in record_path.read_text()

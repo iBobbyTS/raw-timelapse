@@ -68,7 +68,7 @@ profile 中的镜头设置包括 `lens_correction`、`lens_vignette`、`lens_dis
 
 Prepare auto 新增运行依赖 **ExifTool**，默认 /opt/homebrew/bin/exiftool，可通过 profile 的 `exiftool` 指定绝对可执行路径。数值采集保留 -n，并另做一次有界命名身份查询，以区分数字 ID、规格和解码后的具体名称。优先明确的厂商/EXIF LensModel；只有规格、Unknown、带 or 的歧义名称和泛称不作为独立型号。来源和两种字段值保留为证据；命名结果仍须精确配置匹配及消歧，不能把有名称直接算作新增支持。调用通过 argv，无 shell，禁用用户 ExifTool config；XML 通过 LibXml2 有界解析，禁用 DTD/外部实体与网络。任一真正消费的单值字段冲突、工具失败、损坏契约都显式失败；非消费字段的合法多值保留为证据。
 
-native 独立诊断默认 off。显式启用时，--prepare / --prepare-batch 负责采集；--stdout-frame-f32 --prepared 只接受 auto/off，不允许把 ExifTool/LCP 路径交给 Develop。analysis 即使收到 auto 也不新增处理。
+native 独立诊断默认 off。显式启用时，--prepare / --prepare-sequence 负责采集；--stdout-frame-f32 --prepared 只接受 auto/off，不允许把 ExifTool/LCP 路径交给 Develop。analysis 即使收到 auto 也不新增处理。
 
 ## 显式有效区与固定画幅
 

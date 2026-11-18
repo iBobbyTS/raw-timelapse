@@ -90,7 +90,7 @@ The log is line-oriented; every entry carries `wall=<epoch seconds>` and
 - `run.start`, `profile`, `settings`, `inventory`, `graph`, `encoder`, `colour`
 - `prepare`, `measure`, `develop` (frame, EV, applied/own white balance,
   pixel byte count and duration; prepare timing depends on its mode)
-- `prepare.batch` (batch ID, first/last frame, count, actual ADC calls, conversion,
+- `prepare.sequence` (frame count, actual ADC calls, conversion,
   verification and total wall time)
 - `node` completion events for every declared node and frame
 - `delete` events naming each deleted cache DNG
@@ -136,9 +136,9 @@ source -> convert-cache --prepared references--> measure-solve -> apply-ev
                        delete-cache (waits apply-ev frame completion) -----+
 ```
 
-- `prepare` (`convert-cache`) defaults to one bounded native batch of up to 32 sources
-  (`dng-linear-frame --prepare-batch`). Each successful batch publishes source-ordered
-  references; it can overlap the next batch with measurements of earlier frames.
+- `prepare` (`convert-cache`) prepares the full sequence with
+  `dng-linear-frame --prepare-sequence`. Adobe DNG Converter runs once for all
+  inputs that need it. Validated references are published in source order.
 - `measure-solve` measures independent frames concurrently, then seals the full
   frame inventory and publishes one EV table. `strength 0` replaces it with a zero plan.
 - `develop` applies the plan EV exactly once and returns owned FP32 pixels; the
@@ -148,28 +148,10 @@ source -> convert-cache --prepared references--> measure-solve -> apply-ev
 - `delete` waits for the per-frame develop completion and removes only the
   run-generated cache DNG. Original RAW/DNG sources are never deletion targets.
 
-Set concurrency per node in the graph JSON:
-
-```json
-{"id":"convert-cache","kind":"prepare","concurrency":4,"inputs":{"source":"source"}}
-```
-
-`prepare`, `develop`, `identity`, `exposure`, `resize`, `color`, and the
-measurement phase of `solve` accept integer `concurrency` values from 1 to 64;
-omission means 1. Source, references, barrier, zero, encode and delete only
-accept 1. Prepare also accepts `batch_size`, an integer in 1..64, omitted=1.
-Null, booleans, strings, fractions, overflow, duplicates and declarations on other
-node kinds are rejected. With `batch_size=1`, concurrency retains its per-frame
-meaning, including old `concurrency=4` graphs. With `batch_size>1`, concurrency
-must be 1; conflicting fields fail before RAW work or output creation.
-
-```json
-{"id":"convert-cache","kind":"prepare","concurrency":1,"batch_size":32,"inputs":{"source":"source"}}
-```
-
-The built-in graph uses Prepare=1/batch_size=32, Solve measurement=8, Develop=4,
-and 1 elsewhere. 32 is an engineering initial value, not a measured optimum.
-The final Solve operation still runs once.
+Develop, identity, exposure, resize, color and the measurement phase of Solve
+accept integer `concurrency` from 1 to 64. Prepare and the remaining nodes
+accept only 1. The built-in graph uses Solve measurement=8, Develop=4 and
+Color=4. The final Solve operation runs once.
 
 The previous per-frame 4/8/4 defaults were selected from repeated 1/4/8 real-CR3 comparisons,
 isolated-stage controls and a direct 4/4/4 versus 4/8/4 comparison. Develop=8
@@ -203,26 +185,15 @@ frame may still occupy its producer while a frame-dependent Delete runs. A ready
 lightweight reference directory, so it does not wait for every consumer. The
 reference directory, features, EV plan and on-disk cache can grow with sequence
 length; the concurrency bound is a frame bound, not a byte or disk limit.
-Prepare batch mode has one task slot holding at most B input/result references.
-It selects the continuous available prefix from the next unreceived frame,
-checking each source and every frame/sequence wait. It drains currently emittable
-source events first, dispatches a short prefix immediately, and flushes tails
-without waiting to fill B. Empty prefixes wait only for real work. The complete
-result set passes identity validation before any frame commit; frame 0 commits
-first. The slot releases after all references are materialized, without waiting
-for measure/develop/delete consumption. Exact frame coverage and no outstanding
-batch are required for EOF. Other stages retain their frame capacities.
-
-When a batched Prepare directly feeds Solve on macOS, it may offer frames for
-early measurement while Adobe DNG Converter is still running. After an observed
-writable descriptor disappears, the output must stay unchanged with no observed
-writer for five seconds. Measurement admits only the ready prefix in frame
-order. Early and final measurement share Solve's concurrency, while queued
-contexts and provisional results are stored in scratch on disk. Final batch
-validation still gates accepted measurements. A matching source, prepared DNG
-hash and white balance allow reuse; other frames use the normal measurement
-path. The run log records early admissions and whether each final measurement
-reused an early result.
+Prepare waits for the sealed source inventory and launches one sequence task.
+When Prepare directly feeds Solve on macOS, it can make frames available for
+early measurement while Converter is still running. After a writable
+descriptor disappears, the file must stay unchanged with no observed writer
+for five seconds. Solve admits only the ready prefix in frame order and shares
+its worker limit between early and final measurements. The paths and
+provisional results are stored in scratch. Prepare validates the full sequence
+before final publication. Matching source identity, DNG hash and white balance
+allow reuse of early measurements. The log records early admission and reuse.
 
 Prepare hashes RAW inputs and sealed Converter outputs once. Internal consumers
 check file identity, length and modification/change times without rereading the
@@ -235,24 +206,16 @@ native worksets and each transformation's temporary buffers.
 Frame 0's white balance is frozen at ordered prepare commit. Solve runs once,
 after every measurement and matching EOF is sealed. Per-node logs commit in
 source order; different nodes can interleave. Durations measure computation,
-not time waiting in ordered slots, and their sum is not wall time. In batch mode,
-`kind=prepare duration` measures independent reference materialization/publication
-preparation only, excluding shared native conversion, context loading and verification.
-`kind=prepare.batch` records those shared costs separately: actual ADC calls,
-conversion process wall, output+metadata verification wall and total adapter wall.
-Total includes routing, hashes, context/result publication and Rust loading; it
-need not equal conversion+verification. Custom tools without native diagnostics
-log unknown metrics. Single mode keeps the old per-frame wall-time interpretation.
-`mode`, `duration_scope` and stage `capacity_unit=frames|batch_tasks` distinguish
-these meanings; never sum per-frame batch durations as conversion cost.
-
-`converter_timeout` remains a total timeout per actual ADC sub-call (default
-120 seconds, 1..3600), including a multi-file invocation. It is not multiplied by
-frame count. Filename collisions and argv limits may split a logical batch into
-serial calls; cancellation stops later calls. Each batch has a unique private
-`cache/batch_NNNNNN` with request/result/contexts, shared records and
-`batch-native.log`. Shared records survive per-frame Delete until run scratch
-cleanup. Materials remain read-only.
+not time waiting in ordered slots, and their sum is not wall time.
+`kind=prepare.sequence` records the converter call count, conversion and
+verification wall time, and total Prepare time. The sequence Converter timeout
+defaults to 15 seconds multiplied by the number of frames sent to Converter and
+can be overridden with `converter_timeout`.
+Filename collisions or long paths use short aliases inside the run scratch.
+If even the alias list exceeds the OS command-line limit, Prepare fails before
+starting Converter. The scratch keeps one `cache/linear` directory, the exact
+`cache/converter.argv` invocation, per-frame provenance records and the
+`cache/prepare-native.log` transcript.
 
 All prepare, measure, develop and FFmpeg processes share the run's multi-task
 process owner. Encode runs as a capacity-1 task with one writer to one FFmpeg

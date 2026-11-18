@@ -3,7 +3,7 @@
 //!
 //! Structure: `doc` decodes the prepared-context line document, `stream` owns the
 //! native record protocol and process lifetime, `orchestrate` drives one frame or
-//! batch through prepare/analyze/develop, and `sidecar` parses and formats frame
+//! sequence through prepare/analyze/develop, and `sidecar` parses and formats frame
 //! metadata envelopes.
 
 mod contract;
@@ -16,9 +16,11 @@ pub use doc::PreparedFrame;
 #[cfg(test)]
 pub use doc::PreparedRoute;
 pub use orchestrate::{
-    analyze_prepared_at, develop_prepared_at, prepare_active, prepare_batch_active,
-    prepare_batch_with_early_measurements, PrepareBatchItem, PrepareBatchSettings, PrepareSettings, PreparedSettings,
+    analyze_prepared_at, develop_prepared_at, prepare_sequence_active,
+    PrepareSequenceItem, PrepareSequenceSettings, PreparedSettings,
 };
+#[allow(unused_imports)] // desktop preview and single-frame tests
+pub use orchestrate::{prepare_active, PrepareSettings};
 pub use sidecar::{analysis_bytes, format_wb};
 #[cfg(test)]
 pub use stream::Protocol;
@@ -100,4 +102,4 @@ mod protocol_tests;
 #[cfg(test)]
 mod prepared_tests;
 #[cfg(test)]
-mod batch_tests;
+mod sequence_tests;

@@ -61,10 +61,17 @@ impl Backend for Controlled {
     fn source_identity(&self, id: usize) -> String {
         format!("source-{id}")
     }
-    fn prepare_task(&mut self, id: usize) -> Result<FrameTask<String>> {
-        Ok(Box::new(move || Ok(format!("hash-{id}"))))
+    fn prepare_sequence_task(&mut self, count: usize) -> Result<FrameTask<PreparedSequence<String>>> {
+        Ok(Box::new(move || Ok(PreparedSequence {
+            frames: (0..count).map(|id| PreparedReference {
+                frame_id: id,
+                source: format!("source-{id}"),
+                value: format!("hash-{id}"),
+            }).collect(),
+            diagnostics: String::new(),
+        })))
     }
-    fn commit_prepare(&mut self, _: usize, _: &String, _: Duration) -> Result<()> {
+    fn commit_prepare(&mut self, _: usize, _: &String) -> Result<()> {
         Ok(())
     }
     fn hash<'a>(&self, r: &'a String) -> &'a str {

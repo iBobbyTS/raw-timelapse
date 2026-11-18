@@ -1,4 +1,5 @@
 #include "frame.h"
+#include <Availability.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <algorithm>
@@ -76,7 +77,7 @@ size_t converter_argv_budget() {
   for (char **p = environ; *p; ++p) environment += strlen(*p) + 1 + sizeof(char *);
   if (limit <= 0 || size_t(limit) <= environment + 4096)
     throw Error(26, "insufficient platform argv budget for Converter");
-  return std::min<size_t>(65536, size_t(limit) - environment - 4096);
+  return size_t(limit) - environment - 4096;
 }
 std::string output_collision_key(const fs::path &source) {
   auto name = source.stem().string() + ".dng";
@@ -125,7 +126,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using FileIdentity = std::pair<dev_t, ino_t>;
 std::optional<std::set<FileIdentity>> writable_files(int pid) {
-  // A helper process could still own a writer. Use the sealed batch path
+  // A helper process could still own a writer. Use the sealed sequence path
   // whenever this Converter invocation cannot be observed unambiguously.
   pid_t child;
   if (proc_listchildpids(pid, &child, sizeof child) != 0) return {};
@@ -150,17 +151,62 @@ std::optional<std::set<FileIdentity>> writable_files(int pid) {
 
 std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
                          const fs::path &linear_dir,
-                         const std::string &converter, int timeout,
-                         bool temporary,
+                         const std::string &converter, std::optional<int> timeout_override,
+                         bool temporary, bool sequence,
                          const std::function<void(size_t, const fs::path &)> &ready) {
+  constexpr int seconds_per_image = 15;
+  if (!timeout_override && inputs.size() > size_t(std::numeric_limits<int>::max() / seconds_per_image))
+    throw Error(24, "too many inputs to represent the Converter timeout");
+  const int timeout = timeout_override ? *timeout_override : int(inputs.size()) * seconds_per_image;
   std::vector<std::string> command{converter, "-c", "-l", "-d", linear_dir.string(), "-mp"};
+  command[0] = fs::absolute(converter).string();
+  const auto command_prefix = command;
+  const auto scratch = linear_dir.parent_path();
+  const auto log = scratch / "linear-converter.log";
   std::set<std::string> expected;
+  fs::path working_directory;
+  const auto argv_bytes = [](const auto &args) {
+    size_t bytes = 0;
+    for (const auto &arg : args) bytes += arg.size() + 1 + sizeof(char *);
+    return bytes;
+  };
+  auto budget = converter_argv_budget();
+  bool collisions = false;
   for (const auto &input : inputs) {
     check_cancelled();
     command.push_back(input.string());
-    expected.insert(input.stem().string() + ".dng");
+    collisions |= !expected.insert(output_collision_key(input)).second;
   }
-  auto log = linear_dir.parent_path() / (linear_dir.filename().string() + "-converter.log");
+  if (collisions || argv_bytes(command) > budget) {
+    // Adobe accepts explicit relative filenames but does not accept a directory
+    // as input. Short uniquely named aliases keep one invocation across volumes.
+    working_directory = scratch / "converter-input";
+    fs::create_directory(working_directory);
+    command = command_prefix;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      check_cancelled();
+      auto name = std::to_string(i) + inputs[i].extension().string();
+      fs::create_symlink(inputs[i], working_directory / name);
+      command.push_back("./" + name);
+    }
+    if (argv_bytes(command) > budget)
+      throw Error(24, "sequence exceeds the OS command-line limit for one Adobe DNG Converter invocation");
+  }
+  expected.clear();
+  std::vector<fs::path> paths;
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    auto name = fs::path(command[command_prefix.size() + i]).stem().string() + ".dng";
+    expected.insert(name);
+    paths.push_back(linear_dir / name);
+  }
+  fs::path invocation;
+  if (sequence) {
+    invocation = scratch / "converter.argv";
+    std::ofstream trace(invocation, std::ios::binary);
+    for (const auto &arg : command) trace.write(arg.c_str(), arg.size() + 1);
+    trace.close();
+    if (!trace) throw Error(24, "could not record the Converter invocation");
+  }
   auto conversion_start = std::chrono::steady_clock::now();
   struct Candidate {
     std::optional<FileState> state;
@@ -169,10 +215,6 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
     bool offered = false;
   };
   std::vector<Candidate> candidates(ready ? inputs.size() : 0);
-  std::vector<fs::path> paths;
-  if (ready)
-    for (const auto &input : inputs)
-      paths.push_back(linear_dir / (input.stem().string() + ".dng"));
   const auto observe = [&](int pid) {
     auto writers = writable_files(pid);
     auto now = Clock::now();
@@ -202,10 +244,11 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
     }
   };
   auto result = run_process(command, log, timeout, std::nullopt,
-                            ready ? std::function<void(int)>(observe) : std::function<void(int)>{});
+                            ready ? std::function<void(int)>(observe) : std::function<void(int)>{},
+                            working_directory);
   auto verification_start = std::chrono::steady_clock::now();
   std::string transcript = read_text(log);
-  std::string identity = "batch Converter [" + inputs.front().string() + " .. " + inputs.back().string() +
+  std::string identity = "Converter [" + inputs.front().string() + " .. " + inputs.back().string() +
       "] count=" + std::to_string(inputs.size()) + " timeout=" + std::to_string(timeout) + "s";
   if (result.timed_out || result.exit_code != 0) {
     std::cerr << transcript;
@@ -221,22 +264,26 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
     actual.insert(e.path().filename().string());
   }
   if (actual != expected)
-    throw Error(23, identity + ": Converter output set differs from requested stems");
+    throw Error(23, identity + ": Converter output set differs from requested names");
   std::vector<Conversion> outputs;
-  for (const auto &input : inputs) {
+  const auto version_name = converter_version(command.front());
+  for (size_t i = 0; i < inputs.size(); ++i) {
     check_cancelled();
-    auto output = linear_dir / (input.stem().string() + ".dng");
+    const auto &output = paths[i];
     const auto version = file_version(output);
     auto check = inspect(output);
     if (!check || check->photometric != 34892 || !check->width || !check->height)
       throw Error(23, identity + ": output is not nonzero LinearRaw (34892): " + output.string());
     ConversionInfo info;
     info.used = true;
-    info.executable = converter;
-    info.version = converter_version(converter);
-    info.command = command;
+    info.executable = command.front();
+    info.version = version_name;
+    info.command = command_prefix;
+    info.command.push_back(command[command_prefix.size() + i]);
+    info.working_directory = working_directory;
+    info.invocation = invocation;
     info.exit_code = result.exit_code;
-    info.transcript = transcript;
+    if (!sequence) info.transcript = transcript;
     info.output_name = output.filename().string();
     info.output_sha256 = sha256(output);
     info.photometric = check->photometric;
@@ -247,7 +294,7 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
       throw Error(23, identity + ": Converter output changed during verification: " + output.string());
     outputs.push_back({output, version, info});
   }
-  std::cerr << "converter batch count=" << inputs.size()
+  std::cerr << "converter count=" << inputs.size()
             << " source_first=" << inputs.front() << " source_last=" << inputs.back()
             << " timeout_s=" << timeout
             << " process_s=" << std::chrono::duration<double>(verification_start-conversion_start).count()
@@ -256,7 +303,8 @@ std::vector<Conversion> convert_inputs(const std::vector<fs::path> &inputs,
 }
 ProcessResult run_process(const std::vector<std::string> &args,
                           const fs::path &log, int timeout, std::optional<fs::path> stdout_path,
-                          const std::function<void(int)> &observe) {
+                          const std::function<void(int)> &observe,
+                          const fs::path &working_directory) {
   check_cancelled();
   std::vector<char *> argv;
   for (auto &a : args)
@@ -270,6 +318,24 @@ ProcessResult run_process(const std::vector<std::string> &args,
     posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
   else
     posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+  if (!working_directory.empty()) {
+    int error;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    if (__builtin_available(macOS 26.0, *)) {
+      error = posix_spawn_file_actions_addchdir(&actions, working_directory.c_str());
+    } else
+#endif
+    {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+      error = posix_spawn_file_actions_addchdir_np(&actions, working_directory.c_str());
+#pragma clang diagnostic pop
+    }
+    if (error) {
+      posix_spawn_file_actions_destroy(&actions);
+      throw Error(24, "cannot set the Converter working directory: " + std::to_string(error));
+    }
+  }
   posix_spawnattr_t attr;
   posix_spawnattr_init(&attr);
   posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
@@ -310,7 +376,7 @@ ProcessResult run_process(const std::vector<std::string> &args,
     }
     if (cancelled) {
       terminate_group();
-      throw Error(130, "caller cancelled batch Converter; owned process group terminated and leader reaped");
+      throw Error(130, "caller cancelled Converter; owned process group terminated and leader reaped");
     }
     if (reaped && (!WIFEXITED(status) || WEXITSTATUS(status) != 0)) {
       int root_status = status;

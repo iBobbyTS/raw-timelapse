@@ -55,8 +55,8 @@ source -> convert-cache --prepared references--------------------+
 ```
 
 - `source`：按数字序发出 frame token。
-- `convert-cache`：默认用一个 native 批任务处理最多 32 个源（`--prepare-batch`），
-  全批成功后按源序发布轻量引用；下一批转换可与上一批测量重叠。
+- `convert-cache` 对整段素材执行一次 `--prepare-sequence`。需要转换的帧共用
+  一个 Adobe DNG Converter 进程，已解拜耳的 DNG 直接引用。
 - `measure-solve`：可并发逐帧测量（0 EV），按序提交并在完整封口后仅求解一次有限 EV 表。
   `strength = 0` 时该节点替换为 `zero`，不执行测量。
 - `apply-ev`：按帧读取 EV，二次 develop，EV 恰好应用一次，返回自有 FP32 像素。Develop 内部的[独立镜头校正模块](lens-correction.md)只消费 Prepare 冻结的分项校准，不重新读取 RAW 元数据或查找 LCP，不与高光/颜色配方互相耦合。
@@ -71,20 +71,8 @@ RAW 处理前报配置错误。
 
 ### 节点并发配置
 
-节点 JSON 可写 `"concurrency":4`；省略为 1，显式值必须是 1..64 的整数。
-null、字符串、布尔、小数、越界和重复字段均在重工作前拒绝。prepare、solve 的测量阶段、
-develop / identity / exposure / resize / color 支持大于 1。source / references / barrier /
-zero / encode / delete 只允许 1，不会静默忽略大于 1 的声明。内置图显式配置为：
-Prepare=1 / batch_size=32、Solve 测量=8、Develop=4，其余=1；最终 Solve 仍只执行一次。
-
-`batch_size` 仅属于 prepare，必须是 1..64 的整数，省略为 1。null、布尔、字符串、
-小数、溢出、重复字段及其他 kind 的声明均拒绝。batch_size=1 保留旧逐帧 concurrency
-语义（旧 concurrency=4 图仍为最多四个逐帧任务）；batch_size>1 要求 concurrency=1，
-冲突在重工作及输出创建前报错。默认 32 是工程初值，不是测定最优值。
-
-```json
-{"id":"convert-cache","kind":"prepare","concurrency":1,"batch_size":32,"inputs":{"source":"source"}}
-```
+Solve 测量、Develop、Identity、Exposure、Resize 和 Color 可配置 1..64 的
+并发度。Prepare 及其他节点只允许 1。内置图使用 Solve 测量=8、Develop=4、Color=4。
 
 此前逐帧 4/8/4 默认值来自真实 CR3 的 1/4/8 轮换组合与节点隔离测量，以及 4/4/4 和 4/8/4 的
 直接对比。Develop=8 的额外收益很小、内存更多；测量=8 在实际 4/N/4 组合中有收益。
@@ -99,7 +87,7 @@ EV/WB、develop 像素摘要和解码后逐帧摘要一致，输出/scratch 在�
 `strength = 0` 把合法 solve 规范化为 zero，同时把并发度变为 1，完全跳过测量。
 CLI resize 覆盖保留原节点的并发度，新插入节点为 1。没有全局 --threads 或并发环境变量。
 
-逐帧阶段的容量等于节点并发度 N（prepare 批模式另见下文）：
+逐帧阶段的容量等于节点并发度 N：
 
 ```
 accepted_not_delivered = queued_or_running + completed_waiting <= N
@@ -108,13 +96,9 @@ accepted_not_delivered = queued_or_running + completed_waiting <= N
 计算可乱序完成；只有轮到源帧顺序时才校验身份、有序提交并发出完成事件。结果即使已
 提交，仍占名额，直到下游接收；不等待整波任务结束。prepare 的下游是轻量引用目录，
 目录接收即释放 prepare 名额，不等待 Solve / Develop / Delete 全部消费。
-prepare 批模式只占一个任务名额，最多 B 个输入/结果轻量引用。选批前先推进当前所有
-可发的连续 source 事件，逐帧检查 source 与 waits，从下一未接收 ID 取当前可用连续前缀。
-遇到未就绪项立即派发已有短批，不等凑满 B，尾批正常冲刷；空前缀只等待真实工作。
-完整结果集合验证先于首个 commit，按 frame_id 顺序材料化并发事件，全部材料化后释放
-批名额，不等 measure/develop/delete 消费。EOF 要求精确完整帧覆盖且无在途批。
-其他节点容量语义不变。测量特征、EV 表、引用目录和磁盘缓存仍可随总帧数增长；
-N/B 不是总字节或磁盘上限。
+Prepare 在源序列封口后启动一次转换。可测帧按连续帧序交付给去闪节点，
+提前测量的结果待最终验证后复用。输入引用、测量特征、EV 表和磁盘缓存可随帧数增长，
+节点并发度只限制在途计算。
 整条图像链允许多帧在途；重型帧数上限由各阶段容量之和约束，还需计入 native 工作集、
 缩放/颜色转换和编码写入的临时缓冲。事件发生不等于名额释放。序列完成必须同时满足
 完整输入封口、任务完成、有序提交齐全和输出交付，不把 EOF 当作任务完成。
@@ -123,19 +107,14 @@ N/B 不是总字节或磁盘上限。
 Solve 必须等待所有测量和匹配 EOF 封口，完整验证 ID、源摘要、EV 有限性与顺序。
 参考几何和相机模型也在 Develop 有序提交端建立，后帧不能抢占帧 0 基准。
 同一节点的日志按源帧顺序提交，不同节点可交错；计算耗时不包含排队等待，任务耗时
-之和不是整体墙钟时间。批模式的 kind=prepare duration 仅为独立引用材料化/发布准备，
-排除共享 native 转换、context 加载与核验；kind=prepare.batch 单独记录实际 ADC 次数、
-转换进程墙钟、输出+元数据核验墙钟和 adapter 总墙钟（含路由/hash/context 发布/Rust 加载，
-不要求前两项之和等于 total）。自定义 native 缺诊断时写 unknown。batch_size=1 保留旧逐帧
-墙钟解释。mode / duration_scope / capacity_unit=frames|batch_tasks 明确区分，不能把批墙钟
-复制到每帧累加。--converter-timeout 仍是每次实际 ADC 子调用的总时限（默认120秒，
-1..3600），不乘帧数；冲突/argv 拆分的后续调用随 run 取消停止。
+之和不是整体墙钟时间。`prepare.sequence` 记录 Converter 调用次数、
+转换、校验及 Prepare 总耗时。默认转换总时限为实际送入 Converter 的帧数乘以 15 秒，可通过 profile 覆盖。
 所有 prepare / measure / develop 进程按任务身份登记到同一个
 run owner（FFmpeg 也登记其中），单任务结束只注销自己；失败、停止或编码失败会取消并回收全部活跃任务，
 取消后的晚到结果不提交。每个阶段/帧有独立 transcript，错误时留在 scratch。
 
-每个批目录仅供本 run 的该批使用，batch-native.log 是 ActiveNative 的独立注册身份。
-共享转换记录不随逐帧 Delete 删除，保留到 run scratch 生命周期结束。
+`cache/prepare-native.log` 是整个准备任务的日志。逐帧删除缓存 DNG 后，
+转换记录仍保留到当前运行的 scratch 被清理。
 
 ## 4. 运行日志合同
 
@@ -152,11 +131,11 @@ wall=<epoch 秒.毫秒> elapsed=<单调秒.毫秒> kind=<事件> <有界字段..
 | `run.start` | input / video / log / scratch 路径 |
 | `settings` | fps、白平衡模式、去闪参数、ROI、step 数、reference gain |
 | `inventory` | 帧数、首尾文件名 |
-| `graph` | 图来源（内置/路径）、节点 ID 顺序、实际 concurrency/batch_size 与容量单位 |
+| `graph` | 图来源（内置/路径）、节点 ID 顺序、实际 concurrency 与容量单位 |
 | `encoder` | encoder/container/pix_fmt/profile/range/几何 |
 | `colour` | profile、相机颜色方法、matrix/primaries/transfer、effective range、reference_status、输出 CAT |
-| `prepare` | 帧号、源名、路由、generated、缓存路径、mode/duration_scope、独立耗时 |
-| `prepare.batch` | 批 ID、帧范围/数、实际 ADC 调用数、转换/核验/总墙钟 |
+| `prepare` | 帧号、源名、路由、generated、缓存路径 |
+| `prepare.sequence` | 总帧数、实际 ADC 调用数、转换/核验/总墙钟 |
 | `measure` | 帧号、源名、耗时 |
 | `develop` | 帧号、源名、EV、应用/自身白平衡、源与像素摘要、像素字节数、耗时 |
 | `image` / `encode` | 图像/编码单帧任务计算耗时（不含排序等待） |
@@ -182,8 +161,8 @@ stderr 只保留错误与 scratch 保留提示。
 
 ```
 .rawtl-<video-stem>-<pid>-<nonce>/
-  cache/frame_NNNNNN/            逐帧 prepare 产物与 prepared.context
-  cache/batch_NNNNNN/            批 request/result/frame_ID.context、共享记录与 batch-native.log
+  cache/                         序列 request/result、frame_ID.context、转换记录与 prepare-native.log
+  cache/linear/                  生成的线性 DNG
   transcripts/prepare|measure|develop/frame_NNNNNN.log
   transcripts/encode.log
   <video-file>                   编码中的 partial

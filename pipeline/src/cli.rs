@@ -40,7 +40,7 @@ REQUIRED:
                                overwritten; choose a new name or remove the old run first.
 
 OPTIONS:
-    --graph <FILE>            Typed graph JSON (default: prepare P1/B32, solve 8, develop 4)
+    --graph <FILE>            Typed graph JSON (default: one Prepare per sequence, Solve 8, Develop 4)
     --fps <N[/D]>              Frame rate as an integer or rational (default: 60)
     --white-balance <MODE>     first-frame | per-frame (default: first-frame)
                                first-frame freezes frame 1's as-shot neutral for the sequence;
@@ -86,7 +86,7 @@ OPTIONS:
     --exiftool <PATH>          Read-only Prepare metadata tool (default: /opt/homebrew/bin/exiftool)
     --lens-profile-dir <DIR>   Installed LCP root, repeatable; replaces default Adobe roots
     --converter <PATH>         Adobe DNG Converter override passed to the native tool
-    --converter-timeout <SEC>  Total timeout per ADC call, including batches (1-3600 seconds)
+    --converter-timeout <SEC>  Override total Converter timeout (1-3600 seconds, default 15 per converted frame)
     --verify-output           Strictly decode and count all frames with FFmpeg
                                (default: read stream metadata and one encoded packet)
     --strength <0..1>          Correction strength (default: 1.0; 0 disables deflicker)

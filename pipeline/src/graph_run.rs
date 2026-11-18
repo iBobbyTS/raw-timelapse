@@ -4,7 +4,7 @@
 use crate::encoder::{Container, ResolvedConfig};
 use crate::error::{Error, Result, EXIT_FRAME, EXIT_PREVIEW, EXIT_USAGE, EXIT_VALIDATION};
 use crate::frame::{
-    self, FrameInfo, FrameSequence, PrepareSettings, PreparedFrame, PreparedSettings,
+    self, FrameInfo, FrameSequence, PreparedFrame, PreparedSettings,
 };
 use crate::run_log::{quote, RunLog};
 use crate::video::{self, ResizeRecord};
@@ -62,6 +62,8 @@ struct Runner<'a, 'b> {
     measurements: Vec<FrameMeasurement>,
     reference_wb: Option<[f64; 3]>,
     early_contexts: Vec<Option<std::path::PathBuf>>,
+    convert_progress_at: Instant,
+    convert_progress: u32,
     capture_times: Vec<Option<String>>,
     frames: Vec<FrameInfo>,
     source_geometry: Option<(u32, u32)>,
@@ -79,7 +81,6 @@ struct Runner<'a, 'b> {
     stage_stats: BTreeMap<String, graph::ordered_frames::StageStats>,
     worker_failure: Arc<Mutex<Option<Error>>>,
     failure: Option<Error>,
-    prepare_batch_size: usize,
     /// Ordered per-run clipping totals, accumulated only from committed colour
     /// frames. Unit is channel samples (3 per pixel), never pixels.
     clipped_low: usize,
@@ -308,6 +309,24 @@ impl Backend for Runner<'_, '_> {
                 "streaming encoder failed; scheduling cancelled",
             )));
         }
+        if self.capture_times.is_empty()
+            && self.convert_progress_at.elapsed() >= Duration::from_millis(250)
+        {
+            self.convert_progress_at = Instant::now();
+            let linear = self.context.scratch.join("cache").join("linear");
+            if let Ok(files) = fs::read_dir(linear) {
+                // Visible DNGs are only a progress estimate. They do not
+                // establish readiness or enter the prepared inventory.
+                let visible = files.flatten()
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "dng"))
+                    .count();
+                let percent = (40 * visible / self.context.sources.len()).min(39) as u32;
+                if percent > self.convert_progress {
+                    self.convert_progress = percent;
+                    self.log.progress("convert", percent);
+                }
+            }
+        }
         Ok(())
     }
     fn source_identity(&self, id: usize) -> String {
@@ -316,54 +335,15 @@ impl Backend for Runner<'_, '_> {
     fn cancel(&mut self) {
         proc::cancel(&self.active);
     }
-    fn prepare_task(&mut self, id: usize) -> graph::Result<FrameTask<PreparedFrame>> {
-        let scratch = self
-            .context
-            .scratch
-            .join("cache")
-            .join(format!("frame_{:06}", id + 1));
-        let context = scratch.join("prepared.context");
-        let log = self.transcript("prepare", id);
-        let source = self.context.sources[id].clone();
-        let tool = self.context.options.native_tool.clone();
-        let converter = self.context.options.converter.clone();
-        let converter_timeout = self.context.options.converter_timeout;
-        let lens = self.context.options.lens.clone();
-        let active = self.active.clone();
-        Ok(Box::new(move || {
-            fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
-            frame::prepare_active(
-                &tool,
-                &source,
-                &PrepareSettings {
-                    scratch_dir: &scratch,
-                    context_path: &context,
-                    log: &log,
-                    converter: converter.as_deref(),
-                    converter_timeout,
-                    lens,
-                },
-                active,
-            )
-            .map_err(|e| e.message)
-        }))
-    }
-    fn prepare_batch_task(
+    fn prepare_sequence_task(
         &mut self,
-        ids: &[usize],
-    ) -> graph::Result<FrameTask<graph::PreparedBatch<PreparedFrame>>> {
-        let scratch = self
-            .context
-            .scratch
-            .join("cache")
-            .join(format!("batch_{:06}", ids[0] + 1));
-        let sources: Vec<_> = ids
-            .iter()
-            .map(|id| (*id, self.context.sources[*id].clone()))
-            .collect();
+        count: usize,
+    ) -> graph::Result<FrameTask<graph::PreparedSequence<PreparedFrame>>> {
+        let scratch = self.context.scratch.join("cache");
+        let sources = self.context.sources.to_vec();
         let streaming = self.context.options.deflicker.enabled();
         if streaming {
-            for &id in ids {
+            for id in 0..count {
                 self.early_contexts[id] =
                     Some(scratch.join("early").join(format!("frame_{id}.context")));
             }
@@ -374,78 +354,49 @@ impl Backend for Runner<'_, '_> {
         let lens = self.context.options.lens.clone();
         let active = self.active.clone();
         Ok(Box::new(move || {
-            fs::create_dir_all(scratch.parent().unwrap()).map_err(|e| e.to_string())?;
-            // create_dir, rather than create_dir_all, prevents accidental reuse.
-            fs::create_dir(&scratch).map_err(|e| format!("private batch scratch: {e}"))?;
-            let items: Vec<_> = sources
-                .iter()
-                .map(|(id, source)| frame::PrepareBatchItem {
-                    frame_id: *id,
-                    source,
-                })
+            fs::create_dir(&scratch).map_err(|e| format!("private sequence scratch: {e}"))?;
+            let items: Vec<_> = sources.iter().enumerate()
+                .map(|(frame_id, source)| frame::PrepareSequenceItem { frame_id, source })
                 .collect();
-            let prepare = if streaming {
-                frame::prepare_batch_with_early_measurements
-            } else {
-                frame::prepare_batch_active
-            };
-            let prepared = prepare(
+            let prepared = frame::prepare_sequence_active(
                 &tool,
                 &items,
-                &frame::PrepareBatchSettings {
+                &frame::PrepareSequenceSettings {
                     scratch_dir: &scratch,
                     converter: converter.as_deref(),
                     converter_timeout,
                     lens,
                 },
                 active,
-            )
-            .map_err(|e| e.message)?;
-            let diagnostics = batch_diagnostics(&scratch.join("batch-native.log"))?;
-            let frames = prepared
-                .into_iter()
-                .map(|(frame_id, value)| {
-                    let started = Instant::now();
-                    let source = sources
-                        .iter()
-                        .find(|(id, _)| *id == frame_id)
-                        .unwrap()
-                        .1
-                        .path
-                        .display()
-                        .to_string();
-                    graph::PreparedReference {
-                        frame_id,
-                        source,
-                        value,
-                        elapsed: started.elapsed(),
-                    }
-                })
-                .collect();
-            Ok(graph::PreparedBatch {
-                frames,
-                diagnostics,
-            })
+                streaming,
+            ).map_err(|e| e.message)?;
+            let diagnostics = prepare_diagnostics(&scratch.join("prepare-native.log"))?;
+            let frames = prepared.into_iter().map(|(frame_id, value)| graph::PreparedReference {
+                frame_id,
+                source: sources[frame_id].path.display().to_string(),
+                value,
+            }).collect();
+            Ok(graph::PreparedSequence { frames, diagnostics })
         }))
     }
-    fn commit_prepare_batch(
+    fn commit_prepare_sequence(
         &mut self,
-        batch_id: usize,
-        ids: &[usize],
+        count: usize,
         elapsed: Duration,
         diagnostics: &str,
     ) -> graph::Result<()> {
-        let written = self.log.line(&format!("kind=prepare.batch batch={} frame_first={} frame_last={} count={} mode=batch {} total_wall={:.6}", batch_id + 1, ids[0] + 1, ids[ids.len()-1] + 1, ids.len(), diagnostics, elapsed.as_secs_f64()));
+        let written = self.log.line(&format!(
+            "kind=prepare.sequence count={count} {diagnostics} total_wall={:.6}",
+            elapsed.as_secs_f64()
+        ));
         self.result(written)
     }
     fn commit_prepare(
         &mut self,
         id: usize,
         prepared: &PreparedFrame,
-        elapsed: Duration,
     ) -> graph::Result<()> {
         self.check()?; // A completed worker cannot revive a cancelled run.
-        let materialize_started = Instant::now();
         if id != self.capture_times.len() {
             return Err("graph: prepare commit order mismatch".into());
         }
@@ -460,19 +411,16 @@ impl Backend for Runner<'_, '_> {
         if prepared.generated {
             self.generated_paths.push(prepared.dng.clone());
         }
-        if !self.generated_paths.is_empty() {
+        if id + 1 == self.context.sources.len() && !self.generated_paths.is_empty() {
             self.progress("convert");
         }
         let written = self.log.line(&format!(
-            "kind=prepare frame={} source={} route={} generated={} cache={} mode={} duration_scope={} duration={:.6}",
+            "kind=prepare frame={} source={} route={} generated={} cache={}",
             id + 1,
             quote(&prepared.source_name),
             prepared.route.token(),
             prepared.generated,
             quote(&prepared.dng.display().to_string()),
-            if self.prepare_batch_size > 1 { "batch" } else { "single" },
-            if self.prepare_batch_size > 1 { "reference_materialization_excludes_shared_native" } else { "single_frame_wall" },
-            (elapsed + if self.prepare_batch_size > 1 { materialize_started.elapsed() } else { Duration::ZERO }).as_secs_f64()
         ));
         self.result(written)
     }
@@ -1065,8 +1013,8 @@ fn apply_color_crop(image: &mut Image) -> graph::Result<()> {
     Ok(())
 }
 
-fn batch_diagnostics(path: &std::path::Path) -> graph::Result<String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("batch transcript: {e}"))?;
+fn prepare_diagnostics(path: &std::path::Path) -> graph::Result<String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("prepare transcript: {e}"))?;
     let mut calls = 0usize;
     let mut conversion = 0.0f64;
     let mut verification = 0.0f64;
@@ -1079,19 +1027,22 @@ fn batch_diagnostics(path: &std::path::Path) -> graph::Result<String> {
             .filter(|n| n.is_finite() && *n >= 0.)
     };
     for line in text.lines() {
-        if line.starts_with("converter batch count=") {
+        if line.starts_with("converter count=") {
             calls += 1;
             conversion +=
                 number(line, "process_s=").ok_or("graph: malformed native conversion timing")?;
             verification += number(line, "output_verification_s=")
                 .ok_or("graph: malformed native verification timing")?;
         }
-        if line.starts_with("prepare batch count=") {
+        if line.starts_with("prepare count=") {
             metadata = number(line, "metadata_verification_s=");
             if number(line, "adc_calls=") != Some(calls as f64) {
                 return Err("graph: native ADC call diagnostics disagree".into());
             }
         }
+    }
+    if calls > 1 {
+        return Err("graph: multiple Converter invocations for one sequence".into());
     }
     Ok(match metadata {
         Some(metadata) => format!(
@@ -1207,7 +1158,7 @@ pub fn run(
     let profile = context.output_color.profile;
     let range = config.effective_range(profile);
     log.line(&format!(
-        "kind=graph source={} nodes={} concurrency={} prepare_batch_size={} prepare_capacity_unit={}",
+        "kind=graph source={} nodes={} concurrency={}",
         match &context.options.graph {
             Some(path) => quote(&path.display().to_string()),
             None => quote("built-in"),
@@ -1219,8 +1170,6 @@ pub fn run(
             .map(|(id, n)| format!("{id}:{n}"))
             .collect::<Vec<_>>()
             .join(","),
-        graph.prepare_batch_size(),
-        if graph.prepare_batch_size() > 1 { "batch_tasks" } else { "frames" }
     ))?;
     if let Some(export) = config.export() {
         log.line(&format!("kind=export profile={} input_format={}", quote(&export.name), export.input.name()))?;
@@ -1294,6 +1243,8 @@ pub fn run(
         measurements: vec![],
         reference_wb: None,
         early_contexts: vec![None; context.sources.len()],
+        convert_progress_at: Instant::now(),
+        convert_progress: 0,
         capture_times: vec![],
         frames: vec![],
         source_geometry: None,
@@ -1321,7 +1272,6 @@ pub fn run(
         stage_stats: BTreeMap::new(),
         worker_failure: Default::default(),
         failure: None,
-        prepare_batch_size: graph.prepare_batch_size(),
         clipped_low: 0,
         clipped_high: 0,
         color_channel_samples: 0,
@@ -1336,7 +1286,7 @@ pub fn run(
     let graph_started = Instant::now();
     let result = graph::execute(&graph, context.sources.len(), &mut runner);
     for (node, stats) in &runner.stage_stats {
-        let written = runner.log.line(&format!("kind=stage node={} concurrency={} accepted={} committed={} delivered={} peak_in_flight={} capacity_unit={}",node,stats.capacity,stats.accepted,stats.committed,stats.delivered,stats.peak,if graph.prepare_batch_size() > 1 && node == graph.prepare_node_id() { "batch_tasks" } else { "frames" }));
+        let written = runner.log.line(&format!("kind=stage node={} concurrency={} accepted={} committed={} delivered={} peak_in_flight={} capacity_unit={}",node,stats.capacity,stats.accepted,stats.committed,stats.delivered,stats.peak,if node == graph.prepare_node_id() { "sequence" } else { "frames" }));
         // Diagnostics must not replace the graph's selected error or STOP.
         // With a successful graph, a summary append failure remains fatal.
         if result.is_ok() {

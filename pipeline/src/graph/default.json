@@ -1,7 +1,7 @@
 {
   "nodes": [
     {"id":"source", "kind":"source", "concurrency":1},
-    {"id":"convert-cache", "kind":"prepare", "concurrency":1, "batch_size":32, "inputs":{"source":"source"}},
+    {"id":"convert-cache", "kind":"prepare", "concurrency":1, "inputs":{"source":"source"}},
     {"id":"measure-solve", "kind":"solve", "concurrency":8, "inputs":{"frames":"convert-cache"}},
     {"id":"apply-ev", "kind":"develop", "concurrency":4, "inputs":{"frames":"convert-cache", "plan":"measure-solve"}},
     {"id":"color", "kind":"color", "concurrency":4, "inputs":{"image":"apply-ev"}},

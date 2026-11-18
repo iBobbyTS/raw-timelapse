@@ -1,6 +1,6 @@
 use super::*;
-#[path = "prepare_batch_tests.rs"]
-mod prepare_batch_tests;
+#[path = "prepare_sequence_tests.rs"]
+mod prepare_sequence_tests;
 #[derive(Default)]
 struct Fake {
     frame_count: usize,
@@ -12,13 +12,13 @@ struct Fake {
     resizes: Vec<(u32, u32)>,
     zero: bool,
     bad_plan: bool,
-    batches: Vec<Vec<usize>>,
+    sequences: Vec<Vec<usize>>,
     prepare_commits: Vec<usize>,
-    batch_defect: Option<&'static str>,
-    batch_stats: Vec<ordered_frames::StageStats>,
+    sequence_defect: Option<&'static str>,
+    sequence_stats: Vec<ordered_frames::StageStats>,
     cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     trace: Option<std::sync::mpsc::Sender<String>>,
-    batch_completion: Option<std::sync::mpsc::Receiver<usize>>,
+    sequence_completion: Option<std::sync::mpsc::Receiver<usize>>,
     early_ready: Option<Arc<std::sync::Mutex<BTreeSet<usize>>>>,
     slow_measure: Option<std::sync::mpsc::Receiver<()>>,
     plan_defect: Option<&'static str>,
@@ -42,22 +42,18 @@ impl Backend for Fake {
     fn source_identity(&self, id: usize) -> String {
         format!("source{id}")
     }
-    fn prepare_task(&mut self, id: usize) -> Result<FrameTask<String>> {
-        self.order.push(format!("prepare {id}"));
-        Ok(Box::new(move || Ok(format!("hash{id}"))))
-    }
-    fn prepare_batch_task(&mut self, ids: &[usize]) -> Result<FrameTask<PreparedBatch<String>>> {
-        self.batches.push(ids.to_vec());
+    fn prepare_sequence_task(&mut self, count: usize) -> Result<FrameTask<PreparedSequence<String>>> {
+        let ids: Vec<_> = (0..count).collect();
+        self.sequences.push(ids.clone());
         self.order
             .extend(ids.iter().map(|id| format!("prepare {id}")));
-        let ids = ids.to_vec();
         let trace = self.trace.clone();
-        let completion = self.batch_completion.take();
-        let defect = self.batch_defect;
+        let completion = self.sequence_completion.take();
+        let defect = self.sequence_defect;
         let cancelled = self.cancelled.clone();
         Ok(Box::new(move || {
             if let Some(trace) = &trace {
-                trace.send(format!("batch-start {ids:?}")).unwrap();
+                trace.send(format!("prepare-start {ids:?}")).unwrap();
             }
             let order = if let Some(completion) = completion {
                 let mut order = vec![];
@@ -80,7 +76,6 @@ impl Backend for Fake {
                     frame_id: id,
                     source: format!("source{id}"),
                     value: format!("hash{id}"),
-                    elapsed: Duration::ZERO,
                 })
                 .collect();
             match defect {
@@ -102,13 +97,13 @@ impl Backend for Fake {
                     .store(true, std::sync::atomic::Ordering::SeqCst),
                 _ => (),
             }
-            Ok(PreparedBatch {
+            Ok(PreparedSequence {
                 frames,
                 diagnostics: String::new(),
             })
         }))
     }
-    fn commit_prepare(&mut self, id: usize, _: &String, _: Duration) -> Result<()> {
+    fn commit_prepare(&mut self, id: usize, _: &String) -> Result<()> {
         self.prepare_commits.push(id);
         if let Some(trace) = &self.trace {
             trace.send(format!("prepare-commit {id}")).unwrap();
@@ -262,7 +257,7 @@ impl Backend for Fake {
     }
     fn activity(&mut self, node: &str, stats: ordered_frames::StageStats) -> Result<()> {
         if node == "convert-cache" {
-            self.batch_stats.push(stats);
+            self.sequence_stats.push(stats);
         }
         Ok(())
     }
@@ -575,20 +570,13 @@ fn last_measurement_and_unread_sink_are_controlled_by_events() {
         fn source_identity(&self, id: usize) -> String {
             self.fake.source_identity(id)
         }
-        fn prepare_task(&mut self, id: usize) -> Result<FrameTask<String>> {
-            std::fs::write(self.root.join(format!("{id}.dng")), b"generated").unwrap();
-            self.fake.prepare_task(id)
-        }
-        fn prepare_batch_task(
-            &mut self,
-            ids: &[usize],
-        ) -> Result<FrameTask<PreparedBatch<String>>> {
-            for id in ids {
+        fn prepare_sequence_task(&mut self, count: usize) -> Result<FrameTask<PreparedSequence<String>>> {
+            for id in 0..count {
                 std::fs::write(self.root.join(format!("{id}.dng")), b"generated").unwrap();
             }
-            self.fake.prepare_batch_task(ids)
+            self.fake.prepare_sequence_task(count)
         }
-        fn commit_prepare(&mut self, _: usize, _: &String, _: Duration) -> Result<()> {
+        fn commit_prepare(&mut self, _: usize, _: &String) -> Result<()> {
             Ok(())
         }
         fn hash<'a>(&self, r: &'a String) -> &'a str {

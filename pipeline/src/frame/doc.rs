@@ -85,7 +85,7 @@ impl PreparedFrame {
         Self::load_context(context, true, &mut ConversionRecords::default())
     }
 
-    pub(crate) fn load_in_batch(context: &Path, records: &mut ConversionRecords) -> Result<Self> {
+    pub(crate) fn load_in_sequence(context: &Path, records: &mut ConversionRecords) -> Result<Self> {
         Self::load_context(context, false, records)
     }
 
@@ -224,6 +224,7 @@ pub(crate) fn parse_document_fields(bytes: &[u8], header: &str, limit: usize) ->
         return Err(failure("prepared context has an unsupported header"));
     }
     let mut fields: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut lines = lines.peekable();
     while let Some(line) = lines.next() {
         if line.is_empty() {
@@ -246,7 +247,7 @@ pub(crate) fn parse_document_fields(bytes: &[u8], header: &str, limit: usize) ->
         {
             return Err(failure("prepared context field name is malformed"));
         }
-        if fields.iter().any(|(name, _)| name == key) {
+        if !seen.insert(key) {
             return Err(failure(format!("prepared context repeats field {key}")));
         }
         let value = percent_decode(&line[equals + 1..], key)?;
@@ -458,7 +459,7 @@ fn validate_conversion(
     }
     require_fields(fields, &allowed)
 }
-/// A record belongs to one Converter invocation and is shared by its frames.
+/// Caches validated conversion provenance by record path during Prepare.
 #[derive(Default)]
 pub(crate) struct ConversionRecords {
     by_path: BTreeMap<PathBuf, ConversionRecord>,
@@ -493,10 +494,56 @@ impl ConversionRecords {
 }
 
 impl ConversionRecord {
+    fn read_sequence(bytes: &[u8], digest: &str) -> Result<Self> {
+        let fields = parse_document_fields(bytes, "rawtl-sequence-conversion/1", 256 * 1024)?;
+        let get = |name| field_value(&fields, name);
+        let keys = [
+            "executable", "version", "directory", "working_directory", "invocation", "argument",
+            "source", "source_sha256", "output_name", "output_sha256",
+        ].map(String::from);
+        require_fields(&fields, &keys)?;
+        let directory = PathBuf::from(get("directory")?);
+        let scratch = directory.parent().ok_or_else(|| failure("missing Converter scratch"))?;
+        let cwd = Path::new(get("working_directory")?);
+        let source = PathBuf::from(get("source")?);
+        let argument = Path::new(get("argument")?);
+        let name = get("output_name")?;
+        let valid_input = if cwd.as_os_str().is_empty() {
+            argument == source
+        } else {
+            cwd == scratch.join("converter-input")
+                && argument.parent() == Some(Path::new("."))
+                && fs::canonicalize(cwd.join(argument)).ok().as_ref() == Some(&source)
+        };
+        if !directory.is_absolute()
+            || !Path::new(get("executable")?).is_absolute()
+            || !source.is_absolute()
+            || Path::new(get("invocation")?) != scratch.join("converter.argv")
+            || !valid_input
+            || argument.file_stem().and_then(|stem| stem.to_str())
+                .is_none_or(|stem| format!("{stem}.dng") != name)
+        {
+            return Err(failure("sequence conversion record invocation mismatch"));
+        }
+        let output = ConversionOutput {
+            source_hash: hex64(get("source_sha256")?, "source_sha256")?,
+            name: name.into(),
+            output_hash: hex64(get("output_sha256")?, "output_sha256")?,
+        };
+        Ok(Self {
+            digest: digest.into(),
+            directory,
+            outputs: BTreeMap::from([(source, output)]),
+        })
+    }
+
     fn read(path: &Path, digest: &str) -> Result<Self> {
         let bytes = read_document(path, 1024 * 1024)?;
         if crate::digest::sha256(&bytes) != digest {
             return Err(failure("conversion record hash mismatch"));
+        }
+        if bytes.starts_with(b"rawtl-sequence-conversion/1\n") {
+            return Self::read_sequence(&bytes, digest);
         }
         let record = parse_document_fields(&bytes, "rawtl-conversion/1", 1024 * 1024)?;
         let r = |key: &str| field_value(&record, key);

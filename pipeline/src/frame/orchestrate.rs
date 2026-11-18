@@ -1,10 +1,10 @@
-//! One-frame and batch orchestration: prepare, analyze, develop, and the
+//! Single-frame and sequence orchestration: prepare, analyze, develop, and the
 //! per-frame native run with full metadata contract checks.
 use super::contract::{frame_metadata, validate_prepared_metadata, validate_sidecar_contracts};
 use super::doc::{
     ConversionRecords,
-    field_value, hex64, parse_document_fields, parse_u32, PreparedFrame, PreparedRoute,
-    read_document, require_fields,
+    hex64, parse_document_fields, parse_u32, PreparedFrame, PreparedRoute,
+    read_document,
 };
 use super::sidecar::{analysis_sidecar_envelope, format_axis, format_ev, format_wb, parse_json};
 #[cfg(test)]
@@ -200,6 +200,7 @@ fn produce_inner(
 }
 /// Settings for `dng-linear-frame --prepare`. The caller owns the scratch
 /// directory (it must already exist), the context path and its transcript.
+#[allow(dead_code)] // desktop preview
 pub struct PrepareSettings<'a> {
     pub scratch_dir: &'a Path,
     pub context_path: &'a Path,
@@ -228,6 +229,7 @@ pub fn prepare(
 ) -> Result<PreparedFrame> {
     prepare_active(tool, source, settings, Default::default())
 }
+#[allow(dead_code)] // desktop preview
 pub fn prepare_active(
     tool: &Path,
     source: &SourceFrame,
@@ -283,67 +285,51 @@ pub fn prepare_active(
     Ok(prepared)
 }
 
-/// One explicit source identity in an ordered batch (1..64 entries).
-pub struct PrepareBatchItem<'a> {
+const SEQUENCE_DOCUMENT_LIMIT: usize = 64 * 1024 * 1024;
+
+/// One explicit source identity in the ordered sequence.
+pub struct PrepareSequenceItem<'a> {
     pub frame_id: usize,
     pub source: &'a SourceFrame,
 }
-/// A private, empty batch scratch directory. This adapter owns prepare.request,
-/// prepare.result, batch-native.log and frame_{id}.context in that directory.
-/// The transcript is the batch's unique ActiveNative registration key.
-pub struct PrepareBatchSettings<'a> {
+/// A private, empty sequence scratch directory. This adapter owns prepare.request,
+/// prepare.result, prepare-native.log and frame_{id}.context in that directory.
+/// The transcript is the sequence's unique ActiveNative registration key.
+pub struct PrepareSequenceSettings<'a> {
     pub scratch_dir: &'a Path,
     pub converter: Option<&'a str>,
     pub converter_timeout: Option<u64>,
     pub lens: crate::lens::Settings,
 }
-fn batch_check_stop(active: &ActiveNative) -> Result<()> {
+fn sequence_check_stop(active: &ActiveNative) -> Result<()> {
     proc::check_stop()?;
     if active.lock().unwrap().cancelled {
-        return Err(failure("run cancelled before batch publication"));
+        return Err(failure("run cancelled before sequence publication"));
     }
     Ok(())
 }
-/// Returns the complete validated batch in request order, or no frames. No
+/// Returns the complete validated sequence in request order, or no frames. No
 /// caller may load individual contexts as a substitute for this success path.
-pub fn prepare_batch_active(
+pub fn prepare_sequence_active(
     tool: &Path,
-    items: &[PrepareBatchItem<'_>],
-    settings: &PrepareBatchSettings<'_>,
-    active: ActiveNative,
-) -> Result<Vec<(usize, PreparedFrame)>> {
-    prepare_batch(tool, items, settings, active, false)
-}
-
-pub fn prepare_batch_with_early_measurements(
-    tool: &Path,
-    items: &[PrepareBatchItem<'_>],
-    settings: &PrepareBatchSettings<'_>,
-    active: ActiveNative,
-) -> Result<Vec<(usize, PreparedFrame)>> {
-    prepare_batch(tool, items, settings, active, true)
-}
-
-fn prepare_batch(
-    tool: &Path,
-    items: &[PrepareBatchItem<'_>],
-    settings: &PrepareBatchSettings<'_>,
+    items: &[PrepareSequenceItem<'_>],
+    settings: &PrepareSequenceSettings<'_>,
     active: ActiveNative,
     early_measurements: bool,
 ) -> Result<Vec<(usize, PreparedFrame)>> {
-    batch_check_stop(&active)?;
-    if items.is_empty() || items.len() > 64 {
-        return Err(failure("batch count must be 1..64"));
+    sequence_check_stop(&active)?;
+    if items.is_empty() {
+        return Err(failure("prepare requires at least one source"));
     }
     let scratch = fs::canonicalize(settings.scratch_dir)
-        .map_err(|e| failure(format!("batch scratch: {e}")))?;
+        .map_err(|e| failure(format!("sequence scratch: {e}")))?;
     if fs::read_dir(&scratch)
         .map_err(|e| failure(e.to_string()))?
         .next()
         .is_some()
     {
         return Err(failure(
-            "batch adapter requires an empty private scratch directory",
+            "sequence adapter requires an empty private scratch directory",
         ));
     }
     if early_measurements {
@@ -352,16 +338,16 @@ fn prepare_batch(
     }
     let request = scratch.join("prepare.request");
     let result = scratch.join("prepare.result");
-    let log = scratch.join("batch-native.log");
+    let log = scratch.join("prepare-native.log");
     let mut expected = Vec::new();
     let mut ids = std::collections::BTreeSet::new();
     let mut text = format!("rawtl-prepare-request/1\ncount={}\n", items.len());
     for (i, item) in items.iter().enumerate() {
         if item.frame_id > u32::MAX as usize || !ids.insert(item.frame_id) {
-            return Err(failure("batch duplicate or out-of-range frame ID"));
+            return Err(failure("sequence duplicate or out-of-range frame ID"));
         }
         let source = fs::canonicalize(&item.source.path)
-            .map_err(|e| failure(format!("batch source: {e}")))?;
+            .map_err(|e| failure(format!("sequence source: {e}")))?;
         let context = scratch.join(format!("frame_{}.context", item.frame_id));
         for (key, value) in [
             ("id", item.frame_id.to_string()),
@@ -372,12 +358,12 @@ fn prepare_batch(
         }
         expected.push((item.frame_id, source, context));
     }
-    if text.len() > 1024 * 1024 {
-        return Err(failure("batch request exceeds size limit"));
+    if text.len() > SEQUENCE_DOCUMENT_LIMIT {
+        return Err(failure("sequence request exceeds size limit"));
     }
-    fs::write(&request, text).map_err(|e| failure(format!("batch request write: {e}")))?;
+    fs::write(&request, text).map_err(|e| failure(format!("sequence request write: {e}")))?;
     let mut args = vec![
-        "--prepare-batch".into(),
+        "--prepare-sequence".into(),
         request.display().to_string(),
         "--scratch".into(),
         scratch.display().to_string(),
@@ -393,70 +379,73 @@ fn prepare_batch(
     settings.lens.prepare_args(&mut args);
     let captured = proc::run_capture_active(tool, &args, EXIT_FRAME, &log, active.clone())?;
     write_prepare_log(&log, tool, &args, &captured)?;
-    batch_check_stop(&active)?;
+    sequence_check_stop(&active)?;
     if !captured.status.success() {
         return Err(failure(format!(
-            "prepared batch failed IDs {ids:?}: {}; transcript {}: {}",
+            "prepared sequence failed ({} frames): {}; transcript {}: {}",
+            items.len(),
             proc::exit_description(&captured.status),
             log.display(),
             proc::tail(&captured.stderr, 1200)
         )));
     }
-    let mut prepared = load_batch_result(&result, &expected)?;
+    let mut prepared = load_sequence_result(&result, &expected)?;
     for (_, frame) in &mut prepared { query_lens_area(tool, frame, &settings.lens, active.clone())?; }
-    batch_check_stop(&active)?; // Late success cannot revive cancelled work.
+    sequence_check_stop(&active)?; // Late success cannot revive cancelled work.
     Ok(prepared)
 }
-fn load_batch_result(
+fn load_sequence_result(
     result: &Path,
     expected: &[(usize, PathBuf, PathBuf)],
 ) -> Result<Vec<(usize, PreparedFrame)>> {
     let fields = parse_document_fields(
-        &read_document(result, 1024 * 1024)?,
+        &read_document(result, SEQUENCE_DOCUMENT_LIMIT)?,
         "rawtl-prepare-result/1",
-        1024 * 1024,
+        SEQUENCE_DOCUMENT_LIMIT,
     )?;
-    let get = |key: &str| field_value(&fields, key);
+    let fields: std::collections::HashMap<_, _> = fields.into_iter().collect();
+    let get = |key: &str| fields.get(key).map(String::as_str)
+        .ok_or_else(|| failure(format!("sequence result missing field {key}")));
     let count = parse_u32(get("count")?, "count")? as usize;
     if count != expected.len() {
-        return Err(failure("batch result count differs from request"));
+        return Err(failure("sequence result count differs from request"));
     }
-    let mut keys = vec!["count".into()];
+    if fields.len() != 1 + 4 * count {
+        return Err(failure("sequence result has unexpected fields"));
+    }
+    let by_id: std::collections::HashMap<_, _> = expected
+        .iter()
+        .map(|(id, source, context)| (*id, (source, context)))
+        .collect();
     let mut found = std::collections::BTreeMap::new();
     let mut records = ConversionRecords::default();
     for i in 0..count {
-        for k in ["id", "source", "source_sha256", "context"] {
-            keys.push(format!("item{i}_{k}"));
-        }
         let id = parse_u32(get(&format!("item{i}_id"))?, "id")? as usize;
-        let (_, source, context) = expected
-            .iter()
-            .find(|(n, _, _)| *n == id)
-            .ok_or_else(|| failure("batch result has extra frame ID"))?;
+        let &(source, context) = by_id.get(&id)
+            .ok_or_else(|| failure("sequence result has extra frame ID"))?;
         if Path::new(get(&format!("item{i}_source"))?) != source
             || Path::new(get(&format!("item{i}_context"))?) != context
         {
-            return Err(failure("batch result source/context differs from request"));
+            return Err(failure("sequence result source/context differs from request"));
         }
-        let frame = PreparedFrame::load_in_batch(context, &mut records)?;
+        let frame = PreparedFrame::load_in_sequence(context, &mut records)?;
         if frame.source != *source
             || frame.source_sha256
                 != hex64(get(&format!("item{i}_source_sha256"))?, "source_sha256")?
         {
-            return Err(failure("batch result context identity mismatch"));
+            return Err(failure("sequence result context identity mismatch"));
         }
         if found.insert(id, frame).is_some() {
-            return Err(failure("batch result repeats frame ID"));
+            return Err(failure("sequence result repeats frame ID"));
         }
     }
-    require_fields(&fields, &keys)?;
     expected
         .iter()
         .map(|(id, _, _)| {
             found
                 .remove(id)
                 .map(|f| (*id, f))
-                .ok_or_else(|| failure("batch result missing frame ID"))
+                .ok_or_else(|| failure("sequence result missing frame ID"))
         })
         .collect()
 }
