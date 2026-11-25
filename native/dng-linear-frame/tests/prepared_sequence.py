@@ -2,13 +2,15 @@
 
 All timing assertions use an explicit socket handshake; deadlines only bound faults.
 """
-import hashlib, json, os, pathlib, select, shutil, signal, socket, subprocess, sys, time
+import hashlib, json, os, pathlib, select, signal, socket, subprocess, sys, tempfile
 from urllib.parse import unquote
 from dng_fixture import make_dng
 
-exe, work = [pathlib.Path(x).resolve() for x in sys.argv[1:]]
-work = work / str(time.time_ns())
-work.mkdir(parents=True, exist_ok=True)
+exe, artifacts = [pathlib.Path(x).resolve() for x in sys.argv[1:]]
+artifacts.mkdir(parents=True, exist_ok=True)
+# Keep the owner alive through the test so its directory is removed on process exit.
+scratch = tempfile.TemporaryDirectory(dir=artifacts)
+work = pathlib.Path(scratch.name)
 receipts = []
 def record(argv, p, out, err):
     receipts.append(dict(argv=list(map(str, argv)), exit=p.returncode,
